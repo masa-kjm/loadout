@@ -103,19 +103,18 @@ Before requesting review:
 - Include a negative and zero-mutation case for every new mutation path.
 - Run the relevant checks available for the current workspace and report checks that could not run.
 
-`review-loadout-v0.2` and `test-design-loadout-v0.2` are planned skills, not installed skills.
-Until they exist, review directly against the architecture, specifications, and testing strategy.
+`review-loadout-v0-2`, `propose-loadout-change`, and `test-design-loadout-v0-2` are available project skills.
 
 ## Validation
 
 For documentation-only work, at minimum run `git diff --check` and verify affected relative links.
 
-Once the v0.2.0 Rust workspace exists, run the relevant commands before handoff when the environment permits:
+Once the v0.2.0 Rust package exists, run the relevant commands before handoff when the environment permits:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
 ```
 
 Do not claim an unrun check passed.

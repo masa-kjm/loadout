@@ -1,0 +1,4 @@
+interface:
+  display_name: "Propose Loadout Change Text"
+  short_description: "Draft v0.2 issue, commit, and PR text"
+  default_prompt: "Use $propose-loadout-change to draft an issue, commit, or pull-request message for this Loadout change."

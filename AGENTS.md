@@ -50,6 +50,37 @@ Declared Configuration
 Build the v0.2.0 implementation from a new, narrow foundation.
 An isolated legacy algorithm may be mined only after it has been checked against the v0.2.0 contract; do not carry forward legacy resource models, command semantics, compatibility paths, or broad abstractions.
 
+## Design Principles
+
+### Keep public contracts narrow
+
+Public contracts are expensive to change.
+Treat CLI syntax and behavior, configuration and schema fields, serialized state formats, diagnostics intended for automation, and other user-observable behavior as compatibility boundaries.
+Do not expose new concepts publicly unless necessary.
+Prefer changing internal implementations over expanding or changing public contracts.
+
+### Preserve architectural boundaries
+
+Define domain models and interfaces so that each layer has a clear responsibility and cannot rely on implementation details from other layers.
+Prefer explicit types and narrow interfaces over shared mutable state or cross-layer shortcuts.
+
+- Keep parsing and loading, resolution, validation, inspection, planning, execution, and persistence separate.
+- The planner operates only on resolved domain models. It must not access the filesystem or parse configuration.
+- The executor executes an already-decided Plan. It must not reimplement planning decisions.
+- Keep filesystem- and platform-specific behavior behind the filesystem and resource-execution boundary.
+- Do not put domain decisions in the CLI or rendering layer.
+- Do not leak persistence representations into domain logic unless a domain boundary requires them.
+
+### Make invalid architecture difficult to express
+
+Prefer types, module visibility, constructors, and interfaces that enforce invariants structurally rather than relying on comments or caller discipline.
+Keep APIs minimal; do not make a type or function public unless another boundary requires it.
+
+### Optimize for changeability
+
+Before introducing an abstraction, identify the boundary or expected axis of change it protects.
+Avoid speculative abstractions, but do not couple independent responsibilities merely because the current implementation is small.
+
 ## Safety Invariants
 
 Preserve every applicable invariant:
@@ -71,16 +102,16 @@ Preserve every applicable invariant:
 - Add evidence at the narrowest suitable layer: pure domain, filesystem contract, state durability, executor integration, CLI acceptance, or platform conformance.
 - Test every new mutation path for success, zero-mutation rejection, ownership protection, post-mutation failure, and recovery where applicable.
 - Use disposable test directories only. Never use a real home directory, XDG/AppData directory, source store, or repository state directory in a mutation test.
-- Once the v0.2.0 Rust workspace exists, run the relevant formatter, linter, and tests before handoff. Report checks that could not run and why.
+- Once the v0.2.0 Rust package exists, run the relevant formatter, linter, and tests before handoff. Report checks that could not run and why.
 
-## Planned Skills
+## Project Skills
 
-The following skills are planned but do not exist yet. Do not invoke or assume them until their `SKILL.md` files are added.
+Source skills live in `.claude/skills/` and are synchronized for Codex discovery by `scripts/sync-codex-skills.sh`.
 
-- `review-loadout-v0.2`: reviews architecture boundaries, ownership and mutation safety, state consistency, error handling, future compatibility, and unnecessary abstraction.
-- `test-design-loadout-v0.2`: designs state-transition, crash-recovery, path-safety, durability, and Unix/Windows conformance tests.
+- `review-loadout-v0-2`: reviews v0.2 contracts, architecture boundaries, ownership and mutation safety, state consistency, compatibility, and required test evidence.
+- `propose-loadout-change`: drafts evidence-based issue, commit, and pull-request text without mutating Git or GitHub state.
+- `test-design-loadout-v0-2`: designs state-transition, crash-recovery, path-safety, durability, and Unix/Windows conformance evidence from v0.2 contracts.
 
-Until those skills exist, perform their checks directly against the authoritative architecture, specifications, and testing strategy.
 
 ## Repository and External State
 

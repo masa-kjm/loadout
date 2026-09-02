@@ -1,9 +1,0 @@
-# Cycle detection fixture — part B.
-# Imports config-import-cycle-a.yaml to form a cycle with it.
-# Not a valid standalone config; used only to trigger cycle detection.
-
-imports:
-  - config-import-cycle-a.yaml
-
-profile:
-  components: {}

@@ -1,9 +1,0 @@
-# Partial config defining the 'base' bundle.
-# Imported by import-single and import-merge-order configs.
-# Not a standalone config (no profile section required here).
-
-bundles:
-  base:
-    components:
-      local:
-        dummy-pkg: {}

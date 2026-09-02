@@ -1,8 +1,0 @@
-# Partial config defining the 'extra' bundle.
-# Used by import-merge-order to override the 'base' bundle from import-bundle-base.yaml.
-
-bundles:
-  base:
-    components:
-      local:
-        dummy-fs-copy: {}

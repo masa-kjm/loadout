@@ -103,7 +103,7 @@ Before requesting review:
 - Include a negative and zero-mutation case for every new mutation path.
 - Run the relevant checks available for the current workspace and report checks that could not run.
 
-`review-loadout-v0-2`, `propose-loadout-change`, and `test-design-loadout-v0-2` are available project skills.
+`review-loadout-v0-2`, `propose-loadout-change`, `test-design-loadout-v0-2`, and `maintain-loadout-context` are available project skills.
 
 ## Validation
 

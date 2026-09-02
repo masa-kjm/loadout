@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Loadout v0.2 Changes"
+  short_description: "Review v0.2 contracts and safety evidence"
+  default_prompt: "Use $review-loadout-v0-2 to review this Loadout v0.2 change against its contract."

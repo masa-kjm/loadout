@@ -111,7 +111,7 @@ Source skills live in `.claude/skills/` and are synchronized for Codex discovery
 - `review-loadout-v0-2`: reviews v0.2 contracts, architecture boundaries, ownership and mutation safety, state consistency, compatibility, and required test evidence.
 - `propose-loadout-change`: drafts evidence-based issue, commit, and pull-request text without mutating Git or GitHub state.
 - `test-design-loadout-v0-2`: designs state-transition, crash-recovery, path-safety, durability, and Unix/Windows conformance evidence from v0.2 contracts.
-
+- `maintain-loadout-context`: maintains v0.2 documentation, project-skill sources, and generated skill discovery copies without changing authority boundaries.
 
 ## Repository and External State
 

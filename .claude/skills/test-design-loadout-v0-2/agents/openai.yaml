@@ -1,0 +1,4 @@
+interface:
+  display_name: "Design Loadout v0.2 Tests"
+  short_description: "Design contract evidence for v0.2 tests"
+  default_prompt: "Use $test-design-loadout-v0-2 to design test coverage for this Loadout v0.2 behavior."

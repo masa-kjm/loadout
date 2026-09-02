@@ -97,7 +97,8 @@ It MUST NOT remove parent directories.
 If a stale resource target is `missing`, Loadout may remove its Known state record without a filesystem mutation.
 If its target is any other observation, removal is blocked by a conflict and Known state remains unchanged.
 
-v0.2.0 does not provide a force option or an ownership-transfer operation.
+v0.2.0 does not provide a force option, unmanaged-target takeover, or user-invoked ownership-transfer operation.
+The lifecycle may perform the internal managed-resource identity handoff defined by [Replace Ownership](#replace-ownership) only when Known and Actual state prove Loadout's existing ownership.
 
 ## Mutation Contract
 
@@ -118,6 +119,19 @@ The implementation MUST use a platform operation whose successful post-condition
 It MUST NOT first delete the old link and then attempt an unrelated create.
 
 If the platform cannot perform this replacement while preserving the old link when the replacement fails, preflight MUST block the action before the target is changed.
+
+### Replace Ownership
+
+Replace Ownership is an internal handoff between two Loadout-managed resource identities at one target.
+It applies only when a stale old resource has a Known-state record, Actual observation proves the old resource's expected link, and the new resource source has validated.
+It MUST NOT adopt, replace, or otherwise take over an unmanaged target, including a `matching_unmanaged_link`.
+
+If the old and new resolved link targets are equal, Loadout performs no filesystem mutation and allocates no replacement temporary path.
+After a fresh no-follow verification of the old resource's ownership and the shared expected link, the state repository atomically removes the old Known resource identity, records the new identity, and marks the action `succeeded`.
+
+If the resolved link targets differ, Replace Ownership MUST use the same replacement primitive and failure guarantees as Replace.
+It MUST NOT delete the old managed link before installing the new expected link.
+After the new expected link is verified, the state repository atomically replaces the old Known resource identity with the new identity and marks the action `succeeded`.
 
 ### Remove
 
@@ -148,9 +162,10 @@ The following guarantees apply to a target whose parent path and final entry hav
 | --- | --- |
 | Create | Create only a file symbolic link at a target that is still `missing`. The implementation must not replace an entry that appeared after planning. |
 | Replace | Record a unique Loadout-owned temporary sibling path, construct a new file symbolic link there, then use one target-name replacement operation. The temporary path is action-local and is never a declared resource target. It MUST NOT implement replacement as deleting the managed link and later creating a new one. Success requires both the new expected target link and absence of the temporary entry. If the platform cannot preserve the old expected link when that replacement operation fails, it does not support `replace_link` and preflight MUST block the action. |
+| Source-changing Replace Ownership | Apply every Replace guarantee. It is required only when the old and new resolved link targets differ. |
 | Remove | Remove only the final expected file-symbolic-link entry. It must not follow the link, remove its referent, or remove a parent directory. |
 
-The state repository allocates a replacement action's unique temporary sibling path while it persists that action's operation record, before any mutation.
+The state repository allocates a unique temporary sibling path while it persists the operation record for every `replace_link` action and every `replace_ownership` action whose resolved link targets differ, before any mutation.
 This allocation is an execution-local nonce, not a planner decision, resource identity, or ordering input.
 The executor may use only the recorded path and MUST recheck that it is missing under the same safe parent immediately before creating the temporary link.
 
@@ -163,7 +178,7 @@ Loadout does not wait for the handle, schedule a later retry, or weaken the oper
 
 ### Capability, Permission, and Handle Failures
 
-Preflight MUST block without target mutation when it can determine that the platform cannot create a file symbolic link or cannot provide the required replacement guarantee.
+Preflight MUST block without target mutation when it can determine that the platform cannot create a file symbolic link or cannot provide the required replacement guarantee for an action that requires replacement.
 It must report the unsupported capability and affected action.
 
 Permission and handle availability are mutable filesystem facts and cannot be established conclusively by a separate access check.

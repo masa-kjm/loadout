@@ -81,7 +81,7 @@ loadout apply [--config <path>] [<profile-id>] [--yes] [--dry-run]
 Without a positional profile ID, the environment configuration MUST provide `default_profile`.
 Apply always generates a fresh plan; it never accepts a previously displayed plan as input.
 
-For a normal apply, Loadout displays the Plan before mutation.
+After successful preflight, a normal apply displays the executable Plan before mutation.
 When standard input and standard error are terminals, it asks for confirmation and proceeds only after an affirmative response.
 When the session is non-interactive, `--yes` is REQUIRED; otherwise apply fails without mutation.
 

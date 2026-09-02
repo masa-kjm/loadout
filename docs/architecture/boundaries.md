@@ -43,8 +43,10 @@ For the v0.2.0 file-link resource, removal or replacement is permitted only when
 1. Known state records Loadout's expected link for the resource.
 2. Actual inspection confirms that the target is that expected link.
 
-Any missing proof, wrong link, regular file, directory, symlinked parent, junction, reparse point, or other unexpected entry is a conflict or safety failure.
+Any missing proof, wrong link, regular file, directory, unsafe target-parent path, or other unexpected entry is a conflict or safety failure.
 It must not be replaced, followed, or removed.
+
+The [File Links](../specs/file-link.md) specification defines which target-parent conditions are unsafe and the required no-follow proof on each supported platform.
 
 v0.2.0 has no forceful takeover of an unmanaged target.
 Explicit transfer-of-ownership behavior, if ever introduced, requires its own specification and confirmation contract.
@@ -76,7 +78,8 @@ Failure cleanup must not remove user-visible artifacts other than Loadout's own 
 ## Schema-Version Boundary
 
 Every persisted control document has a schema version that identifies its structural and behavioral contract.
-A normal lifecycle or inspection command must reject an unsupported version before it inspects a managed target, makes a planning decision, or writes durable state.
+A command must reject an unsupported version before an inspection, planning decision, or durable-state mutation relies on that document's contents.
+A command need not read or validate a persisted control document that its operation does not depend on.
 It must not ignore unknown ordering, ownership, recovery, or resource-effect data in order to continue.
 
 Schema migration is outside the v0.2.0 executable surface.

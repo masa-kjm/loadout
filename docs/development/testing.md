@@ -27,10 +27,10 @@ The following matrix is the minimum evidence required before v0.2.0 is considere
 | --- | --- |
 | [Configuration](../specs/configuration.md) | Runtime and CLI configuration selection; path-base resolution; unknown-field rejection; duplicate profile IDs; store roots remain unchanged. |
 | [Profiles](../specs/profiles.md) | Include order; cycle and missing-ID rejection; deduplication through multiple paths; fully qualified identity; target-collision rejection; deterministic ordering independent of input-map iteration. |
-| [File Links](../specs/file-link.md) | Create, no-op, replace, relocate, remove, and forget-missing outcomes; unmanaged-target protection; wrong-link and regular-file conflicts; parent-escape rejection; source and target containment; no parent removal. |
-| [Lifecycle](../specs/lifecycle.md) | Every Desired/Known/Actual table row; blocked plans make no mutation; preflight failure creates no operation record; executor recheck rejects a target changed after planning; phase ordering and stop-after-failure behavior. |
-| [State and Recovery](../specs/state-and-recovery.md) | Corrupt-state rejection; exclusive-lock contention; atomic-commit failure; every operation-status transition; recovery to succeeded, failed, skipped, and uncertain; no rollback of verified earlier actions. |
-| [CLI](../specs/cli.md) | Positional root-profile selection; `validate` default-profile and `--all` behavior; `diff` Known-to-Actual reporting and zero mutation; `plan` and `apply` default-profile behavior; interactive confirmation; non-interactive `--yes` requirement; dry-run zero mutation; all documented exit-status classes. |
+| [File Links](../specs/file-link.md) | Create, no-op, replace, relocate, remove, forget-missing, and managed identity-handoff outcomes; unmanaged-target protection; wrong-link and regular-file conflicts; parent-escape rejection; source and target containment; no parent removal. |
+| [Lifecycle](../specs/lifecycle.md) | Every Desired/Known/Actual table row; blocked plans make no mutation; preflight failure creates no operation record; executor recheck rejects a target changed after planning; phase ordering; contiguous relocation; and stop-after-failure behavior. |
+| [State and Recovery](../specs/state-and-recovery.md) | Corrupt-state rejection; canonical-hash fixtures; exclusive-lock contention; atomic-commit failure; every operation-status transition; same-source identity-handoff recovery; recovery to succeeded, failed, skipped, and uncertain; no rollback of verified earlier actions. |
+| [CLI](../specs/cli.md) | Positional root-profile selection; `validate` default-profile and `--all` behavior; `diff` Known-to-Actual reporting and zero mutation; `plan` and `apply` default-profile behavior; confirmation after successful preflight and before an operation record; non-interactive `--yes` requirement; dry-run zero mutation; all documented exit-status classes. |
 
 ## Pure Domain Tests
 
@@ -39,6 +39,9 @@ They must not parse YAML, access a store, inspect the host filesystem, acquire a
 
 At minimum, domain tests cover every row in the lifecycle transition table and assert both the action and its reason.
 They also prove that resource ordering is stable when equivalent declarations are supplied in different mapping orders.
+Canonical-hash fixtures use typed resolved values and assert the exact `definition_hash` and `desired_hash`, including deterministic resource ordering.
+They prove that equal resolved definitions under distinct resource IDs have the same `definition_hash` and different `desired_hash` values.
+Managed identity-handoff planning cases distinguish equal and differing resolved link targets and assert the recorded old and new identities and link targets.
 
 Tests for a blocked plan must assert that the plan has blocking diagnostics and no executable action for the conflicting target.
 
@@ -63,6 +66,10 @@ The required negative cases include:
 
 Tests that simulate a filesystem change between planning and execution must prove that the executor aborts rather than changing its planned action.
 
+Managed identity-handoff tests cover both resolved-link-target cases.
+When the targets are equal, they prove that the target is untouched, no replacement temporary path is allocated, and only the Known identity changes.
+When the targets differ, they prove the Replace guarantees, including preservation of the old managed link on replacement failure.
+
 ## State Repository Durability Tests
 
 State tests use controlled failures at each commit boundary: temporary-file creation, write, flush, parse, validation, replacement, and directory flush when available.
@@ -77,6 +84,12 @@ Recovery tests construct an active operation record and real filesystem observat
 | A pending action was never started | Mark it skipped without changing Known state. |
 | Neither condition can be proven, or observation is unsafe | Retain the operation as uncertain and block the next apply. |
 
+Relocation recovery tests inject an interruption after the new link is verified and before the old link is removed.
+They assert that recovery retains that partial relocation as `uncertain` without target mutation.
+
+Same-source identity-handoff recovery tests interrupt a `running` action before its atomic state commit.
+They assert that the old Known identity and shared expected link atomically recover to the new identity and `succeeded` without target mutation.
+
 Lock tests require two independently created repository handles or processes.
 They must prove that the second non-dry-run apply fails before target observation or mutation while the first holds the exclusive lock.
 
@@ -84,10 +97,12 @@ They must prove that the second non-dry-run apply fails before target observatio
 
 Executor integration tests exercise the complete sequence from resolved inputs through state commit.
 They inject a filesystem or state failure after a mutation where necessary and assert the resulting operation record and target state.
+They prove that no other action begins between a `relocate_link` action's verified new-link creation and verified old-link removal.
 
 CLI acceptance tests invoke the compiled binary in an isolated environment.
 They assert behavior rather than exact prose formatting.
 For example, they check that a blocked plan identifies a conflict and exits with status `2`, not the precise English wording of that diagnostic.
+Apply confirmation tests prove that prompting follows successful preflight and that a declined or unavailable confirmation leaves no operation record or target mutation.
 
 `diff` acceptance tests construct Known state and expected, missing, wrong-link, other-entry, unsafe-parent, and unfinished-operation observations.
 They assert that the command reports each category while leaving the target tree, state directory, store, configuration files, and operation record unchanged.
@@ -103,6 +118,7 @@ Platform-neutral tests may use a filesystem abstraction for deterministic failur
 Unix coverage must exercise symbolic-link inspection without following the final link, a symlinked-parent rejection, atomic replacement of a managed link, and link-entry removal without touching the referent.
 Windows coverage must exercise file symbolic-link behavior when available and reject junctions or unsupported reparse points.
 It must also cover a replacement or removal rejected by access control or sharing when the test environment can create that condition, proving that no delete-then-create fallback and no premature Known-state update occur.
+It must prove that a same-source managed identity handoff does not require replacement capability, while a source-changing handoff does require the documented replacement guarantee.
 When the host cannot create a file symbolic link or cannot provide the required replacement guarantee, the test must prove the documented preflight failure rather than silently skipping the behavior.
 Replacement tests must cover interruption or failure after the action-local temporary link is created, proving that only the exact recorded temporary link may be cleaned up and that an unexpected or unremovable temporary entry leaves the action uncertain.
 

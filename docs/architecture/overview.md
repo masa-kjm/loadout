@@ -46,7 +46,7 @@ Resolved Desired ----+---- Known State Repository
 ```
 
 The command layer invokes this flow, presents diagnostics, obtains confirmation when required, and maps results to output and exit status.
-It does not implement resource ownership, path safety, planning, or durable-state decisions.
+The application workflow coordinates the lifecycle calls in the required [Lifecycle](../specs/lifecycle.md) order. v0.2.0 does not require this coordination to be a separate subsystem: it may remain in the command implementation or move to an internal use case. In either form, coordination does not make resource-ownership, path-safety, planning, or durable-state decisions.
 The read-only `diff` command uses the same Actual observation model to compare Known and Actual state without resolving Desired state or invoking the planner.
 
 ## Core Data Model
@@ -118,7 +118,7 @@ A future dependency model may constrain action order, but independent actions mu
 
 | Subsystem | Responsibility |
 | --- | --- |
-| Command adapter | Parse command input, request confirmation, render diagnostics and reports, and choose exit status. |
+| Command adapter | Parse command input, invoke or coordinate the application workflow, request confirmation, render diagnostics and reports, and choose exit status. |
 | Configuration loader | Locate and parse machine-local configuration and portable profiles. |
 | Resolver and validator | Compose profiles, bind paths and stores, normalize declarations, and reject invalid desired state. |
 | Actual state inspector | Observe managed targets and safety-relevant filesystem facts without mutation. |

@@ -16,5 +16,5 @@ The following commitments apply throughout v0.2:
 - The executor performs only actions present in a plan and does not make a new planning decision.
 - Filesystem mutation and durable state commits are separate responsibilities, connected by post-condition verification.
 - A resource is never removed solely because it appears in Known state; ownership and the current filesystem entry must both satisfy the applicable contract.
-- A normal lifecycle command rejects unsupported persisted schema versions before target inspection or mutation; a future migration operation is the only boundary allowed to transform them.
+- A command validates every persisted control-document schema version on which it depends before a target inspection, planning decision, or durable-state mutation relies on that document; a future migration operation is the only boundary allowed to transform an unsupported version.
 - A future resource type may extend well-defined lifecycle boundaries, but it must not bypass ownership, state, or diagnostic boundaries.

@@ -1,44 +1,23 @@
 # Specifications
 
-## Purpose
+These documents define the observable v0.2.0 contracts.
+They are authoritative for behavior, data, safety rules, and failure aftermath.
+Architecture documents define responsibility boundaries; they do not replace these specifications.
 
-Specs define normative contracts: what inputs are valid, what outputs are guaranteed,
-what invariants must hold. They do not explain rationale or implementation details.
+## Documents
 
-## Spec Categories
+- [Configuration](configuration.md) defines machine-local runtime configuration, portable environment configuration, stores, and path syntax.
+- [Profiles](profiles.md) defines profile discovery, profile composition, resource declarations, and semantic validation.
+- [File Links](file-link.md) defines the only v0.2.0 resource type and its ownership and filesystem-safety contract.
+- [Lifecycle](lifecycle.md) defines validation, planning, preflight, application, deterministic ordering, and the Desired/Known/Actual transition table.
+- [State and Recovery](state-and-recovery.md) defines durable Known state, operation records, locking, atomic commits, and crash recovery.
+- [CLI](cli.md) defines the v0.2.0 command surface, confirmation behavior, and exit status classes.
 
-**Data specs** — Schemas, semantics, and invariants for persistent data formats.
+## Normative Language
 
-* `data/profile.md` — Profile schema and component declaration semantics
-* `data/strategy.md` — Strategy schema and backend resolution rules
-* `data/state.md` — State schema, invariants, and commit rules
-* `data/sources.md` — Source registry schema and allow-list rules
-* `data/component_index.md` — Component Index schema (dep fields + spec; input to Resolver and ComponentCompiler)
-* `data/desired_resource_graph.md` — DesiredResourceGraph schema (ComponentCompiler output; input to Planner)
+The terms **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, and **MAY** describe the strength of a requirement.
+An implementation that does not satisfy a MUST or MUST NOT requirement is not a v0.2.0 implementation.
 
-**API specs** — Interface contracts for pluggable components.
+## Version Scope
 
-* `api/backend.md` — Backend plugin interface (JSON stdin/stdout protocol)
-* `api/component-host.md` — Component script interface (environment variable protocol)
-
-**Algorithm specs** — Input/output contracts for pure computation modules.
-
-* `algorithms/planner.md` — Planner phases, decision table, plan format
-* `algorithms/resolver.md` — Dependency resolution algorithm
-
-## Stability Expectations
-
-Data specs and algorithm specs are stable.
-Changes require a version bump or migration path.
-
-API specs may evolve as new backend capabilities are added,
-but existing required operations must remain backward-compatible.
-
-## Reading Order
-
-1. `data/state.md` — understand the authority model first
-2. `data/profile.md` — understand input declaration
-3. `data/strategy.md` — understand backend selection
-4. `data/sources.md` — understand source admission and lookup
-5. `algorithms/planner.md` — understand how decisions are made
-6. `api/backend.md` — understand the execution adapter contract
+All schemas in this directory begin at version `1`.

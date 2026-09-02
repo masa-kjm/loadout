@@ -1,86 +1,104 @@
-# Architectural Boundaries
+# Architecture Boundaries
 
-## Planner vs Executor
+## Purpose
 
-Planner is **pure**. Executor is **impure**.
+These boundaries keep safety decisions in one place and prevent the command layer, resource implementations, and persistence code from making incompatible decisions.
+They apply to every v0.2 implementation, including tests and future resource types.
 
-Planner: reads inputs, computes classification, produces a Plan. No side effects.
-Executor: executes actions in plan order, calls component scripts and backends, commits state.
+## Decision Ownership
 
-The boundary is non-negotiable:
+| Concern | Owner | Other layers must not do |
+| --- | --- | --- |
+| Command parsing, confirmation, formatting, and exit status | Command adapter | Reimplement lifecycle, ownership, or filesystem policy. |
+| Declaration parsing, profile composition, path binding, and semantic validation | Resolver and validator | Inspect target state, mutate the filesystem, or write state. |
+| Target and parent observation | Actual state inspector | Change the filesystem or treat an observation as durable ownership. |
+| Desired/Known/Actual classification and action selection | Planner | Perform I/O, mutate state, invoke commands, or print. |
+| Immediate precondition recheck, mutation, and post-condition verification | Executor | Create an unplanned action or reclassify an action after planning. |
+| State lock, operation progress, Known state, and atomic commit | State repository | Delegate authoritative state writes to command or resource code. |
+| Platform-specific path and filesystem primitives | Filesystem implementation | Decide ownership, desired state, or user-visible policy. |
 
-* Planner must not execute, modify state, or call backends.
-* Executor must not decide actions or re-classify operations.
-* The plan produced by the planner is the executor's only instruction set.
+## Planning and Execution
 
-See `specs/algorithms/planner.md` for the full contract.
+The planner is a pure decision boundary:
 
-## Plugin Isolation
-
-Backend plugins must not:
-
-* read strategy directly
-* write state directly
-* communicate with other plugins
-* produce side effects outside their designated install/uninstall scope
-
-Plugins receive only what core passes them explicitly.
-They are execution adapters, not decision makers.
-
-## State Authority Enforcement
-
-```
-planner:   reads state only
-executor:  mutates state (via state module only)
-components:  must not read or modify state directly
-backends:  must not read or modify state directly
+```text
+Resolved Desired + Known + Actual -> Plan
 ```
 
-Violation examples:
+The executor is an effect boundary:
 
-* A component script writing to `state.json` → forbidden
-* The planner modifying state to "reserve" a resource → forbidden
-* A backend reading state to decide which version to install → forbidden
+```text
+Resource Execution Plan + verified execution context -> effects + verification result
+```
 
-## Component Independence
+The executor must execute only actions present in the Plan.
+It may reject an action when its immediate safety recheck fails, but it must not silently convert a rejected action into another action.
+For example, a planned create must not become a replacement because an unexpected target appeared after planning.
 
-Components must not depend on each other's internals.
-Interaction between components is expressed only through the dependency model (`depends`, `requires`/`provides`).
-There are no shared files, shared state slots, or shared install scripts between components.
+## Ownership and Removal
 
-## Dependency Model Constraints
+Known state alone never authorizes a destructive filesystem action.
+For the v0.2.0 file-link resource, removal or replacement is permitted only when both conditions hold:
 
-Dependency declarations are for ordering only.
+1. Known state records Loadout's expected link for the resource.
+2. Actual inspection confirms that the target is that expected link.
 
-* No version constraints in `depends`
-* No conditional dependencies
-* No runtime-computed dependencies
-* Cycles are forbidden
-* Depth must remain shallow
+Any missing proof, wrong link, regular file, directory, symlinked parent, junction, reparse point, or other unexpected entry is a conflict or safety failure.
+It must not be replaced, followed, or removed.
 
-If a required capability (`requires`) has no provider in the current profile, apply aborts.
-If a dependency or backend references an external source item blocked by the source registry, apply aborts.
+v0.2.0 has no forceful takeover of an unmanaged target.
+Explicit transfer-of-ownership behavior, if ever introduced, requires its own specification and confirmation contract.
 
-## Prohibited (Non-Negotiable)
+## Filesystem Mutation
 
-The following are forbidden under any circumstance:
+Filesystem mutation is permitted only after a fresh executable plan and preflight checks.
+The executor must revalidate containment, parent safety, target kind, and the action-specific ownership precondition immediately before mutation.
 
-* Writing to state outside the state module
-* Direct package manager invocation inside component scripts (`brew`, `apt`, `scoop`, etc.)
-* Logic or OS branching inside profiles
-* Filesystem scanning during uninstall to discover removal targets
-* Cross-component resource ownership (two components tracking the same `fs.path`)
-* Deep dependency graphs or runtime-computed dependencies
-* Backend plugins reading strategy or writing state directly
+Path validation must account for symlinks on Unix and symlinks, junctions, reparse points, and case behavior on Windows.
+A lexical path check is not containment proof.
+The detailed algorithms and supported platform behavior belong to the file-link specification.
 
-Violations require architectural review — they cannot be justified by convenience.
+The executor must modify only the resolved target named by the action.
+It must not write to Loadout control files, state files, lock files, profiles, or store contents as a side effect of materializing a resource.
 
-## Breaking the Boundaries
+## State and Failure Boundaries
 
-If a boundary must be revisited, it requires:
+The state repository is the only authority that writes durable Known state.
+The executor must not make a successful mutation appear managed until its post-condition has been verified.
 
-1. An architectural discussion (not just a code change)
-2. Update to the relevant spec
-3. Update to this document
+Apply records durable progress before a resource mutation and commits Known state only after verification.
+If execution stops, a resource without a confirmed post-condition is uncertain rather than successful.
+The next apply observes actual state and creates a new plan; it does not blindly resume an old plan.
 
-Boundaries are not suggestions. They exist to preserve long-term maintainability.
+v0.2.0 does not promise rollback of already verified resource actions.
+Failure cleanup must not remove user-visible artifacts other than Loadout's own temporary files.
+
+## Schema-Version Boundary
+
+Every persisted control document has a schema version that identifies its structural and behavioral contract.
+A normal lifecycle or inspection command must reject an unsupported version before it inspects a managed target, makes a planning decision, or writes durable state.
+It must not ignore unknown ordering, ownership, recovery, or resource-effect data in order to continue.
+
+Schema migration is outside the v0.2.0 executable surface.
+When introduced, it must be an explicit operation rather than an implicit step of validation, planning, application, or inspection.
+State migration must hold the state repository's exclusive lock and require `active_operation == null`.
+An active or uncertain operation must be recovered and closed by the binary that implements its original state contract before migration.
+The future migration protocol is described in [Schema Evolution and Migration](../future/schema-evolution-and-migration.md).
+
+## Diagnostics and Errors
+
+Core layers return structured diagnostics and errors.
+Only the command adapter formats them for a terminal or maps them to an exit status.
+
+A blocking diagnostic prevents mutation.
+An error after a mutation is reported together with the durable operation status needed for a later recovery attempt.
+
+If a dry-run mode is exposed, it must not create directories, acquire a mutating lock, write state, write operation records, create temporary files in managed paths, or otherwise mutate persistent or managed state.
+
+## Extension Boundary
+
+Future resource types must use the same ownership, inspection, planning, execution, verification, diagnostics, and state boundaries.
+They may not add a shortcut from command code to filesystem mutation or from a resource handler to durable state.
+
+The architecture does not require every future concept to be an abstraction today.
+v0.2.0 implements the file-link lifecycle completely first and adds a shared abstraction only when multiple implemented resource types need it.

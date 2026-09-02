@@ -1,124 +1,38 @@
-# loadout
+# Loadout
 
-A declarative and deterministic environment manager system for Linux, WSL, and Windows.
-Designed to safely reproduce development environments.
+Loadout is a local environment manager built around explicit desired state, ownership-aware filesystem operations, and durable recovery.
 
-> Personal / Experimental environment manager.
-> API and catalog may break until v1.0.0
+## Status
 
-## Overview
+v0.2.0 is a clean-break redesign and is not released yet.
+Its architecture and specifications are complete enough to guide the first implementation, but the repository does not yet provide a v0.2.0 binary or installer.
 
-This project turns environment setup into a deterministic system.
-Components are declared in a profile; the system installs, updates, and removes them safely.
+v0.1 is retired and unsupported.
+The published `loadout` v0.1.0 crate is preserved by the `v0.1.0` archive tag, and the final legacy source snapshot is preserved by `legacy/v0.1-final`.
+v0.2.0 does not provide compatibility with v0.1 configuration, state, commands, resources, or behavior.
 
-Key goals:
+## v0.2.0 Direction
 
-* **Reproducible** — the same profile produces the same environment on any machine
-* **Safe** — uninstall removes only what the system installed, never anything else
-* **Deterministic** — given the same inputs, execution always produces the same plan
-* **Plan / Apply execution model** — changes are always previewed as a plan before execution
-* **Cross-platform** — Linux, WSL, and Windows share the same model
+v0.2.0 begins with one complete, safe resource lifecycle: materializing a regular file from a local store as a file symbolic link below the current user's home directory.
+It provides profile composition, validation, planning, drift inspection, conflict detection, state locking, verified application, and crash recovery.
 
-## Installation
+The core planning contract is:
 
-### Linux / macOS
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/massa-kj/loadout/main/install.sh | bash
+```text
+Resolved Desired + Known + Actual -> Plan
 ```
 
-Options:
-
-```bash
-bash install.sh [--version v0.1.0] [--prefix ~/.local]
-```
-
-### Windows (PowerShell)
-
-```powershell
-irm https://raw.githubusercontent.com/massa-kj/loadout/main/install.ps1 | iex
-```
-
-Options:
-
-```powershell
-.\install.ps1 [-Version v0.1.0] [-Prefix $env:USERPROFILE\.local]
-```
-
-The binary is installed to `<prefix>/bin/loadout` (Linux/macOS) or `<Prefix>\bin\loadout.exe` (Windows).
-
-## Quick Start
-
-Declare your environment in a single config file:
-
-```yaml
-# configs/wsl.yaml
-profile:
-  components:
-    git: {}
-    neovim: {}
-    node:
-      version: "22.17.1"
-
-policy:
-  package:
-    default_backend: brew
-  runtime:
-    default_backend: mise
-```
-
-Preview changes without applying:
-
-```bash
-./loadout plan -c wsl
-```
-
-Apply to your machine:
-
-```bash
-./loadout apply -c wsl
-```
-
-Re-running apply is safe. Components already in the correct state are skipped.
-
-## Design Goals
-
-**Declaration over scripting**
-Profiles express intent, not procedures. The system decides how to produce the result.
-
-**State over inference**
-Installed resources are recorded in state.
-The system never scans the filesystem to infer what exists.
-State is the only authority for uninstall decisions.
-
-**Safety over convenience**
-The system aborts rather than guesses.
-Destructive operations require explicit intent.
-
-**Replaceability**
-Backends (Homebrew, mise, winget, …) and components are interchangeable adapters.
-Core does not embed tool-specific logic.
-
-## Key Concepts
-
-**Profile** — declares which components should be present and at what version.
-
-**Policy** — declares which installation strategy to use for package and runtime management.
-
-**Component** — a self-contained module: `meta.yaml` + `install` + `uninstall` + `files/`.
-
-**Backend** — executes package/runtime operations (brew, mise, scoop, winget, npm, uv).
-
-**Plan** — a deterministic list of actions computed from profile vs state.
-
-**State** — the authoritative record of what the system has installed and how to remove it.
+Loadout never adopts, removes, or replaces an unmanaged target through the normal lifecycle.
+A destructive action is permitted only when durable Known state and a current no-follow filesystem observation both prove the required ownership condition.
 
 ## Documentation
 
-Design documents are in [`docs/`](docs/README.md).
+The authoritative v0.2 documentation is currently in [`docs/`](docs/README.md) during the documentation cutover.
 
-| | |
-|---|---|
-| [Architecture](docs/architecture/README.md) | System design principles, execution model, and architectural boundaries |
-| [Guides](docs/guides/README.md) | How to use the system and how to implement components or backends |
-| [Specifications](docs/specs/README.md) | Formal specifications such as state schema and execution contracts |
+- [Architecture](docs/architecture/README.md) defines system responsibilities and boundaries.
+- [Specifications](docs/specs/README.md) define the v0.2.0 observable contracts.
+- [Testing Strategy](docs/development/testing.md) defines the required evidence for those contracts.
+- [Future Considerations](docs/future/README.md) records non-binding work outside v0.2.0.
+
+`docs/architecture/` and `docs/specs/` are authoritative for v0.2.0.
+Future and draft material may inform a later design, but it cannot change a published v0.2.0 contract.

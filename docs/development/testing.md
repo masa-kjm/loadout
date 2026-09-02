@@ -1,95 +1,120 @@
 # Testing Strategy
 
-## Test Types
+## Scope
 
-Three levels of testing exist in this project:
+This document defines how an implementation demonstrates conformance with the v0.2.0 architecture and specifications.
+It does not add runtime behavior, change an error outcome, or replace a specification.
 
-**Unit tests** — pure function behavior (planner logic, state parsing, resolver sort)
+Every behavior change must identify its owning specification and add evidence at the narrowest test layer that can prove the contract.
+An observable CLI or filesystem contract also requires an integration or acceptance test; a private unit test alone is not sufficient evidence.
 
-**Integration tests** — multi-module interaction (orchestrator flow, state commit after apply)
+## Test Layers
 
-**Environment tests** — Docker-based full installation scenarios
+| Layer | Purpose | Typical evidence |
+| --- | --- | --- |
+| Pure domain tests | Prove normalization, validation, state classification, planning, and deterministic ordering without I/O. | A Desired/Known/Actual input produces the required Plan or blocking diagnostic. |
+| Filesystem contract tests | Prove no-follow observation, containment, link operations, and the absence of forbidden mutations using a temporary filesystem. | The before and after entry kinds, link targets, paths, and directory contents. |
+| State repository durability tests | Prove locking, atomic replacement, schema validation, operation progress, and recovery using fault injection. | The complete state before and after an interrupted commit or recovery attempt. |
+| Executor integration tests | Prove the lifecycle across real temporary files, the state repository, and the filesystem implementation. | The planned action, resulting target, post-condition, Known state, and failure aftermath. |
+| CLI acceptance tests | Prove arguments, confirmation, dry-run behavior, output categories, and exit-status classes. | Process status, stdout and stderr category, and isolated filesystem and state snapshots. |
+| Platform conformance tests | Prove Unix and Windows behavior that cannot be established by a platform-neutral fake. | Actual symbolic-link, reparse-point, locking, and replacement behavior on the target platform. |
 
-## Unit Tests
+## Contract Matrix
 
-Unit tests cover stable public APIs and invariant-critical logic.
+The following matrix is the minimum evidence required before v0.2.0 is considered complete.
 
-**Test runner:** `cargo test` (Rust-native)
+| Contract owner | Required evidence |
+| --- | --- |
+| [Configuration](../specs/configuration.md) | Runtime and CLI configuration selection; path-base resolution; unknown-field rejection; duplicate profile IDs; store roots remain unchanged. |
+| [Profiles](../specs/profiles.md) | Include order; cycle and missing-ID rejection; deduplication through multiple paths; fully qualified identity; target-collision rejection; deterministic ordering independent of input-map iteration. |
+| [File Links](../specs/file-link.md) | Create, no-op, replace, relocate, remove, and forget-missing outcomes; unmanaged-target protection; wrong-link and regular-file conflicts; parent-escape rejection; source and target containment; no parent removal. |
+| [Lifecycle](../specs/lifecycle.md) | Every Desired/Known/Actual table row; blocked plans make no mutation; preflight failure creates no operation record; executor recheck rejects a target changed after planning; phase ordering and stop-after-failure behavior. |
+| [State and Recovery](../specs/state-and-recovery.md) | Corrupt-state rejection; exclusive-lock contention; atomic-commit failure; every operation-status transition; recovery to succeeded, failed, skipped, and uncertain; no rollback of verified earlier actions. |
+| [CLI](../specs/cli.md) | Positional root-profile selection; `validate` default-profile and `--all` behavior; `diff` Known-to-Actual reporting and zero mutation; `plan` and `apply` default-profile behavior; interactive confirmation; non-interactive `--yes` requirement; dry-run zero mutation; all documented exit-status classes. |
 
-Target crates:
-* `crates/planner` — classification, decision table
-* `crates/state` — schema validation, invariants, atomic commit
-* `crates/resolver` — topological sort, cycle detection, capability injection
-* `crates/source-registry` — canonical ID parsing, source path resolution, allow-list checks
-* `crates/compiler` — DesiredResourceGraph output format, platform override, backend resolution
-* `crates/executor` — resource routing by kind, all plan operations
-* `crates/model` — data structure validation (State, Profile, Strategy, etc.)
+## Pure Domain Tests
 
-Internal APIs must NOT be tested directly.
-Tests must validate behavior, not implementation details.
+Pure domain tests use resolved paths and typed observations only.
+They must not parse YAML, access a store, inspect the host filesystem, acquire a lock, or serialize state.
 
-## Integration Tests
+At minimum, domain tests cover every row in the lifecycle transition table and assert both the action and its reason.
+They also prove that resource ordering is stable when equivalent declarations are supplied in different mapping orders.
 
-Integration tests verify the orchestrator pipeline end-to-end with real file I/O
-but without executing component scripts.
+Tests for a blocked plan must assert that the plan has blocking diagnostics and no executable action for the conflicting target.
 
-Scenarios to cover:
-* Initial install (create)
-* No-op (noop)
-* Version mismatch (replace)
-* Component removal (destroy)
-* Dependency ordering
+## Filesystem Contract Tests
 
-Test location: `tests/`
+Filesystem contract tests run in a fresh temporary home, state directory, configuration directory, and local store.
+They must never use the developer's real home directory, XDG directories, AppData directories, or a repository-owned state directory.
 
-Tests that exercise path resolution must isolate XDG/AppData roots instead of modifying shared user paths.
+Each mutation test records the filesystem state before and after execution.
+For a successful file-link operation, it asserts the final entry kind and normalized link target.
+For a rejected operation, it asserts that the target, its parents, the store, and control files are unchanged.
 
-## Environment Tests
+The required negative cases include:
 
-| Environment | Description |
-|-------------|-------------|
-| [Environment](../../tests/e2e/README.md) | Full apply execution in isolated environments (Docker, Windows Sandbox) |
-| [Linux (Docker)](../../tests/e2e/linux/docker/README.md) | Full apply execution in a fresh Ubuntu container |
-| [Windows (Sandbox)](../../tests/e2e/windows/README.md) | Full apply execution in a disposable Windows Sandbox instance |
+- a target regular file;
+- a target link to a different source;
+- a link that matches the desired source but lacks Known state;
+- a missing, non-directory, symlinked, junction, or reparse-point parent;
+- a source path that escapes or traverses an unexpected entry beneath the store root;
+- a target outside the home root or inside a store or control path; and
+- a replacement or removal whose actual link no longer matches Known state.
 
-## Path Isolation Rules
+Tests that simulate a filesystem change between planning and execution must prove that the executor aborts rather than changing its planned action.
 
-Tests must not rely on repository-local state/profile/strategy paths as authoritative runtime paths.
+## State Repository Durability Tests
 
-Use:
+State tests use controlled failures at each commit boundary: temporary-file creation, write, flush, parse, validation, replacement, and directory flush when available.
+They assert that a failed commit leaves either the prior valid state or a recoverable active operation record; it must never leave a partial authoritative state.
 
-* `XDG_CONFIG_HOME`
-* `XDG_STATE_HOME`
-* `XDG_DATA_HOME`
+Recovery tests construct an active operation record and real filesystem observations for each case:
 
-to redirect runtime paths in Linux/WSL tests.
-On Windows tests, use disposable AppData/LocalAppData roots.
+| Recorded action result | Expected recovery |
+| --- | --- |
+| The recorded post-condition holds | Commit the matching Known-state update and mark the action succeeded. |
+| The recorded precondition still holds | Mark the action failed without changing prior Known state. |
+| A pending action was never started | Mark it skipped without changing Known state. |
+| Neither condition can be proven, or observation is unsafe | Retain the operation as uncertain and block the next apply. |
 
-`LOADOUT_STATE_FILE` and `LOADOUT_STATE_DIR` must not be reintroduced in tests.
+Lock tests require two independently created repository handles or processes.
+They must prove that the second non-dry-run apply fails before target observation or mutation while the first holds the exclusive lock.
 
-## What Must NOT Be Tested
+## Executor and CLI Tests
 
-Tests must validate behavior, not implementation details.
+Executor integration tests exercise the complete sequence from resolved inputs through state commit.
+They inject a filesystem or state failure after a mutation where necessary and assert the resulting operation record and target state.
 
-Do not test:
-* Internal APIs (functions not listed in crate public API)
-* Rust-specific implementation choices (use of `HashMap` vs `BTreeMap`, iterator style, etc.)
-* Log output format
-* OS-specific branching internals
-* Error message wording (only error type/variant)
+CLI acceptance tests invoke the compiled binary in an isolated environment.
+They assert behavior rather than exact prose formatting.
+For example, they check that a blocked plan identifies a conflict and exits with status `2`, not the precise English wording of that diagnostic.
 
-If a test breaks because of a refactor that preserves behavior, the test is testing the wrong thing.
+`diff` acceptance tests construct Known state and expected, missing, wrong-link, other-entry, unsafe-parent, and unfinished-operation observations.
+They assert that the command reports each category while leaving the target tree, state directory, store, configuration files, and operation record unchanged.
+They also prove that `diff` neither needs nor reads a portable environment configuration.
 
-## Breaking Changes
+Dry-run acceptance tests compare snapshots of the target tree, state directory, store, and control files before and after the command.
+The snapshots must be identical.
 
-Tests and documentation must be updated when:
-* A stable API changes signature or semantics
-* The state schema changes (version bump required)
-* The execution phase order changes
-* The planner decision table changes
+## Platform Conformance
 
-Such changes require coordinated updates: spec + test + doc in the same change.
+Platform-neutral tests may use a filesystem abstraction for deterministic failure injection, but they do not replace real platform evidence.
 
-## CI Strategy
+Unix coverage must exercise symbolic-link inspection without following the final link, a symlinked-parent rejection, atomic replacement of a managed link, and link-entry removal without touching the referent.
+Windows coverage must exercise file symbolic-link behavior when available and reject junctions or unsupported reparse points.
+It must also cover a replacement or removal rejected by access control or sharing when the test environment can create that condition, proving that no delete-then-create fallback and no premature Known-state update occur.
+When the host cannot create a file symbolic link or cannot provide the required replacement guarantee, the test must prove the documented preflight failure rather than silently skipping the behavior.
+Replacement tests must cover interruption or failure after the action-local temporary link is created, proving that only the exact recorded temporary link may be cleaned up and that an unexpected or unremovable temporary entry leaves the action uncertain.
 
-{TODO}
+Platform-specific tests run only in disposable directories and must clean up only the directories they created.
+
+## Change Checklist
+
+Before a change is ready for review:
+
+1. Link the changed behavior to its architecture or specification owner.
+2. Add or update the required test-layer evidence from the contract matrix.
+3. Include at least one negative test for every new mutation path.
+4. Include a zero-mutation test for every new dry-run, validation, blocked-plan, or preflight-failure path.
+5. Add platform evidence when a behavior depends on symbolic links, path normalization, locking, or replacement semantics.
+6. Record validation commands that could not run; do not claim unrun checks passed.

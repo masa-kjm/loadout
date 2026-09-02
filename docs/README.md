@@ -1,64 +1,33 @@
-# Documentation
+# Loadout Documentation
 
-## How to Read These Documents
+This directory defines the v0.2 product.
+It describes a resource-oriented local environment manager.
 
-Each document type has a distinct scope.
-Do not mix concerns across types when writing or updating.
+## Status and Authority
 
-## Document Types
+This documentation is being published in layers.
+Each published document is authoritative only for the subject it owns.
 
-**[Architecture](./architecture/README.md)** — Design philosophy and layer boundaries.
-Does not contain specifications or implementation details.
+- `architecture/` defines the v0.2 system model, responsibility boundaries, and non-negotiable architectural rules.
+- `specs/` defines the v0.2 external contracts, including schemas, lifecycle behavior, ownership, path safety, and durable state.
+- `development/` defines how the contracts are verified without redefining them.
+- `future/` holds non-binding designs for work outside v0.2.0.
+- `draft/` preserves exploratory material and is not an implementation source of truth.
 
-**[Spec](./specs/README.md)** — Normative contracts for data formats, APIs, and algorithms.
-Does not contain opinions or implementation guidance.
+## v0.2.0 Scope
 
-**[Guide](./guides/README.md)** — How to use or implement something.
-References specs for contracts; does not redefine them.
+v0.2.0 establishes the safe core for converging a composed profile to a local environment.
+Its only resource implementation is a local-store source linked to a single-file target.
+The core includes profile composition, validation, drift inspection, planning, conflict detection, state locking, safe application, and durable state recording.
 
-**[Development](./development/README.md)** — Process and tooling for contributors.
-Not relevant to end users.
+Task resources, copy operations, directory resources, remote stores, profile parameters, imports, secret handling, ACL management, rollback, and parallel execution are outside v0.2.0.
 
-## Recommended Reading Order
+## Documentation Rules
 
-To understand the system:
-1. **[architecture/principles.md](./architecture/principles.md)** — why it is designed this way
-2. **[architecture/layers.md](./architecture/layers.md)** — how the layers relate
-3. **[architecture/boundaries.md](./architecture/boundaries.md)** — what is forbidden
+- Architecture documents define responsibility, dependency, and safety boundaries.
+- Specification documents define observable behavior, schemas, and state transitions.
+- Development documents define review and testing practice.
+- Future documents may explore alternatives but must not alter v0.2.0 behavior.
+- Draft documents may inform a decision but never override a published architecture or specification document.
 
-To use the CLI:
-1. **[guides/usage.md](./guides/usage.md)** — workflow overview
-2. **[guides/commands.md](./guides/commands.md)** — full command reference
-
-To implement a component:
-1. **[guides/components.md](./guides/components.md)**
-2. **[specs/data/state.md](./specs/data/state.md)** — state interaction rules
-3. **[specs/algorithms/planner.md](./specs/algorithms/planner.md)** — how your component appears in the plan
-
-To implement a backend:
-1. **[guides/backends.md](./guides/backends.md)**
-2. **[specs/api/backend.md](./specs/api/backend.md)** — the contract you must satisfy
-
-## Directory Structure
-
-```
-docs/
-├── README.md
-├── specs/
-│   ├── data/        profile, strategy, state contracts
-│   ├── api/         backend plugin interface
-│   └── algorithms/  planner, resolver
-├── architecture/
-│   ├── principles.md
-│   ├── layers.md
-│   └── boundaries.md
-├── guides/
-│   ├── usage.md
-│   ├── commands.md
-│   ├── components.md
-│   └── backends.md
-└── development/
-    ├── testing.md
-    ├── documentation.md
-    └── direction.md
-```
+User-visible documentation, code, and code comments are written in English.

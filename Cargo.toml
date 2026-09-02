@@ -1,25 +1,12 @@
-[workspace]
-members = [
-    "crates/cli",
-    "crates/model",
-    "crates/resolver",
-    "crates/planner",
-    "crates/io",
-    "crates/config",
-    "crates/state",
-    "crates/source-registry",
-    "crates/component-index",
-    "crates/compiler",
-    "crates/platform",
-    "crates/backend-host",
-    "crates/component-host",
-    "crates/executor",
-    "crates/backends-builtin",
-    "crates/app",
-    "crates/params-validator",
-    "crates/params-materializer",
-    "crates/for-each-expander",
-    # Test infrastructure (not part of the loadout product binary)
-    "tests/runtime",
-]
-resolver = "2"
+[package]
+name = "loadout"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A local environment manager with explicit desired state"
+license = "MIT"
+repository = "https://github.com/masa-kjm/loadout"
+
+[lib]
+name = "loadout"
+path = "src/lib.rs"

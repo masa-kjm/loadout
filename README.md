@@ -5,7 +5,8 @@ Loadout is a local environment manager built around explicit desired state, owne
 ## Status
 
 v0.2.0 is a clean-break redesign and is not released yet.
-Its architecture and specifications are complete enough to guide the first implementation, but the repository does not yet provide a v0.2.0 binary or installer.
+Its architecture and specifications are complete enough to guide the first implementation, but the repository does not yet provide an implemented v0.2.0 command interface or installer.
+The published package's Rust library target is not yet a supported public API.
 
 v0.1 is retired and unsupported.
 The published `loadout` v0.1.0 crate is preserved by the `v0.1.0` archive tag, and the final legacy source snapshot is preserved by `legacy/v0.1-final`.
@@ -27,7 +28,7 @@ A destructive action is permitted only when durable Known state and a current no
 
 ## Documentation
 
-The authoritative v0.2 documentation is currently in [`docs/`](docs/README.md) during the documentation cutover.
+The authoritative v0.2 documentation is in [`docs/`](docs/README.md).
 
 - [Architecture](docs/architecture/README.md) defines system responsibilities and boundaries.
 - [Specifications](docs/specs/README.md) define the v0.2.0 observable contracts.

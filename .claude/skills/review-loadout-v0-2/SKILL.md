@@ -13,7 +13,8 @@ Review evidence, not intent. Do not edit the reviewed implementation unless the 
 2. For a pull request, inspect its issue, description, comments, changed files, and CI status before concluding. Use the repository's read-only GitHub workflow; invoke `gh` through `bash -lic` as required by `AGENTS.md`. Do not mutate GitHub state.
 3. Identify the comparison base and inspect the complete diff. Do not assume `main` when the pull request specifies another target.
 4. List every observable behavior change, including CLI behavior, schema or state compatibility, failure aftermath, and platform-specific behavior that is not obvious from the title.
-5. Map each acceptance criterion to implementation and test evidence as **verified**, **unverified**, or **violated**.
+5. If explicit acceptance criteria exist, map each criterion to evidence. Do not invent acceptance criteria. Separately identify applicable authoritative contract requirements that are changed or exercised by the implementation.
+6. Do not resolve an ambiguity in an authoritative contract by inferring intended behavior from the implementation, issue, PR description, tests, or future documents. Report the ambiguity separately when it prevents a correctness judgment.
 
 ## Use the relevant review lenses
 

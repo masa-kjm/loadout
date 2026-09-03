@@ -12,7 +12,7 @@ The baseline checks are:
 - Unexpected regular files, directories, links, junctions, reparse points, and unsafe parents are neither followed, adopted, replaced, nor removed.
 - A lexical path check is not containment proof. Existing source and target path components must satisfy the applicable no-follow containment contract.
 - Apply uses a fresh executable Plan and successful preflight. The executor repeats containment, parent, target-kind, source, and ownership checks immediately before mutation without replanning.
-- State records `running` before mutation. Known state changes only after the exact post-condition is verified and the update is atomically committed with `succeeded`.
+- State records running before any mutation, or before the final ownership verification for a state-only action.
 - After an attempted mutation, post-mutation observation classifies the result as succeeded, failed, or uncertain. An operating-system return value alone is not sufficient.
 - Dry-run is fully side-effect free, including locks, directories, temporary links, operation records, state, and cleanup.
 - Cleanup may remove only the exact Loadout-owned temporary entry authorized by the recorded action. It must not remove user-visible artifacts.

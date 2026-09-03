@@ -18,5 +18,6 @@ Choose the narrowest test layer that can prove the contract, then require a high
 - A private implementation refactor may use focused internal tests when it leaves all observable contracts unchanged.
 - Do not broaden the library's public API only to make a test compile.
 - Keep fixtures for intentional stable contracts, not incidental formatting or implementation details.
+- When a contract requires that something must not happen, require evidence for the prohibited side effect itself rather than treating the expected error or diagnostic as sufficient evidence.
 
 For filesystem mutations, seek the applicable successful-operation, zero-mutation dry-run, protected-existing-target, containment-failure, and failure-aftermath cases. A test that checks only an error code is insufficient when the contract constrains retained filesystem or metadata state.

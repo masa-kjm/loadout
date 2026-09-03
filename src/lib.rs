@@ -2,7 +2,16 @@
 //!
 //! This library target does not yet provide a supported public Rust API.
 
+#[allow(dead_code)]
+mod declaration;
+
 mod domain;
 
 #[allow(dead_code)]
+mod inspection;
+
+#[allow(dead_code)]
 mod planner;
+
+#[allow(dead_code)]
+mod resolver;

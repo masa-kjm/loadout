@@ -115,11 +115,11 @@ The snapshots must be identical.
 
 Platform-neutral tests may use a filesystem abstraction for deterministic failure injection, but they do not replace real platform evidence.
 
-Unix coverage must exercise symbolic-link inspection without following the final link, a symlinked-parent rejection, atomic replacement of a managed link, and link-entry removal without touching the referent.
+Unix coverage must exercise symbolic-link inspection without following the final link, a symlinked-parent rejection, and atomic replacement of a managed link. For removal it must exercise either a primitive that binds deletion to the verified final entry, including a substituted-entry race test, or the documented zero-mutation preflight failure when no such primitive is available.
 Windows coverage must exercise file symbolic-link behavior when available and reject junctions or unsupported reparse points.
 It must also cover a replacement or removal rejected by access control or sharing when the test environment can create that condition, proving that no delete-then-create fallback and no premature Known-state update occur.
 It must prove that a same-source managed identity handoff does not require replacement capability, while a source-changing handoff does require the documented replacement guarantee.
-When the host cannot create a file symbolic link or cannot provide the required replacement guarantee, the test must prove the documented preflight failure rather than silently skipping the behavior.
+When the host cannot create a file symbolic link, cannot provide the required replacement guarantee, or cannot provide the required expected-entry deletion guarantee, the test must prove the documented preflight failure rather than silently skipping the behavior.
 Replacement tests must cover interruption or failure after the action-local temporary link is created, proving that only the exact recorded temporary link may be cleaned up and that an unexpected or unremovable temporary entry leaves the action uncertain.
 
 Platform-specific tests run only in disposable directories and must clean up only the directories they created.

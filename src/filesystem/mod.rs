@@ -63,6 +63,19 @@ pub(crate) fn create_file_symbolic_link_no_replace(
     )
 }
 
+/// Removes one final file symbolic-link entry only when the platform can bind the removal to the expected link entry. The executor establishes the expected-link ownership precondition, and this primitive must retain that proof through the mutation boundary rather than deleting by a subsequently resolved name.
+pub(crate) fn remove_expected_file_symbolic_link_entry(
+    canonical_home: &ResolvedPath,
+    physical_target_path: &ResolvedPath,
+    expected_link_target: &LinkTarget,
+) -> io::Result<()> {
+    platform::remove_expected_file_symbolic_link_entry(
+        canonical_home,
+        physical_target_path,
+        expected_link_target,
+    )
+}
+
 /// Rejects a file-link create when the platform cannot prove that it can create the required symbolic-link representation without weakening no-follow safety.
 ///
 /// This deliberately does not attempt a permission probe. Permission and sharing can change after preflight and must still be classified from the post-mutation observation if an actual create attempt is denied.
@@ -70,4 +83,11 @@ pub(crate) fn ensure_file_symbolic_link_creation_supported(
     target_parent: &ResolvedPath,
 ) -> io::Result<()> {
     platform::ensure_file_symbolic_link_creation_supported(target_parent)
+}
+
+/// Rejects a file-link removal when the platform cannot bind the final expected entry to its deletion while retaining no-follow handling through the mutation boundary.
+pub(crate) fn ensure_file_symbolic_link_removal_supported(
+    target_parent: &ResolvedPath,
+) -> io::Result<()> {
+    platform::ensure_file_symbolic_link_removal_supported(target_parent)
 }

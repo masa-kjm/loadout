@@ -20,6 +20,7 @@ use crate::domain::paths::{ResolvedPath, ResolvedPathError};
 use crate::domain::plan::{ActionKind, PlannedAction, TargetCondition};
 use crate::state::operation::{
     ActionId, ActionStatus, OperationId, OperationRecord, OperationRecordError, RecordedAction,
+    RecordedKnownStateUpdate,
 };
 
 const STATE_SCHEMA_VERSION: u32 = 1;
@@ -197,8 +198,8 @@ impl LockedStateRepository {
         }
     }
 
-    /// Persists a fresh pending `create_link` operation before any resource mutation.
-    pub(crate) fn begin_create_operation(
+    /// Persists a fresh pending single-action operation before its executor work begins.
+    pub(crate) fn begin_operation(
         &mut self,
         desired_hash: DesiredHash,
         action: &PlannedAction,
@@ -207,12 +208,21 @@ impl LockedStateRepository {
             return Err(StateRepositoryError::ActiveOperationPresent);
         }
         let (operation, action_id) =
-            OperationRecord::new_create_link(new_operation_id(), desired_hash, action)
+            OperationRecord::new_single_action(new_operation_id(), desired_hash, action)
                 .map_err(StateRepositoryError::Operation)?;
         let mut candidate = self.state.clone();
         candidate.active_operation = Some(operation);
         self.commit_candidate(candidate)?;
         Ok(action_id)
+    }
+
+    /// Compatibility entry point for Slice 4's create-only coordinator.
+    pub(crate) fn begin_create_operation(
+        &mut self,
+        desired_hash: DesiredHash,
+        action: &PlannedAction,
+    ) -> Result<ActionId, StateRepositoryError> {
+        self.begin_operation(desired_hash, action)
     }
 
     /// Atomically records `running` before the executor attempts a mutation.
@@ -248,23 +258,41 @@ impl LockedStateRepository {
         self.commit_candidate(candidate)
     }
 
-    /// Atomically commits a verified create post-condition, its Known fact, and `succeeded`.
-    pub(crate) fn commit_create_succeeded(
+    /// Atomically commits a verified action's exact Known-state update and `succeeded` status.
+    pub(crate) fn commit_succeeded(
         &mut self,
         action_id: &ActionId,
     ) -> Result<(), StateRepositoryError> {
         let mut candidate = self.state.clone();
-        let known = candidate
+        let update = candidate
             .active_operation
             .as_mut()
             .ok_or(StateRepositoryError::NoActiveOperation)?
-            .mark_create_succeeded(action_id)
+            .mark_succeeded(action_id)
             .map_err(StateRepositoryError::Operation)?;
-        candidate.known = candidate
-            .known
-            .with_upserted(known)
-            .map_err(StateRepositoryError::KnownState)?;
+        candidate.known = match update {
+            RecordedKnownStateUpdate::Upsert(known) => candidate
+                .known
+                .with_upserted(known)
+                .map_err(StateRepositoryError::KnownState)?,
+            RecordedKnownStateUpdate::RemoveExpected(known) => candidate
+                .known
+                .with_removed(&known)
+                .map_err(StateRepositoryError::KnownState)?,
+            RecordedKnownStateUpdate::RemoveMissing { resource_id } => candidate
+                .known
+                .with_missing_resource_removed(&resource_id)
+                .map_err(StateRepositoryError::KnownState)?,
+        };
         self.commit_candidate(candidate)
+    }
+
+    /// Compatibility entry point for Slice 4's create-only coordinator.
+    pub(crate) fn commit_create_succeeded(
+        &mut self,
+        action_id: &ActionId,
+    ) -> Result<(), StateRepositoryError> {
+        self.commit_succeeded(action_id)
     }
 
     /// Removes a completed operation only when no action remains pending, running, or uncertain.
@@ -448,6 +476,7 @@ impl StateDocument {
             .transpose()?;
         if let Some(operation) = &active_operation {
             validate_succeeded_actions(&known, operation)?;
+            validate_unfinished_stale_action_known_state(&known, operation)?;
         }
         Ok(PersistedState {
             known,
@@ -591,6 +620,8 @@ impl PersistedRecordedAction {
     fn from_action(action: &RecordedAction) -> Result<Self, CommitError> {
         let kind = match action.kind() {
             ActionKind::CreateLink => PersistedActionKind::CreateLink,
+            ActionKind::RemoveLink => PersistedActionKind::RemoveLink,
+            ActionKind::ForgetMissing => PersistedActionKind::ForgetMissing,
             kind => return Err(CommitError::UnsupportedOperationAction { kind }),
         };
         Ok(Self {
@@ -613,16 +644,20 @@ impl PersistedRecordedAction {
         let target_path = decode_path(self.target_path)?;
         let precondition = self.precondition.into_condition(&target_path)?;
         let postcondition = self.postcondition.into_condition(&target_path)?;
-        match self.kind {
-            PersistedActionKind::CreateLink => RecordedAction::from_persisted_create_link(
-                resource_id,
-                target_path,
-                precondition,
-                postcondition,
-                self.status.into_status(),
-            )
-            .map_err(StateDecodeError::InvalidOperation),
-        }
+        let kind = match self.kind {
+            PersistedActionKind::CreateLink => ActionKind::CreateLink,
+            PersistedActionKind::RemoveLink => ActionKind::RemoveLink,
+            PersistedActionKind::ForgetMissing => ActionKind::ForgetMissing,
+        };
+        RecordedAction::from_persisted(
+            kind,
+            resource_id,
+            target_path,
+            precondition,
+            postcondition,
+            self.status.into_status(),
+        )
+        .map_err(StateDecodeError::InvalidOperation)
     }
 }
 
@@ -630,6 +665,8 @@ impl PersistedRecordedAction {
 #[serde(rename_all = "snake_case")]
 enum PersistedActionKind {
     CreateLink,
+    RemoveLink,
+    ForgetMissing,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -809,13 +846,60 @@ fn validate_succeeded_actions(
         if action.status() != ActionStatus::Succeeded {
             continue;
         }
-        let expected = action
-            .known_after_success()
+        let update = action
+            .known_state_update_after_success()
             .map_err(StateDecodeError::InvalidOperation)?;
-        if known.get(expected.resource_id()) != Some(&expected) {
+        let matches = match update {
+            RecordedKnownStateUpdate::Upsert(expected) => {
+                known.get(expected.resource_id()) == Some(&expected)
+            }
+            RecordedKnownStateUpdate::RemoveExpected(expected) => {
+                known.get(expected.resource_id()).is_none()
+            }
+            RecordedKnownStateUpdate::RemoveMissing { resource_id } => {
+                known.get(&resource_id).is_none()
+            }
+        };
+        if !matches {
             return Err(StateDecodeError::SucceededActionKnownMismatch {
                 action_id: action_id.as_str().to_owned(),
-                resource_id: expected.resource_id().clone(),
+                resource_id: action.resource_id().clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A pending, running, failed, skipped, or uncertain stale action must retain the exact Known fact it was authorized to remove. Otherwise a corrupted record could be completed against a different historical resource.
+fn validate_unfinished_stale_action_known_state(
+    known: &KnownState,
+    operation: &OperationRecord,
+) -> Result<(), StateDecodeError> {
+    for (action_id, action) in operation.actions() {
+        if action.status() == ActionStatus::Succeeded {
+            continue;
+        }
+
+        let matches = match action.kind() {
+            ActionKind::RemoveLink => match action
+                .known_state_update_after_success()
+                .map_err(StateDecodeError::InvalidOperation)?
+            {
+                RecordedKnownStateUpdate::RemoveExpected(expected) => {
+                    known.get(expected.resource_id()) == Some(&expected)
+                }
+                _ => unreachable!("a validated remove action has an exact removal update"),
+            },
+            ActionKind::ForgetMissing => known
+                .get(action.resource_id())
+                .is_some_and(|resource| resource.target_path() == action.target_path()),
+            ActionKind::CreateLink => true,
+            _ => true,
+        };
+        if !matches {
+            return Err(StateDecodeError::ActiveActionKnownMismatch {
+                action_id: action_id.as_str().to_owned(),
+                resource_id: action.resource_id().clone(),
             });
         }
     }
@@ -989,6 +1073,10 @@ pub(crate) enum StateDecodeError {
         action_id: String,
         resource_id: FullyQualifiedResourceId,
     },
+    ActiveActionKnownMismatch {
+        action_id: String,
+        resource_id: FullyQualifiedResourceId,
+    },
 }
 
 impl fmt::Display for StateDecodeError {
@@ -1046,6 +1134,13 @@ impl fmt::Display for StateDecodeError {
                 formatter,
                 "succeeded action {action_id} lacks its atomically committed Known resource {resource_id}"
             ),
+            Self::ActiveActionKnownMismatch {
+                action_id,
+                resource_id,
+            } => write!(
+                formatter,
+                "active action {action_id} does not retain its required Known resource {resource_id}"
+            ),
         }
     }
 }
@@ -1065,7 +1160,8 @@ impl std::error::Error for StateDecodeError {
             | Self::DefinitionHashMismatch { .. }
             | Self::NonNormalizedPath { .. }
             | Self::InvalidTargetCondition
-            | Self::SucceededActionKnownMismatch { .. } => None,
+            | Self::SucceededActionKnownMismatch { .. }
+            | Self::ActiveActionKnownMismatch { .. } => None,
         }
     }
 }
@@ -1359,6 +1455,22 @@ mod tests {
         )
     }
 
+    fn stale_action(kind: ActionKind) -> PlannedAction {
+        let previous = KnownFileLink::from_resolved(
+            &ResolvedFileLink::new(
+                FullyQualifiedResourceId::parse("base/git").unwrap(),
+                path("loadout-state-store", "git/config"),
+                path("loadout-state-home", ".gitconfig"),
+            )
+            .unwrap(),
+        );
+        match kind {
+            ActionKind::RemoveLink => PlannedAction::remove_link(previous),
+            ActionKind::ForgetMissing => PlannedAction::forget_missing(previous),
+            _ => panic!("test helper supports only Slice 5 stale actions"),
+        }
+    }
+
     fn desired_hash() -> DesiredHash {
         DesiredHash::parse(format!("sha256:{}", "a".repeat(64))).unwrap()
     }
@@ -1498,6 +1610,96 @@ mod tests {
                 .unwrap()
                 .starts_with("sha256:")
         );
+    }
+
+    #[test]
+    fn stale_action_progress_keeps_known_until_its_verified_succeeded_commit() {
+        for (kind, expected_precondition) in [
+            (ActionKind::RemoveLink, "expected_link"),
+            (ActionKind::ForgetMissing, "missing"),
+        ] {
+            let directory = TestStateDirectory::new();
+            let repository = directory.repository();
+            let mut locked = repository.acquire_exclusive().unwrap();
+
+            let create_id = locked
+                .begin_create_operation(desired_hash(), &create_action())
+                .unwrap();
+            locked.mark_running(&create_id).unwrap();
+            locked.commit_create_succeeded(&create_id).unwrap();
+            locked.close_finished_operation().unwrap();
+
+            let action_id = locked
+                .begin_operation(desired_hash(), &stale_action(kind))
+                .unwrap();
+            let pending_json: serde_json::Value =
+                serde_json::from_slice(&fs::read(directory.state_file()).unwrap()).unwrap();
+            let recorded = &pending_json["active_operation"]["actions"]["a1"];
+            assert_eq!(
+                recorded["kind"],
+                match kind {
+                    ActionKind::RemoveLink => "remove_link",
+                    ActionKind::ForgetMissing => "forget_missing",
+                    _ => unreachable!(),
+                }
+            );
+            assert_eq!(recorded["precondition"]["target"], expected_precondition);
+            assert_eq!(recorded["postcondition"]["target"], "missing");
+            assert_eq!(
+                active_status(locked.state(), &action_id),
+                ActionStatus::Pending
+            );
+            assert_eq!(locked.state().known().resources().len(), 1);
+
+            locked.mark_running(&action_id).unwrap();
+            assert_eq!(locked.state().known().resources().len(), 1);
+            locked.commit_succeeded(&action_id).unwrap();
+            assert_eq!(
+                active_status(locked.state(), &action_id),
+                ActionStatus::Succeeded
+            );
+            assert!(locked.state().known().resources().next().is_none());
+            locked.close_finished_operation().unwrap();
+            assert!(locked.state().active_operation().is_none());
+        }
+    }
+
+    #[test]
+    fn active_stale_action_without_its_required_known_fact_is_rejected_as_corrupt_state() {
+        for kind in [ActionKind::RemoveLink, ActionKind::ForgetMissing] {
+            let directory = TestStateDirectory::new();
+            let repository = directory.repository();
+            let mut locked = repository.acquire_exclusive().unwrap();
+
+            let create_id = locked
+                .begin_create_operation(desired_hash(), &create_action())
+                .unwrap();
+            locked.mark_running(&create_id).unwrap();
+            locked.commit_create_succeeded(&create_id).unwrap();
+            locked.close_finished_operation().unwrap();
+            let action_id = locked
+                .begin_operation(desired_hash(), &stale_action(kind))
+                .unwrap();
+            locked.mark_running(&action_id).unwrap();
+            drop(locked);
+
+            let mut document: serde_json::Value =
+                serde_json::from_slice(&fs::read(directory.state_file()).unwrap()).unwrap();
+            document["resources"] = serde_json::json!({});
+            fs::write(
+                directory.state_file(),
+                serde_json::to_vec(&document).unwrap(),
+            )
+            .unwrap();
+
+            assert!(matches!(
+                repository.load(),
+                Err(StateRepositoryError::InvalidState {
+                    source: StateDecodeError::ActiveActionKnownMismatch { .. },
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

@@ -65,10 +65,31 @@ pub(super) fn create_file_symbolic_link_no_replace(
     }
 }
 
+pub(super) fn remove_expected_file_symbolic_link_entry(
+    _: &ResolvedPath,
+    _: &ResolvedPath,
+    _: &LinkTarget,
+) -> io::Result<()> {
+    // Keep the mutation primitive fail-closed as well as preflight. POSIX `unlinkat` accepts only a directory entry name; it cannot require that the name still denotes the no-follow entry that was inspected as the expected link. A replacement between the inspection and `unlinkat` would otherwise delete an unmanaged entry.
+    Err(expected_entry_removal_unsupported())
+}
+
 pub(super) fn ensure_file_symbolic_link_creation_supported(_: &ResolvedPath) -> io::Result<()> {
     // Unix exposes file symbolic links as a supported platform primitive.
     // Filesystem-specific errors remain mutable facts of the actual create.
     Ok(())
+}
+
+pub(super) fn ensure_file_symbolic_link_removal_supported(_: &ResolvedPath) -> io::Result<()> {
+    // A directory descriptor keeps parent traversal safe, but it does not make `unlinkat(parent_fd, name, 0)` conditional on the identity or link value of `name`. Do not authorize a destructive action until the platform supplies an expected-entry removal primitive.
+    Err(expected_entry_removal_unsupported())
+}
+
+fn expected_entry_removal_unsupported() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Unix file-link removal requires an atomic expected-entry deletion primitive; unlinkat deletes an unchecked current name",
+    )
 }
 
 fn open_directory(path: &Path) -> io::Result<fs::File> {

@@ -7,7 +7,10 @@ use crate::domain::hashes::{CanonicalHashError, desired_hash};
 use crate::domain::ids::FullyQualifiedResourceId;
 use crate::domain::paths::ResolvedPath;
 use crate::domain::plan::{ActionKind, Plan, PlannedAction};
-use crate::executor::file_link::{CreateLinkExecutionError, FileLinkExecutor};
+use crate::executor::file_link::{
+    CreateLinkExecutionError, FileLinkExecutor, ForgetMissingExecutionError,
+    RemoveLinkExecutionError,
+};
 use crate::inspection::file_link::{FileLinkInspector, TargetInspectionError};
 use crate::planner::file_link::plan;
 use crate::resolver::ResolvedApplyInput;
@@ -47,6 +50,116 @@ impl ApplyCoordinator {
         F: FnOnce(&Plan) -> bool,
     {
         self.apply_with_hooks(resolved, confirm, |_| {})
+    }
+
+    /// Executes one Slice 5 stale-resource plan from fresh state.
+    ///
+    /// The planner decides whether the stale record requires a link-entry removal or a state-only forget. This coordinator only preflights and executes that selected single action.
+    pub(crate) fn apply_stale_link<F>(
+        &self,
+        resolved: &ResolvedApplyInput,
+        confirm: F,
+    ) -> Result<StaleLinkApplyResult, ApplyError>
+    where
+        F: FnOnce(&Plan) -> bool,
+    {
+        self.apply_stale_with_hooks(resolved, confirm, |_| {})
+    }
+
+    fn apply_stale_with_hooks<F, H>(
+        &self,
+        resolved: &ResolvedApplyInput,
+        confirm: F,
+        after_running: H,
+    ) -> Result<StaleLinkApplyResult, ApplyError>
+    where
+        F: FnOnce(&Plan) -> bool,
+        H: FnOnce(&mut crate::state::repository::LockedStateRepository),
+    {
+        let desired = resolved.desired();
+        let mut locked = self
+            .state_repository
+            .acquire_exclusive()
+            .map_err(ApplyError::State)?;
+        if locked.state().active_operation().is_some() {
+            return Err(ApplyError::RecoveryRequired);
+        }
+
+        let inspector = FileLinkInspector::new(self.home_directory.as_ref())
+            .map_err(ApplyError::InitialInspection)?;
+        let actual = inspector
+            .inspect(desired, locked.state().known())
+            .map_err(ApplyError::InitialInspection)?;
+        let plan = plan(desired, locked.state().known(), &actual);
+        if !plan.is_executable() {
+            return Ok(StaleLinkApplyResult::Blocked { plan });
+        }
+
+        let action = require_single_stale_action(&plan)?.clone();
+        let executor = FileLinkExecutor::new(self.home_directory.as_ref())
+            .map_err(ApplyError::InitialInspection)?;
+        preflight_stale_action(&executor, &action).map_err(ApplyError::StalePreflight)?;
+        locked
+            .preflight_writable()
+            .map_err(ApplyError::StatePreflight)?;
+        let desired_hash = desired_hash(desired).map_err(ApplyError::DesiredHash)?;
+        if !confirm(&plan) {
+            return Ok(StaleLinkApplyResult::Declined { plan });
+        }
+
+        let action_id = locked
+            .begin_operation(desired_hash, &action)
+            .map_err(ApplyError::State)?;
+        locked.mark_running(&action_id).map_err(ApplyError::State)?;
+        after_running(&mut locked);
+
+        match action.kind() {
+            ActionKind::RemoveLink => match executor.execute_remove(&action) {
+                Ok(()) => commit_stale_success(&mut locked, &action_id, &action),
+                Err(error) => match classify_remove_execution_error(&error) {
+                    StaleExecutionClassification::Succeeded => {
+                        commit_stale_success(&mut locked, &action_id, &action)
+                    }
+                    StaleExecutionClassification::Failed => close_stale_failure(
+                        &mut locked,
+                        &action_id,
+                        StaleLinkExecutionError::Remove(error),
+                    ),
+                    StaleExecutionClassification::Uncertain => {
+                        locked
+                            .mark_without_known(&action_id, ActionStatus::Uncertain)
+                            .map_err(ApplyError::State)?;
+                        Ok(StaleLinkApplyResult::Uncertain {
+                            error: StaleLinkExecutionError::Remove(error),
+                        })
+                    }
+                },
+            },
+            ActionKind::ForgetMissing => match executor.execute_forget_missing(&action) {
+                Ok(()) => commit_stale_success(&mut locked, &action_id, &action),
+                Err(error) => match classify_forget_missing_execution_error(&error) {
+                    StaleExecutionClassification::Failed => close_stale_failure(
+                        &mut locked,
+                        &action_id,
+                        StaleLinkExecutionError::ForgetMissing(error),
+                    ),
+                    StaleExecutionClassification::Uncertain => {
+                        locked
+                            .mark_without_known(&action_id, ActionStatus::Uncertain)
+                            .map_err(ApplyError::State)?;
+                        Ok(StaleLinkApplyResult::Uncertain {
+                            error: StaleLinkExecutionError::ForgetMissing(error),
+                        })
+                    }
+                    StaleExecutionClassification::Succeeded => unreachable!(
+                        "a state-only stale action reports success directly from its missing recheck"
+                    ),
+                },
+            },
+            kind => Err(ApplyError::SliceFiveRequiresSingleStaleAction {
+                action_kinds: vec![kind],
+            }),
+        }
     }
 
     fn apply_with_hooks<F, H>(
@@ -173,6 +286,18 @@ impl ApplyCoordinator {
     }
 
     #[cfg(test)]
+    fn apply_stale_link_with_after_running<H>(
+        &self,
+        resolved: &ResolvedApplyInput,
+        after_running: H,
+    ) -> Result<StaleLinkApplyResult, ApplyError>
+    where
+        H: FnOnce(&mut crate::state::repository::LockedStateRepository),
+    {
+        self.apply_stale_with_hooks(resolved, |_| true, after_running)
+    }
+
+    #[cfg(test)]
     fn fail_next_state_write_preflight(&mut self) {
         self.state_repository.fail_next_state_write_preflight();
     }
@@ -195,6 +320,69 @@ fn require_single_create_action(plan: &Plan) -> Result<&PlannedAction, ApplyErro
         });
     }
     Ok(action)
+}
+
+fn require_single_stale_action(plan: &Plan) -> Result<&PlannedAction, ApplyError> {
+    let [action] = plan.actions() else {
+        return Err(ApplyError::SliceFiveRequiresSingleStaleAction {
+            action_kinds: plan.actions().iter().map(PlannedAction::kind).collect(),
+        });
+    };
+    if !matches!(
+        action.kind(),
+        ActionKind::RemoveLink | ActionKind::ForgetMissing
+    ) {
+        return Err(ApplyError::SliceFiveRequiresSingleStaleAction {
+            action_kinds: vec![action.kind()],
+        });
+    }
+    Ok(action)
+}
+
+fn preflight_stale_action(
+    executor: &FileLinkExecutor,
+    action: &PlannedAction,
+) -> Result<(), StaleLinkExecutionError> {
+    match action.kind() {
+        ActionKind::RemoveLink => executor
+            .preflight_remove(action)
+            .map_err(StaleLinkExecutionError::Remove),
+        ActionKind::ForgetMissing => executor
+            .preflight_forget_missing(action)
+            .map_err(StaleLinkExecutionError::ForgetMissing),
+        kind => Err(StaleLinkExecutionError::UnsupportedAction { kind }),
+    }
+}
+
+fn commit_stale_success(
+    locked: &mut crate::state::repository::LockedStateRepository,
+    action_id: &crate::state::operation::ActionId,
+    action: &PlannedAction,
+) -> Result<StaleLinkApplyResult, ApplyError> {
+    locked
+        .commit_succeeded(action_id)
+        .map_err(ApplyError::State)?;
+    locked
+        .close_finished_operation()
+        .map_err(ApplyError::State)?;
+    Ok(StaleLinkApplyResult::Applied {
+        resource_id: action.resource_id().clone(),
+        kind: action.kind(),
+    })
+}
+
+fn close_stale_failure(
+    locked: &mut crate::state::repository::LockedStateRepository,
+    action_id: &crate::state::operation::ActionId,
+    error: StaleLinkExecutionError,
+) -> Result<StaleLinkApplyResult, ApplyError> {
+    locked
+        .mark_without_known(action_id, ActionStatus::Failed)
+        .map_err(ApplyError::State)?;
+    locked
+        .close_finished_operation()
+        .map_err(ApplyError::State)?;
+    Ok(StaleLinkApplyResult::Failed { error })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -238,6 +426,60 @@ fn classify_observation(observation: &TargetObservation) -> ExecutionClassificat
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StaleExecutionClassification {
+    Succeeded,
+    Failed,
+    Uncertain,
+}
+
+fn classify_remove_execution_error(
+    error: &RemoveLinkExecutionError,
+) -> StaleExecutionClassification {
+    match error {
+        RemoveLinkExecutionError::RemoveAttemptFailed { aftermath, .. }
+        | RemoveLinkExecutionError::PostconditionNotMet {
+            observation: aftermath,
+            ..
+        } => match aftermath {
+            TargetObservation::Missing => StaleExecutionClassification::Succeeded,
+            TargetObservation::ExpectedLink { .. } => StaleExecutionClassification::Failed,
+            TargetObservation::MatchingUnmanagedLink { .. }
+            | TargetObservation::OtherLink { .. }
+            | TargetObservation::OtherEntry { .. }
+            | TargetObservation::UnsafePath { .. } => StaleExecutionClassification::Uncertain,
+        },
+        // The executor did not attempt a removal after these errors. Keep the historical fact unchanged and let a later fresh plan classify any externally changed target instead of adopting that new state here.
+        RemoveLinkExecutionError::PreconditionNoLongerHolds { .. } => {
+            StaleExecutionClassification::Failed
+        }
+        RemoveLinkExecutionError::UnsupportedAction { .. }
+        | RemoveLinkExecutionError::InvalidRemoveConditions
+        | RemoveLinkExecutionError::TargetInspection(_)
+        | RemoveLinkExecutionError::PlatformCapability { .. }
+        | RemoveLinkExecutionError::RemoveAftermathUnproven { .. }
+        | RemoveLinkExecutionError::PostconditionInspection(_) => {
+            StaleExecutionClassification::Uncertain
+        }
+    }
+}
+
+fn classify_forget_missing_execution_error(
+    error: &ForgetMissingExecutionError,
+) -> StaleExecutionClassification {
+    match error {
+        // A target appeared after planning. This action never mutated it and must retain Known state; a future fresh plan will report its current conflict rather than deleting it.
+        ForgetMissingExecutionError::PostconditionNotMet { .. } => {
+            StaleExecutionClassification::Failed
+        }
+        ForgetMissingExecutionError::UnsupportedAction { .. }
+        | ForgetMissingExecutionError::InvalidForgetMissingConditions
+        | ForgetMissingExecutionError::TargetInspection(_) => {
+            StaleExecutionClassification::Uncertain
+        }
+    }
+}
+
 /// The complete visible outcome of this internal create-only coordinator.
 #[derive(Debug)]
 pub(crate) enum CreateLinkApplyResult {
@@ -258,6 +500,60 @@ pub(crate) enum CreateLinkApplyResult {
     },
 }
 
+/// The complete visible outcome of Slice 5's single stale-resource coordinator.
+#[derive(Debug)]
+pub(crate) enum StaleLinkApplyResult {
+    Applied {
+        resource_id: FullyQualifiedResourceId,
+        kind: ActionKind,
+    },
+    Blocked {
+        plan: Plan,
+    },
+    Declined {
+        plan: Plan,
+    },
+    Failed {
+        error: StaleLinkExecutionError,
+    },
+    Uncertain {
+        error: StaleLinkExecutionError,
+    },
+}
+
+/// The execution error retained by one stale-resource action outcome.
+#[derive(Debug)]
+pub(crate) enum StaleLinkExecutionError {
+    Remove(RemoveLinkExecutionError),
+    ForgetMissing(ForgetMissingExecutionError),
+    UnsupportedAction { kind: ActionKind },
+}
+
+impl fmt::Display for StaleLinkExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Remove(error) => error.fmt(formatter),
+            Self::ForgetMissing(error) => error.fmt(formatter),
+            Self::UnsupportedAction { kind } => {
+                write!(
+                    formatter,
+                    "stale-resource executor cannot execute action kind {kind:?}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for StaleLinkExecutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Remove(error) => Some(error),
+            Self::ForgetMissing(error) => Some(error),
+            Self::UnsupportedAction { .. } => None,
+        }
+    }
+}
+
 /// The reason an apply attempt could not reach an executable create action.
 #[derive(Debug)]
 pub(crate) enum ApplyError {
@@ -272,6 +568,10 @@ pub(crate) enum ApplyError {
         action_kinds: Vec<ActionKind>,
     },
     Preflight(CreateLinkExecutionError),
+    SliceFiveRequiresSingleStaleAction {
+        action_kinds: Vec<ActionKind>,
+    },
+    StalePreflight(StaleLinkExecutionError),
     DesiredHash(CanonicalHashError),
 }
 
@@ -295,6 +595,11 @@ impl fmt::Display for ApplyError {
                 "Slice 4 apply supports exactly one create_link action, not {action_kinds:?}"
             ),
             Self::Preflight(error) => error.fmt(formatter),
+            Self::SliceFiveRequiresSingleStaleAction { action_kinds } => write!(
+                formatter,
+                "Slice 5 apply supports exactly one remove_link or forget_missing action, not {action_kinds:?}"
+            ),
+            Self::StalePreflight(error) => error.fmt(formatter),
             Self::DesiredHash(error) => error.fmt(formatter),
         }
     }
@@ -307,10 +612,12 @@ impl std::error::Error for ApplyError {
             Self::StatePreflight(error) => Some(error),
             Self::InitialInspection(error) => Some(error),
             Self::Preflight(error) => Some(error),
+            Self::StalePreflight(error) => Some(error),
             Self::DesiredHash(error) => Some(error),
             Self::RecoveryRequired
             | Self::MissingVerifiedSource { .. }
-            | Self::SliceFourRequiresSingleCreateAction { .. } => None,
+            | Self::SliceFourRequiresSingleCreateAction { .. }
+            | Self::SliceFiveRequiresSingleStaleAction { .. } => None,
         }
     }
 }
@@ -407,6 +714,13 @@ mod tests {
 
         fn input(&self) -> ResolvedApplyInput {
             ResolvedApplyInput::new_for_test(self.desired(), self.verified_sources())
+        }
+
+        fn stale_input(&self) -> ResolvedApplyInput {
+            ResolvedApplyInput::new_for_test(
+                ResolvedDesired::new(ProfileId::parse("workstation").unwrap(), []).unwrap(),
+                BTreeMap::new(),
+            )
         }
 
         fn resolved_input(&self) -> ResolvedApplyInput {
@@ -712,6 +1026,267 @@ mod tests {
             fs::read_to_string(workspace.path("store/git/config")).unwrap(),
             "[user]\nname = Example\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_owned_link_removal_fails_preflight_without_an_operation_or_target_mutation() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "[user]\nname = Example\n");
+        let current = workspace.input();
+        workspace
+            .coordinator()
+            .apply_create_link(&current, |_| true)
+            .unwrap();
+        let stale = workspace.stale_input();
+
+        let error = workspace
+            .coordinator()
+            .apply_stale_link(&stale, |plan| {
+                assert_eq!(plan.actions()[0].kind(), ActionKind::RemoveLink);
+                panic!("an unsupported removal capability must not request confirmation")
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ApplyError::StalePreflight(StaleLinkExecutionError::Remove(
+                RemoveLinkExecutionError::PlatformCapability { .. }
+            ))
+        ));
+        let target = workspace.path("home/.gitconfig");
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_link(&target).unwrap(),
+            workspace.path("store/git/config")
+        );
+        assert!(
+            fs::symlink_metadata(workspace.path("home"))
+                .unwrap()
+                .is_dir()
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path("store/git/config")).unwrap(),
+            "[user]\nname = Example\n"
+        );
+        let state = workspace.repository().load().unwrap();
+        assert!(state.known().resources().next().is_some());
+        assert!(state.active_operation().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_missing_target_forgets_only_its_known_record() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "[user]\nname = Example\n");
+        let current = workspace.input();
+        workspace
+            .coordinator()
+            .apply_create_link(&current, |_| true)
+            .unwrap();
+        fs::remove_file(workspace.path("home/.gitconfig")).unwrap();
+        let stale = workspace.stale_input();
+
+        let result = workspace
+            .coordinator()
+            .apply_stale_link(&stale, |plan| {
+                assert_eq!(plan.actions()[0].kind(), ActionKind::ForgetMissing);
+                true
+            })
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            StaleLinkApplyResult::Applied {
+                kind: ActionKind::ForgetMissing,
+                ..
+            }
+        ));
+        assert!(!workspace.path("home/.gitconfig").exists());
+        assert_eq!(
+            fs::read_to_string(workspace.path("store/git/config")).unwrap(),
+            "[user]\nname = Example\n"
+        );
+        let state = workspace.repository().load().unwrap();
+        assert!(state.known().resources().next().is_none());
+        assert!(state.active_operation().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forget_missing_rechecks_after_running_and_retains_known_when_a_target_appears() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "owned source\n");
+        let current = workspace.input();
+        workspace
+            .coordinator()
+            .apply_create_link(&current, |_| true)
+            .unwrap();
+        let target = workspace.path("home/.gitconfig");
+        fs::remove_file(&target).unwrap();
+        let stale = workspace.stale_input();
+
+        let result = workspace
+            .coordinator()
+            .apply_stale_link_with_after_running(&stale, |_| {
+                fs::write(&target, "appeared after planning\n").unwrap();
+            })
+            .unwrap();
+
+        assert!(matches!(result, StaleLinkApplyResult::Failed { .. }));
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "appeared after planning\n"
+        );
+        let state = workspace.repository().load().unwrap();
+        assert!(state.active_operation().is_none());
+        assert!(
+            state
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_unmanaged_replacement_blocks_without_changing_target_or_known_state() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "owned source\n");
+        workspace.write("store/git/other", "unmanaged source\n");
+        let current = workspace.input();
+        workspace
+            .coordinator()
+            .apply_create_link(&current, |_| true)
+            .unwrap();
+        let target = workspace.path("home/.gitconfig");
+        fs::remove_file(&target).unwrap();
+        let other = workspace.path("store/git/other");
+        symlink(&other, &target).unwrap();
+        let stale = workspace.stale_input();
+
+        let result = workspace
+            .coordinator()
+            .apply_stale_link(&stale, |_| {
+                panic!("a blocked ownership conflict must not request confirmation")
+            })
+            .unwrap();
+
+        assert!(matches!(result, StaleLinkApplyResult::Blocked { .. }));
+        assert_eq!(fs::read_link(&target).unwrap(), other);
+        assert_eq!(
+            fs::read_to_string(workspace.path("store/git/config")).unwrap(),
+            "owned source\n"
+        );
+        assert!(
+            fs::symlink_metadata(workspace.path("home"))
+                .unwrap()
+                .is_dir()
+        );
+        assert!(
+            workspace
+                .repository()
+                .load()
+                .unwrap()
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_unsafe_parent_blocks_without_touching_the_outside_target_or_known_state() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "owned source\n");
+        let current = workspace.input();
+        workspace
+            .coordinator()
+            .apply_create_link(&current, |_| true)
+            .unwrap();
+        fs::rename(workspace.path("home"), workspace.path("former-home")).unwrap();
+        fs::create_dir(workspace.path("outside")).unwrap();
+        workspace.write("outside/.gitconfig", "outside contents\n");
+        symlink(workspace.path("outside"), workspace.path("home")).unwrap();
+        let stale = workspace.stale_input();
+
+        let result = workspace
+            .coordinator()
+            .apply_stale_link(&stale, |_| {
+                panic!("an unsafe parent must not request confirmation")
+            })
+            .unwrap();
+
+        assert!(matches!(result, StaleLinkApplyResult::Blocked { .. }));
+        assert_eq!(
+            fs::read_to_string(workspace.path("outside/.gitconfig")).unwrap(),
+            "outside contents\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path("store/git/config")).unwrap(),
+            "owned source\n"
+        );
+        assert!(
+            workspace
+                .repository()
+                .load()
+                .unwrap()
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_remove_capability_failure_does_not_invoke_the_after_running_hook() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "owned source\n");
+        let current = workspace.input();
+        workspace
+            .coordinator()
+            .apply_create_link(&current, |_| true)
+            .unwrap();
+        let stale = workspace.stale_input();
+
+        let error = workspace
+            .coordinator()
+            .apply_stale_link_with_after_running(&stale, |locked| {
+                let _ = locked;
+                panic!("preflight must reject before creating an operation")
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ApplyError::StalePreflight(StaleLinkExecutionError::Remove(
+                RemoveLinkExecutionError::PlatformCapability { .. }
+            ))
+        ));
+        let target = workspace.path("home/.gitconfig");
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let state = workspace.repository().load().unwrap();
+        assert!(
+            state
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .is_some()
+        );
+        assert!(state.active_operation().is_none());
     }
 
     #[test]

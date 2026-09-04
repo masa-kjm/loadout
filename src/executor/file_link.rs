@@ -10,6 +10,7 @@ use crate::domain::paths::ResolvedPath;
 use crate::domain::plan::{ActionKind, PlannedAction, TargetCondition};
 use crate::filesystem::{
     create_file_symbolic_link_no_replace, ensure_file_symbolic_link_creation_supported,
+    ensure_file_symbolic_link_removal_supported, remove_expected_file_symbolic_link_entry,
 };
 use crate::inspection::file_link::{FileLinkInspector, TargetInspectionError};
 use crate::inspection::source::{SourceVerificationError, VerifiedSource};
@@ -98,6 +99,96 @@ impl FileLinkExecutor {
         self.ensure_create_capability(&target_path, &physical_target_path)
     }
 
+    /// Rechecks and removes exactly one planned `remove_link` action.
+    ///
+    /// This method removes only the final link entry. It never follows the referent, mutates a parent directory, writes Known state, or selects a replacement action after a failed ownership recheck.
+    pub(crate) fn execute_remove(
+        &self,
+        action: &PlannedAction,
+    ) -> Result<(), RemoveLinkExecutionError> {
+        let (target_path, link_target) = self.recheck_remove(action)?;
+        let physical_target_path = self
+            .inspector
+            .physical_target_path_for_execution(&target_path)
+            .map_err(RemoveLinkExecutionError::TargetInspection)?;
+        self.ensure_remove_capability(&target_path, &physical_target_path)?;
+
+        if let Err(source) = remove_expected_file_symbolic_link_entry(
+            self.inspector.canonical_home(),
+            &physical_target_path,
+            &link_target,
+        ) {
+            return match self
+                .inspector
+                .inspect_target_for_expected_link(&target_path, &link_target)
+            {
+                Ok(after) => Err(RemoveLinkExecutionError::RemoveAttemptFailed {
+                    target_path,
+                    source,
+                    aftermath: after.observation().clone(),
+                }),
+                Err(inspection) => Err(RemoveLinkExecutionError::RemoveAftermathUnproven {
+                    target_path,
+                    source,
+                    inspection,
+                }),
+            };
+        }
+
+        let after = self
+            .inspector
+            .inspect_target_for_expected_link(&target_path, &link_target)
+            .map_err(RemoveLinkExecutionError::PostconditionInspection)?;
+        match after.observation() {
+            TargetObservation::Missing => Ok(()),
+            observation => Err(RemoveLinkExecutionError::PostconditionNotMet {
+                target_path,
+                observation: observation.clone(),
+            }),
+        }
+    }
+
+    /// Performs the non-mutating checks required before a `remove_link` operation record is created. `execute_remove` repeats these checks immediately before the link-entry removal.
+    pub(crate) fn preflight_remove(
+        &self,
+        action: &PlannedAction,
+    ) -> Result<(), RemoveLinkExecutionError> {
+        let (target_path, _) = self.recheck_remove(action)?;
+        let physical_target_path = self
+            .inspector
+            .physical_target_path_for_execution(&target_path)
+            .map_err(RemoveLinkExecutionError::TargetInspection)?;
+        self.ensure_remove_capability(&target_path, &physical_target_path)
+    }
+
+    /// Rechecks the `forget_missing` post-condition before the state repository deletes only the stale Known record. This action has no filesystem mutation and does not inspect a source.
+    pub(crate) fn execute_forget_missing(
+        &self,
+        action: &PlannedAction,
+    ) -> Result<(), ForgetMissingExecutionError> {
+        let target_path = forget_missing_conditions(action)?;
+        let after = self
+            .inspector
+            .inspect_target_for_expected_link(&target_path, &LinkTarget::new(target_path.clone()))
+            .map_err(ForgetMissingExecutionError::TargetInspection)?;
+        match after.observation() {
+            TargetObservation::Missing => Ok(()),
+            observation => Err(ForgetMissingExecutionError::PostconditionNotMet {
+                target_path,
+                observation: observation.clone(),
+            }),
+        }
+    }
+
+    /// Rechecks the missing-target precondition during preflight without
+    /// changing the filesystem or Known state.
+    pub(crate) fn preflight_forget_missing(
+        &self,
+        action: &PlannedAction,
+    ) -> Result<(), ForgetMissingExecutionError> {
+        self.execute_forget_missing(action)
+    }
+
     fn ensure_create_capability(
         &self,
         target_path: &ResolvedPath,
@@ -123,6 +214,26 @@ impl FileLinkExecutor {
 
         ensure_file_symbolic_link_creation_supported(&parent_path).map_err(|source| {
             CreateLinkExecutionError::PlatformCapability {
+                target_path: target_path.clone(),
+                source,
+            }
+        })
+    }
+
+    fn ensure_remove_capability(
+        &self,
+        target_path: &ResolvedPath,
+        physical_target_path: &ResolvedPath,
+    ) -> Result<(), RemoveLinkExecutionError> {
+        let parent_path = physical_target_path
+            .as_ref()
+            .parent()
+            .expect("a validated file-link target must have a parent");
+        let parent_path = ResolvedPath::new(parent_path.to_path_buf())
+            .expect("a validated file-link target parent must be resolved");
+
+        ensure_file_symbolic_link_removal_supported(&parent_path).map_err(|source| {
+            RemoveLinkExecutionError::PlatformCapability {
                 target_path: target_path.clone(),
                 source,
             }
@@ -157,6 +268,24 @@ impl FileLinkExecutor {
             .map_err(CreateLinkExecutionError::TargetInspection)?;
         if !matches!(before.observation(), TargetObservation::Missing) {
             return Err(CreateLinkExecutionError::PreconditionNoLongerHolds {
+                target_path,
+                observation: before.observation().clone(),
+            });
+        }
+        Ok((before.target_path().clone(), link_target))
+    }
+
+    fn recheck_remove(
+        &self,
+        action: &PlannedAction,
+    ) -> Result<(ResolvedPath, LinkTarget), RemoveLinkExecutionError> {
+        let (target_path, link_target) = remove_conditions(action)?;
+        let before = self
+            .inspector
+            .inspect_target_for_expected_link(&target_path, &link_target)
+            .map_err(RemoveLinkExecutionError::TargetInspection)?;
+        if !matches!(before.observation(), TargetObservation::ExpectedLink { .. }) {
+            return Err(RemoveLinkExecutionError::PreconditionNoLongerHolds {
                 target_path,
                 observation: before.observation().clone(),
             });
@@ -198,6 +327,71 @@ fn create_conditions(
     Ok((pre_target.clone(), link_target.clone()))
 }
 
+fn remove_conditions(
+    action: &PlannedAction,
+) -> Result<(ResolvedPath, LinkTarget), RemoveLinkExecutionError> {
+    if action.kind() != ActionKind::RemoveLink {
+        return Err(RemoveLinkExecutionError::UnsupportedAction {
+            kind: action.kind(),
+        });
+    }
+    let preconditions = action.preconditions();
+    let postconditions = action.postconditions();
+    let [
+        TargetCondition::ExpectedLink {
+            target_path: pre_target,
+            link_target,
+        },
+    ] = preconditions.as_slice()
+    else {
+        return Err(RemoveLinkExecutionError::InvalidRemoveConditions);
+    };
+    let [
+        TargetCondition::Missing {
+            target_path: post_target,
+        },
+    ] = postconditions.as_slice()
+    else {
+        return Err(RemoveLinkExecutionError::InvalidRemoveConditions);
+    };
+    if pre_target != post_target {
+        return Err(RemoveLinkExecutionError::InvalidRemoveConditions);
+    }
+    Ok((pre_target.clone(), link_target.clone()))
+}
+
+fn forget_missing_conditions(
+    action: &PlannedAction,
+) -> Result<ResolvedPath, ForgetMissingExecutionError> {
+    if action.kind() != ActionKind::ForgetMissing {
+        return Err(ForgetMissingExecutionError::UnsupportedAction {
+            kind: action.kind(),
+        });
+    }
+    let preconditions = action.preconditions();
+    let postconditions = action.postconditions();
+    let [
+        TargetCondition::Missing {
+            target_path: pre_target,
+        },
+    ] = preconditions.as_slice()
+    else {
+        return Err(ForgetMissingExecutionError::InvalidForgetMissingConditions);
+    };
+    let [
+        TargetCondition::Missing {
+            target_path: post_target,
+        },
+    ] = postconditions.as_slice()
+    else {
+        return Err(ForgetMissingExecutionError::InvalidForgetMissingConditions);
+    };
+    if pre_target != post_target {
+        return Err(ForgetMissingExecutionError::InvalidForgetMissingConditions);
+    }
+    Ok(pre_target.clone())
+}
+
 /// The reason a planned create action could not be safely completed and proven.
 #[derive(Debug)]
 pub(crate) enum CreateLinkExecutionError {
@@ -234,6 +428,154 @@ pub(crate) enum CreateLinkExecutionError {
         target_path: ResolvedPath,
         observation: TargetObservation,
     },
+}
+
+/// The reason a planned link-entry removal could not be safely completed and proven.
+#[derive(Debug)]
+pub(crate) enum RemoveLinkExecutionError {
+    UnsupportedAction {
+        kind: ActionKind,
+    },
+    InvalidRemoveConditions,
+    TargetInspection(TargetInspectionError),
+    PlatformCapability {
+        target_path: ResolvedPath,
+        source: io::Error,
+    },
+    PreconditionNoLongerHolds {
+        target_path: ResolvedPath,
+        observation: TargetObservation,
+    },
+    RemoveAttemptFailed {
+        target_path: ResolvedPath,
+        source: io::Error,
+        aftermath: TargetObservation,
+    },
+    RemoveAftermathUnproven {
+        target_path: ResolvedPath,
+        source: io::Error,
+        inspection: TargetInspectionError,
+    },
+    PostconditionInspection(TargetInspectionError),
+    PostconditionNotMet {
+        target_path: ResolvedPath,
+        observation: TargetObservation,
+    },
+}
+
+impl fmt::Display for RemoveLinkExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedAction { kind } => {
+                write!(formatter, "remove executor cannot execute action kind {kind:?}")
+            }
+            Self::InvalidRemoveConditions => formatter.write_str(
+                "a remove action requires one expected-link precondition and one missing post-condition for the same target",
+            ),
+            Self::TargetInspection(error) | Self::PostconditionInspection(error) => error.fmt(formatter),
+            Self::PlatformCapability {
+                target_path,
+                source,
+            } => write!(
+                formatter,
+                "file symbolic-link removal is unsupported at {target_path}: {source}"
+            ),
+            Self::PreconditionNoLongerHolds {
+                target_path,
+                observation,
+            } => write!(
+                formatter,
+                "remove precondition no longer holds at {target_path}: {observation:?}"
+            ),
+            Self::RemoveAttemptFailed {
+                target_path,
+                source,
+                aftermath,
+            } => write!(
+                formatter,
+                "cannot remove file link at {target_path}: {source}; no-follow aftermath: {aftermath:?}"
+            ),
+            Self::RemoveAftermathUnproven {
+                target_path,
+                source,
+                inspection,
+            } => write!(
+                formatter,
+                "cannot remove file link at {target_path}: {source}; aftermath cannot be proven: {inspection}"
+            ),
+            Self::PostconditionNotMet {
+                target_path,
+                observation,
+            } => write!(
+                formatter,
+                "remove post-condition does not hold at {target_path}: {observation:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RemoveLinkExecutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TargetInspection(error) | Self::PostconditionInspection(error) => Some(error),
+            Self::PlatformCapability { source, .. }
+            | Self::RemoveAttemptFailed { source, .. }
+            | Self::RemoveAftermathUnproven { source, .. } => Some(source),
+            Self::UnsupportedAction { .. }
+            | Self::InvalidRemoveConditions
+            | Self::PreconditionNoLongerHolds { .. }
+            | Self::PostconditionNotMet { .. } => None,
+        }
+    }
+}
+
+/// The reason a stale-Known-only action could not reprove a missing target.
+#[derive(Debug)]
+pub(crate) enum ForgetMissingExecutionError {
+    UnsupportedAction {
+        kind: ActionKind,
+    },
+    InvalidForgetMissingConditions,
+    TargetInspection(TargetInspectionError),
+    PostconditionNotMet {
+        target_path: ResolvedPath,
+        observation: TargetObservation,
+    },
+}
+
+impl fmt::Display for ForgetMissingExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedAction { kind } => {
+                write!(
+                    formatter,
+                    "forget-missing executor cannot execute action kind {kind:?}"
+                )
+            }
+            Self::InvalidForgetMissingConditions => formatter.write_str(
+                "a forget-missing action requires matching missing precondition and post-condition",
+            ),
+            Self::TargetInspection(error) => error.fmt(formatter),
+            Self::PostconditionNotMet {
+                target_path,
+                observation,
+            } => write!(
+                formatter,
+                "forget-missing post-condition does not hold at {target_path}: {observation:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ForgetMissingExecutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TargetInspection(error) => Some(error),
+            Self::UnsupportedAction { .. }
+            | Self::InvalidForgetMissingConditions
+            | Self::PostconditionNotMet { .. } => None,
+        }
+    }
 }
 
 impl fmt::Display for CreateLinkExecutionError {
@@ -320,6 +662,7 @@ mod tests {
     use super::*;
     use crate::domain::file_link::ResolvedFileLink;
     use crate::domain::ids::FullyQualifiedResourceId;
+    use crate::domain::known::KnownFileLink;
     use crate::domain::paths::{ResolvedPath, SourceRelativePath};
     use crate::inspection::source::{resolve_store_root, verify_regular_source};
 
@@ -370,6 +713,17 @@ mod tests {
                 )
                 .unwrap(),
             )
+        }
+
+        fn remove_action(&self) -> PlannedAction {
+            PlannedAction::remove_link(KnownFileLink::from_resolved(
+                &ResolvedFileLink::new(
+                    FullyQualifiedResourceId::parse("base/git-config").unwrap(),
+                    ResolvedPath::new(self.path("store/git/config")).unwrap(),
+                    ResolvedPath::new(self.path("home/.gitconfig")).unwrap(),
+                )
+                .unwrap(),
+            ))
         }
 
         fn executor(&self) -> FileLinkExecutor {
@@ -491,5 +845,119 @@ mod tests {
             }
         ));
         assert!(!workspace.path("outside/.gitconfig").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_executor_fail_closes_when_the_platform_cannot_bind_the_final_entry() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "[user]\nname = Example\n");
+        let action = workspace.remove_action();
+        let source = workspace.path("store/git/config");
+        let target = workspace.path("home/.gitconfig");
+        symlink(&source, &target).unwrap();
+
+        let error = workspace.executor().execute_remove(&action).unwrap_err();
+
+        assert!(matches!(
+            error,
+            RemoveLinkExecutionError::PlatformCapability { .. }
+        ));
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&target).unwrap(), source);
+        assert_eq!(
+            fs::read_to_string(&source).unwrap(),
+            "[user]\nname = Example\n"
+        );
+        assert!(
+            fs::symlink_metadata(workspace.path("home"))
+                .unwrap()
+                .is_dir()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_executor_rejects_wrong_or_non_link_targets_without_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "owned source\n");
+        workspace.write("store/git/other", "other source\n");
+        let action = workspace.remove_action();
+        let target = workspace.path("home/.gitconfig");
+        let other = workspace.path("store/git/other");
+        symlink(&other, &target).unwrap();
+
+        let error = workspace.executor().execute_remove(&action).unwrap_err();
+        assert!(matches!(
+            error,
+            RemoveLinkExecutionError::PreconditionNoLongerHolds {
+                observation: TargetObservation::OtherLink { .. },
+                ..
+            }
+        ));
+        assert_eq!(fs::read_link(&target).unwrap(), other);
+        assert_eq!(
+            fs::read_to_string(workspace.path("store/git/config")).unwrap(),
+            "owned source\n"
+        );
+
+        fs::remove_file(&target).unwrap();
+        fs::create_dir(&target).unwrap();
+        let error = workspace.executor().execute_remove(&action).unwrap_err();
+        assert!(matches!(
+            error,
+            RemoveLinkExecutionError::PreconditionNoLongerHolds {
+                observation: TargetObservation::OtherEntry { .. },
+                ..
+            }
+        ));
+        assert!(fs::symlink_metadata(&target).unwrap().is_dir());
+        assert!(
+            fs::symlink_metadata(workspace.path("home"))
+                .unwrap()
+                .is_dir()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_executor_rejects_a_symlinked_parent_without_touching_the_outside_tree() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "owned source\n");
+        let action = workspace.remove_action();
+        let executor = workspace.executor();
+        fs::rename(workspace.path("home"), workspace.path("former-home")).unwrap();
+        fs::create_dir(workspace.path("outside")).unwrap();
+        workspace.write("outside/.gitconfig", "outside contents\n");
+        symlink(workspace.path("outside"), workspace.path("home")).unwrap();
+
+        let error = executor.execute_remove(&action).unwrap_err();
+
+        assert!(matches!(
+            error,
+            RemoveLinkExecutionError::PreconditionNoLongerHolds {
+                observation: TargetObservation::UnsafePath { .. },
+                ..
+            }
+        ));
+        assert_eq!(
+            fs::read_to_string(workspace.path("outside/.gitconfig")).unwrap(),
+            "outside contents\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path("store/git/config")).unwrap(),
+            "owned source\n"
+        );
     }
 }

@@ -151,6 +151,41 @@ impl KnownState {
         resources.insert(resource.resource_id().clone(), resource);
         Self::new(resources.into_values())
     }
+
+    /// Returns a new Known state without one exact previously verified fact.
+    ///
+    /// The state repository uses this only in the same atomic commit that marks a verified `remove_link` action as succeeded. Requiring the complete expected fact prevents an action record from deleting a newer or different Known resource under the same identity.
+    pub(crate) fn with_removed(&self, expected: &KnownFileLink) -> Result<Self, KnownStateError> {
+        let Some(actual) = self.resources.get(expected.resource_id()) else {
+            return Err(KnownStateError::MissingResource {
+                resource_id: expected.resource_id().clone(),
+            });
+        };
+        if actual != expected {
+            return Err(KnownStateError::ResourceMismatch {
+                resource_id: expected.resource_id().clone(),
+            });
+        }
+
+        let mut resources = self.resources.clone();
+        resources.remove(expected.resource_id());
+        Self::new(resources.into_values())
+    }
+
+    /// Returns a new Known state without a stale resource whose target was freshly proven missing. The caller's operation record supplies the resource identity; no filesystem entry is removed for this transition.
+    pub(crate) fn with_missing_resource_removed(
+        &self,
+        resource_id: &FullyQualifiedResourceId,
+    ) -> Result<Self, KnownStateError> {
+        if !self.resources.contains_key(resource_id) {
+            return Err(KnownStateError::MissingResource {
+                resource_id: resource_id.clone(),
+            });
+        }
+        let mut resources = self.resources.clone();
+        resources.remove(resource_id);
+        Self::new(resources.into_values())
+    }
 }
 
 /// The reason Known state violates a global uniqueness invariant.
@@ -163,6 +198,12 @@ pub(crate) enum KnownStateError {
         target_path: ResolvedPath,
         first_resource_id: FullyQualifiedResourceId,
         duplicate_resource_id: FullyQualifiedResourceId,
+    },
+    MissingResource {
+        resource_id: FullyQualifiedResourceId,
+    },
+    ResourceMismatch {
+        resource_id: FullyQualifiedResourceId,
     },
 }
 
@@ -179,6 +220,16 @@ impl fmt::Display for KnownStateError {
             } => write!(
                 formatter,
                 "Known target {target_path} is recorded for both {first_resource_id} and {duplicate_resource_id}"
+            ),
+            Self::MissingResource { resource_id } => {
+                write!(
+                    formatter,
+                    "Known state does not contain resource {resource_id}"
+                )
+            }
+            Self::ResourceMismatch { resource_id } => write!(
+                formatter,
+                "Known state resource {resource_id} does not match the verified fact selected for removal"
             ),
         }
     }
@@ -286,5 +337,29 @@ mod tests {
                 .source_path(),
             &path("store/git/next")
         );
+    }
+
+    #[test]
+    fn known_state_removal_requires_the_exact_verified_fact() {
+        let existing = known("base/git", "store/git/config", "home/.gitconfig");
+        let state = KnownState::new([existing.clone()]).unwrap();
+
+        let removed = state.with_removed(&existing).unwrap();
+        assert!(removed.resources().next().is_none());
+
+        assert!(matches!(
+            state.with_removed(&known("base/git", "store/git/other", "home/.gitconfig")),
+            Err(KnownStateError::ResourceMismatch { .. })
+        ));
+        assert!(matches!(
+            state.with_removed(&known("base/zsh", "store/zshrc", "home/.zshrc")),
+            Err(KnownStateError::MissingResource { .. })
+        ));
+        assert!(matches!(
+            state.with_missing_resource_removed(
+                &FullyQualifiedResourceId::parse("base/zsh").unwrap()
+            ),
+            Err(KnownStateError::MissingResource { .. })
+        ));
     }
 }

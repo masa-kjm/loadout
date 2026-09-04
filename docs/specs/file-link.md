@@ -135,9 +135,9 @@ After the new expected link is verified, the state repository atomically replace
 
 ### Remove
 
-Remove requires `expected_link` matching the Known-state value.
-It removes only the final symbolic-link entry and then verifies that the target is `missing`.
-No parent directory is removed.
+Remove requires `expected_link` matching the Known-state value and a platform primitive that binds that exact final entry to the deletion.
+It removes only that final symbolic-link entry and then verifies that the target is `missing`.
+No parent directory is removed. If the platform cannot retain the expected-entry proof through deletion, preflight MUST block without creating an operation record or changing the target or Known state.
 
 ### Relocate
 
@@ -150,7 +150,7 @@ If the new target is not missing or the old target is not an expected link, the 
 
 ### Supported Representation
 
-On Unix, the implementation MUST create, replace, remove, and inspect the symbolic-link entry without following its final target.
+On Unix, the implementation MUST create and inspect the symbolic-link entry without following its final target. It MAY remove an entry only when its platform primitive can bind deletion to the final entry that passed the expected-link recheck.
 On Windows, it MUST create, replace, remove, and inspect a file symbolic link and MUST reject junctions and all unsupported reparse points.
 An implementation MUST NOT fall back to copy, hard link, junction, a delayed-at-reboot operation, or another untracked filesystem operation.
 
@@ -163,13 +163,13 @@ The following guarantees apply to a target whose parent path and final entry hav
 | Create | Create only a file symbolic link at a target that is still `missing`. The implementation must not replace an entry that appeared after planning. |
 | Replace | Record a unique Loadout-owned temporary sibling path, construct a new file symbolic link there, then use one target-name replacement operation. The temporary path is action-local and is never a declared resource target. It MUST NOT implement replacement as deleting the managed link and later creating a new one. Success requires both the new expected target link and absence of the temporary entry. If the platform cannot preserve the old expected link when that replacement operation fails, it does not support `replace_link` and preflight MUST block the action. |
 | Source-changing Replace Ownership | Apply every Replace guarantee. It is required only when the old and new resolved link targets differ. |
-| Remove | Remove only the final expected file-symbolic-link entry. It must not follow the link, remove its referent, or remove a parent directory. |
+| Remove | Atomically bind deletion to the final expected file-symbolic-link entry. It must not follow the link, remove its referent, remove a parent directory, or delete an entry substituted after recheck. If that binding is unavailable, preflight must block. |
 
 The state repository allocates a unique temporary sibling path while it persists the operation record for every `replace_link` action and every `replace_ownership` action whose resolved link targets differ, before any mutation.
 This allocation is an execution-local nonce, not a planner decision, resource identity, or ordering input.
 The executor may use only the recorded path and MUST recheck that it is missing under the same safe parent immediately before creating the temporary link.
 
-On Unix, replacement must use an atomic same-filesystem name replacement, and removal must use a link-entry removal operation.
+On Unix, replacement must use an atomic same-filesystem name replacement. Generic POSIX `unlinkat` is not an expected-entry removal primitive: it deletes whichever entry currently has the supplied name. The current Unix backend therefore blocks `remove_link` until a platform-specific primitive can atomically bind the verified final entry to deletion.
 An open referent does not change the operation's ownership rule: removal and replacement are operations on the link entry, never on the referent.
 
 On Windows, symbolic-link creation may be unavailable because of policy, privilege, developer-mode configuration, filesystem support, or access control.
@@ -178,7 +178,7 @@ Loadout does not wait for the handle, schedule a later retry, or weaken the oper
 
 ### Capability, Permission, and Handle Failures
 
-Preflight MUST block without target mutation when it can determine that the platform cannot create a file symbolic link or cannot provide the required replacement guarantee for an action that requires replacement.
+Preflight MUST block without target mutation when it can determine that the platform cannot create a file symbolic link, cannot provide the required replacement guarantee for an action that requires replacement, or cannot provide the required expected-entry deletion guarantee for an action that requires removal.
 It must report the unsupported capability and affected action.
 
 Permission and handle availability are mutable filesystem facts and cannot be established conclusively by a separate access check.

@@ -67,6 +67,16 @@ impl ActionStatus {
     }
 }
 
+/// The exact Known-state transition eligible after a recorded post-condition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RecordedKnownStateUpdate {
+    Upsert(KnownFileLink),
+    RemoveExpected(KnownFileLink),
+    RemoveMissing {
+        resource_id: FullyQualifiedResourceId,
+    },
+}
+
 /// One action whose recorded facts are sufficient for future recovery.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RecordedAction {
@@ -79,55 +89,41 @@ pub(crate) struct RecordedAction {
 }
 
 impl RecordedAction {
-    /// Builds the Slice 4 record for one planner-selected `create_link` action.
-    pub(crate) fn from_create_link(action: &PlannedAction) -> Result<Self, OperationRecordError> {
-        if action.kind() != ActionKind::CreateLink {
-            return Err(OperationRecordError::UnsupportedActionKind {
+    /// Builds a record for one planner-selected action supported by the current vertical slice.
+    pub(crate) fn from_action(action: &PlannedAction) -> Result<Self, OperationRecordError> {
+        let preconditions = action.preconditions();
+        let postconditions = action.postconditions();
+        let [precondition] = preconditions.as_slice() else {
+            return Err(OperationRecordError::InvalidActionConditions {
+                kind: action.kind(),
+            });
+        };
+        let [postcondition] = postconditions.as_slice() else {
+            return Err(OperationRecordError::InvalidActionConditions {
+                kind: action.kind(),
+            });
+        };
+        if precondition.target_path() != postcondition.target_path() {
+            return Err(OperationRecordError::InvalidActionConditions {
                 kind: action.kind(),
             });
         }
 
-        let preconditions = action.preconditions();
-        let postconditions = action.postconditions();
-        let [
-            TargetCondition::Missing {
-                target_path: pre_target,
-            },
-        ] = preconditions.as_slice()
-        else {
-            return Err(OperationRecordError::InvalidCreateConditions);
-        };
-        let [
-            TargetCondition::ExpectedLink {
-                target_path: post_target,
-                link_target: _,
-            },
-        ] = postconditions.as_slice()
-        else {
-            return Err(OperationRecordError::InvalidCreateConditions);
-        };
-        if pre_target != post_target {
-            return Err(OperationRecordError::InvalidCreateConditions);
-        }
-
-        Ok(Self {
-            kind: ActionKind::CreateLink,
+        let record = Self {
+            kind: action.kind(),
             resource_id: action.resource_id().clone(),
-            target_path: pre_target.clone(),
-            precondition: preconditions
-                .into_iter()
-                .next()
-                .expect("a checked create precondition must exist"),
-            postcondition: postconditions
-                .into_iter()
-                .next()
-                .expect("a checked create postcondition must exist"),
+            target_path: precondition.target_path().clone(),
+            precondition: precondition.clone(),
+            postcondition: postcondition.clone(),
             status: ActionStatus::Pending,
-        })
+        };
+        record.validate_conditions()?;
+        Ok(record)
     }
 
-    /// Reconstructs a persisted `create_link` record after validating its facts.
-    pub(crate) fn from_persisted_create_link(
+    /// Reconstructs a persisted action after validating its recovery facts.
+    pub(crate) fn from_persisted(
+        kind: ActionKind,
         resource_id: FullyQualifiedResourceId,
         target_path: ResolvedPath,
         precondition: TargetCondition,
@@ -135,14 +131,14 @@ impl RecordedAction {
         status: ActionStatus,
     ) -> Result<Self, OperationRecordError> {
         let record = Self {
-            kind: ActionKind::CreateLink,
+            kind,
             resource_id,
             target_path,
             precondition,
             postcondition,
             status,
         };
-        record.validate_create_conditions()?;
+        record.validate_conditions()?;
         Ok(record)
     }
 
@@ -176,9 +172,43 @@ impl RecordedAction {
         self.status
     }
 
-    /// Reconstructs the Known fact that a successful create action must have committed atomically with its `succeeded` status.
-    pub(crate) fn known_after_success(&self) -> Result<KnownFileLink, OperationRecordError> {
-        self.known_after_create_success()
+    /// Reconstructs the exact Known-state transition that must be atomic with `succeeded`.
+    pub(crate) fn known_state_update_after_success(
+        &self,
+    ) -> Result<RecordedKnownStateUpdate, OperationRecordError> {
+        self.validate_conditions()?;
+        match self.kind {
+            ActionKind::CreateLink => {
+                let TargetCondition::ExpectedLink { link_target, .. } = &self.postcondition else {
+                    return Err(OperationRecordError::InvalidActionConditions { kind: self.kind });
+                };
+                KnownFileLink::new(
+                    self.resource_id.clone(),
+                    link_target.as_path().clone(),
+                    self.target_path.clone(),
+                    link_target.clone(),
+                )
+                .map(RecordedKnownStateUpdate::Upsert)
+                .map_err(OperationRecordError::InvalidKnownFileLink)
+            }
+            ActionKind::RemoveLink => {
+                let TargetCondition::ExpectedLink { link_target, .. } = &self.precondition else {
+                    return Err(OperationRecordError::InvalidActionConditions { kind: self.kind });
+                };
+                KnownFileLink::new(
+                    self.resource_id.clone(),
+                    link_target.as_path().clone(),
+                    self.target_path.clone(),
+                    link_target.clone(),
+                )
+                .map(RecordedKnownStateUpdate::RemoveExpected)
+                .map_err(OperationRecordError::InvalidKnownFileLink)
+            }
+            ActionKind::ForgetMissing => Ok(RecordedKnownStateUpdate::RemoveMissing {
+                resource_id: self.resource_id.clone(),
+            }),
+            kind => Err(OperationRecordError::UnsupportedActionKind { kind }),
+        }
     }
 
     fn mark_running(&mut self) -> Result<(), OperationRecordError> {
@@ -208,51 +238,48 @@ impl RecordedAction {
         Ok(())
     }
 
-    fn mark_create_succeeded(&mut self) -> Result<KnownFileLink, OperationRecordError> {
+    fn mark_succeeded(&mut self) -> Result<RecordedKnownStateUpdate, OperationRecordError> {
         if self.status != ActionStatus::Running {
             return Err(OperationRecordError::InvalidStatusTransition {
                 from: self.status,
                 to: ActionStatus::Succeeded,
             });
         }
-        let known = self.known_after_create_success()?;
+        let update = self.known_state_update_after_success()?;
         self.status = ActionStatus::Succeeded;
-        Ok(known)
+        Ok(update)
     }
 
-    fn known_after_create_success(&self) -> Result<KnownFileLink, OperationRecordError> {
-        self.validate_create_conditions()?;
-        let TargetCondition::ExpectedLink { link_target, .. } = &self.postcondition else {
-            return Err(OperationRecordError::InvalidCreateConditions);
+    fn validate_conditions(&self) -> Result<(), OperationRecordError> {
+        let is_valid = match self.kind {
+            ActionKind::CreateLink => matches!(
+                (&self.precondition, &self.postcondition),
+                (
+                    TargetCondition::Missing { .. },
+                    TargetCondition::ExpectedLink { .. }
+                )
+            ),
+            ActionKind::RemoveLink => matches!(
+                (&self.precondition, &self.postcondition),
+                (
+                    TargetCondition::ExpectedLink { .. },
+                    TargetCondition::Missing { .. }
+                )
+            ),
+            ActionKind::ForgetMissing => matches!(
+                (&self.precondition, &self.postcondition),
+                (
+                    TargetCondition::Missing { .. },
+                    TargetCondition::Missing { .. }
+                )
+            ),
+            _ => return Err(OperationRecordError::UnsupportedActionKind { kind: self.kind }),
         };
-        KnownFileLink::new(
-            self.resource_id.clone(),
-            link_target.as_path().clone(),
-            self.target_path.clone(),
-            link_target.clone(),
-        )
-        .map_err(OperationRecordError::InvalidKnownFileLink)
-    }
-
-    fn validate_create_conditions(&self) -> Result<(), OperationRecordError> {
-        if self.kind != ActionKind::CreateLink {
-            return Err(OperationRecordError::UnsupportedActionKind { kind: self.kind });
-        }
-        let TargetCondition::Missing {
-            target_path: pre_target,
-        } = &self.precondition
-        else {
-            return Err(OperationRecordError::InvalidCreateConditions);
-        };
-        let TargetCondition::ExpectedLink {
-            target_path: post_target,
-            link_target: _,
-        } = &self.postcondition
-        else {
-            return Err(OperationRecordError::InvalidCreateConditions);
-        };
-        if pre_target != &self.target_path || post_target != &self.target_path {
-            return Err(OperationRecordError::InvalidCreateConditions);
+        if !is_valid
+            || self.precondition.target_path() != &self.target_path
+            || self.postcondition.target_path() != &self.target_path
+        {
+            return Err(OperationRecordError::InvalidActionConditions { kind: self.kind });
         }
         Ok(())
     }
@@ -267,16 +294,25 @@ pub(crate) struct OperationRecord {
 }
 
 impl OperationRecord {
-    /// Creates a new single-action operation for Slice 4's `create_link` path.
-    pub(crate) fn new_create_link(
+    /// Creates a new single-action operation for an action supported by the current vertical slice.
+    pub(crate) fn new_single_action(
         id: OperationId,
         desired_hash: DesiredHash,
         action: &PlannedAction,
     ) -> Result<(Self, ActionId), OperationRecordError> {
         let action_id = ActionId::parse("a1")?;
-        let recorded_action = RecordedAction::from_create_link(action)?;
+        let recorded_action = RecordedAction::from_action(action)?;
         let record = Self::from_actions(id, desired_hash, [(action_id.clone(), recorded_action)])?;
         Ok((record, action_id))
+    }
+
+    /// Compatibility constructor for Slice 4's create-only tests and caller.
+    pub(crate) fn new_create_link(
+        id: OperationId,
+        desired_hash: DesiredHash,
+        action: &PlannedAction,
+    ) -> Result<(Self, ActionId), OperationRecordError> {
+        Self::new_single_action(id, desired_hash, action)
     }
 
     /// Reconstructs an active operation from validated persisted actions.
@@ -293,7 +329,7 @@ impl OperationRecord {
         let mut resource_ids = BTreeSet::new();
         let mut target_paths = BTreeSet::new();
         for action in actions.values() {
-            action.validate_create_conditions()?;
+            action.validate_conditions()?;
             if !resource_ids.insert(action.resource_id.clone()) {
                 return Err(OperationRecordError::DuplicateResourceId {
                     resource_id: action.resource_id.clone(),
@@ -350,12 +386,31 @@ impl OperationRecord {
         self.action_mut(action_id)?.mark_without_known(status)
     }
 
-    /// Marks a `create_link` action successful and returns its verified Known fact.
+    /// Marks a verified action successful and returns its atomic Known-state update.
+    pub(crate) fn mark_succeeded(
+        &mut self,
+        action_id: &ActionId,
+    ) -> Result<RecordedKnownStateUpdate, OperationRecordError> {
+        self.action_mut(action_id)?.mark_succeeded()
+    }
+
+    /// Compatibility transition for Slice 4's create-only caller.
     pub(crate) fn mark_create_succeeded(
         &mut self,
         action_id: &ActionId,
     ) -> Result<KnownFileLink, OperationRecordError> {
-        self.action_mut(action_id)?.mark_create_succeeded()
+        match self.mark_succeeded(action_id)? {
+            RecordedKnownStateUpdate::Upsert(known) => Ok(known),
+            RecordedKnownStateUpdate::RemoveExpected(_)
+            | RecordedKnownStateUpdate::RemoveMissing { .. } => {
+                Err(OperationRecordError::UnsupportedActionKind {
+                    kind: self
+                        .action(action_id)
+                        .expect("a completed action must remain recorded")
+                        .kind(),
+                })
+            }
+        }
     }
 
     /// Whether every action has a closeable final status.
@@ -386,7 +441,9 @@ pub(crate) enum OperationRecordError {
     UnsupportedActionKind {
         kind: ActionKind,
     },
-    InvalidCreateConditions,
+    InvalidActionConditions {
+        kind: ActionKind,
+    },
     DuplicateResourceId {
         resource_id: FullyQualifiedResourceId,
     },
@@ -410,22 +467,36 @@ impl fmt::Display for OperationRecordError {
             Self::EmptyActionId => formatter.write_str("action ID must not be empty"),
             Self::NoActions => formatter.write_str("an operation record must contain an action"),
             Self::UnsupportedActionKind { kind } => {
-                write!(formatter, "Slice 4 cannot record action kind {kind:?}")
+                write!(formatter, "this slice cannot record action kind {kind:?}")
             }
-            Self::InvalidCreateConditions => formatter.write_str(
-                "a create_link record requires one missing precondition and one expected-link postcondition for the same target",
+            Self::InvalidActionConditions { kind } => write!(
+                formatter,
+                "a {kind:?} record has invalid target preconditions or postconditions"
             ),
             Self::DuplicateResourceId { resource_id } => {
-                write!(formatter, "operation records resource {resource_id} more than once")
+                write!(
+                    formatter,
+                    "operation records resource {resource_id} more than once"
+                )
             }
             Self::DuplicateTargetPath { target_path } => {
-                write!(formatter, "operation records target {target_path} more than once")
+                write!(
+                    formatter,
+                    "operation records target {target_path} more than once"
+                )
             }
             Self::UnknownActionId { action_id } => {
-                write!(formatter, "operation does not contain action {}", action_id.as_str())
+                write!(
+                    formatter,
+                    "operation does not contain action {}",
+                    action_id.as_str()
+                )
             }
             Self::InvalidStatusTransition { from, to } => {
-                write!(formatter, "invalid action-status transition: {from:?} -> {to:?}")
+                write!(
+                    formatter,
+                    "invalid action-status transition: {from:?} -> {to:?}"
+                )
             }
             Self::InvalidKnownFileLink(error) => error.fmt(formatter),
         }
@@ -440,7 +511,7 @@ impl std::error::Error for OperationRecordError {
             | Self::EmptyActionId
             | Self::NoActions
             | Self::UnsupportedActionKind { .. }
-            | Self::InvalidCreateConditions
+            | Self::InvalidActionConditions { .. }
             | Self::DuplicateResourceId { .. }
             | Self::DuplicateTargetPath { .. }
             | Self::UnknownActionId { .. }

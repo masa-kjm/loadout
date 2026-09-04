@@ -5,7 +5,13 @@
 #[allow(dead_code)]
 mod declaration;
 
+#[allow(dead_code)]
+mod application;
+
 mod domain;
+
+#[allow(dead_code)]
+mod executor;
 
 mod filesystem;
 
@@ -17,3 +23,6 @@ mod planner;
 
 #[allow(dead_code)]
 mod resolver;
+
+#[allow(dead_code)]
+mod state;

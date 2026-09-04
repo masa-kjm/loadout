@@ -142,6 +142,15 @@ impl KnownState {
     pub(crate) fn resources(&self) -> impl ExactSizeIterator<Item = &KnownFileLink> {
         self.resources.values()
     }
+
+    /// Returns a new Known state with one verified resource fact inserted or updated.
+    ///
+    /// The state repository uses this only in the same atomic commit that records the corresponding action as succeeded.
+    pub(crate) fn with_upserted(&self, resource: KnownFileLink) -> Result<Self, KnownStateError> {
+        let mut resources = self.resources.clone();
+        resources.insert(resource.resource_id().clone(), resource);
+        Self::new(resources.into_values())
+    }
 }
 
 /// The reason Known state violates a global uniqueness invariant.
@@ -250,5 +259,32 @@ mod tests {
             duplicate_target,
             KnownStateError::DuplicateTarget { .. }
         ));
+    }
+
+    #[test]
+    fn known_state_upsert_retains_global_target_uniqueness_and_replaces_one_identity() {
+        let existing = known("base/git", "store/git/config", "home/.gitconfig");
+        let state = KnownState::new([existing.clone()]).unwrap();
+
+        let inserted = state
+            .with_upserted(known("base/zsh", "store/zshrc", "home/.zshrc"))
+            .unwrap();
+        assert_eq!(inserted.resources().len(), 2);
+
+        assert!(matches!(
+            state.with_upserted(known("base/zsh", "store/zshrc", "home/.gitconfig")),
+            Err(KnownStateError::DuplicateTarget { .. })
+        ));
+        let updated = state
+            .with_upserted(known("base/git", "store/git/next", "home/.gitconfig"))
+            .unwrap();
+        assert_eq!(updated.resources().len(), 1);
+        assert_eq!(
+            updated
+                .get(&FullyQualifiedResourceId::parse("base/git").unwrap())
+                .unwrap()
+                .source_path(),
+            &path("store/git/next")
+        );
     }
 }

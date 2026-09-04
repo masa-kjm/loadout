@@ -83,6 +83,38 @@ impl FileLinkInspector {
         ActualState::new(observations).map_err(TargetInspectionError::InvalidActualState)
     }
 
+    /// Rechecks one target against the exact link target required by an executor post-condition. This does not confer ownership or mutate.
+    pub(crate) fn inspect_target_for_expected_link(
+        &self,
+        target_path: &ResolvedPath,
+        expected_link_target: &LinkTarget,
+    ) -> Result<ActualFileLink, TargetInspectionError> {
+        self.inspect_target(
+            target_path.clone(),
+            TargetExpectations {
+                desired_link_target: None,
+                known_link_target: Some(expected_link_target.clone()),
+            },
+        )
+    }
+
+    /// Resolves the physical target name anchored at the canonical home used by this inspector. The executor passes this to the filesystem boundary only after the no-follow recheck has established a safe parent path.
+    pub(crate) fn physical_target_path_for_execution(
+        &self,
+        target_path: &ResolvedPath,
+    ) -> Result<ResolvedPath, TargetInspectionError> {
+        self.physical_target_path(target_path)?.ok_or_else(|| {
+            TargetInspectionError::InvalidTargetPath {
+                target_path: target_path.clone(),
+            }
+        })
+    }
+
+    /// The canonical home root used to anchor a no-follow filesystem mutation.
+    pub(crate) fn canonical_home(&self) -> &ResolvedPath {
+        &self.canonical_home
+    }
+
     fn inspect_target(
         &self,
         target_path: ResolvedPath,
@@ -148,6 +180,27 @@ impl FileLinkInspector {
         })?;
         if !target_parent.starts_with(self.canonical_home.as_ref()) {
             return Ok(ParentSafety::OutsideHome);
+        }
+        let home_metadata = match fs::symlink_metadata(self.canonical_home.as_ref()) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                return Ok(ParentSafety::Missing);
+            }
+            Err(source) => {
+                return Err(TargetInspectionError::ParentMetadata {
+                    target_path: target_path.clone(),
+                    parent_path: self.canonical_home.as_ref().to_path_buf(),
+                    source,
+                });
+            }
+        };
+        match classify_nofollow_entry(&home_metadata) {
+            NoFollowEntryKind::Directory => {}
+            NoFollowEntryKind::FileSymbolicLink => return Ok(ParentSafety::Symlink),
+            NoFollowEntryKind::ReparsePoint => return Ok(ParentSafety::ReparsePoint),
+            NoFollowEntryKind::RegularFile | NoFollowEntryKind::Unsupported => {
+                return Ok(ParentSafety::NotDirectory);
+            }
         }
         let relative_parent = target_parent
             .strip_prefix(self.canonical_home.as_ref())
@@ -682,12 +735,14 @@ mod tests {
 
     #[cfg(windows)]
     fn create_junction(link: &Path, target: &Path) {
+        use std::os::windows::process::CommandExt;
+
         let output = std::process::Command::new("cmd")
-            .arg("/C")
-            .arg("mklink")
-            .arg("/J")
-            .arg(link)
-            .arg(target)
+            .raw_arg(format!(
+                "/C mklink /J \"{}\" \"{}\"",
+                link.display(),
+                target.display()
+            ))
             .output()
             .expect("the Windows command interpreter must be available");
         assert!(

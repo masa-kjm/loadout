@@ -18,8 +18,45 @@ use crate::domain::paths::{
 };
 use crate::filesystem::is_link_or_reparse_point;
 use crate::inspection::source::{
-    PhysicalStoreRoot, SourceVerificationError, resolve_store_root, verify_regular_source,
+    PhysicalStoreRoot, SourceVerificationError, VerifiedSource, resolve_store_root,
+    verify_regular_source,
 };
+
+/// Canonical Desired state and the source proofs needed to execute it safely.
+///
+/// The planner receives only `desired`. The accompanying source proofs remain outside the planner boundary, but retain the physical store-root and relative-path facts needed for the executor's immediate recheck.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResolvedApplyInput {
+    desired: ResolvedDesired,
+    verified_sources: BTreeMap<FullyQualifiedResourceId, VerifiedSource>,
+}
+
+impl ResolvedApplyInput {
+    /// Returns the canonical Desired input for inspection and pure planning.
+    pub(crate) fn desired(&self) -> &ResolvedDesired {
+        &self.desired
+    }
+
+    /// Returns the source proofs keyed by the resource identities they support.
+    pub(crate) fn verified_sources(&self) -> &BTreeMap<FullyQualifiedResourceId, VerifiedSource> {
+        &self.verified_sources
+    }
+
+    fn into_desired(self) -> ResolvedDesired {
+        self.desired
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        desired: ResolvedDesired,
+        verified_sources: BTreeMap<FullyQualifiedResourceId, VerifiedSource>,
+    ) -> Self {
+        Self {
+            desired,
+            verified_sources,
+        }
+    }
+}
 
 /// Immutable machine paths required to bind one environment configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,6 +92,18 @@ pub(crate) fn resolve(
     environment: &EnvironmentConfig,
     selected_root_profile: Option<&str>,
 ) -> Result<ResolvedDesired, ResolverError> {
+    resolve_for_apply(context, environment, selected_root_profile)
+        .map(ResolvedApplyInput::into_desired)
+}
+
+/// Resolves one selected root profile and retains the verified source facts required by a later non-dry-run apply.
+///
+/// This has the same declaration and source-validation behavior as [`resolve`] and still does not inspect managed targets or mutate state.
+pub(crate) fn resolve_for_apply(
+    context: &ResolverContext,
+    environment: &EnvironmentConfig,
+    selected_root_profile: Option<&str>,
+) -> Result<ResolvedApplyInput, ResolverError> {
     let profiles = discover_profiles(context, environment)?;
     let root_profile = select_root_profile(environment, selected_root_profile, &profiles)?;
     let composed_profiles = compose_profiles(&root_profile, &profiles)?;
@@ -66,6 +115,7 @@ pub(crate) fn resolve(
     let protected_paths = ProtectedPaths::new(context, profile_paths)?;
 
     let mut resources = Vec::new();
+    let mut verified_sources = BTreeMap::new();
     for profile_id in composed_profiles {
         let profile = profiles
             .get(&profile_id)
@@ -105,14 +155,23 @@ pub(crate) fn resolve(
             let target_path = bind_target_path(properties.target(), context)?;
             protected_paths.ensure_target_allowed(&target_path, &stores)?;
 
-            let resolved =
-                ResolvedFileLink::new(resource_id, verified_source.path().clone(), target_path)
-                    .map_err(ResolverError::InvalidResolvedFileLink)?;
+            let resolved = ResolvedFileLink::new(
+                resource_id.clone(),
+                verified_source.path().clone(),
+                target_path,
+            )
+            .map_err(ResolverError::InvalidResolvedFileLink)?;
             resources.push(resolved);
+            verified_sources.insert(resource_id, verified_source);
         }
     }
 
-    ResolvedDesired::new(root_profile, resources).map_err(ResolverError::InvalidDesired)
+    let desired =
+        ResolvedDesired::new(root_profile, resources).map_err(ResolverError::InvalidDesired)?;
+    Ok(ResolvedApplyInput {
+        desired,
+        verified_sources,
+    })
 }
 
 #[derive(Debug)]
@@ -978,7 +1037,8 @@ mod tests {
         let environment = environment(Some("workstation"), &["../profiles"], "../store");
         let uncreated_target_parent = workspace.path("home/.uncreated");
 
-        let desired = resolve(&context, &environment, None).unwrap();
+        let resolved = resolve_for_apply(&context, &environment, None).unwrap();
+        let desired = resolved.desired();
 
         assert_eq!(desired.root_profile().as_str(), "workstation");
         assert_eq!(
@@ -991,7 +1051,16 @@ mod tests {
         );
         assert_eq!(
             desired.resources()[0].source_path().as_ref(),
-            workspace.path("store/git/config")
+            fs::canonicalize(workspace.path("store/git/config")).unwrap()
+        );
+        assert_eq!(
+            resolved
+                .verified_sources()
+                .get(&FullyQualifiedResourceId::parse("base/git").unwrap())
+                .unwrap()
+                .path()
+                .as_ref(),
+            fs::canonicalize(workspace.path("store/git/config")).unwrap()
         );
         assert_eq!(
             desired.resources()[2].target_path().as_ref(),

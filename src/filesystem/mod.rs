@@ -3,6 +3,10 @@
 //! This module reports entry-kind facts only. Callers decide whether an entry is safe, owned, or eligible for a lifecycle action.
 
 use std::fs;
+use std::io;
+
+use crate::domain::file_link::LinkTarget;
+use crate::domain::paths::ResolvedPath;
 
 #[cfg(unix)]
 mod unix;
@@ -44,4 +48,26 @@ pub(crate) fn classify_nofollow_entry(metadata: &fs::Metadata) -> NoFollowEntryK
 /// must not traverse.
 pub(crate) fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
     classify_nofollow_entry(metadata).is_link_or_reparse_point()
+}
+
+/// Creates one file symbolic-link entry without replacing an existing final target. The executor owns all lifecycle and ownership decisions.
+pub(crate) fn create_file_symbolic_link_no_replace(
+    canonical_home: &ResolvedPath,
+    physical_target_path: &ResolvedPath,
+    link_target: &LinkTarget,
+) -> io::Result<()> {
+    platform::create_file_symbolic_link_no_replace(
+        canonical_home,
+        physical_target_path,
+        link_target,
+    )
+}
+
+/// Rejects a file-link create when the platform cannot prove that it can create the required symbolic-link representation without weakening no-follow safety.
+///
+/// This deliberately does not attempt a permission probe. Permission and sharing can change after preflight and must still be classified from the post-mutation observation if an actual create attempt is denied.
+pub(crate) fn ensure_file_symbolic_link_creation_supported(
+    target_parent: &ResolvedPath,
+) -> io::Result<()> {
+    platform::ensure_file_symbolic_link_creation_supported(target_parent)
 }

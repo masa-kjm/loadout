@@ -25,12 +25,19 @@ impl PhysicalStoreRoot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct VerifiedSource {
     path: ResolvedPath,
+    store_root: PhysicalStoreRoot,
+    source_path: SourceRelativePath,
 }
 
 impl VerifiedSource {
     /// The verified absolute path used as a file-link source and link target.
     pub(crate) fn path(&self) -> &ResolvedPath {
         &self.path
+    }
+
+    /// Repeats the no-follow store-containment and regular-file proof immediately before a resource mutation.
+    pub(crate) fn reverify(&self) -> Result<Self, SourceVerificationError> {
+        verify_regular_source(&self.store_root, &self.source_path)
     }
 }
 
@@ -64,6 +71,23 @@ pub(crate) fn verify_regular_source(
     store_root: &PhysicalStoreRoot,
     source_path: &SourceRelativePath,
 ) -> Result<VerifiedSource, SourceVerificationError> {
+    let root_metadata = fs::symlink_metadata(store_root.as_path().as_ref()).map_err(|source| {
+        SourceVerificationError::StoreRootIo {
+            path: store_root.as_path().as_ref().to_path_buf(),
+            source,
+        }
+    })?;
+    if is_link_or_reparse_point(&root_metadata) {
+        return Err(SourceVerificationError::StoreRootLinkOrReparsePoint {
+            path: store_root.as_path().as_ref().to_path_buf(),
+        });
+    }
+    if !root_metadata.is_dir() {
+        return Err(SourceVerificationError::StoreRootNotDirectory {
+            path: store_root.as_path().as_ref().to_path_buf(),
+        });
+    }
+
     let (final_component, parent_components) = source_path
         .components()
         .split_last()
@@ -103,7 +127,11 @@ pub(crate) fn verify_regular_source(
     }
 
     let path = ResolvedPath::new(current).map_err(SourceVerificationError::InvalidResolvedPath)?;
-    Ok(VerifiedSource { path })
+    Ok(VerifiedSource {
+        path,
+        store_root: store_root.clone(),
+        source_path: source_path.clone(),
+    })
 }
 
 /// The reason a local-store source cannot be treated as verified input.
@@ -111,6 +139,7 @@ pub(crate) fn verify_regular_source(
 pub(crate) enum SourceVerificationError {
     StoreRootIo { path: PathBuf, source: io::Error },
     StoreRootNotDirectory { path: PathBuf },
+    StoreRootLinkOrReparsePoint { path: PathBuf },
     SourceComponentIo { path: PathBuf, source: io::Error },
     SourceParentLinkOrReparsePoint { path: PathBuf },
     SourceParentNotDirectory { path: PathBuf },
@@ -133,6 +162,13 @@ impl fmt::Display for SourceVerificationError {
                 write!(
                     formatter,
                     "local store root is not a directory: {}",
+                    path.display()
+                )
+            }
+            Self::StoreRootLinkOrReparsePoint { path } => {
+                write!(
+                    formatter,
+                    "local store root must not be a link or reparse point: {}",
                     path.display()
                 )
             }
@@ -184,6 +220,7 @@ impl std::error::Error for SourceVerificationError {
             }
             Self::InvalidResolvedPath(error) => Some(error),
             Self::StoreRootNotDirectory { .. }
+            | Self::StoreRootLinkOrReparsePoint { .. }
             | Self::SourceParentLinkOrReparsePoint { .. }
             | Self::SourceParentNotDirectory { .. }
             | Self::SourceLinkOrReparsePoint { .. }
@@ -254,12 +291,15 @@ mod tests {
     fn verifier_returns_the_regular_file_below_the_physical_store_root() {
         let store = TestStore::new();
         store.write("store/git/config", "[user]\nname = Example\n");
+        let root = store.physical_store_root();
 
-        let verified =
-            verify_regular_source(&store.physical_store_root(), &source_path("git/config"))
-                .unwrap();
+        let verified = verify_regular_source(&root, &source_path("git/config")).unwrap();
 
-        assert_eq!(verified.path().as_ref(), store.path("store/git/config"));
+        assert_eq!(
+            verified.path().as_ref(),
+            root.as_path().as_ref().join("git/config"),
+            "a verified source is rooted at the physical store path"
+        );
     }
 
     #[test]
@@ -343,12 +383,14 @@ mod tests {
 
     #[cfg(windows)]
     fn create_junction(link: &Path, target: &Path) {
+        use std::os::windows::process::CommandExt;
+
         let output = std::process::Command::new("cmd")
-            .arg("/C")
-            .arg("mklink")
-            .arg("/J")
-            .arg(link)
-            .arg(target)
+            .raw_arg(format!(
+                "/C mklink /J \"{}\" \"{}\"",
+                link.display(),
+                target.display()
+            ))
             .output()
             .expect("the Windows command interpreter must be available");
         assert!(

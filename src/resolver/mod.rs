@@ -13,9 +13,12 @@ use crate::domain::file_link::{ResolvedFileLink, ResolvedFileLinkError};
 use crate::domain::ids::{
     FullyQualifiedResourceId, IdentifierError, ProfileId, ResourceId, StoreId,
 };
-use crate::domain::paths::{ResolvedPath, ResolvedPathError};
+use crate::domain::paths::{
+    ResolvedPath, ResolvedPathError, SourceRelativePath, has_windows_drive_prefix,
+};
+use crate::filesystem::is_link_or_reparse_point;
 use crate::inspection::source::{
-    SourceVerificationError, is_link_or_reparse_point, resolve_store_root, verify_regular_source,
+    PhysicalStoreRoot, SourceVerificationError, resolve_store_root, verify_regular_source,
 };
 
 /// Immutable machine paths required to bind one environment configuration.
@@ -46,8 +49,7 @@ impl ResolverContext {
 
 /// Resolves one selected root profile to canonical Desired resources.
 ///
-/// The resolver reads only environment/profile declarations and verified local
-/// store sources. It never observes a managed target or performs mutation.
+/// The resolver reads only environment/profile declarations and verified local store sources. It never observes a managed target or performs mutation.
 pub(crate) fn resolve(
     context: &ResolverContext,
     environment: &EnvironmentConfig,
@@ -318,7 +320,7 @@ fn compose_profiles(
 
 #[derive(Debug)]
 struct ResolvedStore {
-    root: ResolvedPath,
+    root: PhysicalStoreRoot,
 }
 
 fn resolve_stores(
@@ -378,40 +380,10 @@ fn bind_configuration_path(
     }
 }
 
-fn parse_source_path(raw_path: &str) -> Result<Vec<String>, ResolverError> {
-    if raw_path.is_empty()
-        || raw_path.starts_with('/')
-        || raw_path.starts_with("~/")
-        || raw_path.contains('\\')
-        || has_windows_drive_prefix(raw_path)
-        || Path::new(raw_path).is_absolute()
-    {
-        return Err(ResolverError::InvalidSourcePath {
-            value: raw_path.to_owned(),
-        });
-    }
-
-    let components = raw_path
-        .split('/')
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    if components.iter().any(|component| {
-        component.is_empty()
-            || component == "."
-            || component == ".."
-            || has_windows_drive_prefix(component)
-    }) {
-        return Err(ResolverError::InvalidSourcePath {
-            value: raw_path.to_owned(),
-        });
-    }
-
-    Ok(components)
-}
-
-fn has_windows_drive_prefix(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+fn parse_source_path(raw_path: &str) -> Result<SourceRelativePath, ResolverError> {
+    SourceRelativePath::parse(raw_path).map_err(|_| ResolverError::InvalidSourcePath {
+        value: raw_path.to_owned(),
+    })
 }
 
 fn bind_target_path(
@@ -457,6 +429,8 @@ fn bind_target_path(
 }
 
 struct ProtectedPaths {
+    declared_home: ResolvedPath,
+    canonical_home: ResolvedPath,
     runtime_config_path: ResolvedPath,
     environment_config_path: ResolvedPath,
     runtime_config_directory: ResolvedPath,
@@ -469,18 +443,39 @@ impl ProtectedPaths {
         context: &ResolverContext,
         profile_paths: Vec<ResolvedPath>,
     ) -> Result<Self, ResolverError> {
-        let runtime_config_directory = context
-            .runtime_config_path
+        let canonical_home = canonical_home_directory(&context.home_directory)?;
+        let runtime_config_path = resolve_home_alias(
+            &context.home_directory,
+            &canonical_home,
+            &context.runtime_config_path,
+        )?;
+        let environment_config_path = resolve_home_alias(
+            &context.home_directory,
+            &canonical_home,
+            &context.environment_config_path,
+        )?;
+        let state_directory = resolve_home_alias(
+            &context.home_directory,
+            &canonical_home,
+            &context.state_directory,
+        )?;
+        let profile_paths = profile_paths
+            .into_iter()
+            .map(|path| resolve_home_alias(&context.home_directory, &canonical_home, &path))
+            .collect::<Result<Vec<_>, _>>()?;
+        let runtime_config_directory = runtime_config_path
             .as_ref()
             .parent()
             .ok_or(ResolverError::RuntimeConfigHasNoParent)?;
         let runtime_config_directory = ResolvedPath::new(runtime_config_directory.to_path_buf())
             .map_err(ResolverError::InvalidPath)?;
         Ok(Self {
-            runtime_config_path: context.runtime_config_path.clone(),
-            environment_config_path: context.environment_config_path.clone(),
+            declared_home: context.home_directory.clone(),
+            canonical_home,
+            runtime_config_path,
+            environment_config_path,
             runtime_config_directory,
-            state_directory: context.state_directory.clone(),
+            state_directory,
             profile_paths,
         })
     }
@@ -490,6 +485,8 @@ impl ProtectedPaths {
         target_path: &ResolvedPath,
         stores: &BTreeMap<StoreId, ResolvedStore>,
     ) -> Result<(), ResolverError> {
+        let physical_target_path =
+            resolve_home_alias(&self.declared_home, &self.canonical_home, target_path)?;
         let protected = [
             (&self.runtime_config_path, "runtime configuration file"),
             (
@@ -497,13 +494,16 @@ impl ProtectedPaths {
                 "environment configuration file",
             ),
         ];
-        if let Some((_, protected_by)) = protected.iter().find(|(path, _)| *path == target_path) {
+        if let Some((_, protected_by)) = protected
+            .iter()
+            .find(|(path, _)| *path == &physical_target_path)
+        {
             return Err(ResolverError::ProtectedTarget {
                 target_path: target_path.clone(),
                 protected_by,
             });
         }
-        if target_path
+        if physical_target_path
             .as_ref()
             .starts_with(self.runtime_config_directory.as_ref())
         {
@@ -512,7 +512,7 @@ impl ProtectedPaths {
                 protected_by: "runtime configuration directory",
             });
         }
-        if target_path
+        if physical_target_path
             .as_ref()
             .starts_with(self.state_directory.as_ref())
         {
@@ -521,16 +521,21 @@ impl ProtectedPaths {
                 protected_by: "state directory",
             });
         }
-        if self.profile_paths.iter().any(|path| path == target_path) {
+        if self
+            .profile_paths
+            .iter()
+            .any(|path| path == &physical_target_path)
+        {
             return Err(ResolverError::ProtectedTarget {
                 target_path: target_path.clone(),
                 protected_by: "profile file",
             });
         }
-        if stores
-            .values()
-            .any(|store| target_path.as_ref().starts_with(store.root.as_ref()))
-        {
+        if stores.values().any(|store| {
+            physical_target_path
+                .as_ref()
+                .starts_with(store.root.as_path().as_ref())
+        }) {
             return Err(ResolverError::ProtectedTarget {
                 target_path: target_path.clone(),
                 protected_by: "local store root",
@@ -541,11 +546,55 @@ impl ProtectedPaths {
     }
 }
 
+fn canonical_home_directory(home_directory: &ResolvedPath) -> Result<ResolvedPath, ResolverError> {
+    let canonical_home = fs::canonicalize(home_directory.as_ref()).map_err(|source| {
+        ResolverError::HomeDirectoryIo {
+            path: home_directory.as_ref().to_path_buf(),
+            source,
+        }
+    })?;
+    let metadata =
+        fs::metadata(&canonical_home).map_err(|source| ResolverError::HomeDirectoryIo {
+            path: canonical_home.clone(),
+            source,
+        })?;
+    if !metadata.is_dir() {
+        return Err(ResolverError::HomeDirectoryNotDirectory {
+            path: canonical_home,
+        });
+    }
+
+    ResolvedPath::new(canonical_home).map_err(ResolverError::InvalidPath)
+}
+
+fn resolve_home_alias(
+    declared_home: &ResolvedPath,
+    canonical_home: &ResolvedPath,
+    path: &ResolvedPath,
+) -> Result<ResolvedPath, ResolverError> {
+    if path.as_ref().starts_with(canonical_home.as_ref()) {
+        return Ok(path.clone());
+    }
+    let Ok(relative_path) = path.as_ref().strip_prefix(declared_home.as_ref()) else {
+        return Ok(path.clone());
+    };
+
+    ResolvedPath::new(canonical_home.as_ref().join(relative_path))
+        .map_err(ResolverError::InvalidPath)
+}
+
 /// The reason declarations cannot be resolved to safe canonical Desired input.
 #[derive(Debug)]
 pub(crate) enum ResolverError {
     EnvironmentConfigHasNoParent,
     RuntimeConfigHasNoParent,
+    HomeDirectoryIo {
+        path: PathBuf,
+        source: io::Error,
+    },
+    HomeDirectoryNotDirectory {
+        path: PathBuf,
+    },
     InvalidPath(ResolvedPathError),
     InvalidConfigurationPath {
         value: String,
@@ -625,6 +674,20 @@ impl fmt::Display for ResolverError {
             }
             Self::RuntimeConfigHasNoParent => {
                 formatter.write_str("runtime configuration path has no parent directory")
+            }
+            Self::HomeDirectoryIo { path, source } => {
+                write!(
+                    formatter,
+                    "cannot access home directory {}: {source}",
+                    path.display()
+                )
+            }
+            Self::HomeDirectoryNotDirectory { path } => {
+                write!(
+                    formatter,
+                    "home directory is not a directory: {}",
+                    path.display()
+                )
             }
             Self::InvalidPath(error) => error.fmt(formatter),
             Self::InvalidConfigurationPath { value } => {
@@ -733,6 +796,7 @@ impl std::error::Error for ResolverError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidPath(error) => Some(error),
+            Self::HomeDirectoryIo { source, .. } => Some(source),
             Self::ProfileDiscoveryIo { source, .. } | Self::ReadProfile { source, .. } => {
                 Some(source)
             }
@@ -745,6 +809,7 @@ impl std::error::Error for ResolverError {
             Self::InvalidDesired(error) => Some(error),
             Self::EnvironmentConfigHasNoParent
             | Self::RuntimeConfigHasNoParent
+            | Self::HomeDirectoryNotDirectory { .. }
             | Self::InvalidConfigurationPath { .. }
             | Self::ProfileDiscoveryNotDirectory { .. }
             | Self::ProfileDiscoveryLinkOrReparsePoint { .. }
@@ -1071,7 +1136,7 @@ mod tests {
                 "{source_path:?} must not be a valid source path"
             );
         }
-        assert_eq!(parse_source_path("git/config").unwrap(), ["git", "config"]);
+        assert!(parse_source_path("git/config").is_ok());
     }
 
     #[test]
@@ -1229,6 +1294,90 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolver_rejects_targets_inside_physical_protected_paths_through_a_home_alias() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new();
+        workspace.write("physical-home/store/git/config", "[user]\nname = Example\n");
+        workspace.write("physical-home/runtime/loadout.yaml", "schema_version: 1\n");
+        workspace.write(
+            "physical-home/environment/config.yaml",
+            "schema_version: 1\n",
+        );
+        workspace.create_dir("physical-home/state");
+        workspace.write(
+            "physical-home/profiles/workstation.yaml",
+            &profile("workstation", &[], ""),
+        );
+        symlink(
+            workspace.path("physical-home"),
+            workspace.path("declared-home"),
+        )
+        .unwrap();
+        let context = ResolverContext::new(
+            workspace.path("declared-home"),
+            workspace.path("declared-home/runtime/loadout.yaml"),
+            workspace.path("declared-home/environment/config.yaml"),
+            workspace.path("declared-home/state"),
+        )
+        .unwrap();
+        let environment = environment(Some("workstation"), &["../profiles"], "../store");
+        let source_before =
+            fs::read_to_string(workspace.path("physical-home/store/git/config")).unwrap();
+        let runtime_before =
+            fs::read_to_string(workspace.path("physical-home/runtime/loadout.yaml")).unwrap();
+        let environment_before =
+            fs::read_to_string(workspace.path("physical-home/environment/config.yaml")).unwrap();
+
+        for (target, protected_by) in [
+            ("~/store/managed", "local store root"),
+            ("~/runtime/managed", "runtime configuration directory"),
+            (
+                "~/environment/config.yaml",
+                "environment configuration file",
+            ),
+            ("~/state/managed", "state directory"),
+        ] {
+            workspace.write(
+                "physical-home/profiles/workstation.yaml",
+                &profile(
+                    "workstation",
+                    &[],
+                    &file_resource("managed", "git/config", target),
+                ),
+            );
+
+            let error = resolve(&context, &environment, None).unwrap_err();
+
+            match error {
+                ResolverError::ProtectedTarget {
+                    protected_by: actual,
+                    ..
+                } => assert_eq!(actual, protected_by),
+                unexpected => panic!("unexpected resolver error: {unexpected:?}"),
+            }
+        }
+
+        assert_eq!(
+            fs::read_to_string(workspace.path("physical-home/store/git/config")).unwrap(),
+            source_before
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path("physical-home/runtime/loadout.yaml")).unwrap(),
+            runtime_before
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path("physical-home/environment/config.yaml")).unwrap(),
+            environment_before
+        );
+        assert!(
+            !workspace.path("physical-home/store/managed").exists(),
+            "resolver must reject a target in the physical local store before any target mutation"
+        );
     }
 
     #[test]

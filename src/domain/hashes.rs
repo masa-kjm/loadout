@@ -215,8 +215,11 @@ impl std::error::Error for HashParseError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::domain::desired::ResolvedDesired;
+    #[cfg(unix)]
     use crate::domain::ids::{FullyQualifiedResourceId, ProfileId};
+    #[cfg(unix)]
     use crate::domain::paths::ResolvedPath;
 
     #[cfg(unix)]

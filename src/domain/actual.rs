@@ -10,6 +10,7 @@ use crate::domain::paths::ResolvedPath;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ParentSafety {
     Safe,
+    OutsideHome,
     Missing,
     NotDirectory,
     Symlink,

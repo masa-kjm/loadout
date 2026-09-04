@@ -5,7 +5,21 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::domain::paths::{ResolvedPath, ResolvedPathError};
+use crate::domain::paths::{ResolvedPath, ResolvedPathError, SourceRelativePath};
+use crate::filesystem::is_link_or_reparse_point;
+
+/// A canonical existing directory that is safe to use as a local-store root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PhysicalStoreRoot {
+    path: ResolvedPath,
+}
+
+impl PhysicalStoreRoot {
+    /// Returns the canonical directory path for containment comparisons.
+    pub(crate) fn as_path(&self) -> &ResolvedPath {
+        &self.path
+    }
+}
 
 /// A source path that was proven to be a regular file below a physical store root.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -23,7 +37,7 @@ impl VerifiedSource {
 /// Resolves an existing local-store root to its physical directory.
 pub(crate) fn resolve_store_root(
     store_root: &Path,
-) -> Result<ResolvedPath, SourceVerificationError> {
+) -> Result<PhysicalStoreRoot, SourceVerificationError> {
     let physical_root =
         fs::canonicalize(store_root).map_err(|source| SourceVerificationError::StoreRootIo {
             path: store_root.to_path_buf(),
@@ -40,18 +54,21 @@ pub(crate) fn resolve_store_root(
         });
     }
 
-    ResolvedPath::new(physical_root).map_err(SourceVerificationError::InvalidResolvedPath)
+    let path =
+        ResolvedPath::new(physical_root).map_err(SourceVerificationError::InvalidResolvedPath)?;
+    Ok(PhysicalStoreRoot { path })
 }
 
 /// Verifies all source components without following links beneath a physical store root.
 pub(crate) fn verify_regular_source(
-    store_root: &ResolvedPath,
-    source_components: &[String],
+    store_root: &PhysicalStoreRoot,
+    source_path: &SourceRelativePath,
 ) -> Result<VerifiedSource, SourceVerificationError> {
-    let (final_component, parent_components) = source_components
+    let (final_component, parent_components) = source_path
+        .components()
         .split_last()
-        .ok_or(SourceVerificationError::EmptySourcePath)?;
-    let mut current = store_root.as_ref().to_path_buf();
+        .expect("SourcePath always contains at least one validated component");
+    let mut current = store_root.as_path().as_ref().to_path_buf();
 
     for component in parent_components {
         current.push(component);
@@ -89,29 +106,9 @@ pub(crate) fn verify_regular_source(
     Ok(VerifiedSource { path })
 }
 
-/// Whether metadata identifies an entry that source resolution must not traverse.
-pub(crate) fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
-
 /// The reason a local-store source cannot be treated as verified input.
 #[derive(Debug)]
 pub(crate) enum SourceVerificationError {
-    EmptySourcePath,
     StoreRootIo { path: PathBuf, source: io::Error },
     StoreRootNotDirectory { path: PathBuf },
     SourceComponentIo { path: PathBuf, source: io::Error },
@@ -125,7 +122,6 @@ pub(crate) enum SourceVerificationError {
 impl fmt::Display for SourceVerificationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptySourcePath => formatter.write_str("source path must not be empty"),
             Self::StoreRootIo { path, source } => {
                 write!(
                     formatter,
@@ -187,12 +183,228 @@ impl std::error::Error for SourceVerificationError {
                 Some(source)
             }
             Self::InvalidResolvedPath(error) => Some(error),
-            Self::EmptySourcePath
-            | Self::StoreRootNotDirectory { .. }
+            Self::StoreRootNotDirectory { .. }
             | Self::SourceParentLinkOrReparsePoint { .. }
             | Self::SourceParentNotDirectory { .. }
             | Self::SourceLinkOrReparsePoint { .. }
             | Self::SourceNotRegular { .. } => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    static NEXT_WORKSPACE_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestStore {
+        root: PathBuf,
+    }
+
+    impl TestStore {
+        fn new() -> Self {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let unique_id = NEXT_WORKSPACE_ID.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "loadout-source-verification-test-{}-{timestamp}-{unique_id}",
+                std::process::id()
+            ));
+            fs::create_dir(&root).unwrap();
+
+            Self { root }
+        }
+
+        fn path(&self, relative: &str) -> PathBuf {
+            self.root.join(relative)
+        }
+
+        fn create_dir(&self, relative: &str) {
+            fs::create_dir_all(self.path(relative)).unwrap();
+        }
+
+        fn write(&self, relative: &str, contents: &str) {
+            let path = self.path(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+
+        fn physical_store_root(&self) -> PhysicalStoreRoot {
+            resolve_store_root(&self.path("store")).unwrap()
+        }
+    }
+
+    impl Drop for TestStore {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn source_path(raw_path: &str) -> SourceRelativePath {
+        SourceRelativePath::parse(raw_path).unwrap()
+    }
+
+    #[test]
+    fn verifier_returns_the_regular_file_below_the_physical_store_root() {
+        let store = TestStore::new();
+        store.write("store/git/config", "[user]\nname = Example\n");
+
+        let verified =
+            verify_regular_source(&store.physical_store_root(), &source_path("git/config"))
+                .unwrap();
+
+        assert_eq!(verified.path().as_ref(), store.path("store/git/config"));
+    }
+
+    #[test]
+    fn verifier_rejects_a_non_directory_parent_and_non_regular_final_entry() {
+        let store = TestStore::new();
+        store.write("store/not-a-directory", "contents\n");
+        store.create_dir("store/a-directory");
+        let root = store.physical_store_root();
+
+        let parent_error =
+            verify_regular_source(&root, &source_path("not-a-directory/config")).unwrap_err();
+        assert!(matches!(
+            parent_error,
+            SourceVerificationError::SourceParentNotDirectory { .. }
+        ));
+
+        let final_error = verify_regular_source(&root, &source_path("a-directory")).unwrap_err();
+        assert!(matches!(
+            final_error,
+            SourceVerificationError::SourceNotRegular { .. }
+        ));
+    }
+
+    #[test]
+    fn verifier_rejects_a_missing_final_source() {
+        let store = TestStore::new();
+        store.create_dir("store");
+
+        let error =
+            verify_regular_source(&store.physical_store_root(), &source_path("missing-file"))
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SourceVerificationError::SourceComponentIo { .. }
+        ));
+    }
+
+    #[test]
+    fn store_root_must_be_an_existing_directory() {
+        let store = TestStore::new();
+        store.write("not-a-directory", "contents\n");
+
+        let error = resolve_store_root(&store.path("not-a-directory")).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SourceVerificationError::StoreRootNotDirectory { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verifier_rejects_symlinked_source_parents_and_final_entries() {
+        use std::os::unix::fs::symlink;
+
+        let store = TestStore::new();
+        store.write("outside/config", "[user]\n");
+        store.create_dir("store");
+        symlink(store.path("outside"), store.path("store/linked-parent")).unwrap();
+        symlink(
+            store.path("outside/config"),
+            store.path("store/linked-file"),
+        )
+        .unwrap();
+        let root = store.physical_store_root();
+
+        let parent_error =
+            verify_regular_source(&root, &source_path("linked-parent/config")).unwrap_err();
+        assert!(matches!(
+            parent_error,
+            SourceVerificationError::SourceParentLinkOrReparsePoint { .. }
+        ));
+
+        let final_error = verify_regular_source(&root, &source_path("linked-file")).unwrap_err();
+        assert!(matches!(
+            final_error,
+            SourceVerificationError::SourceLinkOrReparsePoint { .. }
+        ));
+    }
+
+    #[cfg(windows)]
+    fn create_junction(link: &Path, target: &Path) {
+        let output = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("the Windows command interpreter must be available");
+        assert!(
+            output.status.success(),
+            "mklink /J must create a disposable junction: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verifier_rejects_windows_junction_parents_and_file_links() {
+        use std::os::windows::fs::symlink_file;
+
+        let store = TestStore::new();
+        store.write("outside/config", "[user]\n");
+        store.create_dir("store");
+        create_junction(&store.path("store/junction"), &store.path("outside"));
+        symlink_file(
+            store.path("outside/config"),
+            store.path("store/linked-file"),
+        )
+        .expect("the Windows test runner must support file symbolic links");
+        let root = store.physical_store_root();
+
+        let junction_error =
+            verify_regular_source(&root, &source_path("junction/config")).unwrap_err();
+        assert!(matches!(
+            junction_error,
+            SourceVerificationError::SourceParentLinkOrReparsePoint { .. }
+        ));
+
+        let link_error = verify_regular_source(&root, &source_path("linked-file")).unwrap_err();
+        assert!(matches!(
+            link_error,
+            SourceVerificationError::SourceLinkOrReparsePoint { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verifier_uses_the_canonical_store_root_for_a_declared_store_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let store = TestStore::new();
+        store.write("physical-store/git/config", "[user]\n");
+        symlink(store.path("physical-store"), store.path("declared-store")).unwrap();
+
+        let root = resolve_store_root(&store.path("declared-store")).unwrap();
+        let verified = verify_regular_source(&root, &source_path("git/config")).unwrap();
+
+        assert_eq!(root.as_path().as_ref(), store.path("physical-store"));
+        assert_eq!(
+            verified.path().as_ref(),
+            store.path("physical-store/git/config")
+        );
     }
 }

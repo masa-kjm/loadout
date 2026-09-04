@@ -7,6 +7,8 @@ mod declaration;
 
 mod domain;
 
+mod filesystem;
+
 #[allow(dead_code)]
 mod inspection;
 

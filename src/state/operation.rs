@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::domain::file_link::LinkTarget;
 use crate::domain::hashes::DesiredHash;
 use crate::domain::ids::FullyQualifiedResourceId;
 use crate::domain::known::{KnownFileLink, KnownFileLinkError};
@@ -80,12 +81,28 @@ pub(crate) enum RecordedKnownStateUpdate {
 /// One action whose recorded facts are sufficient for future recovery.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RecordedAction {
-    kind: ActionKind,
-    resource_id: FullyQualifiedResourceId,
-    target_path: ResolvedPath,
-    precondition: TargetCondition,
-    postcondition: TargetCondition,
+    facts: ActionFacts,
     status: ActionStatus,
+}
+
+/// Only the facts required by an implemented action are representable.
+/// Preconditions and post-conditions are derived from these facts rather than stored independently where they could contradict the action kind.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ActionFacts {
+    CreateLink {
+        resource_id: FullyQualifiedResourceId,
+        target_path: ResolvedPath,
+        link_target: LinkTarget,
+    },
+    RemoveLink {
+        resource_id: FullyQualifiedResourceId,
+        target_path: ResolvedPath,
+        link_target: LinkTarget,
+    },
+    ForgetMissing {
+        resource_id: FullyQualifiedResourceId,
+        target_path: ResolvedPath,
+    },
 }
 
 impl RecordedAction {
@@ -109,16 +126,14 @@ impl RecordedAction {
             });
         }
 
-        let record = Self {
-            kind: action.kind(),
-            resource_id: action.resource_id().clone(),
-            target_path: precondition.target_path().clone(),
-            precondition: precondition.clone(),
-            postcondition: postcondition.clone(),
-            status: ActionStatus::Pending,
-        };
-        record.validate_conditions()?;
-        Ok(record)
+        Self::from_persisted(
+            action.kind(),
+            action.resource_id().clone(),
+            precondition.target_path().clone(),
+            precondition.clone(),
+            postcondition.clone(),
+            ActionStatus::Pending,
+        )
     }
 
     /// Reconstructs a persisted action after validating its recovery facts.
@@ -130,41 +145,109 @@ impl RecordedAction {
         postcondition: TargetCondition,
         status: ActionStatus,
     ) -> Result<Self, OperationRecordError> {
-        let record = Self {
+        if !matches!(
             kind,
-            resource_id,
-            target_path,
-            precondition,
-            postcondition,
-            status,
+            ActionKind::CreateLink | ActionKind::RemoveLink | ActionKind::ForgetMissing
+        ) {
+            return Err(OperationRecordError::UnsupportedActionKind { kind });
+        }
+        if precondition.target_path() != &target_path || postcondition.target_path() != &target_path
+        {
+            return Err(OperationRecordError::InvalidActionConditions { kind });
+        }
+        let facts = match (kind, precondition, postcondition) {
+            (
+                ActionKind::CreateLink,
+                TargetCondition::Missing { .. },
+                TargetCondition::ExpectedLink { link_target, .. },
+            ) => ActionFacts::CreateLink {
+                resource_id,
+                target_path,
+                link_target,
+            },
+            (
+                ActionKind::RemoveLink,
+                TargetCondition::ExpectedLink { link_target, .. },
+                TargetCondition::Missing { .. },
+            ) => ActionFacts::RemoveLink {
+                resource_id,
+                target_path,
+                link_target,
+            },
+            (
+                ActionKind::ForgetMissing,
+                TargetCondition::Missing { .. },
+                TargetCondition::Missing { .. },
+            ) => ActionFacts::ForgetMissing {
+                resource_id,
+                target_path,
+            },
+            _ => return Err(OperationRecordError::InvalidActionConditions { kind }),
         };
-        record.validate_conditions()?;
-        Ok(record)
+        Ok(Self { facts, status })
     }
 
     /// The planned action kind represented by this persisted record.
     pub(crate) fn kind(&self) -> ActionKind {
-        self.kind
+        match &self.facts {
+            ActionFacts::CreateLink { .. } => ActionKind::CreateLink,
+            ActionFacts::RemoveLink { .. } => ActionKind::RemoveLink,
+            ActionFacts::ForgetMissing { .. } => ActionKind::ForgetMissing,
+        }
     }
 
     /// The stable resource identity affected by this action.
     pub(crate) fn resource_id(&self) -> &FullyQualifiedResourceId {
-        &self.resource_id
+        match &self.facts {
+            ActionFacts::CreateLink { resource_id, .. }
+            | ActionFacts::RemoveLink { resource_id, .. }
+            | ActionFacts::ForgetMissing { resource_id, .. } => resource_id,
+        }
     }
 
     /// The resolved target governed by the action's predicates.
     pub(crate) fn target_path(&self) -> &ResolvedPath {
-        &self.target_path
+        match &self.facts {
+            ActionFacts::CreateLink { target_path, .. }
+            | ActionFacts::RemoveLink { target_path, .. }
+            | ActionFacts::ForgetMissing { target_path, .. } => target_path,
+        }
     }
 
     /// The exact recorded condition that held before mutation began.
-    pub(crate) fn precondition(&self) -> &TargetCondition {
-        &self.precondition
+    pub(crate) fn precondition(&self) -> TargetCondition {
+        match &self.facts {
+            ActionFacts::RemoveLink {
+                target_path,
+                link_target,
+                ..
+            } => TargetCondition::ExpectedLink {
+                target_path: target_path.clone(),
+                link_target: link_target.clone(),
+            },
+            ActionFacts::CreateLink { target_path, .. }
+            | ActionFacts::ForgetMissing { target_path, .. } => TargetCondition::Missing {
+                target_path: target_path.clone(),
+            },
+        }
     }
 
     /// The exact condition required before Known state may change.
-    pub(crate) fn postcondition(&self) -> &TargetCondition {
-        &self.postcondition
+    pub(crate) fn postcondition(&self) -> TargetCondition {
+        match &self.facts {
+            ActionFacts::CreateLink {
+                target_path,
+                link_target,
+                ..
+            } => TargetCondition::ExpectedLink {
+                target_path: target_path.clone(),
+                link_target: link_target.clone(),
+            },
+            ActionFacts::RemoveLink { target_path, .. }
+            | ActionFacts::ForgetMissing { target_path, .. } => TargetCondition::Missing {
+                target_path: target_path.clone(),
+            },
+        }
     }
 
     /// The durable progress status.
@@ -176,38 +259,36 @@ impl RecordedAction {
     pub(crate) fn known_state_update_after_success(
         &self,
     ) -> Result<RecordedKnownStateUpdate, OperationRecordError> {
-        self.validate_conditions()?;
-        match self.kind {
-            ActionKind::CreateLink => {
-                let TargetCondition::ExpectedLink { link_target, .. } = &self.postcondition else {
-                    return Err(OperationRecordError::InvalidActionConditions { kind: self.kind });
-                };
-                KnownFileLink::new(
-                    self.resource_id.clone(),
-                    link_target.as_path().clone(),
-                    self.target_path.clone(),
-                    link_target.clone(),
-                )
-                .map(RecordedKnownStateUpdate::Upsert)
-                .map_err(OperationRecordError::InvalidKnownFileLink)
+        match &self.facts {
+            ActionFacts::CreateLink {
+                resource_id,
+                target_path,
+                link_target,
+            } => KnownFileLink::new(
+                resource_id.clone(),
+                link_target.as_path().clone(),
+                target_path.clone(),
+                link_target.clone(),
+            )
+            .map(RecordedKnownStateUpdate::Upsert)
+            .map_err(OperationRecordError::InvalidKnownFileLink),
+            ActionFacts::RemoveLink {
+                resource_id,
+                target_path,
+                link_target,
+            } => KnownFileLink::new(
+                resource_id.clone(),
+                link_target.as_path().clone(),
+                target_path.clone(),
+                link_target.clone(),
+            )
+            .map(RecordedKnownStateUpdate::RemoveExpected)
+            .map_err(OperationRecordError::InvalidKnownFileLink),
+            ActionFacts::ForgetMissing { resource_id, .. } => {
+                Ok(RecordedKnownStateUpdate::RemoveMissing {
+                    resource_id: resource_id.clone(),
+                })
             }
-            ActionKind::RemoveLink => {
-                let TargetCondition::ExpectedLink { link_target, .. } = &self.precondition else {
-                    return Err(OperationRecordError::InvalidActionConditions { kind: self.kind });
-                };
-                KnownFileLink::new(
-                    self.resource_id.clone(),
-                    link_target.as_path().clone(),
-                    self.target_path.clone(),
-                    link_target.clone(),
-                )
-                .map(RecordedKnownStateUpdate::RemoveExpected)
-                .map_err(OperationRecordError::InvalidKnownFileLink)
-            }
-            ActionKind::ForgetMissing => Ok(RecordedKnownStateUpdate::RemoveMissing {
-                resource_id: self.resource_id.clone(),
-            }),
-            kind => Err(OperationRecordError::UnsupportedActionKind { kind }),
         }
     }
 
@@ -248,40 +329,6 @@ impl RecordedAction {
         let update = self.known_state_update_after_success()?;
         self.status = ActionStatus::Succeeded;
         Ok(update)
-    }
-
-    fn validate_conditions(&self) -> Result<(), OperationRecordError> {
-        let is_valid = match self.kind {
-            ActionKind::CreateLink => matches!(
-                (&self.precondition, &self.postcondition),
-                (
-                    TargetCondition::Missing { .. },
-                    TargetCondition::ExpectedLink { .. }
-                )
-            ),
-            ActionKind::RemoveLink => matches!(
-                (&self.precondition, &self.postcondition),
-                (
-                    TargetCondition::ExpectedLink { .. },
-                    TargetCondition::Missing { .. }
-                )
-            ),
-            ActionKind::ForgetMissing => matches!(
-                (&self.precondition, &self.postcondition),
-                (
-                    TargetCondition::Missing { .. },
-                    TargetCondition::Missing { .. }
-                )
-            ),
-            _ => return Err(OperationRecordError::UnsupportedActionKind { kind: self.kind }),
-        };
-        if !is_valid
-            || self.precondition.target_path() != &self.target_path
-            || self.postcondition.target_path() != &self.target_path
-        {
-            return Err(OperationRecordError::InvalidActionConditions { kind: self.kind });
-        }
-        Ok(())
     }
 }
 
@@ -329,15 +376,14 @@ impl OperationRecord {
         let mut resource_ids = BTreeSet::new();
         let mut target_paths = BTreeSet::new();
         for action in actions.values() {
-            action.validate_conditions()?;
-            if !resource_ids.insert(action.resource_id.clone()) {
+            if !resource_ids.insert(action.resource_id().clone()) {
                 return Err(OperationRecordError::DuplicateResourceId {
-                    resource_id: action.resource_id.clone(),
+                    resource_id: action.resource_id().clone(),
                 });
             }
-            if !target_paths.insert(action.target_path.clone()) {
+            if !target_paths.insert(action.target_path().clone()) {
                 return Err(OperationRecordError::DuplicateTargetPath {
-                    target_path: action.target_path.clone(),
+                    target_path: action.target_path().clone(),
                 });
             }
         }
@@ -549,6 +595,40 @@ mod tests {
 
     fn desired_hash() -> DesiredHash {
         DesiredHash::parse(format!("sha256:{}", "a".repeat(64))).unwrap()
+    }
+
+    #[test]
+    fn persisted_conditions_must_describe_the_recorded_target() {
+        let action = RecordedAction::from_action(&create_action()).unwrap();
+        for (precondition, postcondition) in [
+            (
+                TargetCondition::Missing {
+                    target_path: path("home/other"),
+                },
+                action.postcondition(),
+            ),
+            (
+                action.precondition(),
+                TargetCondition::ExpectedLink {
+                    target_path: path("home/other"),
+                    link_target: LinkTarget::new(path("store/git/config")),
+                },
+            ),
+        ] {
+            assert!(matches!(
+                RecordedAction::from_persisted(
+                    action.kind(),
+                    action.resource_id().clone(),
+                    action.target_path().clone(),
+                    precondition,
+                    postcondition,
+                    ActionStatus::Pending,
+                ),
+                Err(OperationRecordError::InvalidActionConditions {
+                    kind: ActionKind::CreateLink,
+                })
+            ));
+        }
     }
 
     #[test]

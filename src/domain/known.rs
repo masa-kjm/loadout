@@ -186,6 +186,33 @@ impl KnownState {
         resources.remove(resource_id);
         Self::new(resources.into_values())
     }
+
+    /// Atomically replaces one exact managed identity with a newly verified fact at the same target.
+    pub(crate) fn with_replaced_identity(
+        &self,
+        expected_old: &KnownFileLink,
+        new_resource: KnownFileLink,
+    ) -> Result<Self, KnownStateError> {
+        let Some(actual) = self.resources.get(expected_old.resource_id()) else {
+            return Err(KnownStateError::MissingResource {
+                resource_id: expected_old.resource_id().clone(),
+            });
+        };
+        if actual != expected_old {
+            return Err(KnownStateError::ResourceMismatch {
+                resource_id: expected_old.resource_id().clone(),
+            });
+        }
+        if self.resources.contains_key(new_resource.resource_id()) {
+            return Err(KnownStateError::DestinationResourcePresent {
+                resource_id: new_resource.resource_id().clone(),
+            });
+        }
+        let mut resources = self.resources.clone();
+        resources.remove(expected_old.resource_id());
+        resources.insert(new_resource.resource_id().clone(), new_resource);
+        Self::new(resources.into_values())
+    }
 }
 
 /// The reason Known state violates a global uniqueness invariant.
@@ -203,6 +230,9 @@ pub(crate) enum KnownStateError {
         resource_id: FullyQualifiedResourceId,
     },
     ResourceMismatch {
+        resource_id: FullyQualifiedResourceId,
+    },
+    DestinationResourcePresent {
         resource_id: FullyQualifiedResourceId,
     },
 }
@@ -230,6 +260,10 @@ impl fmt::Display for KnownStateError {
             Self::ResourceMismatch { resource_id } => write!(
                 formatter,
                 "Known state resource {resource_id} does not match the verified fact selected for removal"
+            ),
+            Self::DestinationResourcePresent { resource_id } => write!(
+                formatter,
+                "Known state already contains identity-handoff destination {resource_id}"
             ),
         }
     }
@@ -361,5 +395,22 @@ mod tests {
             ),
             Err(KnownStateError::MissingResource { .. })
         ));
+    }
+
+    #[test]
+    fn identity_handoff_requires_an_absent_destination_identity() {
+        let old = known("base/git", "store/git/config", "home/.gitconfig");
+        let destination = known("base/git-renamed", "store/git/config", "home/.gitconfig");
+        let state = KnownState::new([old.clone(), destination.clone()]).unwrap_err();
+        assert!(matches!(state, KnownStateError::DuplicateTarget { .. }));
+
+        let destination = known("base/git-renamed", "store/git/other", "home/.other");
+        let state = KnownState::new([old.clone(), destination.clone()]).unwrap();
+        assert_eq!(
+            state.with_replaced_identity(&old, destination).unwrap_err(),
+            KnownStateError::DestinationResourcePresent {
+                resource_id: FullyQualifiedResourceId::parse("base/git-renamed").unwrap()
+            }
+        );
     }
 }

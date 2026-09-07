@@ -63,6 +63,20 @@ pub(crate) fn create_file_symbolic_link_no_replace(
     )
 }
 
+/// Atomically replaces the final target name with the recorded sibling entry.
+/// Callers must have rechecked the owned target and the missing sibling under a safe parent immediately before this operation.
+pub(crate) fn replace_file_symbolic_link_from_temporary(
+    canonical_home: &ResolvedPath,
+    physical_target_path: &ResolvedPath,
+    physical_temporary_path: &ResolvedPath,
+) -> io::Result<()> {
+    platform::replace_file_symbolic_link_from_temporary(
+        canonical_home,
+        physical_target_path,
+        physical_temporary_path,
+    )
+}
+
 /// Removes one final file symbolic-link entry only when the platform can bind the removal to the expected link entry. The executor establishes the expected-link ownership precondition, and this primitive must retain that proof through the mutation boundary rather than deleting by a subsequently resolved name.
 pub(crate) fn remove_expected_file_symbolic_link_entry(
     canonical_home: &ResolvedPath,
@@ -83,6 +97,13 @@ pub(crate) fn ensure_file_symbolic_link_creation_supported(
     target_parent: &ResolvedPath,
 ) -> io::Result<()> {
     platform::ensure_file_symbolic_link_creation_supported(target_parent)
+}
+
+/// Rejects replacement when the platform cannot atomically replace one name with a sibling while preserving the old name on failure.
+pub(crate) fn ensure_file_symbolic_link_replacement_supported(
+    target_parent: &ResolvedPath,
+) -> io::Result<()> {
+    platform::ensure_file_symbolic_link_replacement_supported(target_parent)
 }
 
 /// Rejects a file-link removal when the platform cannot bind the final expected entry to its deletion while retaining no-follow handling through the mutation boundary.

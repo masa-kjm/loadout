@@ -65,6 +65,45 @@ pub(super) fn create_file_symbolic_link_no_replace(
     }
 }
 
+pub(super) fn replace_file_symbolic_link_from_temporary(
+    canonical_home: &ResolvedPath,
+    physical_target_path: &ResolvedPath,
+    physical_temporary_path: &ResolvedPath,
+) -> io::Result<()> {
+    let target_relative = relative_components(canonical_home, physical_target_path)?;
+    let temporary_relative = relative_components(canonical_home, physical_temporary_path)?;
+    let (target_name, target_parent) = target_relative
+        .split_last()
+        .ok_or_else(|| invalid_input("target must not equal the canonical home root"))?;
+    let (temporary_name, temporary_parent) = temporary_relative
+        .split_last()
+        .ok_or_else(|| invalid_input("temporary path must not equal the canonical home root"))?;
+    if target_parent != temporary_parent {
+        return Err(invalid_input(
+            "replacement temporary must be a target sibling",
+        ));
+    }
+    let mut parent = open_directory(canonical_home.as_ref())?;
+    for component in target_parent {
+        parent = open_directory_at(parent.as_raw_fd(), component)?;
+    }
+    let temporary_name = c_string(Path::new(temporary_name))?;
+    let target_name = c_string(Path::new(target_name))?;
+    let result = unsafe {
+        libc::renameat(
+            parent.as_raw_fd(),
+            temporary_name.as_ptr(),
+            parent.as_raw_fd(),
+            target_name.as_ptr(),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 pub(super) fn remove_expected_file_symbolic_link_entry(
     _: &ResolvedPath,
     _: &ResolvedPath,
@@ -78,6 +117,14 @@ pub(super) fn ensure_file_symbolic_link_creation_supported(_: &ResolvedPath) -> 
     // Unix exposes file symbolic links as a supported platform primitive.
     // Filesystem-specific errors remain mutable facts of the actual create.
     Ok(())
+}
+
+pub(super) fn ensure_file_symbolic_link_replacement_supported(_: &ResolvedPath) -> io::Result<()> {
+    // `renameat` is atomic but does not bind either name to the no-follow entries inspected before it. A substituted unmanaged target or temporary could therefore be moved despite the executor's recheck.
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Unix file-link replacement requires an atomic expected-entry replacement primitive",
+    ))
 }
 
 pub(super) fn ensure_file_symbolic_link_removal_supported(_: &ResolvedPath) -> io::Result<()> {
@@ -101,6 +148,23 @@ fn open_directory(path: &Path) -> io::Result<fs::File> {
         )
     };
     file_from_descriptor(descriptor)
+}
+
+fn relative_components<'a>(
+    canonical_home: &'a ResolvedPath,
+    path: &'a ResolvedPath,
+) -> io::Result<Vec<&'a std::ffi::OsStr>> {
+    path.as_ref()
+        .strip_prefix(canonical_home.as_ref())
+        .map_err(|_| invalid_input("path is not below the canonical home root"))?
+        .components()
+        .map(|component| match component {
+            Component::Normal(component) => Ok(component),
+            _ => Err(invalid_input(
+                "path has an invalid canonical-home-relative component",
+            )),
+        })
+        .collect()
 }
 
 fn open_directory_at(

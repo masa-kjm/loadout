@@ -10,10 +10,12 @@ use crate::domain::paths::ResolvedPath;
 use crate::domain::plan::{ActionKind, PlannedAction, TargetCondition};
 use crate::filesystem::{
     create_file_symbolic_link_no_replace, ensure_file_symbolic_link_creation_supported,
-    ensure_file_symbolic_link_removal_supported, remove_expected_file_symbolic_link_entry,
+    ensure_file_symbolic_link_removal_supported, ensure_file_symbolic_link_replacement_supported,
+    remove_expected_file_symbolic_link_entry, replace_file_symbolic_link_from_temporary,
 };
 use crate::inspection::file_link::{FileLinkInspector, TargetInspectionError};
 use crate::inspection::source::{SourceVerificationError, VerifiedSource};
+use crate::state::operation::{RecordedAction, RelocationFacts};
 
 /// Executes filesystem effects selected by the planner for one home directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -97,6 +99,343 @@ impl FileLinkExecutor {
             .physical_target_path_for_execution(&target_path)
             .map_err(CreateLinkExecutionError::TargetInspection)?;
         self.ensure_create_capability(&target_path, &physical_target_path)
+    }
+
+    /// Rechecks and atomically replaces one managed link using the sibling path already persisted in its `running` operation record.
+    pub(crate) fn execute_replace(
+        &self,
+        action: &PlannedAction,
+        recorded: &RecordedAction,
+        source: &VerifiedSource,
+    ) -> Result<(), ReplaceLinkExecutionError> {
+        let facts = recorded
+            .replacement_facts()
+            .ok_or(ReplaceLinkExecutionError::MissingRecordedFacts)?;
+        if !matches!(
+            action.kind(),
+            ActionKind::ReplaceLink | ActionKind::ReplaceOwnership
+        ) || action.resource_id() != recorded.resource_id()
+        {
+            return Err(ReplaceLinkExecutionError::InvalidReplaceConditions);
+        }
+        let reverified = source
+            .reverify()
+            .map_err(ReplaceLinkExecutionError::SourceRecheck)?;
+        if reverified.path() != facts.new_link_target().as_path() {
+            return Err(ReplaceLinkExecutionError::SourceDoesNotMatchAction {
+                expected: facts.new_link_target().clone(),
+                actual: reverified.path().clone(),
+            });
+        }
+        let before = self
+            .inspector
+            .inspect_target_for_expected_link(facts.target_path(), facts.old_link_target())
+            .map_err(ReplaceLinkExecutionError::TargetInspection)?;
+        if !matches!(before.observation(), TargetObservation::ExpectedLink { .. }) {
+            return Err(ReplaceLinkExecutionError::PreconditionNoLongerHolds {
+                target_path: facts.target_path().clone(),
+                observation: before.observation().clone(),
+            });
+        }
+        let temporary_before = self
+            .inspector
+            .inspect_target_for_expected_link(facts.temporary_path(), facts.new_link_target())
+            .map_err(ReplaceLinkExecutionError::TemporaryInspection)?;
+        if !matches!(temporary_before.observation(), TargetObservation::Missing) {
+            return Err(ReplaceLinkExecutionError::TemporaryNotMissing {
+                temporary_path: facts.temporary_path().clone(),
+                observation: temporary_before.observation().clone(),
+            });
+        }
+        let target = self
+            .inspector
+            .physical_target_path_for_execution(facts.target_path())
+            .map_err(ReplaceLinkExecutionError::TargetInspection)?;
+        let temporary = self
+            .inspector
+            .physical_target_path_for_execution(facts.temporary_path())
+            .map_err(ReplaceLinkExecutionError::TemporaryInspection)?;
+        self.ensure_replace_capability(facts.target_path(), &target)?;
+        if let Err(source) = create_file_symbolic_link_no_replace(
+            self.inspector.canonical_home(),
+            &temporary,
+            facts.new_link_target(),
+        ) {
+            return Err(self.replacement_attempt_aftermath(
+                &facts,
+                source,
+                ReplacementMutation::TemporaryCreate,
+            ));
+        }
+        if let Err(source) = replace_file_symbolic_link_from_temporary(
+            self.inspector.canonical_home(),
+            &target,
+            &temporary,
+        ) {
+            return Err(self.replacement_attempt_aftermath(
+                &facts,
+                source,
+                ReplacementMutation::Rename,
+            ));
+        }
+        let aftermath = self.replacement_aftermath(&facts)?;
+        if aftermath.postcondition_holds() {
+            Ok(())
+        } else {
+            Err(ReplaceLinkExecutionError::Aftermath { aftermath })
+        }
+    }
+
+    /// Rechecks the state-only same-source ownership handoff. It deliberately performs no target mutation and does not allocate a temporary sibling.
+    pub(crate) fn execute_same_source_ownership_handoff(
+        &self,
+        action: &PlannedAction,
+        recorded: &RecordedAction,
+        source: &VerifiedSource,
+    ) -> Result<(), ReplaceLinkExecutionError> {
+        if action.kind() != ActionKind::ReplaceOwnership || recorded.replacement_facts().is_some() {
+            return Err(ReplaceLinkExecutionError::InvalidReplaceConditions);
+        }
+        let verified = source
+            .reverify()
+            .map_err(ReplaceLinkExecutionError::SourceRecheck)?;
+        let preconditions = action.preconditions();
+        let [
+            TargetCondition::ExpectedLink {
+                target_path,
+                link_target,
+            },
+        ] = preconditions.as_slice()
+        else {
+            return Err(ReplaceLinkExecutionError::InvalidReplaceConditions);
+        };
+        let postconditions = action.postconditions();
+        let [
+            TargetCondition::ExpectedLink {
+                link_target: new_link_target,
+                ..
+            },
+        ] = postconditions.as_slice()
+        else {
+            return Err(ReplaceLinkExecutionError::InvalidReplaceConditions);
+        };
+        if link_target != new_link_target || verified.path() != link_target.as_path() {
+            return Err(ReplaceLinkExecutionError::InvalidReplaceConditions);
+        }
+        let actual = self
+            .inspector
+            .inspect_target_for_expected_link(target_path, link_target)
+            .map_err(ReplaceLinkExecutionError::TargetInspection)?;
+        if matches!(actual.observation(), TargetObservation::ExpectedLink { .. }) {
+            Ok(())
+        } else {
+            Err(ReplaceLinkExecutionError::PreconditionNoLongerHolds {
+                target_path: target_path.clone(),
+                observation: actual.observation().clone(),
+            })
+        }
+    }
+
+    pub(crate) fn preflight_same_source_ownership_handoff(
+        &self,
+        action: &PlannedAction,
+        source: &VerifiedSource,
+    ) -> Result<(), ReplaceLinkExecutionError> {
+        if action.kind() != ActionKind::ReplaceOwnership {
+            return Err(ReplaceLinkExecutionError::InvalidReplaceConditions);
+        }
+        let preconditions = action.preconditions();
+        let [
+            TargetCondition::ExpectedLink {
+                target_path,
+                link_target,
+            },
+        ] = preconditions.as_slice()
+        else {
+            return Err(ReplaceLinkExecutionError::InvalidReplaceConditions);
+        };
+        let postconditions = action.postconditions();
+        let [
+            TargetCondition::ExpectedLink {
+                link_target: new_link_target,
+                ..
+            },
+        ] = postconditions.as_slice()
+        else {
+            return Err(ReplaceLinkExecutionError::InvalidReplaceConditions);
+        };
+        if link_target != new_link_target {
+            return Err(ReplaceLinkExecutionError::InvalidReplaceConditions);
+        }
+        let verified = source
+            .reverify()
+            .map_err(ReplaceLinkExecutionError::SourceRecheck)?;
+        if verified.path() != link_target.as_path() {
+            return Err(ReplaceLinkExecutionError::InvalidReplaceConditions);
+        }
+        let actual = self
+            .inspector
+            .inspect_target_for_expected_link(target_path, link_target)
+            .map_err(ReplaceLinkExecutionError::TargetInspection)?;
+        if matches!(actual.observation(), TargetObservation::ExpectedLink { .. }) {
+            Ok(())
+        } else {
+            Err(ReplaceLinkExecutionError::PreconditionNoLongerHolds {
+                target_path: target_path.clone(),
+                observation: actual.observation().clone(),
+            })
+        }
+    }
+
+    /// Preflight validates every fact available before the temporary sibling is recorded.
+    pub(crate) fn preflight_replace(
+        &self,
+        action: &PlannedAction,
+        source: &VerifiedSource,
+    ) -> Result<(), ReplaceLinkExecutionError> {
+        if !matches!(
+            action.kind(),
+            ActionKind::ReplaceLink | ActionKind::ReplaceOwnership
+        ) {
+            return Err(ReplaceLinkExecutionError::InvalidReplaceConditions);
+        }
+        let preconditions = action.preconditions();
+        let [
+            TargetCondition::ExpectedLink {
+                target_path,
+                link_target: old_link_target,
+            },
+        ] = preconditions.as_slice()
+        else {
+            return Err(ReplaceLinkExecutionError::InvalidReplaceConditions);
+        };
+        let postconditions = action.postconditions();
+        let [
+            TargetCondition::ExpectedLink {
+                target_path: post_target,
+                link_target: new_link_target,
+            },
+        ] = postconditions.as_slice()
+        else {
+            return Err(ReplaceLinkExecutionError::InvalidReplaceConditions);
+        };
+        if target_path != post_target || old_link_target == new_link_target {
+            return Err(ReplaceLinkExecutionError::InvalidReplaceConditions);
+        }
+        let verified = source
+            .reverify()
+            .map_err(ReplaceLinkExecutionError::SourceRecheck)?;
+        if verified.path() != new_link_target.as_path() {
+            return Err(ReplaceLinkExecutionError::SourceDoesNotMatchAction {
+                expected: new_link_target.clone(),
+                actual: verified.path().clone(),
+            });
+        }
+        let before = self
+            .inspector
+            .inspect_target_for_expected_link(target_path, old_link_target)
+            .map_err(ReplaceLinkExecutionError::TargetInspection)?;
+        if !matches!(before.observation(), TargetObservation::ExpectedLink { .. }) {
+            return Err(ReplaceLinkExecutionError::PreconditionNoLongerHolds {
+                target_path: target_path.clone(),
+                observation: before.observation().clone(),
+            });
+        }
+        let physical = self
+            .inspector
+            .physical_target_path_for_execution(target_path)
+            .map_err(ReplaceLinkExecutionError::TargetInspection)?;
+        self.ensure_replace_capability(target_path, &physical)
+    }
+
+    /// Rechecks a relocation before it is recorded. Both mutation capabilities must be available before creating the new entry, because a relocation must never knowingly leave two declared targets behind.
+    pub(crate) fn preflight_relocate(
+        &self,
+        action: &PlannedAction,
+        source: &VerifiedSource,
+    ) -> Result<(), RelocateLinkExecutionError> {
+        let facts = relocation_facts_from_action(action)?;
+        self.recheck_relocation_preconditions(&facts, source)?;
+        self.ensure_relocation_capabilities(&facts)
+    }
+
+    /// Creates and verifies the new link, then removes and verifies the old link as one contiguous action. Every attempted-mutation failure is classified from observations of both recorded targets.
+    pub(crate) fn execute_relocate(
+        &self,
+        action: &PlannedAction,
+        recorded: &RecordedAction,
+        source: &VerifiedSource,
+    ) -> Result<(), RelocateLinkExecutionError> {
+        let facts = recorded
+            .relocation_facts()
+            .ok_or(RelocateLinkExecutionError::MissingRecordedFacts)?;
+        if action.kind() != ActionKind::RelocateLink
+            || action.resource_id() != recorded.resource_id()
+            || relocation_facts_from_action(action)? != facts
+        {
+            return Err(RelocateLinkExecutionError::InvalidRelocateConditions);
+        }
+        self.recheck_relocation_preconditions(&facts, source)?;
+        self.ensure_relocation_capabilities(&facts)?;
+
+        let new_physical = self
+            .inspector
+            .physical_target_path_for_execution(facts.new_target_path())
+            .map_err(RelocateLinkExecutionError::NewTargetInspection)?;
+        if create_file_symbolic_link_no_replace(
+            self.inspector.canonical_home(),
+            &new_physical,
+            facts.new_link_target(),
+        )
+        .is_err()
+        {
+            return Err(self.relocation_aftermath_error(&facts)?);
+        }
+        let new_after = self
+            .inspector
+            .inspect_target_for_expected_link(facts.new_target_path(), facts.new_link_target())
+            .map_err(RelocateLinkExecutionError::NewTargetInspection)?;
+        if !matches!(
+            new_after.observation(),
+            TargetObservation::ExpectedLink { .. }
+        ) {
+            return Err(self.relocation_aftermath_error(&facts)?);
+        }
+
+        let old_after_create = self
+            .inspector
+            .inspect_target_for_expected_link(facts.old_target_path(), facts.old_link_target())
+            .map_err(RelocateLinkExecutionError::OldTargetInspection)?;
+        if !matches!(
+            old_after_create.observation(),
+            TargetObservation::ExpectedLink { .. }
+        ) {
+            return Err(self.relocation_aftermath_error(&facts)?);
+        }
+        let old_physical = self
+            .inspector
+            .physical_target_path_for_execution(facts.old_target_path())
+            .map_err(RelocateLinkExecutionError::OldTargetInspection)?;
+        if remove_expected_file_symbolic_link_entry(
+            self.inspector.canonical_home(),
+            &old_physical,
+            facts.old_link_target(),
+        )
+        .is_err()
+        {
+            return Err(self.relocation_aftermath_error(&facts)?);
+        }
+        let aftermath = self.relocation_observations(&facts)?;
+        if matches!(aftermath.0, TargetObservation::Missing)
+            && matches!(aftermath.1, TargetObservation::ExpectedLink { .. })
+        {
+            Ok(())
+        } else {
+            Err(RelocateLinkExecutionError::Aftermath {
+                old_observation: aftermath.0,
+                new_observation: aftermath.1,
+            })
+        }
     }
 
     /// Rechecks and removes exactly one planned `remove_link` action.
@@ -240,6 +579,146 @@ impl FileLinkExecutor {
         })
     }
 
+    fn ensure_replace_capability(
+        &self,
+        target_path: &ResolvedPath,
+        physical_target_path: &ResolvedPath,
+    ) -> Result<(), ReplaceLinkExecutionError> {
+        let parent = physical_target_path
+            .as_ref()
+            .parent()
+            .expect("validated target has a parent");
+        let parent = ResolvedPath::new(parent.to_path_buf()).expect("validated parent is resolved");
+        ensure_file_symbolic_link_replacement_supported(&parent).map_err(|source| {
+            ReplaceLinkExecutionError::PlatformCapability {
+                target_path: target_path.clone(),
+                source,
+            }
+        })
+    }
+
+    fn ensure_relocation_capabilities(
+        &self,
+        facts: &RelocationFacts,
+    ) -> Result<(), RelocateLinkExecutionError> {
+        let new_physical = self
+            .inspector
+            .physical_target_path_for_execution(facts.new_target_path())
+            .map_err(RelocateLinkExecutionError::NewTargetInspection)?;
+        self.ensure_create_capability(facts.new_target_path(), &new_physical)
+            .map_err(RelocateLinkExecutionError::CreateCapability)?;
+        let old_physical = self
+            .inspector
+            .physical_target_path_for_execution(facts.old_target_path())
+            .map_err(RelocateLinkExecutionError::OldTargetInspection)?;
+        self.ensure_remove_capability(facts.old_target_path(), &old_physical)
+            .map_err(RelocateLinkExecutionError::RemoveCapability)
+    }
+
+    fn recheck_relocation_preconditions(
+        &self,
+        facts: &RelocationFacts,
+        source: &VerifiedSource,
+    ) -> Result<(), RelocateLinkExecutionError> {
+        let verified = source
+            .reverify()
+            .map_err(RelocateLinkExecutionError::SourceRecheck)?;
+        if verified.path() != facts.new_link_target().as_path() {
+            return Err(RelocateLinkExecutionError::SourceDoesNotMatchAction {
+                expected: facts.new_link_target().clone(),
+                actual: verified.path().clone(),
+            });
+        }
+        let old = self
+            .inspector
+            .inspect_target_for_expected_link(facts.old_target_path(), facts.old_link_target())
+            .map_err(RelocateLinkExecutionError::OldTargetInspection)?;
+        if !matches!(old.observation(), TargetObservation::ExpectedLink { .. }) {
+            return Err(RelocateLinkExecutionError::PreconditionNoLongerHolds {
+                target_path: facts.old_target_path().clone(),
+                observation: old.observation().clone(),
+            });
+        }
+        let new = self
+            .inspector
+            .inspect_target_for_expected_link(facts.new_target_path(), facts.new_link_target())
+            .map_err(RelocateLinkExecutionError::NewTargetInspection)?;
+        if !matches!(new.observation(), TargetObservation::Missing) {
+            return Err(RelocateLinkExecutionError::PreconditionNoLongerHolds {
+                target_path: facts.new_target_path().clone(),
+                observation: new.observation().clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn relocation_observations(
+        &self,
+        facts: &RelocationFacts,
+    ) -> Result<(TargetObservation, TargetObservation), RelocateLinkExecutionError> {
+        let old = self
+            .inspector
+            .inspect_target_for_expected_link(facts.old_target_path(), facts.old_link_target())
+            .map_err(RelocateLinkExecutionError::OldTargetInspection)?;
+        let new = self
+            .inspector
+            .inspect_target_for_expected_link(facts.new_target_path(), facts.new_link_target())
+            .map_err(RelocateLinkExecutionError::NewTargetInspection)?;
+        Ok((old.observation().clone(), new.observation().clone()))
+    }
+
+    fn relocation_aftermath_error(
+        &self,
+        facts: &RelocationFacts,
+    ) -> Result<RelocateLinkExecutionError, RelocateLinkExecutionError> {
+        let (old_observation, new_observation) = self.relocation_observations(facts)?;
+        Ok(RelocateLinkExecutionError::Aftermath {
+            old_observation,
+            new_observation,
+        })
+    }
+
+    fn replacement_aftermath(
+        &self,
+        facts: &crate::state::operation::ReplacementFacts,
+    ) -> Result<ReplacementAftermath, ReplaceLinkExecutionError> {
+        let postcondition = self
+            .inspector
+            .inspect_target_for_expected_link(facts.target_path(), facts.new_link_target())
+            .map_err(ReplaceLinkExecutionError::PostconditionInspection)?
+            .observation()
+            .clone();
+        let precondition = self
+            .inspector
+            .inspect_target_for_expected_link(facts.target_path(), facts.old_link_target())
+            .map_err(ReplaceLinkExecutionError::TargetInspection)?
+            .observation()
+            .clone();
+        let temporary = self
+            .inspector
+            .inspect_target_for_expected_link(facts.temporary_path(), facts.new_link_target())
+            .map_err(ReplaceLinkExecutionError::TemporaryInspection)?
+            .observation()
+            .clone();
+        Ok(ReplacementAftermath {
+            precondition,
+            postcondition,
+            temporary,
+        })
+    }
+
+    fn replacement_attempt_aftermath(
+        &self,
+        facts: &crate::state::operation::ReplacementFacts,
+        source: io::Error,
+        mutation: ReplacementMutation,
+    ) -> ReplaceLinkExecutionError {
+        match self.replacement_aftermath(facts) {
+            Ok(aftermath) => ReplaceLinkExecutionError::MutationAttempt { source, aftermath },
+            Err(_) => ReplaceLinkExecutionError::MutationAftermathUnproven { mutation, source },
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn with_forced_capability_failure_for_test(mut self) -> Self {
         self.force_capability_failure = true;
@@ -325,6 +804,52 @@ fn create_conditions(
         return Err(CreateLinkExecutionError::InvalidCreateConditions);
     }
     Ok((pre_target.clone(), link_target.clone()))
+}
+
+fn relocation_facts_from_action(
+    action: &PlannedAction,
+) -> Result<RelocationFacts, RelocateLinkExecutionError> {
+    if action.kind() != ActionKind::RelocateLink {
+        return Err(RelocateLinkExecutionError::InvalidRelocateConditions);
+    }
+    let preconditions = action.preconditions();
+    let [
+        TargetCondition::ExpectedLink {
+            target_path: old_target_path,
+            link_target: old_link_target,
+        },
+        TargetCondition::Missing {
+            target_path: new_precondition_target,
+        },
+    ] = preconditions.as_slice()
+    else {
+        return Err(RelocateLinkExecutionError::InvalidRelocateConditions);
+    };
+    let postconditions = action.postconditions();
+    let [
+        TargetCondition::Missing {
+            target_path: old_postcondition_target,
+        },
+        TargetCondition::ExpectedLink {
+            target_path: new_target_path,
+            link_target: new_link_target,
+        },
+    ] = postconditions.as_slice()
+    else {
+        return Err(RelocateLinkExecutionError::InvalidRelocateConditions);
+    };
+    if old_target_path == new_target_path
+        || old_target_path != old_postcondition_target
+        || new_precondition_target != new_target_path
+    {
+        return Err(RelocateLinkExecutionError::InvalidRelocateConditions);
+    }
+    Ok(RelocationFacts::new_for_executor(
+        old_target_path.clone(),
+        new_target_path.clone(),
+        old_link_target.clone(),
+        new_link_target.clone(),
+    ))
 }
 
 fn remove_conditions(
@@ -428,6 +953,217 @@ pub(crate) enum CreateLinkExecutionError {
         target_path: ResolvedPath,
         observation: TargetObservation,
     },
+}
+
+/// The reason a recorded replacement could not be completed and proven.
+#[derive(Debug)]
+pub(crate) enum ReplaceLinkExecutionError {
+    MissingRecordedFacts,
+    InvalidReplaceConditions,
+    SourceRecheck(SourceVerificationError),
+    SourceDoesNotMatchAction {
+        expected: LinkTarget,
+        actual: ResolvedPath,
+    },
+    TargetInspection(TargetInspectionError),
+    TemporaryInspection(TargetInspectionError),
+    PlatformCapability {
+        target_path: ResolvedPath,
+        source: io::Error,
+    },
+    PreconditionNoLongerHolds {
+        target_path: ResolvedPath,
+        observation: TargetObservation,
+    },
+    TemporaryNotMissing {
+        temporary_path: ResolvedPath,
+        observation: TargetObservation,
+    },
+    MutationAttempt {
+        source: io::Error,
+        aftermath: ReplacementAftermath,
+    },
+    MutationAftermathUnproven {
+        mutation: ReplacementMutation,
+        source: io::Error,
+    },
+    PostconditionInspection(TargetInspectionError),
+    Aftermath {
+        aftermath: ReplacementAftermath,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) enum ReplacementMutation {
+    TemporaryCreate,
+    Rename,
+}
+
+#[derive(Debug)]
+pub(crate) struct ReplacementAftermath {
+    precondition: TargetObservation,
+    postcondition: TargetObservation,
+    temporary: TargetObservation,
+}
+
+impl ReplacementAftermath {
+    pub(crate) fn postcondition_holds(&self) -> bool {
+        matches!(self.postcondition, TargetObservation::ExpectedLink { .. })
+            && matches!(self.temporary, TargetObservation::Missing)
+    }
+
+    pub(crate) fn precondition_holds(&self) -> bool {
+        matches!(self.precondition, TargetObservation::ExpectedLink { .. })
+            && matches!(self.temporary, TargetObservation::Missing)
+    }
+}
+
+/// The reason a two-target relocation could not be completed and proven.
+#[derive(Debug)]
+pub(crate) enum RelocateLinkExecutionError {
+    MissingRecordedFacts,
+    InvalidRelocateConditions,
+    SourceRecheck(SourceVerificationError),
+    SourceDoesNotMatchAction {
+        expected: LinkTarget,
+        actual: ResolvedPath,
+    },
+    OldTargetInspection(TargetInspectionError),
+    NewTargetInspection(TargetInspectionError),
+    CreateCapability(CreateLinkExecutionError),
+    RemoveCapability(RemoveLinkExecutionError),
+    PreconditionNoLongerHolds {
+        target_path: ResolvedPath,
+        observation: TargetObservation,
+    },
+    Aftermath {
+        old_observation: TargetObservation,
+        new_observation: TargetObservation,
+    },
+}
+
+impl fmt::Display for RelocateLinkExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingRecordedFacts => {
+                formatter.write_str("relocation action has no recorded facts")
+            }
+            Self::InvalidRelocateConditions => formatter.write_str(
+                "relocate action requires an expected old target and a missing distinct new target",
+            ),
+            Self::SourceRecheck(error) => error.fmt(formatter),
+            Self::SourceDoesNotMatchAction { expected, actual } => write!(
+                formatter,
+                "verified source {actual:?} does not match relocation target {expected:?}"
+            ),
+            Self::OldTargetInspection(error) | Self::NewTargetInspection(error) => {
+                error.fmt(formatter)
+            }
+            Self::CreateCapability(error) => error.fmt(formatter),
+            Self::RemoveCapability(error) => error.fmt(formatter),
+            Self::PreconditionNoLongerHolds {
+                target_path,
+                observation,
+            } => write!(
+                formatter,
+                "relocation precondition no longer holds at {target_path:?}: {observation:?}"
+            ),
+            Self::Aftermath {
+                old_observation,
+                new_observation,
+            } => write!(
+                formatter,
+                "relocation aftermath is old={old_observation:?}, new={new_observation:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RelocateLinkExecutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SourceRecheck(error) => Some(error),
+            Self::OldTargetInspection(error) | Self::NewTargetInspection(error) => Some(error),
+            Self::CreateCapability(error) => Some(error),
+            Self::RemoveCapability(error) => Some(error),
+            Self::MissingRecordedFacts
+            | Self::InvalidRelocateConditions
+            | Self::SourceDoesNotMatchAction { .. }
+            | Self::PreconditionNoLongerHolds { .. }
+            | Self::Aftermath { .. } => None,
+        }
+    }
+}
+
+impl fmt::Display for ReplaceLinkExecutionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingRecordedFacts => {
+                f.write_str("replacement action has no recorded temporary sibling")
+            }
+            Self::InvalidReplaceConditions => {
+                f.write_str("replace action requires changed sources at one target")
+            }
+            Self::SourceRecheck(error) => error.fmt(f),
+            Self::SourceDoesNotMatchAction { expected, actual } => write!(
+                f,
+                "replacement source changed: expected {expected}, found {actual}"
+            ),
+            Self::TargetInspection(error)
+            | Self::TemporaryInspection(error)
+            | Self::PostconditionInspection(error) => error.fmt(f),
+            Self::PlatformCapability {
+                target_path,
+                source,
+            } => write!(
+                f,
+                "file symbolic-link replacement is unsupported at {target_path}: {source}"
+            ),
+            Self::PreconditionNoLongerHolds {
+                target_path,
+                observation,
+            } => write!(
+                f,
+                "replacement precondition no longer holds at {target_path}: {observation:?}"
+            ),
+            Self::TemporaryNotMissing {
+                temporary_path,
+                observation,
+            } => write!(
+                f,
+                "replacement temporary path is not missing at {temporary_path}: {observation:?}"
+            ),
+            Self::MutationAttempt { source, aftermath } => write!(
+                f,
+                "replacement mutation returned {source}; aftermath is precondition={:?}, postcondition={:?}, temporary={:?}",
+                aftermath.precondition, aftermath.postcondition, aftermath.temporary,
+            ),
+            Self::MutationAftermathUnproven { mutation, source } => write!(
+                f,
+                "replacement {mutation:?} returned {source} and its aftermath could not be proven"
+            ),
+            Self::Aftermath { aftermath } => write!(
+                f,
+                "replacement aftermath is precondition={:?}, postcondition={:?}, temporary={:?}",
+                aftermath.precondition, aftermath.postcondition, aftermath.temporary,
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReplaceLinkExecutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SourceRecheck(error) => Some(error),
+            Self::TargetInspection(error)
+            | Self::TemporaryInspection(error)
+            | Self::PostconditionInspection(error) => Some(error),
+            Self::PlatformCapability { source, .. }
+            | Self::MutationAttempt { source, .. }
+            | Self::MutationAftermathUnproven { source, .. } => Some(source),
+            _ => None,
+        }
+    }
 }
 
 /// The reason a planned link-entry removal could not be safely completed and proven.

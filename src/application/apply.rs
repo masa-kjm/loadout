@@ -9,12 +9,13 @@ use crate::domain::paths::ResolvedPath;
 use crate::domain::plan::{ActionKind, Plan, PlannedAction};
 use crate::executor::file_link::{
     CreateLinkExecutionError, FileLinkExecutor, ForgetMissingExecutionError,
-    RemoveLinkExecutionError,
+    RelocateLinkExecutionError, RemoveLinkExecutionError, ReplaceLinkExecutionError,
 };
 use crate::inspection::file_link::{FileLinkInspector, TargetInspectionError};
 use crate::planner::file_link::plan;
 use crate::resolver::ResolvedApplyInput;
 use crate::state::operation::ActionStatus;
+use crate::state::operation::RecordedAction;
 use crate::state::repository::{LockedStateRepository, StateRepository, StateRepositoryError};
 
 /// Coordinates a confirmed non-dry-run apply for one home and state directory.
@@ -66,6 +67,198 @@ impl ApplyCoordinator {
         self.apply_stale_with_hooks(resolved, confirm, |_| {})
     }
 
+    /// Executes one same-target, source-changing managed replacement.
+    pub(crate) fn apply_replace_link<F>(
+        &self,
+        resolved: &ResolvedApplyInput,
+        confirm: F,
+    ) -> Result<ReplaceLinkApplyResult, ApplyError>
+    where
+        F: FnOnce(&Plan) -> bool,
+    {
+        self.apply_replace_link_with_hooks(resolved, confirm, |_| {})
+    }
+
+    fn apply_replace_link_with_hooks<F, H>(
+        &self,
+        resolved: &ResolvedApplyInput,
+        confirm: F,
+        after_running: H,
+    ) -> Result<ReplaceLinkApplyResult, ApplyError>
+    where
+        F: FnOnce(&Plan) -> bool,
+        H: FnOnce(&mut LockedStateRepository),
+    {
+        let result = self.apply_single_action(resolved, confirm, after_running, |plan| {
+            let action = require_single_replace_action(plan)?.clone();
+            let source = resolved
+                .verified_sources()
+                .get(action.resource_id())
+                .ok_or_else(|| ApplyError::MissingVerifiedSource {
+                    resource_id: action.resource_id().clone(),
+                })?
+                .clone();
+            let executor = FileLinkExecutor::new(self.home_directory.as_ref())
+                .map_err(ApplyError::InitialInspection)?;
+            executor
+                .preflight_replace(&action, &source)
+                .map_err(ApplyError::ReplacePreflight)?;
+            Ok((
+                action,
+                move |action: &PlannedAction, recorded: RecordedAction| {
+                    classify_execution(
+                        executor.execute_replace(action, &recorded, &source),
+                        classify_replace_execution_error,
+                    )
+                },
+            ))
+        })?;
+        Ok(match result {
+            SingleActionApplyResult::Applied { resource_id, .. } => {
+                ReplaceLinkApplyResult::Applied { resource_id }
+            }
+            SingleActionApplyResult::Blocked { plan } => ReplaceLinkApplyResult::Blocked { plan },
+            SingleActionApplyResult::Declined { plan } => ReplaceLinkApplyResult::Declined { plan },
+            SingleActionApplyResult::Failed { error } => ReplaceLinkApplyResult::Failed { error },
+            SingleActionApplyResult::Uncertain { error } => {
+                ReplaceLinkApplyResult::Uncertain { error }
+            }
+        })
+    }
+
+    /// Executes an internal managed identity handoff at one target.
+    pub(crate) fn apply_replace_ownership<F>(
+        &self,
+        resolved: &ResolvedApplyInput,
+        confirm: F,
+    ) -> Result<ReplaceOwnershipApplyResult, ApplyError>
+    where
+        F: FnOnce(&Plan) -> bool,
+    {
+        self.apply_replace_ownership_with_hooks(resolved, confirm, |_| {})
+    }
+
+    /// Executes one managed file-link relocation selected by the planner.
+    pub(crate) fn apply_relocate_link<F>(
+        &self,
+        resolved: &ResolvedApplyInput,
+        confirm: F,
+    ) -> Result<RelocateLinkApplyResult, ApplyError>
+    where
+        F: FnOnce(&Plan) -> bool,
+    {
+        let result = self.apply_single_action(
+            resolved,
+            confirm,
+            |_| {},
+            |plan| {
+                let action = require_single_relocate_action(plan)?.clone();
+                let source = resolved
+                    .verified_sources()
+                    .get(action.resource_id())
+                    .ok_or_else(|| ApplyError::MissingVerifiedSource {
+                        resource_id: action.resource_id().clone(),
+                    })?
+                    .clone();
+                let executor = FileLinkExecutor::new(self.home_directory.as_ref())
+                    .map_err(ApplyError::InitialInspection)?;
+                executor
+                    .preflight_relocate(&action, &source)
+                    .map_err(ApplyError::RelocatePreflight)?;
+                Ok((
+                    action,
+                    move |action: &PlannedAction, recorded: RecordedAction| {
+                        classify_execution(
+                            executor.execute_relocate(action, &recorded, &source),
+                            classify_relocate_execution_error,
+                        )
+                    },
+                ))
+            },
+        )?;
+        Ok(match result {
+            SingleActionApplyResult::Applied { resource_id, .. } => {
+                RelocateLinkApplyResult::Applied { resource_id }
+            }
+            SingleActionApplyResult::Blocked { plan } => RelocateLinkApplyResult::Blocked { plan },
+            SingleActionApplyResult::Declined { plan } => {
+                RelocateLinkApplyResult::Declined { plan }
+            }
+            SingleActionApplyResult::Failed { error } => RelocateLinkApplyResult::Failed { error },
+            SingleActionApplyResult::Uncertain { error } => {
+                RelocateLinkApplyResult::Uncertain { error }
+            }
+        })
+    }
+
+    fn apply_replace_ownership_with_hooks<F, H>(
+        &self,
+        resolved: &ResolvedApplyInput,
+        confirm: F,
+        after_running: H,
+    ) -> Result<ReplaceOwnershipApplyResult, ApplyError>
+    where
+        F: FnOnce(&Plan) -> bool,
+        H: FnOnce(&mut LockedStateRepository),
+    {
+        let result = self.apply_single_action(resolved, confirm, after_running, |plan| {
+            let action = require_single_replace_ownership_action(plan)?.clone();
+            let source = resolved
+                .verified_sources()
+                .get(action.resource_id())
+                .ok_or_else(|| ApplyError::MissingVerifiedSource {
+                    resource_id: action.resource_id().clone(),
+                })?
+                .clone();
+            let executor = FileLinkExecutor::new(self.home_directory.as_ref())
+                .map_err(ApplyError::InitialInspection)?;
+            let changed_source = action.preconditions()[0] != action.postconditions()[0];
+            if changed_source {
+                executor
+                    .preflight_replace(&action, &source)
+                    .map_err(ApplyError::ReplacePreflight)?;
+            } else {
+                executor
+                    .preflight_same_source_ownership_handoff(&action, &source)
+                    .map_err(ApplyError::ReplacePreflight)?;
+            }
+            Ok((
+                action,
+                move |action: &PlannedAction, recorded: RecordedAction| {
+                    if recorded.replacement_facts().is_some() {
+                        classify_execution(
+                            executor.execute_replace(action, &recorded, &source),
+                            classify_replace_execution_error,
+                        )
+                    } else {
+                        classify_execution(
+                            executor
+                                .execute_same_source_ownership_handoff(action, &recorded, &source),
+                            classify_replace_execution_error,
+                        )
+                    }
+                },
+            ))
+        })?;
+        Ok(match result {
+            SingleActionApplyResult::Applied { resource_id, .. } => {
+                ReplaceOwnershipApplyResult::Applied { resource_id }
+            }
+            SingleActionApplyResult::Blocked { plan } => {
+                ReplaceOwnershipApplyResult::Blocked { plan }
+            }
+            SingleActionApplyResult::Declined { plan } => {
+                ReplaceOwnershipApplyResult::Declined { plan }
+            }
+            SingleActionApplyResult::Failed { error } => {
+                ReplaceOwnershipApplyResult::Failed { error }
+            }
+            SingleActionApplyResult::Uncertain { error } => {
+                ReplaceOwnershipApplyResult::Uncertain { error }
+            }
+        })
+    }
+
     fn apply_stale_with_hooks<F, H>(
         &self,
         resolved: &ResolvedApplyInput,
@@ -81,7 +274,7 @@ impl ApplyCoordinator {
             let executor = FileLinkExecutor::new(self.home_directory.as_ref())
                 .map_err(ApplyError::InitialInspection)?;
             preflight_stale_action(&executor, &action).map_err(ApplyError::StalePreflight)?;
-            Ok((action, move |action: &PlannedAction| {
+            Ok((action, move |action: &PlannedAction, _: RecordedAction| {
                 let result = match action.kind() {
                     ActionKind::RemoveLink => executor
                         .execute_remove(action)
@@ -124,7 +317,8 @@ impl ApplyCoordinator {
                 .get(action.resource_id())
                 .ok_or_else(|| ApplyError::MissingVerifiedSource {
                     resource_id: action.resource_id().clone(),
-                })?;
+                })?
+                .clone();
             let executor = FileLinkExecutor::new(self.home_directory.as_ref())
                 .map_err(ApplyError::InitialInspection)?;
             #[cfg(test)]
@@ -134,11 +328,11 @@ impl ApplyCoordinator {
                 executor
             };
             executor
-                .preflight_create(&action, source)
+                .preflight_create(&action, &source)
                 .map_err(ApplyError::Preflight)?;
-            Ok((action, move |action: &PlannedAction| {
+            Ok((action, move |action: &PlannedAction, _: RecordedAction| {
                 classify_execution(
-                    executor.execute_create(action, source),
+                    executor.execute_create(action, &source),
                     classify_execution_error,
                 )
             }))
@@ -167,7 +361,7 @@ impl ApplyCoordinator {
         prepare: impl FnOnce(&Plan) -> Result<(PlannedAction, X), ApplyError>,
     ) -> Result<SingleActionApplyResult<E>, ApplyError>
     where
-        X: FnOnce(&PlannedAction) -> ExecutionOutcome<E>,
+        X: for<'a> FnOnce(&'a PlannedAction, RecordedAction) -> ExecutionOutcome<E>,
     {
         // Locking precedes every state-for-execution read and target inspection.
         let mut locked = self
@@ -204,7 +398,12 @@ impl ApplyCoordinator {
         locked.mark_running(&action_id).map_err(ApplyError::State)?;
         after_running(&mut locked);
 
-        let result = match execute(&action) {
+        let recorded = locked
+            .state()
+            .active_operation()
+            .and_then(|operation| operation.action(&action_id))
+            .expect("begin_operation records the action before marking it running");
+        let result = match execute(&action, recorded.clone()) {
             ExecutionOutcome::Succeeded => {
                 locked
                     .commit_succeeded(&action_id)
@@ -258,6 +457,18 @@ impl ApplyCoordinator {
     }
 
     #[cfg(test)]
+    fn apply_replace_ownership_with_after_running<H>(
+        &self,
+        resolved: &ResolvedApplyInput,
+        after_running: H,
+    ) -> Result<ReplaceOwnershipApplyResult, ApplyError>
+    where
+        H: FnOnce(&mut LockedStateRepository),
+    {
+        self.apply_replace_ownership_with_hooks(resolved, |_| true, after_running)
+    }
+
+    #[cfg(test)]
     fn fail_next_state_write_preflight(&mut self) {
         self.state_repository.fail_next_state_write_preflight();
     }
@@ -293,6 +504,48 @@ fn require_single_stale_action(plan: &Plan) -> Result<&PlannedAction, ApplyError
         ActionKind::RemoveLink | ActionKind::ForgetMissing
     ) {
         return Err(ApplyError::SliceFiveRequiresSingleStaleAction {
+            action_kinds: vec![action.kind()],
+        });
+    }
+    Ok(action)
+}
+
+fn require_single_replace_action(plan: &Plan) -> Result<&PlannedAction, ApplyError> {
+    let [action] = plan.actions() else {
+        return Err(ApplyError::SliceSixRequiresSingleReplaceAction {
+            action_kinds: plan.actions().iter().map(PlannedAction::kind).collect(),
+        });
+    };
+    if action.kind() != ActionKind::ReplaceLink {
+        return Err(ApplyError::SliceSixRequiresSingleReplaceAction {
+            action_kinds: vec![action.kind()],
+        });
+    }
+    Ok(action)
+}
+
+fn require_single_replace_ownership_action(plan: &Plan) -> Result<&PlannedAction, ApplyError> {
+    let [action] = plan.actions() else {
+        return Err(ApplyError::SliceSixRequiresSingleReplaceOwnershipAction {
+            action_kinds: plan.actions().iter().map(PlannedAction::kind).collect(),
+        });
+    };
+    if action.kind() != ActionKind::ReplaceOwnership {
+        return Err(ApplyError::SliceSixRequiresSingleReplaceOwnershipAction {
+            action_kinds: vec![action.kind()],
+        });
+    }
+    Ok(action)
+}
+
+fn require_single_relocate_action(plan: &Plan) -> Result<&PlannedAction, ApplyError> {
+    let [action] = plan.actions() else {
+        return Err(ApplyError::SliceSixRequiresSingleRelocateAction {
+            action_kinds: plan.actions().iter().map(PlannedAction::kind).collect(),
+        });
+    };
+    if action.kind() != ActionKind::RelocateLink {
+        return Err(ApplyError::SliceSixRequiresSingleRelocateAction {
             action_kinds: vec![action.kind()],
         });
     }
@@ -394,6 +647,46 @@ fn classify_execution_error(error: &CreateLinkExecutionError) -> ExecutionClassi
     }
 }
 
+fn classify_replace_execution_error(error: &ReplaceLinkExecutionError) -> ExecutionClassification {
+    match error {
+        ReplaceLinkExecutionError::MutationAttempt { aftermath, .. }
+        | ReplaceLinkExecutionError::Aftermath { aftermath }
+            if aftermath.postcondition_holds() =>
+        {
+            ExecutionClassification::Succeeded
+        }
+        ReplaceLinkExecutionError::MutationAttempt { aftermath, .. }
+        | ReplaceLinkExecutionError::Aftermath { aftermath }
+            if aftermath.precondition_holds() =>
+        {
+            ExecutionClassification::Failed
+        }
+        ReplaceLinkExecutionError::PreconditionNoLongerHolds { .. } => {
+            ExecutionClassification::Uncertain
+        }
+        _ => ExecutionClassification::Uncertain,
+    }
+}
+
+fn classify_relocate_execution_error(
+    error: &RelocateLinkExecutionError,
+) -> ExecutionClassification {
+    match error {
+        RelocateLinkExecutionError::PreconditionNoLongerHolds { .. } => {
+            ExecutionClassification::Uncertain
+        }
+        RelocateLinkExecutionError::Aftermath {
+            old_observation: TargetObservation::Missing,
+            new_observation: TargetObservation::ExpectedLink { .. },
+        } => ExecutionClassification::Succeeded,
+        RelocateLinkExecutionError::Aftermath {
+            old_observation: TargetObservation::ExpectedLink { .. },
+            new_observation: TargetObservation::Missing,
+        } => ExecutionClassification::Failed,
+        _ => ExecutionClassification::Uncertain,
+    }
+}
+
 fn classify_observation(observation: &TargetObservation) -> ExecutionClassification {
     match observation {
         TargetObservation::ExpectedLink { .. } => ExecutionClassification::Succeeded,
@@ -466,6 +759,64 @@ pub(crate) enum CreateLinkApplyResult {
     },
 }
 
+/// The complete outcome of Slice 6's single managed replacement coordinator.
+#[derive(Debug)]
+pub(crate) enum ReplaceLinkApplyResult {
+    Applied {
+        resource_id: FullyQualifiedResourceId,
+    },
+    Blocked {
+        plan: Plan,
+    },
+    Declined {
+        plan: Plan,
+    },
+    Failed {
+        error: ReplaceLinkExecutionError,
+    },
+    Uncertain {
+        error: ReplaceLinkExecutionError,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) enum ReplaceOwnershipApplyResult {
+    Applied {
+        resource_id: FullyQualifiedResourceId,
+    },
+    Blocked {
+        plan: Plan,
+    },
+    Declined {
+        plan: Plan,
+    },
+    Failed {
+        error: ReplaceLinkExecutionError,
+    },
+    Uncertain {
+        error: ReplaceLinkExecutionError,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) enum RelocateLinkApplyResult {
+    Applied {
+        resource_id: FullyQualifiedResourceId,
+    },
+    Blocked {
+        plan: Plan,
+    },
+    Declined {
+        plan: Plan,
+    },
+    Failed {
+        error: RelocateLinkExecutionError,
+    },
+    Uncertain {
+        error: RelocateLinkExecutionError,
+    },
+}
+
 /// The complete visible outcome of Slice 5's single stale-resource coordinator.
 #[derive(Debug)]
 pub(crate) enum StaleLinkApplyResult {
@@ -534,6 +885,17 @@ pub(crate) enum ApplyError {
         action_kinds: Vec<ActionKind>,
     },
     Preflight(CreateLinkExecutionError),
+    SliceSixRequiresSingleReplaceAction {
+        action_kinds: Vec<ActionKind>,
+    },
+    ReplacePreflight(ReplaceLinkExecutionError),
+    SliceSixRequiresSingleReplaceOwnershipAction {
+        action_kinds: Vec<ActionKind>,
+    },
+    SliceSixRequiresSingleRelocateAction {
+        action_kinds: Vec<ActionKind>,
+    },
+    RelocatePreflight(RelocateLinkExecutionError),
     SliceFiveRequiresSingleStaleAction {
         action_kinds: Vec<ActionKind>,
     },
@@ -561,6 +923,20 @@ impl fmt::Display for ApplyError {
                 "Slice 4 apply supports exactly one create_link action, not {action_kinds:?}"
             ),
             Self::Preflight(error) => error.fmt(formatter),
+            Self::SliceSixRequiresSingleReplaceAction { action_kinds } => write!(
+                formatter,
+                "Slice 6 apply supports exactly one replace_link action, not {action_kinds:?}"
+            ),
+            Self::ReplacePreflight(error) => error.fmt(formatter),
+            Self::SliceSixRequiresSingleReplaceOwnershipAction { action_kinds } => write!(
+                formatter,
+                "Slice 6 apply supports exactly one replace_ownership action, not {action_kinds:?}"
+            ),
+            Self::SliceSixRequiresSingleRelocateAction { action_kinds } => write!(
+                formatter,
+                "Slice 6 apply supports exactly one relocate_link action, not {action_kinds:?}"
+            ),
+            Self::RelocatePreflight(error) => error.fmt(formatter),
             Self::SliceFiveRequiresSingleStaleAction { action_kinds } => write!(
                 formatter,
                 "Slice 5 apply supports exactly one remove_link or forget_missing action, not {action_kinds:?}"
@@ -578,12 +954,17 @@ impl std::error::Error for ApplyError {
             Self::StatePreflight(error) => Some(error),
             Self::InitialInspection(error) => Some(error),
             Self::Preflight(error) => Some(error),
+            Self::ReplacePreflight(error) => Some(error),
+            Self::RelocatePreflight(error) => Some(error),
             Self::StalePreflight(error) => Some(error),
             Self::DesiredHash(error) => Some(error),
             Self::RecoveryRequired
             | Self::MissingVerifiedSource { .. }
             | Self::SliceFourRequiresSingleCreateAction { .. }
             | Self::SliceFiveRequiresSingleStaleAction { .. } => None,
+            Self::SliceSixRequiresSingleReplaceAction { .. }
+            | Self::SliceSixRequiresSingleReplaceOwnershipAction { .. }
+            | Self::SliceSixRequiresSingleRelocateAction { .. } => None,
         }
     }
 }
@@ -680,6 +1061,62 @@ mod tests {
 
         fn input(&self) -> ResolvedApplyInput {
             ResolvedApplyInput::new_for_test(self.desired(), self.verified_sources())
+        }
+
+        fn replacement_input(&self) -> ResolvedApplyInput {
+            let root = resolve_store_root(&self.path("store")).unwrap();
+            let replacement = verify_regular_source(
+                &root,
+                &SourceRelativePath::parse("git/replacement").unwrap(),
+            )
+            .unwrap();
+            let resource_id = FullyQualifiedResourceId::parse("base/git-config").unwrap();
+            let desired = ResolvedDesired::new(
+                ProfileId::parse("workstation").unwrap(),
+                [ResolvedFileLink::new(
+                    resource_id.clone(),
+                    replacement.path().clone(),
+                    ResolvedPath::new(self.path("home/.gitconfig")).unwrap(),
+                )
+                .unwrap()],
+            )
+            .unwrap();
+            ResolvedApplyInput::new_for_test(desired, BTreeMap::from([(resource_id, replacement)]))
+        }
+
+        fn ownership_input(&self, resource_id: &str, source_relative: &str) -> ResolvedApplyInput {
+            let root = resolve_store_root(&self.path("store")).unwrap();
+            let source =
+                verify_regular_source(&root, &SourceRelativePath::parse(source_relative).unwrap())
+                    .unwrap();
+            let resource_id = FullyQualifiedResourceId::parse(resource_id).unwrap();
+            let desired = ResolvedDesired::new(
+                ProfileId::parse("workstation").unwrap(),
+                [ResolvedFileLink::new(
+                    resource_id.clone(),
+                    source.path().clone(),
+                    ResolvedPath::new(self.path("home/.gitconfig")).unwrap(),
+                )
+                .unwrap()],
+            )
+            .unwrap();
+            ResolvedApplyInput::new_for_test(desired, BTreeMap::from([(resource_id, source)]))
+        }
+
+        fn relocation_input(&self) -> ResolvedApplyInput {
+            let resource_id = FullyQualifiedResourceId::parse("base/git-config").unwrap();
+            let source = self.verified_source();
+            let desired = ResolvedDesired::new(
+                ProfileId::parse("workstation").unwrap(),
+                [ResolvedFileLink::new(
+                    resource_id.clone(),
+                    source.path().clone(),
+                    ResolvedPath::new(self.path("home/.config/gitconfig")).unwrap(),
+                )
+                .unwrap()],
+            )
+            .unwrap();
+            ResolvedApplyInput::new_for_test(desired, BTreeMap::from([(resource_id, source)]))
         }
 
         fn stale_input(&self) -> ResolvedApplyInput {
@@ -856,6 +1293,299 @@ mod tests {
         assert_eq!(
             fs::read_to_string(workspace.path("store/git/config")).unwrap(),
             "source contents\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_link_blocks_before_confirmation_without_touching_either_entry() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "old source\n");
+        workspace.write("store/git/replacement", "new source\n");
+        workspace
+            .coordinator()
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        let replacement = workspace.replacement_input();
+        let error = workspace
+            .coordinator()
+            .apply_replace_link(&replacement, |_| {
+                panic!("an unbound replacement must not request confirmation")
+            })
+            .unwrap_err();
+        assert!(matches!(error, ApplyError::ReplacePreflight(_)));
+        assert_eq!(
+            fs::read_link(workspace.path("home/.gitconfig")).unwrap(),
+            workspace.path("store/git/config")
+        );
+        let state = workspace.repository().load().unwrap();
+        assert!(state.active_operation().is_none());
+        let known = state
+            .known()
+            .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+            .unwrap();
+        assert_eq!(
+            known.link_target().as_path().as_ref(),
+            workspace.path("store/git/config")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_source_ownership_handoff_records_no_temporary_and_commits_both_identities() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "owned source\n");
+        workspace
+            .coordinator()
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        let replacement = workspace.ownership_input("base/git-config-renamed", "git/config");
+        let repository = workspace.repository();
+        let target = workspace.path("home/.gitconfig");
+        let before = fs::read_link(&target).unwrap();
+
+        let result = workspace
+            .coordinator()
+            .apply_replace_ownership_with_after_running(&replacement, |locked| {
+                let _ = locked;
+                let state = repository.load().unwrap();
+                let (_, action) = state.active_operation().unwrap().actions().next().unwrap();
+                assert_eq!(action.status(), ActionStatus::Running);
+                assert_eq!(action.kind(), ActionKind::ReplaceOwnership);
+                assert!(action.replacement_facts().is_none());
+                assert_eq!(
+                    action.replaced_resource_id().unwrap().as_str(),
+                    "base/git-config"
+                );
+                assert_eq!(action.resource_id().as_str(), "base/git-config-renamed");
+            })
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            ReplaceOwnershipApplyResult::Applied { .. }
+        ));
+        assert_eq!(fs::read_link(&target).unwrap(), before);
+        let state = repository.load().unwrap();
+        assert!(state.active_operation().is_none());
+        assert!(
+            state
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .is_none()
+        );
+        let known = state
+            .known()
+            .get(&FullyQualifiedResourceId::parse("base/git-config-renamed").unwrap())
+            .unwrap();
+        assert_eq!(
+            known.link_target().as_path().as_ref(),
+            workspace.path("store/git/config")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_source_ownership_handoff_retains_an_uncertain_operation_when_recheck_loses_old_link() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "owned source\n");
+        workspace
+            .coordinator()
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        let replacement = workspace.ownership_input("base/git-config-renamed", "git/config");
+        let target = workspace.path("home/.gitconfig");
+
+        let result = workspace
+            .coordinator()
+            .apply_replace_ownership_with_after_running(&replacement, |_| {
+                fs::remove_file(&target).unwrap();
+                fs::write(&target, "unmanaged replacement\n").unwrap();
+            })
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            ReplaceOwnershipApplyResult::Uncertain {
+                error: ReplaceLinkExecutionError::PreconditionNoLongerHolds { .. }
+            }
+        ));
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "unmanaged replacement\n"
+        );
+        let state = workspace.repository().load().unwrap();
+        assert!(
+            state
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .is_some()
+        );
+        assert!(
+            state
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config-renamed").unwrap())
+                .is_none()
+        );
+        let (_, action) = state.active_operation().unwrap().actions().next().unwrap();
+        assert_eq!(action.status(), ActionStatus::Uncertain);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changed_source_ownership_handoff_blocks_without_recording_or_replacing() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "old source\n");
+        workspace.write("store/git/replacement", "new source\n");
+        workspace
+            .coordinator()
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        let replacement = workspace.ownership_input("base/git-config-renamed", "git/replacement");
+        let error = workspace
+            .coordinator()
+            .apply_replace_ownership(&replacement, |_| {
+                panic!("an unbound replacement must not request confirmation")
+            })
+            .unwrap_err();
+        assert!(matches!(error, ApplyError::ReplacePreflight(_)));
+        assert_eq!(
+            fs::read_link(workspace.path("home/.gitconfig")).unwrap(),
+            workspace.path("store/git/config")
+        );
+        let state = workspace.repository().load().unwrap();
+        assert!(state.active_operation().is_none());
+        assert!(
+            state
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .is_some()
+        );
+        assert!(
+            state
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config-renamed").unwrap())
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changed_source_ownership_handoff_does_not_run_after_replacement_preflight_fails() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "old source\n");
+        workspace.write("store/git/replacement", "new source\n");
+        workspace
+            .coordinator()
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        let replacement = workspace.ownership_input("base/git-config-renamed", "git/replacement");
+        let error = workspace
+            .coordinator()
+            .apply_replace_ownership_with_after_running(&replacement, |locked| {
+                let _ = locked;
+                panic!("preflight must reject before recording running")
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, ApplyError::ReplacePreflight(_)));
+        assert_eq!(
+            fs::read_link(workspace.path("home/.gitconfig")).unwrap(),
+            workspace.path("store/git/config")
+        );
+        let state = workspace.repository().load().unwrap();
+        assert!(
+            state
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .is_some()
+        );
+        assert!(
+            state
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config-renamed").unwrap())
+                .is_none()
+        );
+        assert!(state.active_operation().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_handoff_rejects_an_unmanaged_target_without_recording_an_operation() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "owned source\n");
+        workspace.write("store/git/other", "unmanaged source\n");
+        workspace
+            .coordinator()
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        let target = workspace.path("home/.gitconfig");
+        fs::remove_file(&target).unwrap();
+        let other = workspace.path("store/git/other");
+        symlink(&other, &target).unwrap();
+        let replacement = workspace.ownership_input("base/git-config-renamed", "git/config");
+
+        let result = workspace
+            .coordinator()
+            .apply_replace_ownership(&replacement, |_| {
+                panic!("an unmanaged target must not request confirmation")
+            })
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            ReplaceOwnershipApplyResult::Blocked { .. }
+        ));
+        assert_eq!(fs::read_link(&target).unwrap(), other);
+        let state = workspace.repository().load().unwrap();
+        assert!(state.active_operation().is_none());
+        assert!(
+            state
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relocation_blocks_before_confirmation_when_expected_entry_removal_is_unavailable() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "owned source\n");
+        workspace
+            .coordinator()
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        fs::create_dir(workspace.path("home/.config")).unwrap();
+        let relocation = workspace.relocation_input();
+
+        let error = workspace
+            .coordinator()
+            .apply_relocate_link(&relocation, |_| {
+                panic!("unsupported relocation must not request confirmation")
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ApplyError::RelocatePreflight(RelocateLinkExecutionError::RemoveCapability(
+                RemoveLinkExecutionError::PlatformCapability { .. }
+            ))
+        ));
+        assert_eq!(
+            fs::read_link(workspace.path("home/.gitconfig")).unwrap(),
+            workspace.path("store/git/config")
+        );
+        assert!(!workspace.path("home/.config/gitconfig").exists());
+        let state = workspace.repository().load().unwrap();
+        assert!(state.active_operation().is_none());
+        assert!(
+            state
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .is_some()
         );
     }
 

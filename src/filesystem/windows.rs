@@ -55,11 +55,29 @@ pub(super) fn remove_expected_file_symbolic_link_entry(
     ))
 }
 
+pub(super) fn replace_file_symbolic_link_from_temporary(
+    _: &ResolvedPath,
+    _: &ResolvedPath,
+    _: &ResolvedPath,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Windows file-link replacement requires a no-follow parent traversal primitive",
+    ))
+}
+
 pub(super) fn ensure_file_symbolic_link_creation_supported(_: &ResolvedPath) -> io::Result<()> {
     // `symlink_file` resolves parents by name. A junction or another reparse point can replace a checked parent before that call, so it cannot retain physical containment through the mutation. Keep Windows create fail-closed until this boundary has a no-follow parent traversal primitive.
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "Windows file-link creation requires a no-follow parent traversal primitive",
+    ))
+}
+
+pub(super) fn ensure_file_symbolic_link_replacement_supported(_: &ResolvedPath) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Windows file-link replacement requires a no-follow parent traversal primitive",
     ))
 }
 

@@ -199,9 +199,15 @@ impl PersistedOperationRecord {
 struct PersistedRecordedAction {
     kind: PersistedActionKind,
     resource_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    old_resource_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    old_target_path: Option<String>,
     target_path: String,
     precondition: PersistedTargetCondition,
     postcondition: PersistedTargetCondition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    temporary_path: Option<String>,
     status: PersistedActionStatus,
 }
 
@@ -209,6 +215,9 @@ impl PersistedRecordedAction {
     fn from_action(action: &RecordedAction) -> Result<Self, CommitError> {
         let kind = match action.kind() {
             ActionKind::CreateLink => PersistedActionKind::CreateLink,
+            ActionKind::ReplaceLink => PersistedActionKind::ReplaceLink,
+            ActionKind::ReplaceOwnership => PersistedActionKind::ReplaceOwnership,
+            ActionKind::RelocateLink => PersistedActionKind::RelocateLink,
             ActionKind::RemoveLink => PersistedActionKind::RemoveLink,
             ActionKind::ForgetMissing => PersistedActionKind::ForgetMissing,
             kind => return Err(CommitError::UnsupportedOperationAction { kind }),
@@ -216,9 +225,20 @@ impl PersistedRecordedAction {
         Ok(Self {
             kind,
             resource_id: action.resource_id().as_str().to_owned(),
+            old_resource_id: action
+                .replaced_resource_id()
+                .map(|id| id.as_str().to_owned()),
+            old_target_path: action
+                .relocation_facts()
+                .map(|facts| encode_path(facts.old_target_path()))
+                .transpose()?,
             target_path: encode_path(action.target_path())?,
             precondition: PersistedTargetCondition::from_condition(&action.precondition())?,
             postcondition: PersistedTargetCondition::from_condition(&action.postcondition())?,
+            temporary_path: action
+                .replacement_facts()
+                .map(|facts| encode_path(facts.temporary_path()))
+                .transpose()?,
             status: PersistedActionStatus::from_status(action.status()),
         })
     }
@@ -230,22 +250,77 @@ impl PersistedRecordedAction {
                 source,
             }
         })?;
-        let target_path = decode_path(self.target_path)?;
-        let precondition = self.precondition.into_condition(&target_path)?;
-        let postcondition = self.postcondition.into_condition(&target_path)?;
         let kind = match self.kind {
             PersistedActionKind::CreateLink => ActionKind::CreateLink,
+            PersistedActionKind::ReplaceLink => ActionKind::ReplaceLink,
+            PersistedActionKind::ReplaceOwnership => ActionKind::ReplaceOwnership,
+            PersistedActionKind::RelocateLink => ActionKind::RelocateLink,
             PersistedActionKind::RemoveLink => ActionKind::RemoveLink,
             PersistedActionKind::ForgetMissing => ActionKind::ForgetMissing,
         };
-        RecordedAction::from_persisted(
-            kind,
-            resource_id,
-            target_path,
-            precondition,
-            postcondition,
-            self.status.into_status(),
-        )
+        let target_path = decode_path(self.target_path)?;
+        let old_target_path = self.old_target_path.map(decode_path).transpose()?;
+        let precondition_target = old_target_path.as_ref().unwrap_or(&target_path);
+        let precondition = self.precondition.into_condition(precondition_target)?;
+        let postcondition = self.postcondition.into_condition(&target_path)?;
+        let status = self.status.into_status();
+        let old_resource_id = self
+            .old_resource_id
+            .map(|value| {
+                FullyQualifiedResourceId::parse(&value)
+                    .map_err(|source| StateDecodeError::InvalidResourceId { value, source })
+            })
+            .transpose()?;
+        match (kind, old_resource_id, old_target_path, self.temporary_path) {
+            (ActionKind::ReplaceLink, None, None, Some(temporary_path)) => {
+                RecordedAction::from_persisted_replace_link(
+                    resource_id,
+                    target_path,
+                    precondition,
+                    postcondition,
+                    decode_path(temporary_path)?,
+                    status,
+                )
+            }
+            (ActionKind::ReplaceLink, None, None, None) => {
+                Err(OperationRecordError::ReplacementTemporaryRequired)
+            }
+            (ActionKind::ReplaceOwnership, Some(old_resource_id), None, temporary_path) => {
+                RecordedAction::from_persisted_replace_ownership(
+                    old_resource_id,
+                    resource_id,
+                    target_path,
+                    precondition,
+                    postcondition,
+                    temporary_path.map(decode_path).transpose()?,
+                    status,
+                )
+            }
+            (ActionKind::ReplaceOwnership, None, None, _) => {
+                Err(OperationRecordError::InvalidActionConditions { kind })
+            }
+            (ActionKind::RelocateLink, None, Some(old_target_path), None) => {
+                RecordedAction::from_persisted_relocate_link(
+                    resource_id,
+                    old_target_path,
+                    target_path,
+                    precondition,
+                    postcondition,
+                    status,
+                )
+            }
+            (_, None, None, None) => RecordedAction::from_persisted(
+                kind,
+                resource_id,
+                target_path,
+                precondition,
+                postcondition,
+                status,
+            ),
+            (_, _, _, Some(_)) | (_, Some(_), _, None) | (_, _, Some(_), None) => {
+                Err(OperationRecordError::InvalidActionConditions { kind })
+            }
+        }
         .map_err(StateDecodeError::InvalidOperation)
     }
 }
@@ -254,6 +329,9 @@ impl PersistedRecordedAction {
 #[serde(rename_all = "snake_case")]
 enum PersistedActionKind {
     CreateLink,
+    ReplaceLink,
+    ReplaceOwnership,
+    RelocateLink,
     RemoveLink,
     ForgetMissing,
 }

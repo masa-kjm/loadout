@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::domain::hashes::{CanonicalHashError, DesiredHash};
-use crate::domain::known::{KnownState, KnownStateError};
+use crate::domain::known::{KnownFileLink, KnownState, KnownStateError};
 use crate::domain::paths::ResolvedPath;
 use crate::domain::plan::{ActionKind, PlannedAction};
 pub(crate) use crate::state::codec::StateDecodeError;
@@ -24,6 +24,7 @@ const MAX_TEMPORARY_NAME_ATTEMPTS: u64 = 128;
 
 static NEXT_OPERATION_NONCE: AtomicU64 = AtomicU64::new(0);
 static NEXT_TEMPORARY_NONCE: AtomicU64 = AtomicU64::new(0);
+static NEXT_REPLACEMENT_NONCE: AtomicU64 = AtomicU64::new(0);
 
 /// A complete in-memory state snapshot validated against the v0.2.0 state schema.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -216,13 +217,101 @@ impl LockedStateRepository {
         if self.state.active_operation.is_some() {
             return Err(StateRepositoryError::ActiveOperationPresent);
         }
-        let (operation, action_id) =
-            OperationRecord::new_single_action(new_operation_id(), desired_hash, action)
-                .map_err(StateRepositoryError::Operation)?;
+        let operation_id = new_operation_id();
+        let (operation, action_id) = if action.kind() == ActionKind::ReplaceLink {
+            let temporary_path = self.allocate_replacement_temporary_path(action)?;
+            OperationRecord::new_replace_link(operation_id, desired_hash, action, temporary_path)
+        } else if action.kind() == ActionKind::ReplaceOwnership {
+            let preconditions = action.preconditions();
+            let [
+                crate::domain::plan::TargetCondition::ExpectedLink {
+                    link_target: old, ..
+                },
+            ] = preconditions.as_slice()
+            else {
+                return Err(StateRepositoryError::Operation(
+                    OperationRecordError::InvalidActionConditions {
+                        kind: action.kind(),
+                    },
+                ));
+            };
+            let postconditions = action.postconditions();
+            let [
+                crate::domain::plan::TargetCondition::ExpectedLink {
+                    link_target: new, ..
+                },
+            ] = postconditions.as_slice()
+            else {
+                return Err(StateRepositoryError::Operation(
+                    OperationRecordError::InvalidActionConditions {
+                        kind: action.kind(),
+                    },
+                ));
+            };
+            let temporary_path = if old == new {
+                None
+            } else {
+                Some(self.allocate_replacement_temporary_path(action)?)
+            };
+            OperationRecord::new_replace_ownership(
+                operation_id,
+                desired_hash,
+                action,
+                temporary_path,
+            )
+        } else if action.kind() == ActionKind::RelocateLink {
+            OperationRecord::new_relocate_link(operation_id, desired_hash, action)
+        } else {
+            OperationRecord::new_single_action(operation_id, desired_hash, action)
+        }
+        .map_err(StateRepositoryError::Operation)?;
         let mut candidate = self.state.clone();
         candidate.active_operation = Some(operation);
         self.commit_candidate(candidate)?;
         Ok(action_id)
+    }
+
+    fn allocate_replacement_temporary_path(
+        &self,
+        action: &PlannedAction,
+    ) -> Result<ResolvedPath, StateRepositoryError> {
+        let target = action.preconditions().into_iter().next().ok_or_else(|| {
+            StateRepositoryError::Operation(OperationRecordError::InvalidActionConditions {
+                kind: action.kind(),
+            })
+        })?;
+        let parent = target.target_path().as_ref().parent().ok_or_else(|| {
+            StateRepositoryError::Operation(OperationRecordError::InvalidActionConditions {
+                kind: action.kind(),
+            })
+        })?;
+        for _ in 0..MAX_TEMPORARY_NAME_ATTEMPTS {
+            let nonce = NEXT_REPLACEMENT_NONCE.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(".loadout-replace-{}-{nonce}", std::process::id()));
+            match fs::symlink_metadata(&path) {
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                    return ResolvedPath::new(path).map_err(|_| {
+                        StateRepositoryError::Operation(
+                            OperationRecordError::InvalidActionConditions {
+                                kind: action.kind(),
+                            },
+                        )
+                    });
+                }
+                Ok(_) => continue,
+                Err(source) => {
+                    return Err(StateRepositoryError::StateDirectoryIo {
+                        path: path.clone(),
+                        source,
+                    });
+                }
+            }
+        }
+        Err(StateRepositoryError::Operation(
+            OperationRecordError::InvalidActionConditions {
+                kind: action.kind(),
+            },
+        ))
     }
 
     /// Compatibility entry point for Slice 4's create-only coordinator.
@@ -291,6 +380,13 @@ impl LockedStateRepository {
             RecordedKnownStateUpdate::RemoveMissing { resource_id } => candidate
                 .known
                 .with_missing_resource_removed(&resource_id)
+                .map_err(StateRepositoryError::KnownState)?,
+            RecordedKnownStateUpdate::ReplaceIdentity {
+                old_resource,
+                new_resource,
+            } => candidate
+                .known
+                .with_replaced_identity(&old_resource, new_resource)
                 .map_err(StateRepositoryError::KnownState)?,
         };
         self.commit_candidate(candidate)
@@ -504,6 +600,13 @@ fn validate_succeeded_actions(
             RecordedKnownStateUpdate::RemoveMissing { resource_id } => {
                 known.get(&resource_id).is_none()
             }
+            RecordedKnownStateUpdate::ReplaceIdentity {
+                old_resource,
+                new_resource,
+            } => {
+                known.get(old_resource.resource_id()).is_none()
+                    && known.get(new_resource.resource_id()) == Some(&new_resource)
+            }
         };
         if !matches {
             return Err(StateDecodeError::SucceededActionKnownMismatch {
@@ -538,6 +641,45 @@ fn validate_unfinished_stale_action_known_state(
             ActionKind::ForgetMissing => known
                 .get(action.resource_id())
                 .is_some_and(|resource| resource.target_path() == action.target_path()),
+            ActionKind::ReplaceLink => match action.replacement_facts() {
+                Some(facts) => KnownFileLink::new(
+                    action.resource_id().clone(),
+                    facts.old_link_target().as_path().clone(),
+                    facts.target_path().clone(),
+                    facts.old_link_target().clone(),
+                )
+                .is_ok_and(|old_resource| {
+                    known.get(old_resource.resource_id()) == Some(&old_resource)
+                }),
+                None => false,
+            },
+            ActionKind::ReplaceOwnership => match action
+                .known_state_update_after_success()
+                .map_err(StateDecodeError::InvalidOperation)?
+            {
+                RecordedKnownStateUpdate::ReplaceIdentity {
+                    old_resource,
+                    new_resource,
+                } => {
+                    known.get(old_resource.resource_id()) == Some(&old_resource)
+                        && known.get(new_resource.resource_id()).is_none()
+                }
+                _ => {
+                    unreachable!("a validated ownership handoff has an identity replacement update")
+                }
+            },
+            ActionKind::RelocateLink => match action.relocation_facts() {
+                Some(facts) => KnownFileLink::new(
+                    action.resource_id().clone(),
+                    facts.old_link_target().as_path().clone(),
+                    facts.old_target_path().clone(),
+                    facts.old_link_target().clone(),
+                )
+                .is_ok_and(|old_resource| {
+                    known.get(old_resource.resource_id()) == Some(&old_resource)
+                }),
+                None => false,
+            },
             ActionKind::CreateLink => true,
             _ => true,
         };
@@ -908,6 +1050,7 @@ mod tests {
 
     use super::*;
     use crate::domain::file_link::ResolvedFileLink;
+    use crate::domain::hashes::definition_hash;
     use crate::domain::ids::FullyQualifiedResourceId;
     use crate::domain::known::KnownFileLink;
 
@@ -984,6 +1127,60 @@ mod tests {
             ActionKind::ForgetMissing => PlannedAction::forget_missing(previous),
             _ => panic!("test helper supports only Slice 5 stale actions"),
         }
+    }
+
+    fn replace_ownership_action(source: &str) -> PlannedAction {
+        let previous = KnownFileLink::from_resolved(
+            &ResolvedFileLink::new(
+                FullyQualifiedResourceId::parse("base/git").unwrap(),
+                path("loadout-state-store", "git/config"),
+                path("loadout-state-home", ".gitconfig"),
+            )
+            .unwrap(),
+        );
+        let desired = ResolvedFileLink::new(
+            FullyQualifiedResourceId::parse("base/git-renamed").unwrap(),
+            path("loadout-state-store", source),
+            path("loadout-state-home", ".gitconfig"),
+        )
+        .unwrap();
+        PlannedAction::replace_ownership(desired, previous).unwrap()
+    }
+
+    fn relocate_action() -> PlannedAction {
+        let previous = KnownFileLink::from_resolved(
+            &ResolvedFileLink::new(
+                FullyQualifiedResourceId::parse("base/git").unwrap(),
+                path("loadout-state-store", "git/config"),
+                path("loadout-state-home", ".gitconfig"),
+            )
+            .unwrap(),
+        );
+        let desired = ResolvedFileLink::new(
+            FullyQualifiedResourceId::parse("base/git").unwrap(),
+            path("loadout-state-store", "git/config"),
+            path("loadout-state-home", ".config/gitconfig"),
+        )
+        .unwrap();
+        PlannedAction::relocate_link(desired, previous).unwrap()
+    }
+
+    fn replace_action() -> PlannedAction {
+        let previous = KnownFileLink::from_resolved(
+            &ResolvedFileLink::new(
+                FullyQualifiedResourceId::parse("base/git").unwrap(),
+                path("loadout-state-store", "git/config"),
+                path("loadout-state-home", ".gitconfig"),
+            )
+            .unwrap(),
+        );
+        let desired = ResolvedFileLink::new(
+            FullyQualifiedResourceId::parse("base/git").unwrap(),
+            path("loadout-state-store", "git/replacement"),
+            path("loadout-state-home", ".gitconfig"),
+        )
+        .unwrap();
+        PlannedAction::replace_link(desired, previous).unwrap()
     }
 
     fn desired_hash() -> DesiredHash {
@@ -1180,6 +1377,178 @@ mod tests {
     }
 
     #[test]
+    fn ownership_handoff_persists_old_and_new_identity_facts_and_commits_them_together() {
+        for (source, expects_temporary) in [("git/config", false), ("git/replacement", true)] {
+            let directory = TestStateDirectory::new();
+            let repository = directory.repository();
+            let mut locked = repository.acquire_exclusive().unwrap();
+
+            let create_id = locked
+                .begin_create_operation(desired_hash(), &create_action())
+                .unwrap();
+            locked.mark_running(&create_id).unwrap();
+            locked.commit_create_succeeded(&create_id).unwrap();
+            locked.close_finished_operation().unwrap();
+
+            let action_id = locked
+                .begin_operation(desired_hash(), &replace_ownership_action(source))
+                .unwrap();
+            let pending: serde_json::Value =
+                serde_json::from_slice(&fs::read(directory.state_file()).unwrap()).unwrap();
+            let action = &pending["active_operation"]["actions"]["a1"];
+            assert_eq!(action["kind"], "replace_ownership");
+            assert_eq!(action["old_resource_id"], "base/git");
+            assert_eq!(action["resource_id"], "base/git-renamed");
+            assert_eq!(action["temporary_path"].is_null(), !expects_temporary);
+
+            locked.mark_running(&action_id).unwrap();
+            drop(locked);
+            let loaded = repository.load().unwrap();
+            let recorded = loaded
+                .active_operation()
+                .unwrap()
+                .action(&action_id)
+                .unwrap();
+            assert_eq!(recorded.status(), ActionStatus::Running);
+            assert_eq!(
+                recorded.replaced_resource_id().unwrap().as_str(),
+                "base/git"
+            );
+            assert_eq!(recorded.replacement_facts().is_some(), expects_temporary);
+
+            let mut locked = repository.acquire_exclusive().unwrap();
+            locked.commit_succeeded(&action_id).unwrap();
+            assert!(
+                locked
+                    .state()
+                    .known()
+                    .get(&FullyQualifiedResourceId::parse("base/git").unwrap())
+                    .is_none()
+            );
+            assert!(
+                locked
+                    .state()
+                    .known()
+                    .get(&FullyQualifiedResourceId::parse("base/git-renamed").unwrap())
+                    .is_some()
+            );
+            locked.close_finished_operation().unwrap();
+        }
+    }
+
+    #[test]
+    fn unfinished_ownership_handoff_with_an_existing_destination_is_rejected_as_corrupt_state() {
+        let directory = TestStateDirectory::new();
+        let repository = directory.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let create_id = locked
+            .begin_create_operation(desired_hash(), &create_action())
+            .unwrap();
+        locked.mark_running(&create_id).unwrap();
+        locked.commit_create_succeeded(&create_id).unwrap();
+        locked.close_finished_operation().unwrap();
+        let action_id = locked
+            .begin_operation(desired_hash(), &replace_ownership_action("git/config"))
+            .unwrap();
+        locked.mark_running(&action_id).unwrap();
+        drop(locked);
+
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.state_file()).unwrap()).unwrap();
+        let destination = ResolvedFileLink::new(
+            FullyQualifiedResourceId::parse("base/git-renamed").unwrap(),
+            path("loadout-state-store", "git/other"),
+            path("loadout-state-home", ".other"),
+        )
+        .unwrap();
+        document["resources"]["base/git-renamed"] = serde_json::json!({
+            "definition_hash": definition_hash(&destination).unwrap().as_str(),
+            "file_link": {
+                "source_path": destination.source_path().as_ref(),
+                "target_path": destination.target_path().as_ref(),
+                "link_target": destination.link_target().as_path().as_ref(),
+            }
+        });
+        fs::write(
+            directory.state_file(),
+            serde_json::to_vec(&document).unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            repository.load(),
+            Err(StateRepositoryError::InvalidState {
+                source: StateDecodeError::ActiveActionKnownMismatch { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn relocation_persists_both_target_facts_and_updates_known_only_after_success() {
+        let directory = TestStateDirectory::new();
+        let repository = directory.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let create_id = locked
+            .begin_create_operation(desired_hash(), &create_action())
+            .unwrap();
+        locked.mark_running(&create_id).unwrap();
+        locked.commit_create_succeeded(&create_id).unwrap();
+        locked.close_finished_operation().unwrap();
+
+        let action_id = locked
+            .begin_operation(desired_hash(), &relocate_action())
+            .unwrap();
+        let pending: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.state_file()).unwrap()).unwrap();
+        let action = &pending["active_operation"]["actions"]["a1"];
+        assert_eq!(action["kind"], "relocate_link");
+        assert_eq!(
+            action["old_target_path"].as_str(),
+            path("loadout-state-home", ".gitconfig").as_ref().to_str()
+        );
+        assert_eq!(
+            action["target_path"].as_str(),
+            path("loadout-state-home", ".config/gitconfig")
+                .as_ref()
+                .to_str()
+        );
+        assert_eq!(action["precondition"]["target"], "expected_link");
+        assert_eq!(action["postcondition"]["target"], "expected_link");
+
+        locked.mark_running(&action_id).unwrap();
+        drop(locked);
+        let loaded = repository.load().unwrap();
+        let facts = loaded
+            .active_operation()
+            .unwrap()
+            .action(&action_id)
+            .unwrap()
+            .relocation_facts()
+            .unwrap();
+        assert_eq!(
+            facts.old_target_path(),
+            &path("loadout-state-home", ".gitconfig")
+        );
+        assert_eq!(
+            facts.new_target_path(),
+            &path("loadout-state-home", ".config/gitconfig")
+        );
+
+        let mut locked = repository.acquire_exclusive().unwrap();
+        locked.commit_succeeded(&action_id).unwrap();
+        let known = locked
+            .state()
+            .known()
+            .get(&FullyQualifiedResourceId::parse("base/git").unwrap())
+            .unwrap();
+        assert_eq!(
+            known.target_path(),
+            &path("loadout-state-home", ".config/gitconfig")
+        );
+    }
+
+    #[test]
     fn active_stale_action_without_its_required_known_fact_is_rejected_as_corrupt_state() {
         for kind in [ActionKind::RemoveLink, ActionKind::ForgetMissing] {
             let directory = TestStateDirectory::new();
@@ -1214,6 +1583,83 @@ mod tests {
                     ..
                 })
             ));
+        }
+    }
+
+    #[test]
+    fn unfinished_replace_link_without_its_exact_old_known_fact_is_rejected_as_corrupt_state() {
+        for status in [
+            ActionStatus::Pending,
+            ActionStatus::Running,
+            ActionStatus::Failed,
+            ActionStatus::Skipped,
+            ActionStatus::Uncertain,
+        ] {
+            let directory = TestStateDirectory::new();
+            let repository = directory.repository();
+            let mut locked = repository.acquire_exclusive().unwrap();
+            let create_id = locked
+                .begin_create_operation(desired_hash(), &create_action())
+                .unwrap();
+            locked.mark_running(&create_id).unwrap();
+            locked.commit_create_succeeded(&create_id).unwrap();
+            locked.close_finished_operation().unwrap();
+
+            let action_id = locked
+                .begin_operation(desired_hash(), &replace_action())
+                .unwrap();
+            match status {
+                ActionStatus::Pending => {}
+                ActionStatus::Running => locked.mark_running(&action_id).unwrap(),
+                ActionStatus::Failed | ActionStatus::Uncertain => {
+                    locked.mark_running(&action_id).unwrap();
+                    locked.mark_without_known(&action_id, status).unwrap();
+                }
+                ActionStatus::Skipped => locked
+                    .mark_without_known(&action_id, ActionStatus::Skipped)
+                    .unwrap(),
+                ActionStatus::Succeeded => unreachable!(),
+            }
+            drop(locked);
+
+            let document: serde_json::Value =
+                serde_json::from_slice(&fs::read(directory.state_file()).unwrap()).unwrap();
+            for changed in [false, true] {
+                let mut corrupt = document.clone();
+                corrupt["resources"] = if changed {
+                    let replacement = ResolvedFileLink::new(
+                        FullyQualifiedResourceId::parse("base/git").unwrap(),
+                        path("loadout-state-store", "git/other"),
+                        path("loadout-state-home", ".gitconfig"),
+                    )
+                    .unwrap();
+                    serde_json::json!({
+                        "base/git": {
+                            "definition_hash": definition_hash(&replacement).unwrap().as_str(),
+                            "file_link": {
+                                "source_path": replacement.source_path().as_ref(),
+                                "target_path": replacement.target_path().as_ref(),
+                                "link_target": replacement.link_target().as_path().as_ref(),
+                            }
+                        }
+                    })
+                } else {
+                    serde_json::json!({})
+                };
+                fs::write(
+                    directory.state_file(),
+                    serde_json::to_vec(&corrupt).unwrap(),
+                )
+                .unwrap();
+
+                assert!(matches!(
+                    repository.load(),
+                    Err(StateRepositoryError::InvalidState {
+                        source: StateDecodeError::ActiveActionKnownMismatch { .. },
+                        ..
+                    })
+                ));
+            }
         }
     }
 

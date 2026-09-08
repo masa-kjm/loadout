@@ -27,13 +27,15 @@ The references help choose evidence. They do not replace the authoritative docum
 For each proposed test group, state:
 
 - the owning contract and the precise behavior being proved;
-- the test layer and why a narrower layer would be insufficient;
+- the test layer and, when non-obvious, why a narrower layer cannot prove the required fact;
 - the controlled setup, including only disposable home, store, configuration, and state directories;
-- the action or failure injection point;
+- the stimulus and, when applicable, the semantic failure boundary or platform condition to inject, without prescribing a mock, trait, method, or module seam unless that seam is itself part of the authoritative contract;
 - assertions on Plan, diagnostics category, filesystem observation, Known state, operation record, process status, or output category as applicable; and
 - the relevant negative, zero-mutation, recovery, and platform cases.
 
-Prefer assertions on structured outcomes and filesystem or state snapshots over incidental diagnostic wording. Do not expose a new public API merely to make a test compile. State any unavailable platform capability or fault-injection limitation explicitly instead of silently omitting the evidence.
+Prefer assertions on structured outcomes and filesystem or state snapshots over incidental diagnostic wording.
+Prefer assertions that remain valid across internal refactors that preserve the authoritative contract; do not couple evidence to private modules, traits, helper calls, or orchestration shape unless that structure is itself part of the contract under test.
+Do not expose a new public API merely to make a test compile.
 
 Use this response shape unless the user requests another format:
 

@@ -1,5 +1,6 @@
 //! Strict state-file persistence, exclusive locking, and operation transitions.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -40,6 +41,20 @@ impl PersistedState {
         active_operation: Option<OperationRecord>,
     ) -> Result<Self, StateDecodeError> {
         if let Some(operation) = &active_operation {
+            for (_, action) in operation.actions() {
+                if let Some(facts) = action.replacement_facts() {
+                    if known
+                        .resources()
+                        .any(|resource| resource.target_path() == facts.temporary_path())
+                    {
+                        return Err(StateDecodeError::InvalidOperation(
+                            OperationRecordError::DuplicateTargetPath {
+                                target_path: facts.temporary_path().clone(),
+                            },
+                        ));
+                    }
+                }
+            }
             validate_succeeded_actions(&known, operation)?;
             validate_unfinished_stale_action_known_state(&known, operation)?;
         }
@@ -89,6 +104,8 @@ impl StateRepository {
 
     /// Creates the state directory and holds the exclusive operating-system lock.
     pub(crate) fn acquire_exclusive(&self) -> Result<LockedStateRepository, StateRepositoryError> {
+        #[cfg(test)]
+        crate::test_support::assert_mutation_allowed();
         fs::create_dir_all(self.state_directory.as_ref()).map_err(|source| {
             StateRepositoryError::StateDirectoryIo {
                 path: self.state_directory.as_ref().to_path_buf(),
@@ -114,8 +131,11 @@ impl StateRepository {
             repository: self.clone(),
             state,
             _lock: lock,
+            last_closed_operation: None,
             #[cfg(test)]
             next_commit_fault: None,
+            #[cfg(test)]
+            commits_before_fault: 0,
             #[cfg(test)]
             fail_state_write_preflight: self.fail_state_write_preflight,
         })
@@ -135,13 +155,31 @@ impl StateRepository {
     }
 }
 
+/// Operation facts captured from a locked session, without another state-file read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum OperationOutcome {
+    Absent,
+    Retained(OperationRecord),
+    Closed(OperationRecord),
+}
+
+/// Whether a failed commit replaced the authoritative state file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CommitFailureEffect {
+    PreviousStateRetained,
+    ReplacedDurabilityUnconfirmed,
+}
+
 /// A repository session that owns the exclusive state lock and its validated state.
 pub(crate) struct LockedStateRepository {
     repository: StateRepository,
     state: PersistedState,
     _lock: ExclusiveStateLock,
+    last_closed_operation: Option<OperationRecord>,
     #[cfg(test)]
     next_commit_fault: Option<CommitStage>,
+    #[cfg(test)]
+    commits_before_fault: usize,
     #[cfg(test)]
     fail_state_write_preflight: bool,
 }
@@ -152,10 +190,20 @@ impl LockedStateRepository {
         &self.state
     }
 
+    pub(crate) fn operation_outcome(&self) -> OperationOutcome {
+        match (&self.state.active_operation, &self.last_closed_operation) {
+            (Some(operation), _) => OperationOutcome::Retained(operation.clone()),
+            (None, Some(operation)) => OperationOutcome::Closed(operation.clone()),
+            (None, None) => OperationOutcome::Absent,
+        }
+    }
+
     /// Proves that the locked repository can use its durable-state channel without creating an operation record or changing `state.json`.
     ///
     /// A read-only state directory or state file is rejected before confirmation. These are snapshots: ACL, permission, or storage changes can still occur later and are handled by the operation-record protocol.
     pub(crate) fn preflight_writable(&mut self) -> Result<(), StateRepositoryError> {
+        #[cfg(test)]
+        crate::test_support::assert_mutation_allowed();
         #[cfg(test)]
         if std::mem::take(&mut self.fail_state_write_preflight) {
             return Err(StateRepositoryError::StateWritePreflight {
@@ -214,66 +262,76 @@ impl LockedStateRepository {
         desired_hash: DesiredHash,
         action: &PlannedAction,
     ) -> Result<ActionId, StateRepositoryError> {
+        let ids = self.begin_actions(desired_hash, std::slice::from_ref(action))?;
+        Ok(ids[0].clone())
+    }
+
+    /// Records the complete execution sequence in one atomic commit. Returned IDs correspond to the supplied sequence; persisted object order is irrelevant.
+    pub(crate) fn begin_actions(
+        &mut self,
+        desired_hash: DesiredHash,
+        actions: &[PlannedAction],
+    ) -> Result<Vec<ActionId>, StateRepositoryError> {
         if self.state.active_operation.is_some() {
             return Err(StateRepositoryError::ActiveOperationPresent);
         }
-        let operation_id = new_operation_id();
-        let (operation, action_id) = if action.kind() == ActionKind::ReplaceLink {
-            let temporary_path = self.allocate_replacement_temporary_path(action)?;
-            OperationRecord::new_replace_link(operation_id, desired_hash, action, temporary_path)
-        } else if action.kind() == ActionKind::ReplaceOwnership {
-            let preconditions = action.preconditions();
-            let [
-                crate::domain::plan::TargetCondition::ExpectedLink {
-                    link_target: old, ..
-                },
-            ] = preconditions.as_slice()
-            else {
-                return Err(StateRepositoryError::Operation(
-                    OperationRecordError::InvalidActionConditions {
-                        kind: action.kind(),
-                    },
-                ));
-            };
-            let postconditions = action.postconditions();
-            let [
-                crate::domain::plan::TargetCondition::ExpectedLink {
-                    link_target: new, ..
-                },
-            ] = postconditions.as_slice()
-            else {
-                return Err(StateRepositoryError::Operation(
-                    OperationRecordError::InvalidActionConditions {
-                        kind: action.kind(),
-                    },
-                ));
-            };
-            let temporary_path = if old == new {
-                None
-            } else {
-                Some(self.allocate_replacement_temporary_path(action)?)
-            };
-            OperationRecord::new_replace_ownership(
-                operation_id,
-                desired_hash,
-                action,
-                temporary_path,
-            )
-        } else if action.kind() == ActionKind::RelocateLink {
-            OperationRecord::new_relocate_link(operation_id, desired_hash, action)
-        } else {
-            OperationRecord::new_single_action(operation_id, desired_hash, action)
+        let mut reserved = self
+            .state
+            .known()
+            .resources()
+            .map(|resource| resource.target_path().clone())
+            .collect::<BTreeSet<_>>();
+        for action in actions {
+            for condition in action
+                .preconditions()
+                .into_iter()
+                .chain(action.postconditions())
+            {
+                reserved.insert(condition.target_path().clone());
+            }
         }
-        .map_err(StateRepositoryError::Operation)?;
+        let mut recorded = Vec::new();
+        let mut ids = Vec::new();
+        for (index, action) in actions.iter().enumerate() {
+            let id = ActionId::parse(format!("a{}", index + 1))
+                .map_err(StateRepositoryError::Operation)?;
+            let facts = match action.kind() {
+                ActionKind::ReplaceLink => crate::state::operation::RecordedAction::replace_link(
+                    action,
+                    self.allocate_replacement_temporary_path(action, &reserved)?,
+                ),
+                ActionKind::ReplaceOwnership => {
+                    let temporary = if action.preconditions() == action.postconditions() {
+                        None
+                    } else {
+                        Some(self.allocate_replacement_temporary_path(action, &reserved)?)
+                    };
+                    crate::state::operation::RecordedAction::replace_ownership(action, temporary)
+                }
+                ActionKind::RelocateLink => {
+                    crate::state::operation::RecordedAction::relocate_link(action)
+                }
+                _ => crate::state::operation::RecordedAction::from_action(action),
+            }
+            .map_err(StateRepositoryError::Operation)?;
+            if let Some(facts) = facts.replacement_facts() {
+                reserved.insert(facts.temporary_path().clone());
+            }
+            ids.push(id.clone());
+            recorded.push((id, facts));
+        }
+        let operation = OperationRecord::from_actions(new_operation_id(), desired_hash, recorded)
+            .map_err(StateRepositoryError::Operation)?;
         let mut candidate = self.state.clone();
         candidate.active_operation = Some(operation);
         self.commit_candidate(candidate)?;
-        Ok(action_id)
+        Ok(ids)
     }
 
     fn allocate_replacement_temporary_path(
         &self,
         action: &PlannedAction,
+        reserved: &BTreeSet<ResolvedPath>,
     ) -> Result<ResolvedPath, StateRepositoryError> {
         let target = action.preconditions().into_iter().next().ok_or_else(|| {
             StateRepositoryError::Operation(OperationRecordError::InvalidActionConditions {
@@ -288,6 +346,9 @@ impl LockedStateRepository {
         for _ in 0..MAX_TEMPORARY_NAME_ATTEMPTS {
             let nonce = NEXT_REPLACEMENT_NONCE.fetch_add(1, Ordering::Relaxed);
             let path = parent.join(format!(".loadout-replace-{}-{nonce}", std::process::id()));
+            if reserved.iter().any(|reserved| reserved.as_ref() == path) {
+                continue;
+            }
             match fs::symlink_metadata(&path) {
                 Err(source) if source.kind() == io::ErrorKind::NotFound => {
                     return ResolvedPath::new(path).map_err(|_| {
@@ -410,8 +471,14 @@ impl LockedStateRepository {
         if !operation.can_close() {
             return Err(StateRepositoryError::OperationNotCloseable);
         }
+        let closed = operation.clone();
         candidate.active_operation = None;
-        self.commit_candidate(candidate)
+        let result = self.commit_candidate(candidate);
+        // The state may have been replaced even when its directory flush failed.
+        if self.state.active_operation.is_none() {
+            self.last_closed_operation = Some(closed);
+        }
+        result
     }
 
     fn commit_candidate(&mut self, candidate: PersistedState) -> Result<(), StateRepositoryError> {
@@ -431,6 +498,8 @@ impl LockedStateRepository {
     }
 
     fn write_state_atomically(&mut self, state: &PersistedState) -> Result<(), CommitError> {
+        #[cfg(test)]
+        crate::test_support::assert_mutation_allowed();
         let document = StateDocument::from_state(state)?;
         let encoded = serde_json::to_vec(&document).map_err(CommitError::Serialize)?;
         let temporary_path = self.unique_temporary_path()?;
@@ -512,6 +581,12 @@ impl LockedStateRepository {
 
     #[cfg(test)]
     fn fail_at(&mut self, stage: CommitStage) -> Result<(), CommitError> {
+        if self.commits_before_fault != 0 {
+            if stage == CommitStage::FlushDirectory {
+                self.commits_before_fault -= 1;
+            }
+            return Ok(());
+        }
         if self.next_commit_fault == Some(stage) {
             self.next_commit_fault = None;
             return Err(CommitError::Injected { stage });
@@ -527,6 +602,13 @@ impl LockedStateRepository {
     #[cfg(test)]
     pub(crate) fn fail_next_commit_at(&mut self, stage: CommitStage) {
         self.next_commit_fault = Some(stage);
+        self.commits_before_fault = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_commit_after(&mut self, successful_commits: usize, stage: CommitStage) {
+        self.fail_next_commit_at(stage);
+        self.commits_before_fault = successful_commits;
     }
 }
 
@@ -878,6 +960,14 @@ pub(crate) enum CommitError {
 }
 
 impl CommitError {
+    pub(crate) fn effect(&self) -> CommitFailureEffect {
+        if self.replacement_completed() {
+            CommitFailureEffect::ReplacedDurabilityUnconfirmed
+        } else {
+            CommitFailureEffect::PreviousStateRetained
+        }
+    }
+
     fn replacement_completed(&self) -> bool {
         if matches!(self, Self::DirectoryFlushAfterReplacement { .. }) {
             return true;
@@ -1194,6 +1284,148 @@ mod tests {
             .action(action_id)
             .unwrap()
             .status()
+    }
+
+    #[test]
+    fn multi_replacement_records_unique_siblings_and_rejects_aliased_recovery_paths() {
+        let workspace = TestStateDirectory::new();
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let home = workspace.root.join("home");
+        fs::create_dir(&home).unwrap();
+        let previous = (0..3)
+            .map(|index| {
+                ResolvedFileLink::new(
+                    FullyQualifiedResourceId::parse(&format!("base/r{index}")).unwrap(),
+                    ResolvedPath::new(workspace.root.join("old-source")).unwrap(),
+                    ResolvedPath::new(home.join(format!("target{index}"))).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let creates = previous
+            .iter()
+            .cloned()
+            .map(PlannedAction::create_link)
+            .collect::<Vec<_>>();
+        let ids = locked.begin_actions(desired_hash(), &creates).unwrap();
+        for id in &ids {
+            locked.mark_running(id).unwrap();
+            locked.commit_succeeded(id).unwrap();
+        }
+        locked.close_finished_operation().unwrap();
+        let replacements = previous
+            .iter()
+            .take(2)
+            .map(|old| {
+                PlannedAction::replace_link(
+                    ResolvedFileLink::new(
+                        old.resource_id().clone(),
+                        ResolvedPath::new(workspace.root.join("new-source")).unwrap(),
+                        old.target_path().clone(),
+                    )
+                    .unwrap(),
+                    KnownFileLink::from_resolved(old),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let ids = locked.begin_actions(desired_hash(), &replacements).unwrap();
+        let state = repository.load().unwrap();
+        let operation = state.active_operation().unwrap();
+        let paths = operation
+            .actions()
+            .map(|(_, action)| action.replacement_facts().unwrap().temporary_path().clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(paths.len(), 2);
+        assert!(
+            paths
+                .iter()
+                .all(|path| path.as_ref().parent() == Some(home.as_path()))
+        );
+        assert_eq!(fs::read_dir(&home).unwrap().count(), 0);
+        let original = fs::read(workspace.state_file()).unwrap();
+        let mut document: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        let shared =
+            document["active_operation"]["actions"][ids[0].as_str()]["temporary_path"].clone();
+        document["active_operation"]["actions"][ids[1].as_str()]["temporary_path"] = shared;
+        fs::write(
+            workspace.state_file(),
+            serde_json::to_vec(&document).unwrap(),
+        )
+        .unwrap();
+        assert!(repository.load().is_err());
+        let mut document: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        document["active_operation"]["actions"][ids[0].as_str()]["temporary_path"] =
+            serde_json::Value::String(
+                previous[1]
+                    .target_path()
+                    .as_ref()
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+        fs::write(
+            workspace.state_file(),
+            serde_json::to_vec(&document).unwrap(),
+        )
+        .unwrap();
+        assert!(repository.load().is_err());
+        // A temporary may not alias an unrelated Known target either.
+        let mut document: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        document["active_operation"]["actions"][ids[0].as_str()]["temporary_path"] =
+            serde_json::Value::String(
+                previous[2]
+                    .target_path()
+                    .as_ref()
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+        fs::write(
+            workspace.state_file(),
+            serde_json::to_vec(&document).unwrap(),
+        )
+        .unwrap();
+        assert!(repository.load().is_err());
+    }
+
+    #[test]
+    fn multi_action_progress_is_atomic_and_ids_do_not_define_execution_order() {
+        let workspace = TestStateDirectory::new();
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let actions = (0..12)
+            .map(|index| {
+                PlannedAction::create_link(
+                    ResolvedFileLink::new(
+                        FullyQualifiedResourceId::parse(&format!("base/r{index}")).unwrap(),
+                        path("loadout-state-store", "source"),
+                        path("loadout-state-home", &format!("target-{index}")),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let ids = locked.begin_actions(desired_hash(), &actions).unwrap();
+        let persisted = repository.load().unwrap();
+        assert_eq!(persisted.active_operation().unwrap().actions().len(), 12);
+        for (id, action) in ids.iter().zip(&actions) {
+            let recorded = persisted.active_operation().unwrap().action(id).unwrap();
+            assert_eq!(recorded.resource_id(), action.resource_id());
+            assert_eq!(recorded.status(), ActionStatus::Pending);
+        }
+        locked.mark_running(&ids[0]).unwrap();
+        locked.commit_succeeded(&ids[0]).unwrap();
+        locked.mark_running(&ids[1]).unwrap();
+        locked.fail_next_commit_at(CommitStage::ReplaceState);
+        assert!(locked.commit_succeeded(&ids[1]).is_err());
+        let persisted = repository.load().unwrap();
+        assert_eq!(persisted.known().resources().len(), 1);
+        assert_eq!(active_status(&persisted, &ids[0]), ActionStatus::Succeeded);
+        assert_eq!(active_status(&persisted, &ids[1]), ActionStatus::Running);
+        assert_eq!(active_status(&persisted, &ids[2]), ActionStatus::Pending);
+        assert!(locked.close_finished_operation().is_err());
     }
 
     #[test]

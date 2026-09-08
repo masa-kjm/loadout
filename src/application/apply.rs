@@ -1,4 +1,4 @@
-//! Non-dry-run coordination for the implemented single file-link actions.
+//! Whole-Plan application coordination and recorded-fact recovery.
 
 use std::fmt;
 
@@ -6,6 +6,7 @@ use crate::domain::actual::TargetObservation;
 use crate::domain::file_link::LinkTarget;
 use crate::domain::hashes::{CanonicalHashError, desired_hash};
 use crate::domain::ids::FullyQualifiedResourceId;
+#[cfg(test)]
 use crate::domain::paths::ResolvedPath;
 use crate::domain::plan::{ActionKind, Plan, PlannedAction, TargetCondition};
 use crate::executor::file_link::{
@@ -14,11 +15,271 @@ use crate::executor::file_link::{
 };
 use crate::inspection::file_link::{FileLinkInspector, TargetInspectionError};
 use crate::planner::file_link::plan;
+#[cfg(test)]
 use crate::resolver::ResolvedApplyInput;
-use crate::state::operation::{ActionStatus, RecordedAction};
-use crate::state::repository::{LockedStateRepository, StateRepository, StateRepositoryError};
+use crate::state::operation::{ActionId, ActionStatus, RecordedAction};
+use crate::state::repository::{
+    CommitFailureEffect, LockedStateRepository, OperationOutcome, StateRepository,
+    StateRepositoryError,
+};
+
+/// Failure stage is independent of error type (notably recovery vs execution uncertainty).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ApplyStage {
+    LockAndState,
+    Recovery,
+    Resolution,
+    Planning,
+    Preflight,
+    OperationCreation,
+    Execution,
+    Closure,
+}
+
+#[derive(Debug)]
+pub(crate) enum ApplyFailureCause {
+    Lifecycle(ApplyError),
+    Input(super::queries::QueryError),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ApplyAction {
+    pub(crate) action_id: Option<ActionId>,
+    pub(crate) resource_id: FullyQualifiedResourceId,
+    pub(crate) kind: ActionKind,
+}
+
+#[derive(Debug)]
+pub(crate) struct ApplyFailure {
+    pub(crate) stage: ApplyStage,
+    pub(crate) cause: ApplyFailureCause,
+    pub(crate) affected_action: Option<ApplyAction>,
+    /// None means locking/loading failed, not that no operation exists.
+    pub(crate) operation: Option<OperationOutcome>,
+    /// Qualifies the recorded statuses; replacement alone is not durable success.
+    pub(crate) commit_failure: Option<CommitFailureEffect>,
+    /// Only actions whose success commit returned successfully.
+    pub(crate) committed: Vec<FullyQualifiedResourceId>,
+    pub(crate) plan: Option<Plan>,
+}
+
+#[derive(Debug)]
+pub(crate) enum ApplyReport {
+    Applied {
+        plan: Plan,
+        committed: Vec<FullyQualifiedResourceId>,
+    },
+    Blocked {
+        plan: Plan,
+    },
+    Declined {
+        plan: Plan,
+    },
+}
+
+/// Accepts declaration selection; no portable declaration is read before recovery.
+pub(crate) fn apply_request(
+    request: &super::queries::DeclarationRequest,
+    confirm: impl FnOnce(&Plan) -> bool,
+) -> Result<ApplyReport, Box<ApplyFailure>> {
+    apply_request_with_hooks(request, confirm, |_, _| {})
+}
+
+fn apply_request_with_hooks(
+    request: &super::queries::DeclarationRequest,
+    confirm: impl FnOnce(&Plan) -> bool,
+    after_running: impl FnMut(usize, &mut LockedStateRepository),
+) -> Result<ApplyReport, Box<ApplyFailure>> {
+    let mut stage = ApplyStage::LockAndState;
+    let mut visible_plan = None;
+    let mut committed = Vec::new();
+    let mut affected_action = None;
+    let mut locked_session = None;
+    let result = (|| -> Result<ApplyReport, ApplyFailureCause> {
+        let lifecycle = ApplyFailureCause::Lifecycle;
+        let state_error = |error| lifecycle(ApplyError::State(error));
+        let repository = StateRepository::new(request.context.state_directory().clone());
+        locked_session = Some(repository.acquire_exclusive().map_err(state_error)?);
+        let locked = locked_session
+            .as_mut()
+            .expect("exclusive session was acquired");
+        stage = ApplyStage::Recovery;
+        if reconcile_active_operation_with_action(
+            locked,
+            request.context.home_directory().as_ref(),
+            &mut affected_action,
+        )
+        .map_err(lifecycle)?
+        {
+            return Err(lifecycle(ApplyError::RecoveryRequired));
+        }
+        stage = ApplyStage::Resolution;
+        let resolved =
+            super::queries::resolve_request(request).map_err(ApplyFailureCause::Input)?;
+        stage = ApplyStage::Planning;
+        let inspector = FileLinkInspector::new(request.context.home_directory().as_ref())
+            .map_err(|error| lifecycle(ApplyError::InitialInspection(error)))?;
+        let actual = inspector
+            .inspect(resolved.desired(), locked.state().known())
+            .map_err(|error| lifecycle(ApplyError::InitialInspection(error)))?;
+        let fresh_plan = plan(resolved.desired(), locked.state().known(), &actual);
+        visible_plan = Some(fresh_plan.clone());
+        if !fresh_plan.is_executable() {
+            return Ok(ApplyReport::Blocked { plan: fresh_plan });
+        }
+        stage = ApplyStage::Preflight;
+        let executor = FileLinkExecutor::new(request.context.home_directory().as_ref())
+            .map_err(|error| lifecycle(ApplyError::InitialInspection(error)))?;
+        for action in fresh_plan.actions() {
+            affected_action = Some(ApplyAction {
+                action_id: None,
+                resource_id: action.resource_id().clone(),
+                kind: action.kind(),
+            });
+            super::dispatch::preflight(&executor, action, &resolved).map_err(lifecycle)?;
+        }
+        affected_action = None;
+        locked
+            .preflight_writable()
+            .map_err(|error| lifecycle(ApplyError::StatePreflight(error)))?;
+        let hash = desired_hash(resolved.desired())
+            .map_err(|error| lifecycle(ApplyError::DesiredHash(error)))?;
+        if !confirm(&fresh_plan) {
+            return Ok(ApplyReport::Declined { plan: fresh_plan });
+        }
+        // Noop is a report, without an executor phase or a Known transition.
+        let actions = fresh_plan
+            .actions()
+            .iter()
+            .filter(|action| action.kind() != ActionKind::Noop)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !actions.is_empty() {
+            stage = ApplyStage::OperationCreation;
+            let ids = locked.begin_actions(hash, &actions).map_err(state_error)?;
+            stage = ApplyStage::Execution;
+            execute_actions(
+                locked,
+                &actions,
+                &ids,
+                &mut committed,
+                &mut affected_action,
+                after_running,
+                |action, recorded| super::dispatch::execute(&executor, action, recorded, &resolved),
+            )
+            .map_err(lifecycle)?;
+            stage = ApplyStage::Closure;
+            locked.close_finished_operation().map_err(state_error)?;
+        }
+        Ok(ApplyReport::Applied {
+            plan: fresh_plan,
+            committed: committed.clone(),
+        })
+    })();
+    result.map_err(|cause| {
+        // Capture repository-owned facts while the exclusive session still lives.
+        let operation = locked_session
+            .as_ref()
+            .map(LockedStateRepository::operation_outcome);
+        let commit_failure = match &cause {
+            ApplyFailureCause::Lifecycle(ApplyError::State(StateRepositoryError::Commit(
+                error,
+            ))) => Some(error.effect()),
+            _ => None,
+        };
+        Box::new(ApplyFailure {
+            stage,
+            cause,
+            affected_action,
+            operation,
+            commit_failure,
+            committed,
+            plan: visible_plan,
+        })
+    })
+}
+
+/// Dry run deliberately shares only the read-only planning path.
+pub(crate) fn dry_run(
+    request: &super::queries::DeclarationRequest,
+) -> Result<super::queries::PlanReport, super::queries::QueryError> {
+    super::queries::plan_request(request)
+}
+
+fn execute_actions(
+    locked: &mut LockedStateRepository,
+    actions: &[PlannedAction],
+    ids: &[crate::state::operation::ActionId],
+    committed: &mut Vec<FullyQualifiedResourceId>,
+    affected_action: &mut Option<ApplyAction>,
+    mut after_running: impl FnMut(usize, &mut LockedStateRepository),
+    mut execute: impl FnMut(&PlannedAction, &RecordedAction) -> Result<(), ApplyError>,
+) -> Result<(), ApplyError> {
+    for (index, (action, id)) in actions.iter().zip(ids).enumerate() {
+        *affected_action = Some(ApplyAction {
+            action_id: Some(id.clone()),
+            resource_id: action.resource_id().clone(),
+            kind: action.kind(),
+        });
+        locked.mark_running(id).map_err(ApplyError::State)?;
+        after_running(index, locked);
+        let recorded = locked
+            .state()
+            .active_operation()
+            .and_then(|op| op.action(id))
+            .expect("complete operation was persisted before execution")
+            .clone();
+        let execution = execute(action, &recorded);
+        let classification = match &execution {
+            Ok(()) => ExecutionClassification::Succeeded,
+            Err(ApplyError::Preflight(error)) => classify_execution_error(error),
+            Err(ApplyError::ReplacePreflight(error)) => classify_replace_execution_error(error),
+            Err(ApplyError::RelocatePreflight(error)) => classify_relocate_execution_error(error),
+            Err(ApplyError::StalePreflight(error)) => classify_stale_execution_error(error),
+            Err(_) => ExecutionClassification::Uncertain,
+        };
+        match classification {
+            ExecutionClassification::Succeeded => {
+                // A commit error stops immediately: the durable record, not an in-memory guess, determines recovery on the next invocation.
+                locked.commit_succeeded(id).map_err(ApplyError::State)?;
+                committed.push(action.resource_id().clone());
+            }
+            ExecutionClassification::Failed | ExecutionClassification::Uncertain => {
+                let status = if classification == ExecutionClassification::Failed {
+                    ActionStatus::Failed
+                } else {
+                    ActionStatus::Uncertain
+                };
+                locked
+                    .mark_without_known(id, status)
+                    .map_err(ApplyError::State)?;
+                let failed_action = affected_action.clone();
+                for (pending, action) in ids[index + 1..].iter().zip(&actions[index + 1..]) {
+                    *affected_action = Some(ApplyAction {
+                        action_id: Some(pending.clone()),
+                        resource_id: action.resource_id().clone(),
+                        kind: action.kind(),
+                    });
+                    locked
+                        .mark_without_known(pending, ActionStatus::Skipped)
+                        .map_err(ApplyError::State)?;
+                }
+                *affected_action = failed_action;
+                if classification == ExecutionClassification::Failed {
+                    locked
+                        .close_finished_operation()
+                        .map_err(ApplyError::State)?;
+                }
+                return execution;
+            }
+        }
+    }
+    *affected_action = None;
+    Ok(())
+}
 
 /// Coordinates a confirmed non-dry-run apply for one home and state directory.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ApplyCoordinator {
     home_directory: ResolvedPath,
@@ -27,6 +288,7 @@ pub(crate) struct ApplyCoordinator {
     force_capability_failure: bool,
 }
 
+#[cfg(test)]
 impl ApplyCoordinator {
     /// Binds resolved machine paths without inspecting targets or writing state.
     pub(crate) fn new(home_directory: ResolvedPath, state_directory: ResolvedPath) -> Self {
@@ -973,6 +1235,16 @@ fn reconcile_active_operation(
     locked: &mut LockedStateRepository,
     home_directory: &std::path::Path,
 ) -> Result<bool, ApplyError> {
+    reconcile_active_operation_with_action(locked, home_directory, &mut None)
+}
+
+fn reconcile_active_operation_with_action(
+    locked: &mut LockedStateRepository,
+    home_directory: &std::path::Path,
+    affected_action: &mut Option<ApplyAction>,
+) -> Result<bool, ApplyError> {
+    #[cfg(test)]
+    crate::test_support::assert_mutation_allowed();
     let Some(operation) = locked.state().active_operation() else {
         return Ok(false);
     };
@@ -994,6 +1266,13 @@ fn reconcile_active_operation(
         .flatten();
 
     for (action_id, action) in actions {
+        if !action.status().closes_operation() {
+            *affected_action = Some(ApplyAction {
+                action_id: Some(action_id.clone()),
+                resource_id: action.resource_id().clone(),
+                kind: action.kind(),
+            });
+        }
         match action.status() {
             ActionStatus::Pending => locked
                 .mark_without_known(&action_id, ActionStatus::Skipped)
@@ -1028,11 +1307,23 @@ fn reconcile_active_operation(
         .active_operation()
         .is_some_and(|operation| operation.can_close())
     {
+        *affected_action = None;
         locked
             .close_finished_operation()
             .map_err(ApplyError::State)?;
+        *affected_action = None;
         Ok(false)
     } else {
+        *affected_action = locked.state().active_operation().and_then(|operation| {
+            operation
+                .actions()
+                .find(|(_, action)| action.status() == ActionStatus::Uncertain)
+                .map(|(id, action)| ApplyAction {
+                    action_id: Some(id.clone()),
+                    resource_id: action.resource_id().clone(),
+                    kind: action.kind(),
+                })
+        });
         Ok(true)
     }
 }
@@ -1197,6 +1488,52 @@ mod tests {
             )
         }
 
+        fn snapshot(&self) -> BTreeMap<PathBuf, Vec<u8>> {
+            fn visit(path: &std::path::Path, snapshot: &mut BTreeMap<PathBuf, Vec<u8>>) {
+                let metadata = fs::symlink_metadata(path).unwrap();
+                if metadata.file_type().is_symlink() {
+                    snapshot.insert(
+                        path.to_owned(),
+                        format!("link:{:?}", fs::read_link(path).unwrap()).into_bytes(),
+                    );
+                } else if metadata.is_dir() {
+                    snapshot.insert(path.to_owned(), b"directory".to_vec());
+                    for entry in fs::read_dir(path).unwrap() {
+                        visit(&entry.unwrap().path(), snapshot);
+                    }
+                } else {
+                    snapshot.insert(path.to_owned(), fs::read(path).unwrap());
+                }
+            }
+            let mut snapshot = BTreeMap::new();
+            visit(&self.root, &mut snapshot);
+            snapshot
+        }
+
+        fn request(&self, resources: &[(&str, &str)]) -> super::super::queries::DeclarationRequest {
+            self.write("config/environment.yaml", "schema_version: 1\ndefault_profile: base\nprofile_discovery:\n  paths: [../profiles]\nstores:\n  dotfiles:\n    type: local\n    path: ../store\n");
+            let mut profile = String::from("schema_version: 1\nid: base\nresources:");
+            if resources.is_empty() {
+                profile.push_str(" {}\n");
+            } else {
+                profile.push('\n');
+            }
+            for (id, target) in resources {
+                profile.push_str(&format!("  {id}:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/{target}\n"));
+            }
+            self.write("profiles/base.yaml", &profile);
+            super::super::queries::DeclarationRequest {
+                context: ResolverContext::new(
+                    self.path("home"),
+                    self.path("config/loadout.yaml"),
+                    self.path("config/environment.yaml"),
+                    self.path("state"),
+                )
+                .unwrap(),
+                root: None,
+            }
+        }
+
         fn repository(&self) -> StateRepository {
             StateRepository::new(ResolvedPath::new(self.path("state")).unwrap())
         }
@@ -1320,6 +1657,933 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn whole_plan_records_every_action_then_executes_in_plan_order_under_one_lock() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let resources = (0..12)
+            .rev()
+            .map(|n| (format!("r{n:02}"), format!("target{n:02}")))
+            .collect::<Vec<_>>();
+        let refs = resources
+            .iter()
+            .map(|(id, target)| (id.as_str(), target.as_str()))
+            .collect::<Vec<_>>();
+        let request = workspace.request(&refs);
+        let mut observed = Vec::new();
+        let report = apply_request_with_hooks(
+            &request,
+            |plan| {
+                assert_eq!(plan.actions().len(), 12);
+                assert!(
+                    workspace
+                        .repository()
+                        .load()
+                        .unwrap()
+                        .active_operation()
+                        .is_none()
+                );
+                assert!(matches!(
+                    workspace.repository().acquire_exclusive(),
+                    Err(StateRepositoryError::LockContended { .. })
+                ));
+                true
+            },
+            |index, locked| {
+                let persisted = workspace.repository().load().unwrap();
+                let operation = persisted.active_operation().unwrap();
+                assert_eq!(operation.actions().len(), 12);
+                assert_eq!(persisted.known().resources().len(), index);
+                let running = operation
+                    .actions()
+                    .find(|(_, action)| action.status() == ActionStatus::Running)
+                    .unwrap()
+                    .1;
+                observed.push(running.resource_id().to_string());
+                assert_eq!(locked.state(), &persisted);
+            },
+        )
+        .unwrap();
+        let ApplyReport::Applied { committed, .. } = report else {
+            panic!("apply failed")
+        };
+        assert_eq!(
+            observed,
+            (0..12).map(|n| format!("base/r{n:02}")).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            committed
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            observed
+        );
+        let state = workspace.repository().load().unwrap();
+        assert!(state.active_operation().is_none());
+        for n in 0..12 {
+            assert_eq!(
+                fs::read_link(workspace.path(&format!("home/target{n:02}"))).unwrap(),
+                workspace.path("store/git/config")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn later_recheck_failure_retains_earlier_success_and_skips_every_remaining_action() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let request = workspace.request(&[("c", "c"), ("b", "b"), ("a", "a")]);
+        let failure = apply_request_with_hooks(
+            &request,
+            |_| true,
+            |index, _| {
+                if index == 1 {
+                    workspace.write("home/b", "unmanaged");
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(failure.stage, ApplyStage::Execution);
+        assert_eq!(
+            failure
+                .committed
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["base/a"]
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path("home/b")).unwrap(),
+            "unmanaged"
+        );
+        assert!(!workspace.path("home/c").exists());
+        let state = workspace.repository().load().unwrap();
+        assert_eq!(state.known().resources().len(), 1);
+        assert_eq!(
+            failure.operation,
+            Some(OperationOutcome::Retained(
+                state.active_operation().unwrap().clone()
+            ))
+        );
+        assert!(failure.commit_failure.is_none());
+        assert_eq!(
+            failure
+                .affected_action
+                .as_ref()
+                .unwrap()
+                .resource_id
+                .as_str(),
+            "base/b"
+        );
+        let statuses = state
+            .active_operation()
+            .unwrap()
+            .actions()
+            .map(|(_, a)| (a.resource_id().to_string(), a.status()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            [
+                ("base/a".into(), ActionStatus::Succeeded),
+                ("base/b".into(), ActionStatus::Uncertain),
+                ("base/c".into(), ActionStatus::Skipped)
+            ]
+        );
+        // Initial recovery uncertainty is a different stage and prevents even reading current YAML.
+        workspace.write("config/environment.yaml", "invalid");
+        let next = apply_request(&request, |_| {
+            panic!("no confirmation after uncertain recovery")
+        })
+        .unwrap_err();
+        assert_eq!(next.stage, ApplyStage::Recovery);
+        assert_eq!(next.operation, failure.operation);
+        assert_eq!(next.affected_action, failure.affected_action);
+        assert!(matches!(
+            next.cause,
+            ApplyFailureCause::Lifecycle(ApplyError::RecoveryRequired)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multi_action_commit_failure_recovers_then_plans_current_declarations() {
+        for fault in [
+            CommitStage::CreateTemporary,
+            CommitStage::WriteTemporary,
+            CommitStage::FlushTemporary,
+            CommitStage::ReopenAndValidate,
+            CommitStage::ReplaceState,
+            CommitStage::FlushDirectory,
+        ] {
+            let workspace = TestWorkspace::new();
+            workspace.write("store/git/config", "source\n");
+            let request = workspace.request(&[("a", "a"), ("b", "b"), ("c", "c")]);
+            let failure = apply_request_with_hooks(
+                &request,
+                |_| true,
+                |index, locked| {
+                    if index == 1 {
+                        locked.fail_next_commit_at(fault);
+                    }
+                },
+            )
+            .unwrap_err();
+            assert_eq!(failure.stage, ApplyStage::Execution);
+            assert_eq!(failure.committed.len(), 1);
+            assert_eq!(
+                fs::read_link(workspace.path("home/b")).unwrap(),
+                workspace.path("store/git/config")
+            );
+            assert!(!workspace.path("home/c").exists());
+            let state = workspace.repository().load().unwrap();
+            assert!(state.active_operation().is_some());
+            assert_eq!(
+                failure.operation,
+                Some(OperationOutcome::Retained(
+                    state.active_operation().unwrap().clone()
+                ))
+            );
+            let affected = failure.affected_action.as_ref().unwrap();
+            assert_eq!(affected.resource_id.as_str(), "base/b");
+            assert_eq!(affected.kind, ActionKind::CreateLink);
+            let recorded = state
+                .active_operation()
+                .unwrap()
+                .action(affected.action_id.as_ref().unwrap())
+                .unwrap();
+            assert_eq!(
+                recorded.status(),
+                if fault == CommitStage::FlushDirectory {
+                    ActionStatus::Succeeded
+                } else {
+                    ActionStatus::Running
+                }
+            );
+            assert_eq!(
+                failure.commit_failure,
+                Some(if fault == CommitStage::FlushDirectory {
+                    CommitFailureEffect::ReplacedDurabilityUnconfirmed
+                } else {
+                    CommitFailureEffect::PreviousStateRetained
+                })
+            );
+
+            assert_eq!(
+                state.known().resources().len(),
+                if fault == CommitStage::FlushDirectory {
+                    2
+                } else {
+                    1
+                }
+            );
+            // Recovery happens despite invalid current input, then resolution fails.
+            workspace.write("config/environment.yaml", "invalid");
+            let failure =
+                apply_request(&request, |_| panic!("invalid input cannot confirm")).unwrap_err();
+            assert_eq!(failure.stage, ApplyStage::Resolution);
+            assert!(failure.affected_action.is_none());
+            assert!(failure.commit_failure.is_none());
+            let Some(OperationOutcome::Closed(operation)) = &failure.operation else {
+                panic!("recovered operation must be reported closed")
+            };
+            assert!(operation.can_close());
+            assert_eq!(
+                operation
+                    .actions()
+                    .map(|(_, action)| action.status())
+                    .collect::<Vec<_>>(),
+                [
+                    ActionStatus::Succeeded,
+                    ActionStatus::Succeeded,
+                    ActionStatus::Skipped
+                ]
+            );
+            let recovered = workspace.repository().load().unwrap();
+            assert!(recovered.active_operation().is_none());
+            assert_eq!(recovered.known().resources().len(), 2);
+            // Changed declarations must determine the next plan, never old pending c.
+            let request = workspace.request(&[("a", "a"), ("b", "b"), ("d", "d")]);
+            let report = apply_request(&request, |plan| {
+                assert_eq!(
+                    plan.actions()
+                        .iter()
+                        .filter(|a| a.kind() == ActionKind::CreateLink)
+                        .map(|a| a.resource_id().to_string())
+                        .collect::<Vec<_>>(),
+                    ["base/d"]
+                );
+                true
+            })
+            .unwrap();
+            assert!(matches!(report, ApplyReport::Applied { .. }));
+            assert!(!workspace.path("home/c").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skipped_progress_commit_failure_identifies_the_unwritten_action() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let request = workspace.request(&[("a", "a"), ("b", "b"), ("c", "c")]);
+        let failure = apply_request_with_hooks(
+            &request,
+            |_| true,
+            |index, locked| {
+                if index == 1 {
+                    workspace.write("home/b", "unmanaged");
+                    locked.fail_commit_after(1, CommitStage::ReplaceState);
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(failure.stage, ApplyStage::Execution);
+        assert_eq!(
+            failure
+                .affected_action
+                .as_ref()
+                .unwrap()
+                .resource_id
+                .as_str(),
+            "base/c"
+        );
+        assert_eq!(
+            failure.commit_failure,
+            Some(CommitFailureEffect::PreviousStateRetained)
+        );
+        let Some(OperationOutcome::Retained(operation)) = failure.operation else {
+            panic!("operation must be retained")
+        };
+        assert_eq!(
+            operation
+                .actions()
+                .map(|(_, action)| action.status())
+                .collect::<Vec<_>>(),
+            [
+                ActionStatus::Succeeded,
+                ActionStatus::Uncertain,
+                ActionStatus::Pending
+            ]
+        );
+        assert_eq!(
+            workspace.repository().load().unwrap().active_operation(),
+            Some(&operation)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closure_commit_failure_reports_retained_or_closed_record_with_durability() {
+        for fault in [CommitStage::ReplaceState, CommitStage::FlushDirectory] {
+            let workspace = TestWorkspace::new();
+            workspace.write("store/git/config", "source\n");
+            let request = workspace.request(&[("a", "a")]);
+            let failure = apply_request_with_hooks(
+                &request,
+                |_| true,
+                |_, locked| {
+                    locked.fail_commit_after(1, fault);
+                },
+            )
+            .unwrap_err();
+            assert_eq!(failure.stage, ApplyStage::Closure);
+            assert!(failure.affected_action.is_none());
+            assert_eq!(failure.committed.len(), 1);
+            let state = workspace.repository().load().unwrap();
+            let operation = match failure.operation.as_ref().unwrap() {
+                OperationOutcome::Retained(operation) => {
+                    assert_eq!(fault, CommitStage::ReplaceState);
+                    assert_eq!(state.active_operation(), Some(operation));
+                    assert_eq!(
+                        failure.commit_failure,
+                        Some(CommitFailureEffect::PreviousStateRetained)
+                    );
+                    operation
+                }
+                OperationOutcome::Closed(operation) => {
+                    assert_eq!(fault, CommitStage::FlushDirectory);
+                    assert!(state.active_operation().is_none());
+                    assert_eq!(
+                        failure.commit_failure,
+                        Some(CommitFailureEffect::ReplacedDurabilityUnconfirmed)
+                    );
+                    operation
+                }
+                OperationOutcome::Absent => panic!("the operation began"),
+            };
+            assert_eq!(
+                operation.actions().next().unwrap().1.status(),
+                ActionStatus::Succeeded
+            );
+            let saved = failure.operation.clone();
+            // A later invocation may change the repository after the lock is released.
+            apply_request(&request, |_| true).unwrap();
+            assert_eq!(failure.operation, saved);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_noop_and_mixed_plans_confirm_but_record_only_required_transitions() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let empty = workspace.request(&[]);
+        let report = apply_request(&empty, |plan| {
+            assert!(plan.actions().is_empty());
+            true
+        })
+        .unwrap();
+        assert!(matches!(report, ApplyReport::Applied { committed, .. } if committed.is_empty()));
+        assert!(!workspace.path("state/state.json").exists());
+        let request = workspace.request(&[("a", "a")]);
+        apply_request(&request, |_| true).unwrap();
+        let before = fs::read(workspace.path("state/state.json")).unwrap();
+        assert!(matches!(
+            apply_request(&request, |_| false).unwrap(),
+            ApplyReport::Declined { .. }
+        ));
+        let report = apply_request(&request, |plan| {
+            assert_eq!(plan.actions()[0].kind(), ActionKind::Noop);
+            true
+        })
+        .unwrap();
+        assert!(matches!(report, ApplyReport::Applied { committed, .. } if committed.is_empty()));
+        assert_eq!(
+            fs::read(workspace.path("state/state.json")).unwrap(),
+            before
+        );
+        let request = workspace.request(&[("a", "a"), ("b", "b")]);
+        apply_request_with_hooks(
+            &request,
+            |_| true,
+            |_, locked| {
+                let op = locked.state().active_operation().unwrap();
+                assert_eq!(op.actions().len(), 1);
+                assert_eq!(
+                    op.actions().next().unwrap().1.resource_id().as_str(),
+                    "base/b"
+                );
+            },
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_later_phase_preflight_prevents_earlier_creation_and_confirmation() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let initial = workspace.request(&[("stale", "stale")]);
+        apply_request(&initial, |_| true).unwrap();
+        let before = fs::read(workspace.path("state/state.json")).unwrap();
+        let request = workspace.request(&[("new", "new")]);
+        let failure =
+            apply_request(&request, |_| panic!("all preflight must pass first")).unwrap_err();
+        assert_eq!(failure.stage, ApplyStage::Preflight);
+        assert!(!workspace.path("home/new").exists());
+        assert_eq!(
+            fs::read(workspace.path("state/state.json")).unwrap(),
+            before
+        );
+        assert_eq!(
+            fs::read_link(workspace.path("home/stale")).unwrap(),
+            workspace.path("store/git/config")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn phase_two_handoff_then_phase_three_forget_are_state_only_and_sequential() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let initial = workspace.request(&[("old", "shared"), ("stale", "stale")]);
+        apply_request(&initial, |_| true).unwrap();
+        fs::remove_file(workspace.path("home/stale")).unwrap();
+        let request = workspace.request(&[("new", "shared"), ("z", "z")]);
+        let mut sequence = Vec::new();
+        apply_request_with_hooks(
+            &request,
+            |_| true,
+            |_, locked| {
+                let op = locked.state().active_operation().unwrap();
+                assert!(op.actions().all(|(_, a)| a.replacement_facts().is_none()));
+                let running = op
+                    .actions()
+                    .find(|(_, a)| a.status() == ActionStatus::Running)
+                    .unwrap()
+                    .1;
+                sequence.push(running.kind());
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            sequence,
+            [
+                ActionKind::CreateLink,
+                ActionKind::ReplaceOwnership,
+                ActionKind::ForgetMissing
+            ]
+        );
+        let state = workspace.repository().load().unwrap();
+        assert_eq!(
+            state
+                .known()
+                .resources()
+                .map(|r| r.resource_id().as_str())
+                .collect::<Vec<_>>(),
+            ["base/new", "base/z"]
+        );
+        assert_eq!(
+            fs::read_link(workspace.path("home/shared")).unwrap(),
+            workspace.path("store/git/config")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failure_in_forget_phase_stops_later_forgets_and_closes_definite_failure() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let initial = workspace.request(&[("old", "shared"), ("stale-a", "a"), ("stale-b", "b")]);
+        apply_request(&initial, |_| true).unwrap();
+        fs::remove_file(workspace.path("home/a")).unwrap();
+        fs::remove_file(workspace.path("home/b")).unwrap();
+        let request = workspace.request(&[("new", "shared"), ("z", "z")]);
+        let mut started = Vec::new();
+        let failure = apply_request_with_hooks(
+            &request,
+            |_| true,
+            |index, locked| {
+                started.push(index);
+                if index == 2 {
+                    workspace.write("home/a", "unmanaged");
+                }
+                assert!(locked.state().active_operation().is_some());
+            },
+        )
+        .unwrap_err();
+        assert_eq!(failure.stage, ApplyStage::Execution);
+        assert_eq!(
+            failure
+                .affected_action
+                .as_ref()
+                .unwrap()
+                .resource_id
+                .as_str(),
+            "base/stale-a"
+        );
+        assert!(failure.commit_failure.is_none());
+        let Some(OperationOutcome::Closed(operation)) = &failure.operation else {
+            panic!("definite failure must report the closed record")
+        };
+        assert_eq!(
+            operation
+                .actions()
+                .map(|(_, action)| action.status())
+                .collect::<Vec<_>>(),
+            [
+                ActionStatus::Succeeded,
+                ActionStatus::Succeeded,
+                ActionStatus::Failed,
+                ActionStatus::Skipped
+            ]
+        );
+        assert_eq!(started, [0, 1, 2]);
+        assert_eq!(
+            failure
+                .committed
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["base/z", "base/new"]
+        );
+        let state = workspace.repository().load().unwrap();
+        assert!(state.active_operation().is_none());
+        assert_eq!(
+            state
+                .known()
+                .resources()
+                .map(|r| r.resource_id().as_str())
+                .collect::<Vec<_>>(),
+            ["base/new", "base/stale-a", "base/stale-b", "base/z"]
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path("home/a")).unwrap(),
+            "unmanaged"
+        );
+        assert!(!workspace.path("home/b").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sequential_executor_boundary_keeps_relocation_contiguous() {
+        use std::os::unix::fs::symlink;
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let initial = workspace.request(&[("move", "old"), ("stale", "stale")]);
+        apply_request(&initial, |_| true).unwrap();
+        fs::remove_file(workspace.path("home/stale")).unwrap();
+        let request = workspace.request(&[("move", "new")]);
+        let resolved = super::super::queries::resolve_request(&request).unwrap();
+        let mut locked = workspace.repository().acquire_exclusive().unwrap();
+        let inspector = FileLinkInspector::new(workspace.path("home").as_path()).unwrap();
+        let actual = inspector
+            .inspect(resolved.desired(), locked.state().known())
+            .unwrap();
+        let plan = plan(resolved.desired(), locked.state().known(), &actual);
+        assert_eq!(
+            plan.actions()
+                .iter()
+                .map(PlannedAction::kind)
+                .collect::<Vec<_>>(),
+            [ActionKind::RelocateLink, ActionKind::ForgetMissing]
+        );
+        let ids = locked
+            .begin_actions(desired_hash(resolved.desired()).unwrap(), plan.actions())
+            .unwrap();
+        let mut committed = Vec::new();
+        // Controlled executor substitute proves coordinator sequencing; it makes
+        // no claim about a supported expected-entry deletion platform primitive.
+        execute_actions(
+            &mut locked,
+            plan.actions(),
+            &ids,
+            &mut committed,
+            &mut None,
+            |_, _| {},
+            |action, recorded| {
+                match action.kind() {
+                    ActionKind::RelocateLink => {
+                        let facts = recorded.relocation_facts().unwrap();
+                        symlink(
+                            facts.new_link_target().as_path().as_ref(),
+                            facts.new_target_path().as_ref(),
+                        )
+                        .unwrap();
+                        assert!(condition_holds(&inspector, &action.postconditions()[1]).unwrap());
+                        let state = workspace.repository().load().unwrap();
+                        assert_eq!(
+                            state
+                                .active_operation()
+                                .unwrap()
+                                .action(&ids[1])
+                                .unwrap()
+                                .status(),
+                            ActionStatus::Pending
+                        );
+                        assert_eq!(state.known().resources().len(), 2);
+                        fs::remove_file(facts.old_target_path().as_ref()).unwrap();
+                        assert!(
+                            action
+                                .postconditions()
+                                .iter()
+                                .all(|condition| condition_holds(&inspector, condition).unwrap())
+                        );
+                    }
+                    ActionKind::ForgetMissing => {
+                        assert!(!workspace.path("home/old").exists());
+                        assert_eq!(
+                            fs::read_link(workspace.path("home/new")).unwrap(),
+                            workspace.path("store/git/config")
+                        );
+                        assert_eq!(
+                            workspace
+                                .repository()
+                                .load()
+                                .unwrap()
+                                .active_operation()
+                                .unwrap()
+                                .action(&ids[0])
+                                .unwrap()
+                                .status(),
+                            ActionStatus::Succeeded
+                        );
+                        FileLinkExecutor::new(workspace.path("home").as_path())
+                            .unwrap()
+                            .execute_forget_missing(action)
+                            .unwrap();
+                    }
+                    _ => panic!("unexpected action"),
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(committed.len(), 2);
+        locked.close_finished_operation().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dry_run_leaves_active_operation_untouched_even_while_exclusive_lock_is_held() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let request = workspace.request(&[("a", "a"), ("b", "b")]);
+        let resolved = super::super::queries::resolve_request(&request).unwrap();
+        let mut locked = workspace.repository().acquire_exclusive().unwrap();
+        let actions = resolved
+            .desired()
+            .resources()
+            .iter()
+            .cloned()
+            .map(PlannedAction::create_link)
+            .collect::<Vec<_>>();
+        let ids = locked
+            .begin_actions(desired_hash(resolved.desired()).unwrap(), &actions)
+            .unwrap();
+        locked.mark_running(&ids[0]).unwrap();
+        let before = fs::read(workspace.path("state/state.json")).unwrap();
+        let entries = fs::read_dir(workspace.path("state")).unwrap().count();
+        let snapshot = workspace.snapshot();
+        let _read_only = crate::test_support::forbid_mutation();
+        let report = dry_run(&request).unwrap();
+        assert_eq!(workspace.snapshot(), snapshot);
+        assert_eq!(report.plan.actions().len(), 2);
+        assert!(report.plan.is_executable());
+        assert_eq!(
+            fs::read(workspace.path("state/state.json")).unwrap(),
+            before
+        );
+        assert_eq!(
+            fs::read_dir(workspace.path("state")).unwrap().count(),
+            entries
+        );
+        assert_eq!(fs::read_dir(workspace.path("home")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn lock_and_invalid_state_fail_before_resolution_or_home_observation() {
+        let workspace = TestWorkspace::new();
+        let request = workspace.request(&[]);
+        fs::remove_dir(workspace.path("home")).unwrap();
+        workspace.write("config/environment.yaml", "invalid");
+        let locked = workspace.repository().acquire_exclusive().unwrap();
+        let failure = apply_request(&request, |_| panic!("no confirmation")).unwrap_err();
+        assert_eq!(failure.stage, ApplyStage::LockAndState);
+        assert!(failure.operation.is_none());
+        assert!(failure.affected_action.is_none());
+        assert!(failure.commit_failure.is_none());
+        assert!(matches!(
+            failure.cause,
+            ApplyFailureCause::Lifecycle(ApplyError::State(
+                StateRepositoryError::LockContended { .. }
+            ))
+        ));
+        drop(locked);
+        workspace.write("state/state.json", "invalid");
+        let failure = apply_request(&request, |_| panic!("no confirmation")).unwrap_err();
+        assert_eq!(failure.stage, ApplyStage::LockAndState);
+        assert!(failure.operation.is_none());
+        assert!(failure.affected_action.is_none());
+        assert!(failure.commit_failure.is_none());
+        assert_eq!(
+            fs::read_to_string(workspace.path("state/state.json")).unwrap(),
+            "invalid"
+        );
+    }
+
+    #[test]
+    fn dry_run_with_absent_state_has_no_write_or_lock_boundary_calls() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let request = workspace.request(&[("a", "a")]);
+        let before = workspace.snapshot();
+        let _read_only = crate::test_support::forbid_mutation();
+        let report = dry_run(&request).unwrap();
+        assert!(report.plan.is_executable());
+        assert_eq!(workspace.snapshot(), before);
+        assert!(!workspace.path("state").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diff_observes_known_targets_without_reading_missing_configuration_or_sources() {
+        use std::os::unix::fs::symlink;
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        fs::create_dir(workspace.path("home/parent")).unwrap();
+        let request = workspace.request(&[
+            ("expected", "expected"),
+            ("missing", "missing"),
+            ("wrong", "wrong"),
+            ("file", "file"),
+            ("unsafe", "parent/unsafe"),
+        ]);
+        apply_request(&request, |_| true).unwrap();
+        fs::remove_file(workspace.path("home/missing")).unwrap();
+        fs::remove_file(workspace.path("home/wrong")).unwrap();
+        symlink(workspace.path("other"), workspace.path("home/wrong")).unwrap();
+        fs::remove_file(workspace.path("home/file")).unwrap();
+        workspace.write("home/file", "unmanaged");
+        fs::rename(
+            workspace.path("home/parent"),
+            workspace.path("moved-parent"),
+        )
+        .unwrap();
+        fs::remove_file(workspace.path("store/git/config")).unwrap();
+        fs::remove_file(workspace.path("config/environment.yaml")).unwrap();
+        fs::remove_file(workspace.path("profiles/base.yaml")).unwrap();
+        let before = workspace.snapshot();
+        let _read_only = crate::test_support::forbid_mutation();
+        let report =
+            super::super::queries::diff(request.context.home_directory(), &workspace.repository())
+                .unwrap();
+        let observations = report
+            .resources
+            .iter()
+            .map(|(id, actual)| (id.as_str(), actual.observation()))
+            .collect::<BTreeMap<_, _>>();
+        assert!(matches!(
+            observations["base/expected"],
+            TargetObservation::ExpectedLink { .. }
+        ));
+        assert!(matches!(
+            observations["base/missing"],
+            TargetObservation::Missing
+        ));
+        assert!(matches!(
+            observations["base/wrong"],
+            TargetObservation::OtherLink { .. }
+        ));
+        assert!(matches!(
+            observations["base/file"],
+            TargetObservation::OtherEntry { .. }
+        ));
+        assert!(matches!(
+            observations["base/unsafe"],
+            TargetObservation::UnsafePath { .. }
+        ));
+        assert_eq!(workspace.snapshot(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_unsupported_phase_two_action_blocks_an_earlier_create() {
+        for kind in [
+            ActionKind::ReplaceLink,
+            ActionKind::ReplaceOwnership,
+            ActionKind::RelocateLink,
+        ] {
+            let workspace = TestWorkspace::new();
+            workspace.write("store/git/config", "old\n");
+            workspace.write("store/git/replacement", "new\n");
+            let initial = workspace.request(&[("old", "old")]);
+            apply_request(&initial, |_| true).unwrap();
+            let request = match kind {
+                ActionKind::ReplaceLink => {
+                    workspace.request(&[("old", "old"), ("create", "create")])
+                }
+                ActionKind::ReplaceOwnership => {
+                    workspace.request(&[("renamed", "old"), ("create", "create")])
+                }
+                ActionKind::RelocateLink => {
+                    workspace.request(&[("old", "moved"), ("create", "create")])
+                }
+                _ => unreachable!(),
+            };
+            if kind != ActionKind::RelocateLink {
+                let yaml = fs::read_to_string(workspace.path("profiles/base.yaml"))
+                    .unwrap()
+                    .replace("path: git/config", "path: git/replacement");
+                workspace.write("profiles/base.yaml", &yaml);
+            }
+            let before = workspace.snapshot();
+            let failure = apply_request(&request, |_| panic!("unsupported plan must not confirm"))
+                .unwrap_err();
+            assert_eq!(failure.stage, ApplyStage::Preflight);
+            assert!(
+                failure
+                    .plan
+                    .unwrap()
+                    .actions()
+                    .iter()
+                    .any(|a| a.kind() == kind)
+            );
+            assert_eq!(workspace.snapshot(), before);
+        }
+    }
+
+    #[test]
+    fn validate_all_reports_each_root_and_retains_independent_resolution_errors() {
+        use super::super::queries::*;
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let request = workspace.request(&[("a", "a")]);
+        workspace.write(
+            "profiles/other.yaml",
+            "schema_version: 1\nid: other\nincludes: [{id: missing}]\nresources: {}\n",
+        );
+        let before = workspace.snapshot();
+        let _read_only = crate::test_support::forbid_mutation();
+        let _no_targets = crate::test_support::forbid_target_inspection();
+        let report = validate(&ValidationRequest {
+            context: request.context.clone(),
+            selection: ValidationSelection::All,
+        })
+        .unwrap();
+        assert_eq!(report.profiles.len(), 2);
+        assert_eq!(report.profiles[0].0.as_str(), "base");
+        assert!(report.profiles[0].1.is_ok());
+        assert_eq!(report.profiles[1].0.as_str(), "other");
+        assert!(report.profiles[1].1.is_err());
+        let selected = validate(&ValidationRequest {
+            context: request.context.clone(),
+            selection: ValidationSelection::Root(None),
+        })
+        .unwrap();
+        assert_eq!(selected.profiles.len(), 1);
+        assert_eq!(workspace.snapshot(), before);
+        fs::remove_file(workspace.path("profiles/base.yaml")).unwrap();
+        fs::remove_file(workspace.path("profiles/other.yaml")).unwrap();
+        fs::rename(workspace.path("store"), workspace.path("unavailable-store")).unwrap();
+        let before = workspace.snapshot();
+        assert!(
+            validate(&ValidationRequest {
+                context: request.context,
+                selection: ValidationSelection::All,
+            })
+            .is_err()
+        );
+        assert_eq!(workspace.snapshot(), before);
+    }
+
+    #[test]
+    fn queries_validate_without_target_or_state_access_and_plan_without_locking() {
+        use super::super::queries::*;
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let request = workspace.request(&[("a", "missing-parent/target")]);
+        // A state path that cannot be used as a directory must be irrelevant to validation.
+        workspace.write("state", "not a directory");
+        let no_targets = crate::test_support::forbid_target_inspection();
+        let _read_only = crate::test_support::forbid_mutation();
+        let report = validate(&ValidationRequest {
+            context: request.context.clone(),
+            selection: ValidationSelection::All,
+        })
+        .unwrap();
+        assert_eq!(report.profiles.len(), 1);
+        assert!(report.profiles[0].1.is_ok());
+        drop(no_targets);
+        fs::remove_file(workspace.path("state")).unwrap();
+        let report = plan_request(&request).unwrap();
+        assert!(!report.plan.is_executable());
+        assert!(!workspace.path("state").exists());
+        assert!(!workspace.path("home/missing-parent").exists());
+    }
+
+    #[test]
+    fn diff_with_absent_state_needs_neither_home_nor_declarations() {
+        let workspace = TestWorkspace::new();
+        let home = ResolvedPath::new(workspace.path("absent-home")).unwrap();
+        let report = super::super::queries::diff(&home, &workspace.repository()).unwrap();
+        assert!(report.resources.is_empty());
+        assert!(report.active_operation.is_none());
+        assert!(!workspace.path("state").exists());
     }
 
     #[test]

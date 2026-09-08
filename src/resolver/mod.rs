@@ -68,6 +68,16 @@ pub(crate) struct ResolverContext {
 }
 
 impl ResolverContext {
+    pub(crate) fn home_directory(&self) -> &ResolvedPath {
+        &self.home_directory
+    }
+    pub(crate) fn state_directory(&self) -> &ResolvedPath {
+        &self.state_directory
+    }
+    pub(crate) fn environment_config_path(&self) -> &ResolvedPath {
+        &self.environment_config_path
+    }
+
     /// Creates a context from already selected, absolute control paths.
     pub(crate) fn new(
         home_directory: PathBuf,
@@ -82,6 +92,16 @@ impl ResolverContext {
             state_directory: ResolvedPath::new(state_directory)?,
         })
     }
+}
+
+/// Discovers every root and validates store definitions for validate-all, even when discovery finds no profiles. This never observes managed targets.
+pub(crate) fn discovered_roots(
+    context: &ResolverContext,
+    environment: &EnvironmentConfig,
+) -> Result<Vec<ProfileId>, ResolverError> {
+    let profiles = discover_profiles(context, environment)?;
+    resolve_stores(context, environment)?;
+    Ok(profiles.into_keys().collect())
 }
 
 /// Resolves one selected root profile to canonical Desired resources.

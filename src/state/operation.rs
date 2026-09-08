@@ -1017,6 +1017,17 @@ impl OperationRecord {
             }
         }
 
+        // Temporary siblings are action-local and may never alias another recorded target or another replacement's temporary entry.
+        for action in actions.values() {
+            if let Some(facts) = action.replacement_facts() {
+                if !target_paths.insert(facts.temporary_path().clone()) {
+                    return Err(OperationRecordError::DuplicateTargetPath {
+                        target_path: facts.temporary_path().clone(),
+                    });
+                }
+            }
+        }
+
         Ok(Self {
             id,
             desired_hash,

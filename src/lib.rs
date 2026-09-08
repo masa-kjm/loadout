@@ -26,3 +26,6 @@ mod resolver;
 
 #[allow(dead_code)]
 mod state;
+
+#[cfg(test)]
+mod test_support;

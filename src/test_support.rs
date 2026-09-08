@@ -52,3 +52,27 @@ pub(crate) fn assert_target_inspection_allowed() {
         "forbidden managed-target inspection boundary"
     );
 }
+
+thread_local! {
+    static FORBID_DECLARATION_READ: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) struct NoDeclarationReadGuard {
+    previous: bool,
+}
+pub(crate) fn forbid_desired_dependencies() -> NoDeclarationReadGuard {
+    NoDeclarationReadGuard {
+        previous: FORBID_DECLARATION_READ.replace(true),
+    }
+}
+impl Drop for NoDeclarationReadGuard {
+    fn drop(&mut self) {
+        FORBID_DECLARATION_READ.set(self.previous);
+    }
+}
+pub(crate) fn assert_desired_dependencies_allowed() {
+    assert!(
+        !FORBID_DECLARATION_READ.get(),
+        "forbidden configuration/profile/source/planner dependency"
+    );
+}

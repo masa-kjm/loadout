@@ -29,3 +29,13 @@ mod state;
 
 #[cfg(test)]
 mod test_support;
+
+mod cli;
+mod loader;
+
+/// Entry point for the Loadout executable; core domain types remain internal.
+/// This is not a supported embeddable Rust API.
+#[doc(hidden)]
+pub fn run_cli() -> std::process::ExitCode {
+    cli::run()
+}

@@ -45,6 +45,8 @@ impl VerifiedSource {
 pub(crate) fn resolve_store_root(
     store_root: &Path,
 ) -> Result<PhysicalStoreRoot, SourceVerificationError> {
+    #[cfg(test)]
+    crate::test_support::assert_desired_dependencies_allowed();
     let physical_root =
         fs::canonicalize(store_root).map_err(|source| SourceVerificationError::StoreRootIo {
             path: store_root.to_path_buf(),

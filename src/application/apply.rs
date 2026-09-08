@@ -3,10 +3,11 @@
 use std::fmt;
 
 use crate::domain::actual::TargetObservation;
+use crate::domain::file_link::LinkTarget;
 use crate::domain::hashes::{CanonicalHashError, desired_hash};
 use crate::domain::ids::FullyQualifiedResourceId;
 use crate::domain::paths::ResolvedPath;
-use crate::domain::plan::{ActionKind, Plan, PlannedAction};
+use crate::domain::plan::{ActionKind, Plan, PlannedAction, TargetCondition};
 use crate::executor::file_link::{
     CreateLinkExecutionError, FileLinkExecutor, ForgetMissingExecutionError,
     RelocateLinkExecutionError, RemoveLinkExecutionError, ReplaceLinkExecutionError,
@@ -14,8 +15,7 @@ use crate::executor::file_link::{
 use crate::inspection::file_link::{FileLinkInspector, TargetInspectionError};
 use crate::planner::file_link::plan;
 use crate::resolver::ResolvedApplyInput;
-use crate::state::operation::ActionStatus;
-use crate::state::operation::RecordedAction;
+use crate::state::operation::{ActionStatus, RecordedAction};
 use crate::state::repository::{LockedStateRepository, StateRepository, StateRepositoryError};
 
 /// Coordinates a confirmed non-dry-run apply for one home and state directory.
@@ -368,8 +368,7 @@ impl ApplyCoordinator {
             .state_repository
             .acquire_exclusive()
             .map_err(ApplyError::State)?;
-        if locked.state().active_operation().is_some() {
-            // Until recovery is implemented, leave unfinished records untouched.
+        if reconcile_active_operation(&mut locked, self.home_directory.as_ref())? {
             return Err(ApplyError::RecoveryRequired);
         }
         let desired = resolved.desired();
@@ -967,6 +966,174 @@ impl std::error::Error for ApplyError {
             | Self::SliceSixRequiresSingleRelocateAction { .. } => None,
         }
     }
+}
+
+/// Reconciles recorded facts only; it never executes an old plan or mutates a declared target. `true` means an uncertain record remains open.
+fn reconcile_active_operation(
+    locked: &mut LockedStateRepository,
+    home_directory: &std::path::Path,
+) -> Result<bool, ApplyError> {
+    let Some(operation) = locked.state().active_operation() else {
+        return Ok(false);
+    };
+    let actions = operation
+        .actions()
+        .map(|(action_id, action)| (action_id.clone(), action.clone()))
+        .collect::<Vec<_>>();
+    let inspector = actions
+        .iter()
+        .any(|(_, action)| {
+            matches!(
+                action.status(),
+                ActionStatus::Running | ActionStatus::Uncertain
+            )
+        })
+        .then(|| FileLinkInspector::new(home_directory))
+        .transpose()
+        .ok()
+        .flatten();
+
+    for (action_id, action) in actions {
+        match action.status() {
+            ActionStatus::Pending => locked
+                .mark_without_known(&action_id, ActionStatus::Skipped)
+                .map_err(ApplyError::State)?,
+            ActionStatus::Running | ActionStatus::Uncertain => {
+                // An unavailable or unsafe recorded-path observation cannot prove either recorded condition, so it remains uncertain.
+                let decision = inspector
+                    .as_ref()
+                    .and_then(|inspector| recovery_decision(inspector, &action).ok())
+                    .unwrap_or(RecoveryDecision::Uncertain);
+                match decision {
+                    RecoveryDecision::Succeeded => locked
+                        .commit_succeeded(&action_id)
+                        .map_err(ApplyError::State)?,
+                    RecoveryDecision::Failed => locked
+                        .mark_without_known(&action_id, ActionStatus::Failed)
+                        .map_err(ApplyError::State)?,
+                    RecoveryDecision::Uncertain if action.status() == ActionStatus::Running => {
+                        locked
+                            .mark_without_known(&action_id, ActionStatus::Uncertain)
+                            .map_err(ApplyError::State)?
+                    }
+                    RecoveryDecision::Uncertain => {}
+                }
+            }
+            ActionStatus::Succeeded | ActionStatus::Failed | ActionStatus::Skipped => {}
+        }
+    }
+
+    if locked
+        .state()
+        .active_operation()
+        .is_some_and(|operation| operation.can_close())
+    {
+        locked
+            .close_finished_operation()
+            .map_err(ApplyError::State)?;
+        Ok(false)
+    } else {
+        Ok(true)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryDecision {
+    Succeeded,
+    Failed,
+    Uncertain,
+}
+
+fn recovery_decision(
+    inspector: &FileLinkInspector,
+    action: &RecordedAction,
+) -> Result<RecoveryDecision, TargetInspectionError> {
+    if action.kind() == ActionKind::RelocateLink {
+        let facts = action
+            .relocation_facts()
+            .expect("validated relocation record has facts");
+        let old_missing = condition_holds(
+            inspector,
+            &TargetCondition::Missing {
+                target_path: facts.old_target_path().clone(),
+            },
+        )?;
+        let new_expected = condition_holds(
+            inspector,
+            &TargetCondition::ExpectedLink {
+                target_path: facts.new_target_path().clone(),
+                link_target: facts.new_link_target().clone(),
+            },
+        )?;
+        if old_missing && new_expected {
+            return Ok(RecoveryDecision::Succeeded);
+        }
+        let old_expected = condition_holds(
+            inspector,
+            &TargetCondition::ExpectedLink {
+                target_path: facts.old_target_path().clone(),
+                link_target: facts.old_link_target().clone(),
+            },
+        )?;
+        let new_missing = condition_holds(
+            inspector,
+            &TargetCondition::Missing {
+                target_path: facts.new_target_path().clone(),
+            },
+        )?;
+        return Ok(if old_expected && new_missing {
+            RecoveryDecision::Failed
+        } else {
+            RecoveryDecision::Uncertain
+        });
+    }
+
+    if let Some(facts) = action.replacement_facts() {
+        let postcondition = condition_holds(inspector, &action.postcondition())?;
+        let temporary_missing = condition_holds(
+            inspector,
+            &TargetCondition::Missing {
+                target_path: facts.temporary_path().clone(),
+            },
+        )?;
+        if postcondition && temporary_missing {
+            return Ok(RecoveryDecision::Succeeded);
+        }
+        let precondition = condition_holds(inspector, &action.precondition())?;
+        return Ok(if precondition && temporary_missing {
+            RecoveryDecision::Failed
+        } else {
+            RecoveryDecision::Uncertain
+        });
+    }
+
+    // Same-source ownership handoff has identical predicates: a matching link proves its state-only postcondition rather than a failed mutation.
+    if condition_holds(inspector, &action.postcondition())? {
+        return Ok(RecoveryDecision::Succeeded);
+    }
+    if condition_holds(inspector, &action.precondition())? {
+        return Ok(RecoveryDecision::Failed);
+    }
+    Ok(RecoveryDecision::Uncertain)
+}
+
+fn condition_holds(
+    inspector: &FileLinkInspector,
+    condition: &TargetCondition,
+) -> Result<bool, TargetInspectionError> {
+    let expected = match condition {
+        TargetCondition::ExpectedLink { link_target, .. } => link_target.clone(),
+        TargetCondition::Missing { target_path } => LinkTarget::new(target_path.clone()),
+    };
+    let actual = inspector.inspect_target_for_expected_link(condition.target_path(), &expected)?;
+    Ok(match condition {
+        TargetCondition::ExpectedLink { .. } => {
+            matches!(actual.observation(), TargetObservation::ExpectedLink { .. })
+        }
+        TargetCondition::Missing { .. } => {
+            matches!(actual.observation(), TargetObservation::Missing)
+        }
+    })
 }
 
 #[cfg(test)]
@@ -2127,7 +2294,7 @@ mod tests {
     }
 
     #[test]
-    fn running_operation_blocks_a_fresh_plan_without_changing_the_target() {
+    fn recovery_marks_an_unprovable_running_operation_uncertain_before_blocking_a_fresh_plan() {
         let workspace = TestWorkspace::new();
         workspace.write("store/git/config", "[user]\nname = Example\n");
         let resolved = workspace.input();
@@ -2154,6 +2321,753 @@ mod tests {
         let state = workspace.repository().load().unwrap();
         let operation = state.active_operation().unwrap();
         let (_, action) = operation.actions().next().unwrap();
+        assert_eq!(action.status(), ActionStatus::Uncertain);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_commits_a_running_create_when_its_recorded_postcondition_is_present() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let resolved = workspace.input();
+        let action = PlannedAction::create_link(resolved.desired().resources()[0].clone());
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let action_id = locked
+            .begin_create_operation(desired_hash(resolved.desired()).unwrap(), &action)
+            .unwrap();
+        locked.mark_running(&action_id).unwrap();
+        symlink(
+            workspace.path("store/git/config"),
+            workspace.path("home/.gitconfig"),
+        )
+        .unwrap();
+
+        assert!(
+            !reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap()
+        );
+        assert!(locked.state().active_operation().is_none());
+        assert!(
+            locked
+                .state()
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_commits_a_same_source_handoff_without_mutating_its_target() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        workspace
+            .coordinator()
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        let resolved = workspace.ownership_input("base/git-config-renamed", "git/config");
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let inspector = FileLinkInspector::new(workspace.path("home").as_path()).unwrap();
+        let actual = inspector
+            .inspect(resolved.desired(), locked.state().known())
+            .unwrap();
+        let action = plan(resolved.desired(), locked.state().known(), &actual).actions()[0].clone();
+        let action_id = locked
+            .begin_operation(desired_hash(resolved.desired()).unwrap(), &action)
+            .unwrap();
+        locked.mark_running(&action_id).unwrap();
+        let before = fs::read_link(workspace.path("home/.gitconfig")).unwrap();
+
+        assert!(
+            !reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap()
+        );
+        assert_eq!(
+            fs::read_link(workspace.path("home/.gitconfig")).unwrap(),
+            before
+        );
+        assert!(
+            locked
+                .state()
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .is_none()
+        );
+        assert!(
+            locked
+                .state()
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config-renamed").unwrap())
+                .is_some()
+        );
+        assert!(locked.state().active_operation().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_corrected_uncertain_operation_recovers_before_apply_creates_a_fresh_plan() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let resolved = workspace.input();
+        let action = PlannedAction::create_link(resolved.desired().resources()[0].clone());
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let action_id = locked
+            .begin_create_operation(desired_hash(resolved.desired()).unwrap(), &action)
+            .unwrap();
+        locked.mark_running(&action_id).unwrap();
+        let target = workspace.path("home/.gitconfig");
+        fs::write(&target, "unmanaged interruption\n").unwrap();
+        assert!(reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap());
+        drop(locked);
+
+        fs::remove_file(&target).unwrap();
+        let result = workspace
+            .coordinator()
+            .apply_create_link(&resolved, |_| true)
+            .unwrap();
+
+        assert!(matches!(result, CreateLinkApplyResult::Applied { .. }));
+        assert_eq!(
+            fs::read_link(&target).unwrap(),
+            workspace.path("store/git/config")
+        );
+        let state = repository.load().unwrap();
+        assert!(state.active_operation().is_none());
+        assert!(
+            state
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_commits_a_corrected_durable_uncertain_action_when_its_postcondition_holds() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let resolved = workspace.input();
+        let action = PlannedAction::create_link(resolved.desired().resources()[0].clone());
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let action_id = locked
+            .begin_create_operation(desired_hash(resolved.desired()).unwrap(), &action)
+            .unwrap();
+        locked.mark_running(&action_id).unwrap();
+        locked
+            .mark_without_known(&action_id, ActionStatus::Uncertain)
+            .unwrap();
+        drop(locked);
+
+        let persisted = repository.load().unwrap();
+        let (_, action) = persisted
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap();
+        assert_eq!(action.status(), ActionStatus::Uncertain);
+        assert_eq!(persisted.known().resources().len(), 0);
+
+        symlink(
+            workspace.path("store/git/config"),
+            workspace.path("home/.gitconfig"),
+        )
+        .unwrap();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        assert!(
+            !reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap()
+        );
+        drop(locked);
+
+        let persisted = repository.load().unwrap();
+        assert!(persisted.active_operation().is_none());
+        assert!(
+            persisted
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn recovery_marks_running_actions_uncertain_when_the_home_cannot_be_inspected() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let resolved = workspace.input();
+        let action = PlannedAction::create_link(resolved.desired().resources()[0].clone());
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let action_id = locked
+            .begin_create_operation(desired_hash(resolved.desired()).unwrap(), &action)
+            .unwrap();
+        locked.mark_running(&action_id).unwrap();
+        drop(locked);
+        fs::rename(workspace.path("home"), workspace.path("unavailable-home")).unwrap();
+
+        let error = workspace
+            .coordinator()
+            .apply_create_link(&resolved, |_| panic!("recovery must block planning"))
+            .unwrap_err();
+
+        assert!(matches!(error, ApplyError::RecoveryRequired));
+        let state = repository.load().unwrap();
+        let (_, action) = state.active_operation().unwrap().actions().next().unwrap();
+        assert_eq!(action.status(), ActionStatus::Uncertain);
+        assert_eq!(state.known().resources().len(), 0);
+    }
+
+    #[test]
+    fn recovery_skips_a_pending_action_without_mutating_known_state() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let resolved = workspace.input();
+        let action = PlannedAction::create_link(resolved.desired().resources()[0].clone());
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        locked
+            .begin_create_operation(desired_hash(resolved.desired()).unwrap(), &action)
+            .unwrap();
+
+        assert!(
+            !reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap()
+        );
+        assert!(locked.state().active_operation().is_none());
+        assert_eq!(locked.state().known().resources().len(), 0);
+    }
+
+    #[test]
+    fn recovery_marks_a_running_create_failed_when_its_precondition_still_holds() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let resolved = workspace.input();
+        let action = PlannedAction::create_link(resolved.desired().resources()[0].clone());
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let action_id = locked
+            .begin_create_operation(desired_hash(resolved.desired()).unwrap(), &action)
+            .unwrap();
+        locked.mark_running(&action_id).unwrap();
+
+        assert!(
+            !reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap()
+        );
+        assert!(locked.state().active_operation().is_none());
+        assert_eq!(locked.state().known().resources().len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_keeps_a_partial_relocation_uncertain() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        workspace
+            .coordinator()
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        fs::create_dir(workspace.path("home/.config")).unwrap();
+        let resolved = workspace.relocation_input();
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let inspector = FileLinkInspector::new(workspace.path("home").as_path()).unwrap();
+        let actual = inspector
+            .inspect(resolved.desired(), locked.state().known())
+            .unwrap();
+        let action = plan(resolved.desired(), locked.state().known(), &actual).actions()[0].clone();
+        let action_id = locked
+            .begin_operation(desired_hash(resolved.desired()).unwrap(), &action)
+            .unwrap();
+        locked.mark_running(&action_id).unwrap();
+        symlink(
+            workspace.path("store/git/config"),
+            workspace.path("home/.config/gitconfig"),
+        )
+        .unwrap();
+
+        assert!(reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap());
+        let (_, action) = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap();
+        assert_eq!(action.status(), ActionStatus::Uncertain);
+        assert!(
+            locked
+                .state()
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_keeps_a_replacement_with_an_unexpected_temporary_entry_uncertain() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "old\n");
+        workspace.write("store/git/replacement", "new\n");
+        workspace
+            .coordinator()
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        let resolved = workspace.replacement_input();
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let inspector = FileLinkInspector::new(workspace.path("home").as_path()).unwrap();
+        let actual = inspector
+            .inspect(resolved.desired(), locked.state().known())
+            .unwrap();
+        let action = plan(resolved.desired(), locked.state().known(), &actual).actions()[0].clone();
+        let action_id = locked
+            .begin_operation(desired_hash(resolved.desired()).unwrap(), &action)
+            .unwrap();
+        let temporary_path = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap()
+            .1
+            .replacement_facts()
+            .unwrap()
+            .temporary_path()
+            .clone();
+        locked.mark_running(&action_id).unwrap();
+        fs::write(temporary_path.as_path(), "unmanaged temporary entry\n").unwrap();
+
+        assert!(reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap());
+        let (_, action) = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap();
+        assert_eq!(action.status(), ActionStatus::Uncertain);
+        assert_eq!(
+            fs::read_to_string(temporary_path.as_path()).unwrap(),
+            "unmanaged temporary entry\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_marks_a_running_changed_source_ownership_handoff_failed() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "old\n");
+        workspace.write("store/git/replacement", "new\n");
+        workspace
+            .coordinator()
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        let resolved = workspace.ownership_input("base/git-config-renamed", "git/replacement");
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let inspector = FileLinkInspector::new(workspace.path("home").as_path()).unwrap();
+        let actual = inspector
+            .inspect(resolved.desired(), locked.state().known())
+            .unwrap();
+        let action = plan(resolved.desired(), locked.state().known(), &actual).actions()[0].clone();
+        assert_eq!(action.kind(), ActionKind::ReplaceOwnership);
+        let action_id = locked
+            .begin_operation(desired_hash(resolved.desired()).unwrap(), &action)
+            .unwrap();
+        locked.mark_running(&action_id).unwrap();
+
+        assert!(
+            !reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap()
+        );
+        assert!(locked.state().active_operation().is_none());
+        assert!(
+            locked
+                .state()
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .is_some()
+        );
+        assert!(
+            locked
+                .state()
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config-renamed").unwrap())
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_commits_or_fails_remove_link_from_its_recorded_conditions() {
+        let successful = TestWorkspace::new();
+        successful.write("store/git/config", "source\n");
+        successful
+            .coordinator()
+            .apply_create_link(&successful.input(), |_| true)
+            .unwrap();
+        let repository = successful.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let inspector = FileLinkInspector::new(successful.path("home").as_path()).unwrap();
+        let actual = inspector
+            .inspect(successful.stale_input().desired(), locked.state().known())
+            .unwrap();
+        let action = plan(
+            successful.stale_input().desired(),
+            locked.state().known(),
+            &actual,
+        )
+        .actions()[0]
+            .clone();
+        assert_eq!(action.kind(), ActionKind::RemoveLink);
+        let action_id = locked
+            .begin_operation(
+                desired_hash(successful.stale_input().desired()).unwrap(),
+                &action,
+            )
+            .unwrap();
+        locked.mark_running(&action_id).unwrap();
+        fs::remove_file(successful.path("home/.gitconfig")).unwrap();
+        assert!(
+            !reconcile_active_operation(&mut locked, successful.path("home").as_path()).unwrap()
+        );
+        assert!(locked.state().active_operation().is_none());
+        assert_eq!(locked.state().known().resources().len(), 0);
+
+        let failed = TestWorkspace::new();
+        failed.write("store/git/config", "source\n");
+        failed
+            .coordinator()
+            .apply_create_link(&failed.input(), |_| true)
+            .unwrap();
+        let repository = failed.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let inspector = FileLinkInspector::new(failed.path("home").as_path()).unwrap();
+        let actual = inspector
+            .inspect(failed.stale_input().desired(), locked.state().known())
+            .unwrap();
+        let action = plan(
+            failed.stale_input().desired(),
+            locked.state().known(),
+            &actual,
+        )
+        .actions()[0]
+            .clone();
+        let action_id = locked
+            .begin_operation(
+                desired_hash(failed.stale_input().desired()).unwrap(),
+                &action,
+            )
+            .unwrap();
+        locked.mark_running(&action_id).unwrap();
+        assert!(!reconcile_active_operation(&mut locked, failed.path("home").as_path()).unwrap());
+        assert!(locked.state().active_operation().is_none());
+        assert!(
+            locked
+                .state()
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_commits_forget_missing_and_keeps_a_lost_precondition_uncertain() {
+        use std::os::unix::fs::symlink;
+
+        let successful = TestWorkspace::new();
+        successful.write("store/git/config", "source\n");
+        successful
+            .coordinator()
+            .apply_create_link(&successful.input(), |_| true)
+            .unwrap();
+        fs::remove_file(successful.path("home/.gitconfig")).unwrap();
+        let repository = successful.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let inspector = FileLinkInspector::new(successful.path("home").as_path()).unwrap();
+        let actual = inspector
+            .inspect(successful.stale_input().desired(), locked.state().known())
+            .unwrap();
+        let action = plan(
+            successful.stale_input().desired(),
+            locked.state().known(),
+            &actual,
+        )
+        .actions()[0]
+            .clone();
+        assert_eq!(action.kind(), ActionKind::ForgetMissing);
+        let action_id = locked
+            .begin_operation(
+                desired_hash(successful.stale_input().desired()).unwrap(),
+                &action,
+            )
+            .unwrap();
+        locked.mark_running(&action_id).unwrap();
+        assert!(
+            !reconcile_active_operation(&mut locked, successful.path("home").as_path()).unwrap()
+        );
+        assert!(locked.state().active_operation().is_none());
+        assert_eq!(locked.state().known().resources().len(), 0);
+
+        let interrupted = TestWorkspace::new();
+        interrupted.write("store/git/config", "source\n");
+        interrupted
+            .coordinator()
+            .apply_create_link(&interrupted.input(), |_| true)
+            .unwrap();
+        fs::remove_file(interrupted.path("home/.gitconfig")).unwrap();
+        let repository = interrupted.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let inspector = FileLinkInspector::new(interrupted.path("home").as_path()).unwrap();
+        let actual = inspector
+            .inspect(interrupted.stale_input().desired(), locked.state().known())
+            .unwrap();
+        let action = plan(
+            interrupted.stale_input().desired(),
+            locked.state().known(),
+            &actual,
+        )
+        .actions()[0]
+            .clone();
+        let action_id = locked
+            .begin_operation(
+                desired_hash(interrupted.stale_input().desired()).unwrap(),
+                &action,
+            )
+            .unwrap();
+        locked.mark_running(&action_id).unwrap();
+        symlink(
+            interrupted.path("store/git/config"),
+            interrupted.path("home/.gitconfig"),
+        )
+        .unwrap();
+        assert!(
+            reconcile_active_operation(&mut locked, interrupted.path("home").as_path()).unwrap()
+        );
+        let (_, action) = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap();
+        assert_eq!(action.status(), ActionStatus::Uncertain);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_commits_or_fails_replace_link_from_its_recorded_conditions() {
+        use std::os::unix::fs::symlink;
+
+        let successful = TestWorkspace::new();
+        successful.write("store/git/config", "old\n");
+        successful.write("store/git/replacement", "new\n");
+        successful
+            .coordinator()
+            .apply_create_link(&successful.input(), |_| true)
+            .unwrap();
+        let resolved = successful.replacement_input();
+        let repository = successful.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let inspector = FileLinkInspector::new(successful.path("home").as_path()).unwrap();
+        let actual = inspector
+            .inspect(resolved.desired(), locked.state().known())
+            .unwrap();
+        let action = plan(resolved.desired(), locked.state().known(), &actual).actions()[0].clone();
+        assert_eq!(action.kind(), ActionKind::ReplaceLink);
+        let action_id = locked
+            .begin_operation(desired_hash(resolved.desired()).unwrap(), &action)
+            .unwrap();
+        locked.mark_running(&action_id).unwrap();
+        fs::remove_file(successful.path("home/.gitconfig")).unwrap();
+        symlink(
+            successful.path("store/git/replacement"),
+            successful.path("home/.gitconfig"),
+        )
+        .unwrap();
+        assert!(
+            !reconcile_active_operation(&mut locked, successful.path("home").as_path()).unwrap()
+        );
+        assert!(locked.state().active_operation().is_none());
+        assert_eq!(
+            locked
+                .state()
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .unwrap()
+                .source_path()
+                .as_ref(),
+            successful.path("store/git/replacement").as_path()
+        );
+
+        let failed = TestWorkspace::new();
+        failed.write("store/git/config", "old\n");
+        failed.write("store/git/replacement", "new\n");
+        failed
+            .coordinator()
+            .apply_create_link(&failed.input(), |_| true)
+            .unwrap();
+        let resolved = failed.replacement_input();
+        let repository = failed.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let inspector = FileLinkInspector::new(failed.path("home").as_path()).unwrap();
+        let actual = inspector
+            .inspect(resolved.desired(), locked.state().known())
+            .unwrap();
+        let action = plan(resolved.desired(), locked.state().known(), &actual).actions()[0].clone();
+        let action_id = locked
+            .begin_operation(desired_hash(resolved.desired()).unwrap(), &action)
+            .unwrap();
+        locked.mark_running(&action_id).unwrap();
+        assert!(!reconcile_active_operation(&mut locked, failed.path("home").as_path()).unwrap());
+        assert!(locked.state().active_operation().is_none());
+        assert_eq!(
+            locked
+                .state()
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .unwrap()
+                .source_path()
+                .as_ref(),
+            failed.path("store/git/config").as_path()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_commits_or_fails_relocation_from_its_recorded_conditions() {
+        use std::os::unix::fs::symlink;
+
+        let successful = TestWorkspace::new();
+        successful.write("store/git/config", "source\n");
+        successful
+            .coordinator()
+            .apply_create_link(&successful.input(), |_| true)
+            .unwrap();
+        fs::create_dir(successful.path("home/.config")).unwrap();
+        let resolved = successful.relocation_input();
+        let repository = successful.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let inspector = FileLinkInspector::new(successful.path("home").as_path()).unwrap();
+        let actual = inspector
+            .inspect(resolved.desired(), locked.state().known())
+            .unwrap();
+        let action = plan(resolved.desired(), locked.state().known(), &actual).actions()[0].clone();
+        assert_eq!(action.kind(), ActionKind::RelocateLink);
+        let action_id = locked
+            .begin_operation(desired_hash(resolved.desired()).unwrap(), &action)
+            .unwrap();
+        locked.mark_running(&action_id).unwrap();
+        fs::remove_file(successful.path("home/.gitconfig")).unwrap();
+        symlink(
+            successful.path("store/git/config"),
+            successful.path("home/.config/gitconfig"),
+        )
+        .unwrap();
+        assert!(
+            !reconcile_active_operation(&mut locked, successful.path("home").as_path()).unwrap()
+        );
+        assert!(locked.state().active_operation().is_none());
+        assert_eq!(
+            locked
+                .state()
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .unwrap()
+                .target_path()
+                .as_ref(),
+            successful.path("home/.config/gitconfig").as_path()
+        );
+
+        let failed = TestWorkspace::new();
+        failed.write("store/git/config", "source\n");
+        failed
+            .coordinator()
+            .apply_create_link(&failed.input(), |_| true)
+            .unwrap();
+        fs::create_dir(failed.path("home/.config")).unwrap();
+        let resolved = failed.relocation_input();
+        let repository = failed.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let inspector = FileLinkInspector::new(failed.path("home").as_path()).unwrap();
+        let actual = inspector
+            .inspect(resolved.desired(), locked.state().known())
+            .unwrap();
+        let action = plan(resolved.desired(), locked.state().known(), &actual).actions()[0].clone();
+        let action_id = locked
+            .begin_operation(desired_hash(resolved.desired()).unwrap(), &action)
+            .unwrap();
+        locked.mark_running(&action_id).unwrap();
+        assert!(!reconcile_active_operation(&mut locked, failed.path("home").as_path()).unwrap());
+        assert!(locked.state().active_operation().is_none());
+        assert_eq!(
+            locked
+                .state()
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .unwrap()
+                .target_path()
+                .as_ref(),
+            failed.path("home/.gitconfig").as_path()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_preserves_a_running_action_when_its_state_commit_fails() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let resolved = workspace.input();
+        let action = PlannedAction::create_link(resolved.desired().resources()[0].clone());
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let action_id = locked
+            .begin_create_operation(desired_hash(resolved.desired()).unwrap(), &action)
+            .unwrap();
+        locked.mark_running(&action_id).unwrap();
+        symlink(
+            workspace.path("store/git/config"),
+            workspace.path("home/.gitconfig"),
+        )
+        .unwrap();
+        locked.fail_next_commit_at(CommitStage::CreateTemporary);
+
+        let error =
+            reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap_err();
+        assert!(matches!(
+            error,
+            ApplyError::State(StateRepositoryError::Commit(CommitError::Injected {
+                stage: CommitStage::CreateTemporary
+            }))
+        ));
+        let (_, action) = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap();
         assert_eq!(action.status(), ActionStatus::Running);
+        assert_eq!(locked.state().known().resources().len(), 0);
+        drop(locked);
+        let persisted = repository.load().unwrap();
+        let (_, action) = persisted
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap();
+        assert_eq!(action.status(), ActionStatus::Running);
+        assert_eq!(persisted.known().resources().len(), 0);
     }
 }

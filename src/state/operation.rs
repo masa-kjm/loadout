@@ -812,7 +812,9 @@ impl RecordedAction {
 
     fn mark_without_known(&mut self, status: ActionStatus) -> Result<(), OperationRecordError> {
         let permitted = match status {
-            ActionStatus::Failed | ActionStatus::Uncertain => self.status == ActionStatus::Running,
+            ActionStatus::Failed | ActionStatus::Uncertain => {
+                matches!(self.status, ActionStatus::Running | ActionStatus::Uncertain)
+            }
             ActionStatus::Skipped => self.status == ActionStatus::Pending,
             ActionStatus::Pending | ActionStatus::Running | ActionStatus::Succeeded => false,
         };
@@ -827,7 +829,7 @@ impl RecordedAction {
     }
 
     fn mark_succeeded(&mut self) -> Result<RecordedKnownStateUpdate, OperationRecordError> {
-        if self.status != ActionStatus::Running {
+        if !matches!(self.status, ActionStatus::Running | ActionStatus::Uncertain) {
             return Err(OperationRecordError::InvalidStatusTransition {
                 from: self.status,
                 to: ActionStatus::Succeeded,

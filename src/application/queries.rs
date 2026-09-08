@@ -58,6 +58,8 @@ pub(crate) enum QueryError {
 }
 
 fn load_environment(context: &ResolverContext) -> Result<EnvironmentConfig, QueryError> {
+    #[cfg(test)]
+    crate::test_support::assert_desired_dependencies_allowed();
     let yaml =
         fs::read_to_string(context.environment_config_path().as_ref()).map_err(|source| {
             QueryError::ConfigurationRead {

@@ -204,6 +204,8 @@ fn discover_profiles(
     context: &ResolverContext,
     environment: &EnvironmentConfig,
 ) -> Result<BTreeMap<ProfileId, DiscoveredProfile>, ResolverError> {
+    #[cfg(test)]
+    crate::test_support::assert_desired_dependencies_allowed();
     let config_directory = context
         .environment_config_path
         .as_ref()
@@ -441,7 +443,7 @@ fn bind_configuration_path(
 ) -> Result<PathBuf, ResolverError> {
     if raw_path == "~"
         || (raw_path.starts_with('~') && !raw_path.starts_with("~/"))
-        || has_windows_drive_prefix(raw_path)
+        || (has_windows_drive_prefix(raw_path) && !Path::new(raw_path).is_absolute())
     {
         return Err(ResolverError::InvalidConfigurationPath {
             value: raw_path.to_owned(),

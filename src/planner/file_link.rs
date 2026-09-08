@@ -17,6 +17,8 @@ use crate::planner::ordering::sort_actions;
 /// This is intentionally a pure function. Every input is a typed domain value;
 /// it neither observes nor mutates the filesystem or durable state.
 pub(crate) fn plan(desired: &ResolvedDesired, known: &KnownState, actual: &ActualState) -> Plan {
+    #[cfg(test)]
+    crate::test_support::assert_desired_dependencies_allowed();
     let mut actions = Vec::new();
     let mut diagnostics = Vec::new();
     let blocked_targets = desired_target_collisions(desired, &mut diagnostics);

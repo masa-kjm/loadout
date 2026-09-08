@@ -459,3 +459,204 @@ mod unix {
         }
     }
 }
+
+#[cfg(windows)]
+mod windows {
+    use super::*;
+    use std::os::windows::fs::symlink_file;
+
+    fn assert_create_rejected_without_mutation(f: &Fixture) {
+        let protected_snapshot = || {
+            f.snapshot()
+                .into_iter()
+                .filter(|(path, _)| !path.starts_with(f.path("state")))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let before = protected_snapshot();
+        for flags in [vec![], vec!["--yes"]] {
+            let output = f.command().args(ARGS).args(flags).output().unwrap();
+            assert!(!text(&output).contains("Apply this plan?"));
+            expect(
+                output,
+                2,
+                &[
+                    "Preflight",
+                    "base/item",
+                    "target",
+                    "no-follow parent traversal",
+                ],
+            );
+            no_new_operation(f);
+            assert!(!f.path("state/loadout/state.json").exists());
+            assert_eq!(protected_snapshot(), before);
+        }
+    }
+
+    fn owned_link_or_assert_rejection(f: &Fixture, creation: std::io::Result<()>) -> bool {
+        match creation {
+            Ok(()) => true,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+                ) || error.raw_os_error() == Some(1314) =>
+            {
+                eprintln!(
+                    "fixture symlink unavailable: {error}; verifying preflight rejection instead of owned-link execution"
+                );
+                assert_create_rejected_without_mutation(f);
+                false
+            }
+            Err(error) => panic!("unexpected fixture symlink creation failure: {error}"),
+        }
+    }
+
+    #[test]
+    fn native_windows_create_is_blocked_before_confirmation_or_progress() {
+        assert_create_rejected_without_mutation(&Fixture::new());
+    }
+
+    #[test]
+    fn unavailable_fixture_privilege_still_exercises_binary_preflight_rejection() {
+        let f = Fixture::new();
+        // Exercise the unavailable-capability branch even on privileged runners.
+        assert!(!owned_link_or_assert_rejection(
+            &f,
+            Err(std::io::Error::from_raw_os_error(1314))
+        ));
+    }
+
+    #[test]
+    fn native_windows_replacement_removal_and_relocation_reject_before_progress() {
+        let f = Fixture::new();
+        if !owned_link_or_assert_rejection(
+            &f,
+            symlink_file(f.path("store/source"), f.path("home/target")),
+        ) {
+            return;
+        }
+        f.state(json!({"base/item":f.known("target")}), Value::Null);
+        let before = state(&f);
+        let profile = fs::read_to_string(f.path("portable/profiles/base.yaml")).unwrap();
+        f.write("store/new", "new source");
+        for (declaration, action) in [
+            (profile.replace("path: source", "path: new"), "replace_link"),
+            (
+                profile
+                    .replace("item:", "renamed:")
+                    .replace("path: source", "path: new"),
+                "replace_ownership",
+            ),
+            (profile.replace("~/target", "~/moved"), "relocate_link"),
+            (
+                "schema_version: 1\nid: base\nresources: {}\n".to_string(),
+                "remove_link",
+            ),
+        ] {
+            f.write("portable/profiles/base.yaml", &declaration);
+            expect(
+                f.command().args(ARGS).arg("--yes").output().unwrap(),
+                2,
+                &["Preflight", action, "base/item"],
+            );
+            assert_eq!(state(&f), before);
+            assert_eq!(
+                fs::read_link(f.path("home/target")).unwrap(),
+                f.path("store/source")
+            );
+            assert_eq!(fs::read_dir(f.path("home")).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn native_windows_prefix_mismatch_preserves_known_and_target() {
+        // Known records the exact observed DOS spelling. Resolver canonicalization produces a verbatim spelling; no ownership alias rule is assumed here.
+        let f = Fixture::new();
+        if !owned_link_or_assert_rejection(
+            &f,
+            symlink_file(f.path("store/source"), f.path("home/target")),
+        ) {
+            return;
+        }
+        f.state(json!({"base/old":f.known("target")}), Value::Null);
+        assert_ne!(
+            fs::canonicalize(f.path("store/source")).unwrap(),
+            fs::read_link(f.path("home/target")).unwrap()
+        );
+        let before = state(&f);
+        expect(
+            f.command().args(ARGS).arg("--yes").output().unwrap(),
+            2,
+            &["Preflight", "replace_ownership"],
+        );
+        assert_eq!(state(&f), before);
+        assert_eq!(
+            fs::read_link(f.path("home/target")).unwrap(),
+            f.path("store/source")
+        );
+        assert_eq!(fs::read_dir(f.path("home")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn native_windows_forget_is_blocked_by_later_preflight_or_state_sharing_denial() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let f = Fixture::new();
+        if !owned_link_or_assert_rejection(
+            &f,
+            symlink_file(f.path("store/source"), f.path("home/target")),
+        ) {
+            return;
+        }
+        f.write(
+            "portable/profiles/base.yaml",
+            "schema_version: 1\nid: base\nresources: {}\n",
+        );
+        f.state(
+            json!({"base/a":f.known("missing"), "base/z":f.known("target")}),
+            Value::Null,
+        );
+        let before = state(&f);
+        expect(
+            f.command().args(ARGS).arg("--yes").output().unwrap(),
+            2,
+            &["Preflight", "forget_missing", "remove_link"],
+        );
+        assert_eq!(
+            state(&f),
+            before,
+            "later removal must block the earlier state-only action"
+        );
+        f.state(json!({"base/a":f.known("missing")}), Value::Null);
+        {
+            let before = state(&f);
+            let _held = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(f.path("state/loadout/state.json"))
+                .unwrap();
+            expect(
+                f.command().args(ARGS).arg("--yes").output().unwrap(),
+                2,
+                &[
+                    "Preflight",
+                    "not writable",
+                    "committed actions: 0",
+                    "operation: absent",
+                ],
+            );
+            assert_eq!(state(&f), before);
+        }
+        expect(
+            f.command().args(ARGS).arg("--yes").output().unwrap(),
+            0,
+            &["forget_missing"],
+        );
+        assert_eq!(state(&f)["resources"], json!({}));
+        assert!(state(&f)["active_operation"].is_null());
+        assert_eq!(
+            fs::read_link(f.path("home/target")).unwrap(),
+            f.path("store/source")
+        );
+        assert_eq!(fs::read_dir(f.path("home")).unwrap().count(), 1);
+    }
+}

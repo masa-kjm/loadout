@@ -597,8 +597,8 @@ mod tests {
     // Paths are platform-local values only; these tests never access the filesystem.
     fn document_fixture(kind: &str, status: &str) -> Value {
         let root = std::env::temp_dir().join("loadout-codec-fixture");
-        let source = root.join("store/config");
-        let target = root.join("home/.config");
+        let source = root.join("store").join("config");
+        let target = root.join("home").join(".config");
         let resolved = ResolvedFileLink::new(
             FullyQualifiedResourceId::parse("base/config").unwrap(),
             ResolvedPath::new(source.clone()).unwrap(),

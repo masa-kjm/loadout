@@ -760,7 +760,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn inspector_observes_file_links_and_rejects_junction_targets_and_parents() {
-        use std::os::windows::fs::symlink_file;
+        use std::os::windows::fs::{symlink_dir, symlink_file};
 
         let workspace = TestWorkspace::new();
         workspace.create_dir("home/config");
@@ -796,6 +796,17 @@ mod tests {
             &workspace.path("home/parent-junction"),
             &workspace.path("outside"),
         );
+        let directory_link = resource(
+            &workspace,
+            "workstation/directory-link",
+            "dir-source",
+            "directory-link",
+        );
+        symlink_dir(
+            workspace.path("outside"),
+            directory_link.target_path().as_ref(),
+        )
+        .unwrap();
         let known = KnownState::new([KnownFileLink::from_resolved(&expected)]).unwrap();
 
         let actual = workspace
@@ -805,6 +816,7 @@ mod tests {
                     expected.clone(),
                     final_junction.clone(),
                     parent_junction.clone(),
+                    directory_link.clone(),
                 ]),
                 &known,
             )
@@ -833,6 +845,19 @@ mod tests {
             &TargetObservation::UnsafePath {
                 parent_safety: ParentSafety::ReparsePoint,
             }
+        );
+        assert_eq!(
+            actual
+                .get(directory_link.target_path())
+                .unwrap()
+                .observation(),
+            &TargetObservation::OtherEntry {
+                kind: OtherEntryKind::ReparsePoint
+            }
+        );
+        assert_eq!(
+            fs::read_link(directory_link.target_path().as_ref()).unwrap(),
+            workspace.path("outside")
         );
         assert!(
             !workspace.path("outside/target").exists(),

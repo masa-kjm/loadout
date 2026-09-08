@@ -67,7 +67,7 @@ impl FileLinkExecutor {
                 Err(inspection) => Err(CreateLinkExecutionError::CreateAftermathUnproven {
                     target_path,
                     source,
-                    inspection,
+                    inspection: Box::new(inspection),
                 }),
             };
         }
@@ -184,7 +184,9 @@ impl FileLinkExecutor {
         if aftermath.postcondition_holds() {
             Ok(())
         } else {
-            Err(ReplaceLinkExecutionError::Aftermath { aftermath })
+            Err(ReplaceLinkExecutionError::Aftermath {
+                aftermath: Box::new(aftermath),
+            })
         }
     }
 
@@ -499,7 +501,7 @@ impl FileLinkExecutor {
                 Err(inspection) => Err(RemoveLinkExecutionError::RemoveAftermathUnproven {
                     target_path,
                     source,
-                    inspection,
+                    inspection: Box::new(inspection),
                 }),
             };
         }
@@ -748,7 +750,10 @@ impl FileLinkExecutor {
         mutation: ReplacementMutation,
     ) -> ReplaceLinkExecutionError {
         match self.replacement_aftermath(facts) {
-            Ok(aftermath) => ReplaceLinkExecutionError::MutationAttempt { source, aftermath },
+            Ok(aftermath) => ReplaceLinkExecutionError::MutationAttempt {
+                source,
+                aftermath: Box::new(aftermath),
+            },
             Err(_) => ReplaceLinkExecutionError::MutationAftermathUnproven { mutation, source },
         }
     }
@@ -980,7 +985,7 @@ pub(crate) enum CreateLinkExecutionError {
     CreateAftermathUnproven {
         target_path: ResolvedPath,
         source: io::Error,
-        inspection: TargetInspectionError,
+        inspection: Box<TargetInspectionError>,
     },
     PostconditionInspection(TargetInspectionError),
     PostconditionNotMet {
@@ -1015,7 +1020,7 @@ pub(crate) enum ReplaceLinkExecutionError {
     },
     MutationAttempt {
         source: io::Error,
-        aftermath: ReplacementAftermath,
+        aftermath: Box<ReplacementAftermath>,
     },
     MutationAftermathUnproven {
         mutation: ReplacementMutation,
@@ -1023,7 +1028,7 @@ pub(crate) enum ReplaceLinkExecutionError {
     },
     PostconditionInspection(TargetInspectionError),
     Aftermath {
-        aftermath: ReplacementAftermath,
+        aftermath: Box<ReplacementAftermath>,
     },
 }
 
@@ -1224,7 +1229,7 @@ pub(crate) enum RemoveLinkExecutionError {
     RemoveAftermathUnproven {
         target_path: ResolvedPath,
         source: io::Error,
-        inspection: TargetInspectionError,
+        inspection: Box<TargetInspectionError>,
     },
     PostconditionInspection(TargetInspectionError),
     PostconditionNotMet {

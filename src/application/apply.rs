@@ -3117,6 +3117,8 @@ mod tests {
         );
     }
 
+    // Requires the supported Unix create path; Windows proves preflight rejection separately.
+    #[cfg(unix)]
     #[test]
     fn state_write_preflight_failure_skips_confirmation_and_leaves_no_operation_record() {
         let workspace = TestWorkspace::new();
@@ -3195,6 +3197,8 @@ mod tests {
         );
     }
 
+    // Requires the supported Unix create path; Windows proves preflight rejection separately.
+    #[cfg(unix)]
     #[test]
     fn declined_confirmation_follows_preflight_and_leaves_no_operation_record() {
         let workspace = TestWorkspace::new();
@@ -3215,6 +3219,8 @@ mod tests {
         assert!(!workspace.path("state/state.json").exists());
     }
 
+    // Requires the supported Unix create path; Windows proves preflight rejection separately.
+    #[cfg(unix)]
     #[test]
     fn running_is_durable_before_executor_recheck_and_an_uncertain_result_is_retained() {
         let workspace = TestWorkspace::new();

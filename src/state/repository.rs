@@ -1134,6 +1134,65 @@ impl Drop for ExclusiveStateLock {
     }
 }
 
+#[cfg(windows)]
+fn acquire_platform_lock(
+    file: File,
+    path: &Path,
+) -> Result<ExclusiveStateLock, StateRepositoryError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, GetLastError};
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let mut overlapped = OVERLAPPED::default();
+    let result = unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if result != 0 {
+        return Ok(ExclusiveStateLock { file });
+    }
+    let error = unsafe { GetLastError() };
+    if error == ERROR_LOCK_VIOLATION {
+        Err(StateRepositoryError::LockContended {
+            path: path.to_path_buf(),
+        })
+    } else {
+        Err(StateRepositoryError::LockIo {
+            path: path.to_path_buf(),
+            source: io::Error::from_raw_os_error(error as i32),
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ExclusiveStateLock {
+    fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+
+        let mut overlapped = OVERLAPPED::default();
+        let _ = unsafe {
+            UnlockFileEx(
+                self.file.as_raw_handle(),
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2028,64 +2087,5 @@ mod tests {
             active_status(&repository.load().unwrap(), &action_id),
             ActionStatus::Running
         );
-    }
-}
-
-#[cfg(windows)]
-fn acquire_platform_lock(
-    file: File,
-    path: &Path,
-) -> Result<ExclusiveStateLock, StateRepositoryError> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, GetLastError};
-    use windows_sys::Win32::Storage::FileSystem::{
-        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
-    };
-    use windows_sys::Win32::System::IO::OVERLAPPED;
-
-    let mut overlapped = OVERLAPPED::default();
-    let result = unsafe {
-        LockFileEx(
-            file.as_raw_handle(),
-            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-            0,
-            u32::MAX,
-            u32::MAX,
-            &mut overlapped,
-        )
-    };
-    if result != 0 {
-        return Ok(ExclusiveStateLock { file });
-    }
-    let error = unsafe { GetLastError() };
-    if error == ERROR_LOCK_VIOLATION {
-        Err(StateRepositoryError::LockContended {
-            path: path.to_path_buf(),
-        })
-    } else {
-        Err(StateRepositoryError::LockIo {
-            path: path.to_path_buf(),
-            source: io::Error::from_raw_os_error(error as i32),
-        })
-    }
-}
-
-#[cfg(windows)]
-impl Drop for ExclusiveStateLock {
-    fn drop(&mut self) {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
-        use windows_sys::Win32::System::IO::OVERLAPPED;
-
-        let mut overlapped = OVERLAPPED::default();
-        let _ = unsafe {
-            UnlockFileEx(
-                self.file.as_raw_handle(),
-                0,
-                u32::MAX,
-                u32::MAX,
-                &mut overlapped,
-            )
-        };
     }
 }

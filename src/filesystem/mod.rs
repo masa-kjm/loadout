@@ -65,8 +65,7 @@ pub(crate) fn create_file_symbolic_link_no_replace(
     )
 }
 
-/// Atomically replaces the final target name with the recorded sibling entry.
-/// Callers must have rechecked the owned target and the missing sibling under a safe parent immediately before this operation.
+/// Replaces the expected target with its recorded sibling only when the backend can retain both entry proofs through atomic replacement. The primitive must reject unsupported guarantees even if a caller bypasses capability preflight.
 pub(crate) fn replace_file_symbolic_link_from_temporary(
     canonical_home: &ResolvedPath,
     physical_target_path: &ResolvedPath,
@@ -117,4 +116,126 @@ pub(crate) fn ensure_file_symbolic_link_removal_supported(
     target_parent: &ResolvedPath,
 ) -> io::Result<()> {
     platform::ensure_file_symbolic_link_removal_supported(target_parent)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "loadout-primitive-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("source"), "source referent").unwrap();
+            Self(root)
+        }
+        fn path(&self, name: &str) -> ResolvedPath {
+            ResolvedPath::new(self.0.join(name)).unwrap()
+        }
+        fn root(&self) -> ResolvedPath {
+            ResolvedPath::new(self.0.clone()).unwrap()
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn unsupported_destructive_primitives_protect_substituted_entries_even_without_preflight() {
+        let f = Fixture::new();
+        let root = f.root();
+        let target = f.path("target");
+        let temporary = f.path("temporary");
+        let expected = LinkTarget::new(f.path("source"));
+        // On Unix, explicitly substitute a regular file after observing the old link.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(expected.as_path().as_ref(), target.as_ref()).unwrap();
+            assert_eq!(
+                classify_nofollow_entry(&fs::symlink_metadata(target.as_ref()).unwrap()),
+                NoFollowEntryKind::FileSymbolicLink
+            );
+            fs::remove_file(target.as_ref()).unwrap();
+        }
+        fs::write(target.as_ref(), "substituted unmanaged target").unwrap();
+        fs::write(temporary.as_ref(), "substituted unmanaged temporary").unwrap();
+        assert_eq!(
+            ensure_file_symbolic_link_replacement_supported(&root)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            ensure_file_symbolic_link_removal_supported(&root)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            replace_file_symbolic_link_from_temporary(&root, &target, &temporary)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        for path in [&target, &temporary] {
+            assert_eq!(
+                remove_expected_file_symbolic_link_entry(&root, path, &expected)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::Unsupported
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(target.as_ref()).unwrap(),
+            "substituted unmanaged target"
+        );
+        assert_eq!(
+            fs::read_to_string(temporary.as_ref()).unwrap(),
+            "substituted unmanaged temporary"
+        );
+        assert_eq!(
+            fs::read_to_string(expected.as_path().as_ref()).unwrap(),
+            "source referent"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_create_boundary_rejects_without_touching_missing_or_existing_targets() {
+        let f = Fixture::new();
+        let target = f.path("target");
+        let source = LinkTarget::new(f.path("source"));
+        assert_eq!(
+            ensure_file_symbolic_link_creation_supported(&f.root())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            create_file_symbolic_link_no_replace(&f.root(), &target, &source)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert!(fs::symlink_metadata(target.as_ref()).is_err());
+        fs::write(target.as_ref(), "unmanaged").unwrap();
+        assert_eq!(
+            create_file_symbolic_link_no_replace(&f.root(), &target, &source)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(fs::read_to_string(target.as_ref()).unwrap(), "unmanaged");
+    }
 }

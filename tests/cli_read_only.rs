@@ -38,7 +38,7 @@ impl Fixture {
         fixture
     }
     fn path(&self, name: &str) -> PathBuf {
-        self.root.join(name)
+        self.root.join(name).components().collect()
     }
     fn write(&self, name: &str, text: &str) {
         let path = self.path(name);

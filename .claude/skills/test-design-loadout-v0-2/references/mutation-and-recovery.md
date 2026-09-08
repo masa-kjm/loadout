@@ -7,7 +7,7 @@ For every new or changed mutation path, design evidence for the applicable cases
 - successful mutation and exact no-follow post-condition;
 - rejected ownership, target-kind, source, containment, parent-safety, validation, preflight, or capability condition with no target mutation;
 - executor recheck after a change between planning and mutation;
-- durable `running` progress before mutation and no Known-state update before verified post-condition;
+- durable running progress before any mutation, or before the final verification that authorizes a state-only action, and no Known-state update before the required post-condition is verified;
 - failure after mutation classified from the recorded precondition and post-condition as succeeded, failed, or uncertain; and
 - recovery of recorded `pending`, `running` with proven post-condition, `running` with retained precondition, and unprovable or unsafe observations.
 

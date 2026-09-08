@@ -56,6 +56,8 @@ pub(crate) fn create_file_symbolic_link_no_replace(
     physical_target_path: &ResolvedPath,
     link_target: &LinkTarget,
 ) -> io::Result<()> {
+    #[cfg(test)]
+    crate::test_support::assert_mutation_allowed();
     platform::create_file_symbolic_link_no_replace(
         canonical_home,
         physical_target_path,
@@ -70,6 +72,8 @@ pub(crate) fn replace_file_symbolic_link_from_temporary(
     physical_target_path: &ResolvedPath,
     physical_temporary_path: &ResolvedPath,
 ) -> io::Result<()> {
+    #[cfg(test)]
+    crate::test_support::assert_mutation_allowed();
     platform::replace_file_symbolic_link_from_temporary(
         canonical_home,
         physical_target_path,
@@ -83,6 +87,8 @@ pub(crate) fn remove_expected_file_symbolic_link_entry(
     physical_target_path: &ResolvedPath,
     expected_link_target: &LinkTarget,
 ) -> io::Result<()> {
+    #[cfg(test)]
+    crate::test_support::assert_mutation_allowed();
     platform::remove_expected_file_symbolic_link_entry(
         canonical_home,
         physical_target_path,

@@ -93,6 +93,8 @@ impl FileLinkExecutor {
         action: &PlannedAction,
         source: &VerifiedSource,
     ) -> Result<(), CreateLinkExecutionError> {
+        #[cfg(test)]
+        crate::test_support::assert_mutation_allowed();
         let (target_path, _) = self.recheck_create(action, source)?;
         let physical_target_path = self
             .inspector
@@ -241,9 +243,33 @@ impl FileLinkExecutor {
         action: &PlannedAction,
         source: &VerifiedSource,
     ) -> Result<(), ReplaceLinkExecutionError> {
+        #[cfg(test)]
+        crate::test_support::assert_mutation_allowed();
         if action.kind() != ActionKind::ReplaceOwnership {
             return Err(ReplaceLinkExecutionError::InvalidReplaceConditions);
         }
+        self.preflight_unchanged_link(action, source)
+    }
+
+    /// Revalidates an already satisfied action without requiring mutation capability.
+    pub(crate) fn preflight_noop(
+        &self,
+        action: &PlannedAction,
+        source: &VerifiedSource,
+    ) -> Result<(), ReplaceLinkExecutionError> {
+        #[cfg(test)]
+        crate::test_support::assert_mutation_allowed();
+        if action.kind() != ActionKind::Noop {
+            return Err(ReplaceLinkExecutionError::InvalidReplaceConditions);
+        }
+        self.preflight_unchanged_link(action, source)
+    }
+
+    fn preflight_unchanged_link(
+        &self,
+        action: &PlannedAction,
+        source: &VerifiedSource,
+    ) -> Result<(), ReplaceLinkExecutionError> {
         let preconditions = action.preconditions();
         let [
             TargetCondition::ExpectedLink {
@@ -293,6 +319,8 @@ impl FileLinkExecutor {
         action: &PlannedAction,
         source: &VerifiedSource,
     ) -> Result<(), ReplaceLinkExecutionError> {
+        #[cfg(test)]
+        crate::test_support::assert_mutation_allowed();
         if !matches!(
             action.kind(),
             ActionKind::ReplaceLink | ActionKind::ReplaceOwnership
@@ -354,6 +382,8 @@ impl FileLinkExecutor {
         action: &PlannedAction,
         source: &VerifiedSource,
     ) -> Result<(), RelocateLinkExecutionError> {
+        #[cfg(test)]
+        crate::test_support::assert_mutation_allowed();
         let facts = relocation_facts_from_action(action)?;
         self.recheck_relocation_preconditions(&facts, source)?;
         self.ensure_relocation_capabilities(&facts)
@@ -492,6 +522,8 @@ impl FileLinkExecutor {
         &self,
         action: &PlannedAction,
     ) -> Result<(), RemoveLinkExecutionError> {
+        #[cfg(test)]
+        crate::test_support::assert_mutation_allowed();
         let (target_path, _) = self.recheck_remove(action)?;
         let physical_target_path = self
             .inspector
@@ -525,6 +557,8 @@ impl FileLinkExecutor {
         &self,
         action: &PlannedAction,
     ) -> Result<(), ForgetMissingExecutionError> {
+        #[cfg(test)]
+        crate::test_support::assert_mutation_allowed();
         self.execute_forget_missing(action)
     }
 

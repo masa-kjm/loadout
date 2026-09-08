@@ -25,6 +25,8 @@ pub(crate) struct FileLinkInspector {
 impl FileLinkInspector {
     /// Establishes the canonical home directory used for physical target containment.
     pub(crate) fn new(home_directory: &Path) -> Result<Self, TargetInspectionError> {
+        #[cfg(test)]
+        crate::test_support::assert_target_inspection_allowed();
         let declared_home = ResolvedPath::new(home_directory.to_path_buf())
             .map_err(TargetInspectionError::InvalidDeclaredHome)?;
         let physical_home = fs::canonicalize(home_directory).map_err(|source| {
@@ -120,6 +122,8 @@ impl FileLinkInspector {
         target_path: ResolvedPath,
         expectations: TargetExpectations,
     ) -> Result<ActualFileLink, TargetInspectionError> {
+        #[cfg(test)]
+        crate::test_support::assert_target_inspection_allowed();
         let observation = if let Some(physical_target_path) =
             self.physical_target_path(&target_path)?
         {

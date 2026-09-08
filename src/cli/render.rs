@@ -2,12 +2,12 @@ use crate::application::queries::{DiffReport, PlanReport, QueryError, Validation
 use crate::domain::{
     actual::TargetObservation,
     diagnostic::Diagnostic,
-    plan::{ActionKind, ActionReason},
+    plan::{ActionKind, ActionReason, Plan},
 };
 use crate::state::operation::ActionStatus;
 use std::io::{self, Write};
 
-fn action_name(kind: ActionKind) -> &'static str {
+pub(super) fn action_name(kind: ActionKind) -> &'static str {
     match kind {
         ActionKind::CreateLink => "create_link",
         ActionKind::ReplaceLink => "replace_link",
@@ -122,7 +122,11 @@ pub(super) fn plan(
             "blocked"
         }
     )?;
-    for action in report.plan.actions() {
+    planned(out, err, &report.plan)
+}
+
+pub(super) fn planned(out: &mut impl Write, err: &mut impl Write, plan: &Plan) -> io::Result<u8> {
+    for action in plan.actions() {
         let paths = action
             .preconditions()
             .iter()
@@ -141,7 +145,7 @@ pub(super) fn plan(
             reason(action.reason())
         )?;
     }
-    for diagnostic in report.plan.diagnostics() {
+    for diagnostic in plan.diagnostics() {
         match diagnostic {
             Diagnostic::TargetCollision {
                 target_path,
@@ -187,7 +191,7 @@ pub(super) fn plan(
             )?,
         }
     }
-    Ok(if report.plan.is_executable() { 0 } else { 2 })
+    Ok(if plan.is_executable() { 0 } else { 2 })
 }
 
 pub(super) fn query_error(error: &QueryError) -> String {

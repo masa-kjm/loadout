@@ -1,5 +1,6 @@
 //! Terminal adapter. Selection, resolution, observation and planning stay in core layers.
 
+mod apply;
 mod args;
 mod render;
 use crate::application::queries::{
@@ -9,7 +10,7 @@ use crate::loader::{LoadError, MachinePaths, StatePaths};
 use crate::state::repository::StateRepository;
 use args::Command;
 use std::{
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     process::ExitCode,
 };
 
@@ -19,7 +20,7 @@ pub(crate) fn run() -> ExitCode {
     match run_with(std::env::args_os().skip(1), &mut stdout, &mut stderr) {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
-            let _ = writeln!(stderr, "output error: {error}");
+            let _ = writeln!(stderr, "CLI I/O error: {error}");
             ExitCode::FAILURE
         }
     }
@@ -79,6 +80,26 @@ fn run_command(
             };
             queries::validate(&ValidationRequest { context, selection })
                 .map(|report| render::validation(out, err, &report))
+        }
+        Command::Apply {
+            config,
+            root,
+            yes,
+            dry_run,
+        } => {
+            let context = match machine.select(config.as_deref()) {
+                Ok(context) => context,
+                Err(error) => return load_error(err, error),
+            };
+            return apply::run(
+                &DeclarationRequest { context, root },
+                yes,
+                dry_run,
+                &mut io::stdin().lock(),
+                io::stdin().is_terminal() && io::stderr().is_terminal(),
+                out,
+                err,
+            );
         }
         Command::Plan { config, root } => {
             let context = match machine.select(config.as_deref()) {
@@ -179,6 +200,67 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn dry_run_adapter_cannot_enter_any_mutating_boundary() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.root.join("home/absent-parent")).unwrap();
+        let _read_only = test_support::forbid_mutation();
+        for yes in [false, true] {
+            assert_eq!(
+                run_command(
+                    Command::Apply {
+                        config: Some(fixture.root.join("config.yaml").into_os_string()),
+                        root: None,
+                        yes,
+                        dry_run: true,
+                    },
+                    &fixture.machine(),
+                    &mut Vec::new(),
+                    &mut Vec::new()
+                )
+                .unwrap(),
+                0
+            );
+        }
+        assert!(!fixture.root.join("state").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_plan_output_cannot_authorize_execution_even_with_yes() {
+        struct Unwritable;
+        impl Write for Unwritable {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("injected output failure"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.root.join("home/absent-parent")).unwrap();
+        let request = DeclarationRequest {
+            context: fixture
+                .machine()
+                .select(Some(fixture.root.join("config.yaml").as_os_str()))
+                .unwrap(),
+            root: None,
+        };
+        let error = apply::run(
+            &request,
+            true,
+            false,
+            &mut io::empty(),
+            false,
+            &mut Unwritable,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("injected output failure"));
+        assert!(!fixture.root.join("state/state.json").exists());
+        assert!(!fixture.root.join("home/absent-parent/target").exists());
     }
 
     #[test]

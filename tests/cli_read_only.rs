@@ -482,3 +482,6 @@ fn dangling_runtime_selection_is_an_error_and_does_not_fall_back() {
         &["base"],
     );
 }
+
+#[path = "support/apply.rs"]
+mod apply;

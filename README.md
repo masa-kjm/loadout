@@ -5,8 +5,9 @@ Loadout is a local environment manager built around explicit desired state, owne
 ## Status
 
 v0.2.0 is a clean-break redesign and is not released yet.
-The repository implements the read-only `validate`, `diff`, and `plan` commands described in the [CLI specification](docs/specs/cli.md).
-The `apply` command adapter and installer are not implemented yet.
+The repository implements `validate`, `diff`, `plan`, and `apply` (including confirmation and dry run) as described in the [CLI specification](docs/specs/cli.md).
+Platform support is incomplete: the current Unix backend supports link creation, while guarded replacement and removal are rejected during preflight; Windows mutation support and conformance remain unfinished.
+The installer is not implemented yet.
 The published package's Rust library target is not yet a supported public API.
 
 v0.1 is retired and unsupported.

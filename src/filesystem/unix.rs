@@ -70,7 +70,7 @@ pub(super) fn replace_file_symbolic_link_from_temporary(
     _: &ResolvedPath,
     _: &ResolvedPath,
 ) -> io::Result<()> {
-    // Rejection must hold at the mutation boundary too: renameat can replace or move an entry substituted after an executor's no-follow observation.
+    // Keep replacement disabled at the direct boundary until shared-parent rechecks and native integration evidence are implemented.
     Err(expected_entry_replacement_unsupported())
 }
 
@@ -79,7 +79,7 @@ pub(super) fn remove_expected_file_symbolic_link_entry(
     _: &ResolvedPath,
     _: &LinkTarget,
 ) -> io::Result<()> {
-    // Keep the mutation primitive fail-closed as well as preflight. POSIX `unlinkat` accepts only a directory entry name; it cannot require that the name still denotes the no-follow entry that was inspected as the expected link. A replacement between the inspection and `unlinkat` would otherwise delete an unmanaged entry.
+    // Keep removal disabled until the retained-parent execution context, immediate checks and required observations are implemented.
     Err(expected_entry_removal_unsupported())
 }
 
@@ -90,26 +90,26 @@ pub(super) fn ensure_file_symbolic_link_creation_supported(_: &ResolvedPath) -> 
 }
 
 pub(super) fn ensure_file_symbolic_link_replacement_supported(_: &ResolvedPath) -> io::Result<()> {
-    // `renameat` is atomic but does not bind either name to the no-follow entries inspected before it. A substituted unmanaged target or temporary could therefore be moved despite the executor's recheck.
+    // The observational contract permits name replacement, but the required intermediate checks and native action evidence are not implemented yet.
     Err(expected_entry_replacement_unsupported())
 }
 
 pub(super) fn ensure_file_symbolic_link_removal_supported(_: &ResolvedPath) -> io::Result<()> {
-    // A directory descriptor keeps parent traversal safe, but it does not make `unlinkat(parent_fd, name, 0)` conditional on the identity or link value of `name`. Do not authorize a destructive action until the platform supplies an expected-entry removal primitive.
+    // Name-based deletion is permitted by the concurrency contract; enabling it still requires the execution context and native removal evidence.
     Err(expected_entry_removal_unsupported())
 }
 
 fn expected_entry_replacement_unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
-        "Unix file-link replacement requires an atomic expected-entry replacement primitive",
+        "Unix file-link replacement is unavailable pending retained-parent rechecks and native integration",
     )
 }
 
 fn expected_entry_removal_unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
-        "Unix file-link removal requires an atomic expected-entry deletion primitive; unlinkat deletes an unchecked current name",
+        "Unix file-link removal is unavailable pending retained-parent rechecks and native integration",
     )
 }
 

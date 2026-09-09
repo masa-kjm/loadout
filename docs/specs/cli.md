@@ -83,12 +83,15 @@ Apply always generates a fresh plan; it never accepts a previously displayed pla
 
 After successful preflight, a normal apply displays the executable Plan before mutation.
 When standard input and standard error are terminals, it asks for confirmation and proceeds only after an affirmative response.
-When the session is non-interactive, `--yes` is REQUIRED; otherwise apply fails without mutation.
+When the session is non-interactive, `--yes` is REQUIRED; otherwise apply fails without new target mutation or a new operation record. Permitted recovery effects may precede confirmation.
 
 `--yes` does not bypass conflicts, ownership checks, preflight, path safety, or post-condition verification.
 
 `--dry-run` performs the dry-run lifecycle defined by [Lifecycle](lifecycle.md).
 It does not ask for confirmation, and `--yes` has no effect with it.
+
+Loadout checks recorded ownership and filesystem safety immediately before mutations, but does not exclude concurrent external changes. An entry substituted after the last check can be deleted or replaced, and successful postcondition verification may not reveal the race. See the [file-link concurrency contract](file-link.md#external-filesystem-concurrency) for the scope and limits of these guarantees.
+This explanation adds no confirmation step and does not change `--yes` semantics.
 
 ## Output
 
@@ -113,10 +116,10 @@ Observed drift is reportable state, not a `diff` runtime failure.
 | --- | --- |
 | `0` | The command completed successfully. A plan may contain actions or only `noop` actions, and a `diff` report may contain drift. |
 | `1` | A runtime failure occurred, including an execution or state-commit failure. Earlier verified actions may remain applied. |
-| `2` | Input was invalid, a plan was blocked, preflight failed, recovery is uncertain, confirmation was declined, or required non-interactive confirmation was absent. No new target mutation is performed for this outcome. |
+| `2` | Input was invalid, a plan was blocked, preflight failed, recovery is uncertain, confirmation was declined, or required non-interactive confirmation was absent. No new planned target mutation is performed for this outcome; permitted prior-operation recovery cleanup and state commits may already have occurred. |
 
 An `apply` that has already completed one or more verified actions and then fails exits with `1`.
-It never reports success merely because some earlier actions were committed.
+It never reports success merely because some earlier actions were committed. A failed recheck after a mutation step is an execution failure, with recorded effects classified as specified by State and Recovery. Conversely, exit `0` after verified removal does not prove the identity of the deleted entry when external substitution was indistinguishable from the required postconditions.
 
 ## Excluded Commands
 

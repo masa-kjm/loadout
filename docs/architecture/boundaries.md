@@ -44,7 +44,7 @@ For the v0.2.0 file-link resource, removal or replacement is permitted only when
 2. Actual inspection confirms that the target is that expected link.
 
 Any missing proof, wrong link, regular file, directory, unsafe target-parent path, or other unexpected entry is a conflict or safety failure.
-It must not be replaced, followed, or removed.
+The executor must reject that observed condition before the next mutation step. The [external filesystem concurrency contract](../specs/file-link.md#external-filesystem-concurrency) limits this protection: a later substituted unmanaged entry can be removed or replaced, and post-observations may be indistinguishable from success.
 
 The [File Links](../specs/file-link.md) specification defines which target-parent conditions are unsafe and the required no-follow proof on each supported platform.
 
@@ -54,13 +54,13 @@ Explicit transfer-of-ownership behavior, if ever introduced, requires its own sp
 ## Filesystem Mutation
 
 Filesystem mutation is permitted only after a fresh executable plan and preflight checks.
-The executor must revalidate containment, parent safety, target kind, and the action-specific ownership precondition immediately before mutation.
+The executor must revalidate applicable source, containment, parent safety, target kind, temporary and action-specific ownership predicates immediately before each mutation step. Retained directory handles bind directory objects, not uninterrupted physical containment or association with declared paths. Required path association must be checked at recheck and post-observation boundaries; a handle-local result alone cannot establish success at a different declared path. The state lock does not exclude external filesystem writers.
 
 Path validation must account for symlinks on Unix and symlinks, junctions, reparse points, and case behavior on Windows.
 A lexical path check is not containment proof.
 The detailed algorithms and supported platform behavior belong to the file-link specification.
 
-The executor must modify only the resolved target named by the action.
+The executor must address only the resolved target and exact recorded temporary named by the action. This addressing constraint does not promise protection against external substitution or parent movement after the last recheck.
 It must not write to Loadout control files, state files, lock files, profiles, or store contents as a side effect of materializing a resource.
 
 ## State and Failure Boundaries
@@ -93,7 +93,7 @@ The future migration protocol is described in [Schema Evolution and Migration](.
 Core layers return structured diagnostics and errors.
 Only the command adapter formats them for a terminal or maps them to an exit status.
 
-A blocking diagnostic prevents mutation.
+A blocking diagnostic prevents the next mutation. Whole-Plan preflight rejection prevents new operation creation and new target mutation, but does not undo prior recovery effects. A failed execution recheck after an earlier step or action preserves those effects for classification rather than claiming the whole apply made no mutation.
 An error after a mutation is reported together with the durable operation status needed for a later recovery attempt.
 
 If a dry-run mode is exposed, it must not create directories, acquire a mutating lock, write state, write operation records, create temporary files in managed paths, or otherwise mutate persistent or managed state.

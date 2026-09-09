@@ -88,6 +88,7 @@ pub(crate) fn replace_file_symbolic_link_from_temporary(
 }
 
 /// Removes a freshly rechecked expected link by name under the observational concurrency contract. Currently disabled pending retained-context action integration and native evidence; no atomic entry-identity guarantee is claimed.
+#[cfg_attr(unix, allow(dead_code))]
 pub(crate) fn remove_expected_file_symbolic_link_entry(
     canonical_home: &ResolvedPath,
     physical_target_path: &ResolvedPath,
@@ -182,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_destructive_primitives_protect_substituted_entries_even_without_preflight() {
+    fn unavailable_direct_destructive_primitives_protect_substituted_entries() {
         let f = Fixture::new();
         let root = f.root();
         let target = f.path("target");
@@ -206,6 +207,9 @@ mod tests {
                 .kind(),
             io::ErrorKind::Unsupported
         );
+        #[cfg(unix)]
+        ensure_file_symbolic_link_removal_supported(&root).unwrap();
+        #[cfg(windows)]
         assert_eq!(
             ensure_file_symbolic_link_removal_supported(&root)
                 .unwrap_err()

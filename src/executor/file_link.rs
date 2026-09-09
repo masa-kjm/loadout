@@ -8,10 +8,12 @@ use crate::domain::actual::TargetObservation;
 use crate::domain::file_link::LinkTarget;
 use crate::domain::paths::ResolvedPath;
 use crate::domain::plan::{ActionKind, PlannedAction, TargetCondition};
+#[cfg(windows)]
+use crate::filesystem::remove_expected_file_symbolic_link_entry;
 use crate::filesystem::{
     create_file_symbolic_link_no_replace, ensure_file_symbolic_link_creation_supported,
     ensure_file_symbolic_link_removal_supported, ensure_file_symbolic_link_replacement_supported,
-    remove_expected_file_symbolic_link_entry, replace_file_symbolic_link_from_temporary,
+    replace_file_symbolic_link_from_temporary,
 };
 use crate::inspection::file_link::{FileLinkInspector, TargetInspectionError};
 use crate::inspection::source::{SourceVerificationError, VerifiedSource};
@@ -479,60 +481,168 @@ impl FileLinkExecutor {
             .inspector
             .physical_target_path_for_execution(facts.new_target_path())
             .map_err(RelocateLinkExecutionError::NewTargetInspection)?;
-        if create_file_symbolic_link_no_replace(
-            self.inspector.canonical_home(),
-            &new_physical,
-            facts.new_link_target(),
-            source.physical_root(),
-        )
-        .is_err()
+        #[cfg(unix)]
         {
-            return Err(self.relocation_aftermath_error(&facts)?);
+            use crate::filesystem::ExecutionTarget;
+            let new_context = ExecutionTarget::open_with_declared_root(
+                self.inspector.canonical_home(),
+                self.inspector.declared_home(),
+                &new_physical,
+            )
+            .map_err(|source| {
+                RelocateLinkExecutionError::NewTargetInspection(execution_target_inspection(
+                    facts.new_target_path(),
+                    source,
+                ))
+            })?;
+            let old_physical = self
+                .inspector
+                .physical_target_path_for_execution(facts.old_target_path())
+                .map_err(RelocateLinkExecutionError::OldTargetInspection)?;
+            let old_context = ExecutionTarget::open_with_declared_root(
+                self.inspector.canonical_home(),
+                self.inspector.declared_home(),
+                &old_physical,
+            )
+            .map_err(|source| {
+                RelocateLinkExecutionError::OldTargetInspection(execution_target_inspection(
+                    facts.old_target_path(),
+                    source,
+                ))
+            })?;
+            let create = new_context
+                .prepare_create(source.physical_root(), facts.new_link_target())
+                .and_then(|checked| checked.attempt());
+            if create.is_err() {
+                return Err(self.relocation_context_aftermath_error(
+                    &facts,
+                    &old_context,
+                    &new_context,
+                )?);
+            }
+            if !matches!(
+                self.observe_execution_target(
+                    &new_context,
+                    facts.new_target_path(),
+                    facts.new_link_target()
+                )
+                .map_err(RelocateLinkExecutionError::NewTargetInspection)?,
+                TargetObservation::ExpectedLink { .. }
+            ) {
+                return Err(self.relocation_context_aftermath_error(
+                    &facts,
+                    &old_context,
+                    &new_context,
+                )?);
+            }
+            #[cfg(test)]
+            crate::test_support::execution_boundary(
+                crate::test_support::ExecutionBoundary::BeforeRelocateRemovalRecheck,
+            )
+            .map_err(|source| {
+                RelocateLinkExecutionError::OldTargetInspection(execution_target_inspection(
+                    facts.old_target_path(),
+                    source,
+                ))
+            })?;
+            let reverified = source
+                .reverify()
+                .map_err(RelocateLinkExecutionError::SourceRecheck)?;
+            if reverified.path() != facts.new_link_target().as_path() {
+                return Err(RelocateLinkExecutionError::SourceDoesNotMatchAction {
+                    expected: facts.new_link_target().clone(),
+                    actual: reverified.path().clone(),
+                });
+            }
+            new_context
+                .recheck_expected_link(facts.new_link_target())
+                .map_err(|source| {
+                    RelocateLinkExecutionError::NewTargetInspection(execution_target_inspection(
+                        facts.new_target_path(),
+                        source,
+                    ))
+                })?;
+            // This is the final old-entry recheck. No action is interleaved between the complete relocation predicate recheck and unlinkat.
+            let remove = old_context
+                .prepare_remove(facts.old_link_target())
+                .and_then(|checked| checked.attempt());
+            if remove.is_err() {
+                return Err(self.relocation_context_aftermath_error(
+                    &facts,
+                    &old_context,
+                    &new_context,
+                )?);
+            }
+            let aftermath =
+                self.relocation_context_observations(&facts, &old_context, &new_context)?;
+            if matches!(aftermath.0, TargetObservation::Missing)
+                && matches!(aftermath.1, TargetObservation::ExpectedLink { .. })
+            {
+                Ok(())
+            } else {
+                Err(RelocateLinkExecutionError::Aftermath {
+                    old_observation: aftermath.0,
+                    new_observation: aftermath.1,
+                })
+            }
         }
-        let new_after = self
-            .inspector
-            .inspect_target_for_expected_link(facts.new_target_path(), facts.new_link_target())
-            .map_err(RelocateLinkExecutionError::NewTargetInspection)?;
-        if !matches!(
-            new_after.observation(),
-            TargetObservation::ExpectedLink { .. }
-        ) {
-            return Err(self.relocation_aftermath_error(&facts)?);
-        }
+        #[cfg(windows)]
+        {
+            if create_file_symbolic_link_no_replace(
+                self.inspector.canonical_home(),
+                &new_physical,
+                facts.new_link_target(),
+                source.physical_root(),
+            )
+            .is_err()
+            {
+                return Err(self.relocation_aftermath_error(&facts)?);
+            }
+            let new_after = self
+                .inspector
+                .inspect_target_for_expected_link(facts.new_target_path(), facts.new_link_target())
+                .map_err(RelocateLinkExecutionError::NewTargetInspection)?;
+            if !matches!(
+                new_after.observation(),
+                TargetObservation::ExpectedLink { .. }
+            ) {
+                return Err(self.relocation_aftermath_error(&facts)?);
+            }
 
-        let old_after_create = self
-            .inspector
-            .inspect_target_for_expected_link(facts.old_target_path(), facts.old_link_target())
-            .map_err(RelocateLinkExecutionError::OldTargetInspection)?;
-        if !matches!(
-            old_after_create.observation(),
-            TargetObservation::ExpectedLink { .. }
-        ) {
-            return Err(self.relocation_aftermath_error(&facts)?);
-        }
-        let old_physical = self
-            .inspector
-            .physical_target_path_for_execution(facts.old_target_path())
-            .map_err(RelocateLinkExecutionError::OldTargetInspection)?;
-        if remove_expected_file_symbolic_link_entry(
-            self.inspector.canonical_home(),
-            &old_physical,
-            facts.old_link_target(),
-        )
-        .is_err()
-        {
-            return Err(self.relocation_aftermath_error(&facts)?);
-        }
-        let aftermath = self.relocation_observations(&facts)?;
-        if matches!(aftermath.0, TargetObservation::Missing)
-            && matches!(aftermath.1, TargetObservation::ExpectedLink { .. })
-        {
-            Ok(())
-        } else {
-            Err(RelocateLinkExecutionError::Aftermath {
-                old_observation: aftermath.0,
-                new_observation: aftermath.1,
-            })
+            let old_after_create = self
+                .inspector
+                .inspect_target_for_expected_link(facts.old_target_path(), facts.old_link_target())
+                .map_err(RelocateLinkExecutionError::OldTargetInspection)?;
+            if !matches!(
+                old_after_create.observation(),
+                TargetObservation::ExpectedLink { .. }
+            ) {
+                return Err(self.relocation_aftermath_error(&facts)?);
+            }
+            let old_physical = self
+                .inspector
+                .physical_target_path_for_execution(facts.old_target_path())
+                .map_err(RelocateLinkExecutionError::OldTargetInspection)?;
+            if remove_expected_file_symbolic_link_entry(
+                self.inspector.canonical_home(),
+                &old_physical,
+                facts.old_link_target(),
+            )
+            .is_err()
+            {
+                return Err(self.relocation_aftermath_error(&facts)?);
+            }
+            let aftermath = self.relocation_observations(&facts)?;
+            if matches!(aftermath.0, TargetObservation::Missing)
+                && matches!(aftermath.1, TargetObservation::ExpectedLink { .. })
+            {
+                Ok(())
+            } else {
+                Err(RelocateLinkExecutionError::Aftermath {
+                    old_observation: aftermath.0,
+                    new_observation: aftermath.1,
+                })
+            }
         }
     }
 
@@ -550,39 +660,150 @@ impl FileLinkExecutor {
             .map_err(RemoveLinkExecutionError::TargetInspection)?;
         self.ensure_remove_capability(&target_path, &physical_target_path)?;
 
-        if let Err(source) = remove_expected_file_symbolic_link_entry(
-            self.inspector.canonical_home(),
-            &physical_target_path,
-            &link_target,
-        ) {
-            return match self
-                .inspector
-                .inspect_target_for_expected_link(&target_path, &link_target)
-            {
-                Ok(after) => Err(RemoveLinkExecutionError::RemoveAttemptFailed {
-                    target_path,
+        #[cfg(unix)]
+        {
+            use crate::filesystem::ExecutionTarget;
+            let context = ExecutionTarget::open_with_declared_root(
+                self.inspector.canonical_home(),
+                self.inspector.declared_home(),
+                &physical_target_path,
+            )
+            .map_err(|source| {
+                RemoveLinkExecutionError::TargetInspection(execution_target_inspection(
+                    &target_path,
                     source,
-                    aftermath: after.observation().clone(),
-                }),
-                Err(inspection) => Err(RemoveLinkExecutionError::RemoveAftermathUnproven {
+                ))
+            })?;
+            let attempt = context
+                .prepare_remove(&link_target)
+                .and_then(|checked| checked.attempt());
+            let observation = self.observe_execution_target(&context, &target_path, &link_target);
+            if let Err(source) = attempt {
+                return match observation {
+                    Ok(aftermath) => Err(RemoveLinkExecutionError::RemoveAttemptFailed {
+                        target_path,
+                        source,
+                        aftermath,
+                    }),
+                    Err(inspection) => Err(RemoveLinkExecutionError::RemoveAftermathUnproven {
+                        target_path,
+                        source,
+                        inspection: Box::new(inspection),
+                    }),
+                };
+            }
+            match observation.map_err(RemoveLinkExecutionError::PostconditionInspection)? {
+                TargetObservation::Missing => Ok(()),
+                observation => Err(RemoveLinkExecutionError::PostconditionNotMet {
                     target_path,
-                    source,
-                    inspection: Box::new(inspection),
+                    observation,
                 }),
-            };
+            }
         }
 
-        let after = self
-            .inspector
-            .inspect_target_for_expected_link(&target_path, &link_target)
-            .map_err(RemoveLinkExecutionError::PostconditionInspection)?;
-        match after.observation() {
-            TargetObservation::Missing => Ok(()),
-            observation => Err(RemoveLinkExecutionError::PostconditionNotMet {
-                target_path,
-                observation: observation.clone(),
-            }),
+        #[cfg(windows)]
+        {
+            if let Err(source) = remove_expected_file_symbolic_link_entry(
+                self.inspector.canonical_home(),
+                &physical_target_path,
+                &link_target,
+            ) {
+                return match self
+                    .inspector
+                    .inspect_target_for_expected_link(&target_path, &link_target)
+                {
+                    Ok(after) => Err(RemoveLinkExecutionError::RemoveAttemptFailed {
+                        target_path,
+                        source,
+                        aftermath: after.observation().clone(),
+                    }),
+                    Err(inspection) => Err(RemoveLinkExecutionError::RemoveAftermathUnproven {
+                        target_path,
+                        source,
+                        inspection: Box::new(inspection),
+                    }),
+                };
+            }
+
+            let after = self
+                .inspector
+                .inspect_target_for_expected_link(&target_path, &link_target)
+                .map_err(RemoveLinkExecutionError::PostconditionInspection)?;
+            match after.observation() {
+                TargetObservation::Missing => Ok(()),
+                observation => Err(RemoveLinkExecutionError::PostconditionNotMet {
+                    target_path,
+                    observation: observation.clone(),
+                }),
+            }
         }
+    }
+
+    #[cfg(unix)]
+    fn observe_execution_target(
+        &self,
+        context: &crate::filesystem::ExecutionTarget,
+        target_path: &ResolvedPath,
+        link_target: &LinkTarget,
+    ) -> Result<TargetObservation, TargetInspectionError> {
+        let observation = context
+            .observe(link_target)
+            .map_err(|source| execution_target_inspection(target_path, source))?;
+        let declared = self.inspect_target_for_execution(target_path, link_target)?;
+        if declared != observation {
+            return Err(execution_target_inspection(
+                target_path,
+                io::Error::other("recorded-path and retained-parent observations disagree"),
+            ));
+        }
+        context
+            .check_association()
+            .map_err(|source| execution_target_inspection(target_path, source))?;
+        Ok(observation)
+    }
+
+    #[cfg(unix)]
+    fn inspect_target_for_execution(
+        &self,
+        target_path: &ResolvedPath,
+        link_target: &LinkTarget,
+    ) -> Result<TargetObservation, TargetInspectionError> {
+        Ok(self
+            .inspector
+            .inspect_target_for_expected_link(target_path, link_target)?
+            .observation()
+            .clone())
+    }
+
+    #[cfg(unix)]
+    fn relocation_context_observations(
+        &self,
+        facts: &RelocationFacts,
+        old: &crate::filesystem::ExecutionTarget,
+        new: &crate::filesystem::ExecutionTarget,
+    ) -> Result<(TargetObservation, TargetObservation), RelocateLinkExecutionError> {
+        let old = self
+            .observe_execution_target(old, facts.old_target_path(), facts.old_link_target())
+            .map_err(RelocateLinkExecutionError::OldTargetInspection)?;
+        let new = self
+            .observe_execution_target(new, facts.new_target_path(), facts.new_link_target())
+            .map_err(RelocateLinkExecutionError::NewTargetInspection)?;
+        Ok((old, new))
+    }
+
+    #[cfg(unix)]
+    fn relocation_context_aftermath_error(
+        &self,
+        facts: &RelocationFacts,
+        old: &crate::filesystem::ExecutionTarget,
+        new: &crate::filesystem::ExecutionTarget,
+    ) -> Result<RelocateLinkExecutionError, RelocateLinkExecutionError> {
+        let (old_observation, new_observation) =
+            self.relocation_context_observations(facts, old, new)?;
+        Ok(RelocateLinkExecutionError::Aftermath {
+            old_observation,
+            new_observation,
+        })
     }
 
     /// Performs the non-mutating checks required before a `remove_link` operation record is created. `execute_remove` repeats these checks immediately before the link-entry removal.
@@ -909,6 +1130,17 @@ fn create_conditions(
         return Err(CreateLinkExecutionError::InvalidCreateConditions);
     }
     Ok((pre_target.clone(), link_target.clone()))
+}
+
+#[cfg(unix)]
+fn execution_target_inspection(
+    target_path: &ResolvedPath,
+    source: io::Error,
+) -> TargetInspectionError {
+    TargetInspectionError::TargetMetadata {
+        target_path: target_path.clone(),
+        source,
+    }
 }
 
 fn relocation_facts_from_action(
@@ -1690,7 +1922,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn remove_executor_fail_closes_when_the_platform_cannot_bind_the_final_entry() {
+    fn remove_executor_removes_only_the_link_entry_and_preserves_its_referent() {
         use std::os::unix::fs::symlink;
 
         let workspace = TestWorkspace::new();
@@ -1700,19 +1932,9 @@ mod tests {
         let target = workspace.path("home/.gitconfig");
         symlink(&source, &target).unwrap();
 
-        let error = workspace.executor().execute_remove(&action).unwrap_err();
+        workspace.executor().execute_remove(&action).unwrap();
 
-        assert!(matches!(
-            error,
-            RemoveLinkExecutionError::PlatformCapability { .. }
-        ));
-        assert!(
-            fs::symlink_metadata(&target)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(fs::read_link(&target).unwrap(), source);
+        assert!(!target.exists());
         assert_eq!(
             fs::read_to_string(&source).unwrap(),
             "[user]\nname = Example\n"

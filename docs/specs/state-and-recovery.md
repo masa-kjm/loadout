@@ -197,6 +197,7 @@ When that verification proves the recorded old ownership and shared expected lin
 
 After an executor attempts a mutation, it MUST perform the action's no-follow post-mutation observation before deciding the operation result.
 The observation, rather than the operating system call's success or error result alone, decides whether Known state may change.
+For a create attempt that returns an error, the execution-time exception below takes precedence over the general post-condition row.
 
 | Observation after an attempted mutation | Required result |
 | --- | --- |
@@ -204,12 +205,14 @@ The observation, rather than the operating system call's success or error result
 | The recorded precondition still holds exactly | Mark the action `failed`; leave Known state unchanged. |
 | Neither condition holds exactly, or observation is unsafe or unavailable | Mark the action `uncertain`; leave Known state unchanged. |
 
+During execution, a failed `create_link` attempt followed by `expected_link` MUST remain `uncertain`, with Known unchanged. The observed link can have been created externally after the final recheck, so its matching value does not establish successful creation by this attempt. This includes an already-existing-entry error and errors whose physical effects cannot be distinguished from external creation. A failed create whose recorded missing precondition still holds remains `failed`; unsafe or unavailable observations remain `uncertain`. This exception does not alter removal or replacement result classification.
+
 The [external filesystem concurrency contract](file-link.md#external-filesystem-concurrency) applies to execution and recovery observations and cleanup. The state lock does not exclude unrelated filesystem mutation. After a removal race, `missing` at the recorded target can be indistinguishable from ordinary success: when every required recorded postcondition and path association holds, the result is `succeeded`, Known is removed, and apply can ultimately exit 0. This does not prove which entry was deleted and does not require a race diagnostic based on information unavailable to production observations.
 
 Required observations include the recorded path association, not just the contents of a retained parent handle. They are not a globally atomic snapshot. If required facts cannot be established, retain uncertainty; postcondition verification does not restore atomic entry-identity or continuous-containment guarantees.
 
 This rule covers permission, sharing, lock, read-only-filesystem, process-interruption, and other platform errors that occur after an action has been marked `running`.
-It also applies if an operating system call reports an error but a later observation proves the recorded post-condition.
+It also applies if an operating system call reports an error but a later observation proves the recorded post-condition, subject to the failed-create execution exception above.
 For a multi-step action such as `relocate_link`, the recorded precondition and post-condition include every required target observation; a partial relocation is therefore `uncertain`.
 
 A `replace_link` action, and a `replace_ownership` action whose resolved link targets differ, also requires its recorded temporary sibling path to be `missing` as part of the complete post-condition.
@@ -232,6 +235,8 @@ For each unfinished action, recovery applies the same evidence rules:
 | `running`; recorded precondition still holds exactly | Mark `failed`; leave the prior Known state unchanged. |
 | `running`; neither condition holds exactly, or inspection is unsafe | Mark `uncertain`; retain Known state unchanged. |
 
+An unfinished `create_link` is an exception to the recorded-postcondition row. Whether its status is `running` or `uncertain`, an observed `expected_link` remains `uncertain` and Known remains unchanged. That observation cannot prove that Loadout created the link: it is indistinguishable from external creation after the final recheck, including when the create syscall returned success before the process stopped. If the recorded create target is `missing`, recovery marks the action `failed`; every other observation remains `uncertain`. This deliberately sacrifices automatic recovery of a successful create whose Known commit was interrupted in order to preserve the rule that Loadout does not adopt an unmanaged matching link.
+
 For `relocate_link`, both required final observations must hold to prove success.
 A partial relocation, such as both old and new links existing, is `uncertain`.
 
@@ -243,7 +248,7 @@ After every action has a final status of `succeeded`, `failed`, or `skipped`, th
 If any action is `uncertain`, the repository retains the operation record and apply returns a blocking diagnostic without creating a new plan.
 
 An operator may correct the filesystem manually.
-A later apply re-runs recovery and proceeds only if every formerly uncertain action can then be proven successful or failed by its recorded conditions.
+A later apply re-runs recovery and proceeds only if every formerly uncertain action can then be proven successful or failed by its recorded conditions. For `create_link`, only the recorded missing precondition can close an uncertain action; a matching link remains open.
 
 Verified actions from before a failure remain in Known state.
 v0.2.0 does not roll them back.

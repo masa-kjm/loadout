@@ -504,6 +504,14 @@ impl LockedStateRepository {
         let encoded = serde_json::to_vec(&document).map_err(CommitError::Serialize)?;
         let temporary_path = self.unique_temporary_path()?;
         let result = (|| {
+            #[cfg(all(test, unix))]
+            crate::test_support::execution_boundary(
+                crate::test_support::ExecutionBoundary::BeforeCommit,
+            )
+            .map_err(|source| CommitError::TemporaryCreate {
+                path: temporary_path.clone(),
+                source,
+            })?;
             self.fail_at(CommitStage::CreateTemporary)?;
             let mut temporary = OpenOptions::new()
                 .write(true)

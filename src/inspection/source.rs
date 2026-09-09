@@ -35,6 +35,11 @@ impl VerifiedSource {
         &self.path
     }
 
+    /// Physical root supplied to the execution filesystem's immediate source check.
+    pub(crate) fn physical_root(&self) -> &ResolvedPath {
+        self.store_root.as_path()
+    }
+
     /// Repeats the no-follow store-containment and regular-file proof immediately before a resource mutation.
     pub(crate) fn reverify(&self) -> Result<Self, SourceVerificationError> {
         verify_regular_source(&self.store_root, &self.source_path)

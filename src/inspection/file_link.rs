@@ -13,7 +13,9 @@ use crate::domain::desired::ResolvedDesired;
 use crate::domain::file_link::LinkTarget;
 use crate::domain::known::KnownState;
 use crate::domain::paths::{ResolvedPath, ResolvedPathError};
-use crate::filesystem::{NoFollowEntryKind, classify_nofollow_entry};
+use crate::filesystem::{
+    NoFollowEntryKind, classify_nofollow_entry, normalize_observed_absolute_path,
+};
 
 /// A read-only observer rooted at the current user's canonical home directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,6 +112,12 @@ impl FileLinkInspector {
                 target_path: target_path.clone(),
             }
         })
+    }
+
+    /// The declared home spelling whose association execution must also retain.
+    #[cfg(unix)]
+    pub(crate) fn declared_home(&self) -> &ResolvedPath {
+        &self.declared_home
     }
 
     /// The canonical home root used to anchor a no-follow filesystem mutation.
@@ -327,27 +335,6 @@ fn read_normalized_link_target(
     })?;
 
     Ok(LinkTarget::new(normalized))
-}
-
-fn normalize_observed_absolute_path(path: &Path) -> Result<ResolvedPath, ResolvedPathError> {
-    if !path.is_absolute() {
-        return ResolvedPath::new(path.to_path_buf());
-    }
-
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Normal(component) => normalized.push(component),
-        }
-    }
-
-    ResolvedPath::new(normalized)
 }
 
 /// The reason target observation could not produce a complete safe Actual state.

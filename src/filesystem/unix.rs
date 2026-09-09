@@ -1,11 +1,10 @@
-//! Unix no-follow metadata classification and file-link creation.
+//! Unix metadata classification and lifecycle capability gates.
+//! Retained-context execution primitives live in `execution`.
 
-use std::ffi::CString;
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::ffi::OsStrExt;
-use std::path::{Component, Path};
+
+pub(super) mod execution;
 
 use crate::domain::file_link::LinkTarget;
 use crate::domain::paths::ResolvedPath;
@@ -29,40 +28,11 @@ pub(super) fn create_file_symbolic_link_no_replace(
     canonical_home: &ResolvedPath,
     physical_target_path: &ResolvedPath,
     link_target: &LinkTarget,
+    source_root: &ResolvedPath,
 ) -> io::Result<()> {
-    let relative_target = physical_target_path
-        .as_ref()
-        .strip_prefix(canonical_home.as_ref())
-        .map_err(|_| invalid_input("target is not below the canonical home root"))?;
-    let components = relative_target
-        .components()
-        .map(|component| match component {
-            Component::Normal(component) => Ok(component),
-            Component::CurDir
-            | Component::ParentDir
-            | Component::RootDir
-            | Component::Prefix(_) => Err(invalid_input(
-                "target has an invalid canonical-home-relative component",
-            )),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let (final_component, parent_components) = components
-        .split_last()
-        .ok_or_else(|| invalid_input("target must not equal the canonical home root"))?;
-
-    let mut parent = open_directory(canonical_home.as_ref())?;
-    for component in parent_components {
-        parent = open_directory_at(parent.as_raw_fd(), component)?;
-    }
-
-    let source = c_string(link_target.as_path().as_ref())?;
-    let entry = c_string(Path::new(final_component))?;
-    let result = unsafe { libc::symlinkat(source.as_ptr(), parent.as_raw_fd(), entry.as_ptr()) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    execution::ExecutionTarget::open(canonical_home, physical_target_path)?
+        .prepare_create(source_root, link_target)?
+        .attempt()
 }
 
 pub(super) fn replace_file_symbolic_link_from_temporary(
@@ -70,7 +40,7 @@ pub(super) fn replace_file_symbolic_link_from_temporary(
     _: &ResolvedPath,
     _: &ResolvedPath,
 ) -> io::Result<()> {
-    // Keep replacement disabled at the direct boundary until shared-parent rechecks and native integration evidence are implemented.
+    // Keep replacement disabled at the direct boundary until the retained-context primitive is integrated with replacement and recovery.
     Err(expected_entry_replacement_unsupported())
 }
 
@@ -79,7 +49,7 @@ pub(super) fn remove_expected_file_symbolic_link_entry(
     _: &ResolvedPath,
     _: &LinkTarget,
 ) -> io::Result<()> {
-    // Keep removal disabled until the retained-parent execution context, immediate checks and required observations are implemented.
+    // Keep removal disabled until the retained-context primitive is integrated with removal and recovery.
     Err(expected_entry_removal_unsupported())
 }
 
@@ -90,68 +60,25 @@ pub(super) fn ensure_file_symbolic_link_creation_supported(_: &ResolvedPath) -> 
 }
 
 pub(super) fn ensure_file_symbolic_link_replacement_supported(_: &ResolvedPath) -> io::Result<()> {
-    // The observational contract permits name replacement, but the required intermediate checks and native action evidence are not implemented yet.
+    // The observational contract permits name replacement, but executor integration and native action evidence are not complete yet.
     Err(expected_entry_replacement_unsupported())
 }
 
 pub(super) fn ensure_file_symbolic_link_removal_supported(_: &ResolvedPath) -> io::Result<()> {
-    // Name-based deletion is permitted by the concurrency contract; enabling it still requires the execution context and native removal evidence.
+    // Name-based deletion is permitted by the concurrency contract; enabling it still requires executor integration and native removal evidence.
     Err(expected_entry_removal_unsupported())
 }
 
 fn expected_entry_replacement_unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
-        "Unix file-link replacement is unavailable pending retained-parent rechecks and native integration",
+        "Unix file-link replacement is unavailable pending retained-context executor integration and native action evidence",
     )
 }
 
 fn expected_entry_removal_unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
-        "Unix file-link removal is unavailable pending retained-parent rechecks and native integration",
+        "Unix file-link removal is unavailable pending retained-context executor integration and native action evidence",
     )
-}
-
-fn open_directory(path: &Path) -> io::Result<fs::File> {
-    let path = c_string(path)?;
-    let descriptor = unsafe {
-        libc::open(
-            path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    file_from_descriptor(descriptor)
-}
-
-fn open_directory_at(
-    parent_descriptor: std::os::fd::RawFd,
-    component: &std::ffi::OsStr,
-) -> io::Result<fs::File> {
-    let component = c_string(Path::new(component))?;
-    let descriptor = unsafe {
-        libc::openat(
-            parent_descriptor,
-            component.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    file_from_descriptor(descriptor)
-}
-
-fn file_from_descriptor(descriptor: libc::c_int) -> io::Result<fs::File> {
-    if descriptor < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(unsafe { fs::File::from_raw_fd(descriptor) })
-    }
-}
-
-fn c_string(path: &Path) -> io::Result<CString> {
-    CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| invalid_input("path contains an interior NUL byte"))
-}
-
-fn invalid_input(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message)
 }

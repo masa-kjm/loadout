@@ -76,3 +76,55 @@ pub(crate) fn assert_desired_dependencies_allowed() {
         "forbidden configuration/profile/source/planner dependency"
     );
 }
+
+#[cfg(unix)]
+pub(crate) use execution_hooks::*;
+
+#[cfg(unix)]
+mod execution_hooks {
+    /// Semantic execution seams compiled only into tests. One-shot hooks are removed before invocation so callbacks may inspect the filesystem without reentrancy.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum ExecutionBoundary {
+        BeforeFinalRecheck,
+        AfterFinalRecheck,
+        AfterMutationAttempt,
+        AfterTemporaryCreation,
+        BeforePostObservation,
+        BeforeCommit,
+    }
+
+    type ExecutionHook = Box<dyn FnOnce() -> std::io::Result<()>>;
+    thread_local! {
+        static EXECUTION_HOOK: std::cell::RefCell<Option<(ExecutionBoundary, ExecutionHook)>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(crate) struct ExecutionHookGuard;
+    pub(crate) fn on_execution_boundary(
+        boundary: ExecutionBoundary,
+        hook: impl FnOnce() -> std::io::Result<()> + 'static,
+    ) -> ExecutionHookGuard {
+        EXECUTION_HOOK.with_borrow_mut(|slot| {
+            assert!(slot.is_none(), "execution hook already installed");
+            *slot = Some((boundary, Box::new(hook)));
+        });
+        ExecutionHookGuard
+    }
+    impl Drop for ExecutionHookGuard {
+        fn drop(&mut self) {
+            EXECUTION_HOOK.with_borrow_mut(|slot| *slot = None);
+        }
+    }
+    pub(crate) fn execution_boundary(boundary: ExecutionBoundary) -> std::io::Result<()> {
+        let hook = EXECUTION_HOOK.with_borrow_mut(|slot| {
+            if slot.as_ref().is_some_and(|(at, _)| *at == boundary) {
+                slot.take().map(|(_, hook)| hook)
+            } else {
+                None
+            }
+        });
+        if let Some(hook) = hook {
+            hook()?;
+        }
+        Ok(())
+    }
+}

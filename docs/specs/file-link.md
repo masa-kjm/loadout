@@ -120,6 +120,8 @@ The executor MUST repeat the applicable source, containment, parent, target-kind
 Create requires a safe parent path, a verified source, and a `missing` target.
 It creates the absolute symbolic link and then verifies `expected_link` against the planned source target.
 No Known state is committed until that verification succeeds.
+If the create attempt returns an error, a subsequently matching link alone MUST NOT authorize a Known-state update. In particular, an external process may create a matching unmanaged link after the final recheck, causing no-replace creation to fail with an already-existing-entry error. During execution, a failed create followed by `expected_link` MUST be classified as `uncertain`, preserving Known and the observed link.
+Recovery applies the same non-adoption rule to every unfinished create. A matching link does not prove that Loadout created it, including when the process stopped after a successful create syscall but before the Known-state commit. Recovery retains the action as `uncertain` and does not update Known until the target is missing and the recorded create can close as `failed`. v0.2.0 provides no automatic recovery path that adopts this link; any future explicit ownership-transfer operation requires its own specification and confirmation contract.
 
 ### Replace
 

@@ -888,6 +888,12 @@ enum ExecutionClassification {
 
 fn classify_execution_error(error: &CreateLinkExecutionError) -> ExecutionClassification {
     match error {
+        // Matching bytes after a failed create do not establish who created the link. In particular EEXIST must never turn an external link into
+        // Known state, even when it appeared after the final recheck.
+        CreateLinkExecutionError::CreateAttemptFailed {
+            aftermath: TargetObservation::ExpectedLink { .. },
+            ..
+        } => ExecutionClassification::Uncertain,
         CreateLinkExecutionError::CreateAttemptFailed { aftermath, .. }
         | CreateLinkExecutionError::PostconditionNotMet {
             observation: aftermath,
@@ -1339,6 +1345,14 @@ fn recovery_decision(
     inspector: &FileLinkInspector,
     action: &RecordedAction,
 ) -> Result<RecoveryDecision, TargetInspectionError> {
+    if action.kind() == ActionKind::CreateLink {
+        // A matching link does not prove that this create created it.
+        if condition_holds(inspector, &action.precondition())? {
+            return Ok(RecoveryDecision::Failed);
+        }
+        return Ok(RecoveryDecision::Uncertain);
+    }
+
     if action.kind() == ActionKind::RelocateLink {
         let facts = action
             .relocation_facts()
@@ -1884,6 +1898,36 @@ mod tests {
             workspace.write("config/environment.yaml", "invalid");
             let failure =
                 apply_request(&request, |_| panic!("invalid input cannot confirm")).unwrap_err();
+            if fault != CommitStage::FlushDirectory {
+                assert_eq!(failure.stage, ApplyStage::Recovery);
+                assert_eq!(
+                    failure
+                        .affected_action
+                        .as_ref()
+                        .unwrap()
+                        .resource_id
+                        .as_str(),
+                    "base/b"
+                );
+                let Some(OperationOutcome::Retained(operation)) = &failure.operation else {
+                    panic!("unfinished create must remain retained")
+                };
+                assert_eq!(
+                    operation
+                        .actions()
+                        .map(|(_, action)| action.status())
+                        .collect::<Vec<_>>(),
+                    [
+                        ActionStatus::Succeeded,
+                        ActionStatus::Uncertain,
+                        ActionStatus::Skipped
+                    ]
+                );
+                let recovered = workspace.repository().load().unwrap();
+                assert_eq!(recovered.active_operation(), Some(operation));
+                assert_eq!(recovered.known().resources().len(), 1);
+                continue;
+            }
             assert_eq!(failure.stage, ApplyStage::Resolution);
             assert!(failure.affected_action.is_none());
             assert!(failure.commit_failure.is_none());
@@ -3304,6 +3348,318 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn native_create_final_recheck_does_not_adopt_a_matching_external_link() {
+        use crate::test_support::{ExecutionBoundary, on_execution_boundary};
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source");
+        let resolved = workspace.input();
+        let target = workspace.path("home/.gitconfig");
+        let source = workspace.verified_source().path().clone();
+        let _hook = on_execution_boundary(ExecutionBoundary::BeforeFinalRecheck, move || {
+            std::os::unix::fs::symlink(source.as_ref(), target)
+        });
+        let result = workspace
+            .coordinator()
+            .apply_create_link(&resolved, |_| true)
+            .unwrap();
+        assert!(matches!(result, CreateLinkApplyResult::Uncertain { .. }));
+        let state = workspace.repository().load().unwrap();
+        assert!(state.known().resources().next().is_none());
+        assert_eq!(
+            state
+                .active_operation()
+                .unwrap()
+                .actions()
+                .next()
+                .unwrap()
+                .1
+                .status(),
+            ActionStatus::Uncertain
+        );
+        assert!(
+            fs::symlink_metadata(workspace.path("home/.gitconfig"))
+                .unwrap()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_create_after_final_recheck_matching_external_link_is_not_adopted() {
+        use crate::test_support::{ExecutionBoundary, on_execution_boundary};
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source");
+        let resolved = workspace.input();
+        let target = workspace.path("home/.gitconfig");
+        let source = workspace.verified_source().path().clone();
+        let repository = workspace.repository();
+        let _hook = on_execution_boundary(ExecutionBoundary::AfterFinalRecheck, move || {
+            let state = repository.load().unwrap();
+            assert!(state.known().resources().next().is_none());
+            assert_eq!(
+                state
+                    .active_operation()
+                    .unwrap()
+                    .actions()
+                    .next()
+                    .unwrap()
+                    .1
+                    .status(),
+                ActionStatus::Running
+            );
+            std::os::unix::fs::symlink(source.as_ref(), target)
+        });
+        let result = workspace
+            .coordinator()
+            .apply_create_link(&resolved, |_| true)
+            .unwrap();
+        let CreateLinkApplyResult::Uncertain {
+            error:
+                CreateLinkExecutionError::CreateAttemptFailed {
+                    source, aftermath, ..
+                },
+        } = result
+        else {
+            panic!("a failed create must not adopt the external matching link: {result:?}");
+        };
+        assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(matches!(aftermath, TargetObservation::ExpectedLink { .. }));
+        let state = workspace.repository().load().unwrap();
+        assert!(state.known().resources().next().is_none());
+        assert_eq!(
+            state
+                .active_operation()
+                .unwrap()
+                .actions()
+                .next()
+                .unwrap()
+                .1
+                .status(),
+            ActionStatus::Uncertain
+        );
+        assert_eq!(
+            fs::read_link(workspace.path("home/.gitconfig")).unwrap(),
+            workspace.verified_source().path().as_ref()
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path("store/git/config")).unwrap(),
+            "source"
+        );
+        let recovery_error = workspace
+            .coordinator()
+            .apply_create_link(&resolved, |_| panic!("recovery must block planning"))
+            .unwrap_err();
+        assert!(matches!(recovery_error, ApplyError::RecoveryRequired));
+        let state = workspace.repository().load().unwrap();
+        let (_, action) = state.active_operation().unwrap().actions().next().unwrap();
+        assert_eq!(action.status(), ActionStatus::Uncertain);
+        assert!(state.known().resources().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_create_error_after_effect_remains_uncertain_despite_matching_postcondition() {
+        use crate::test_support::{ExecutionBoundary, on_execution_boundary};
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source");
+        let resolved = workspace.input();
+        let repository = workspace.repository();
+        let _hook = on_execution_boundary(ExecutionBoundary::AfterMutationAttempt, move || {
+            let state = repository.load().unwrap();
+            assert!(state.known().resources().next().is_none());
+            assert_eq!(
+                state
+                    .active_operation()
+                    .unwrap()
+                    .actions()
+                    .next()
+                    .unwrap()
+                    .1
+                    .status(),
+                ActionStatus::Running
+            );
+            Err(std::io::Error::other("injected error after real create"))
+        });
+        let result = workspace
+            .coordinator()
+            .apply_create_link(&resolved, |_| true)
+            .unwrap();
+        assert!(matches!(result, CreateLinkApplyResult::Uncertain { .. }));
+        let state = workspace.repository().load().unwrap();
+        assert!(state.known().resources().next().is_none());
+        assert_eq!(
+            state
+                .active_operation()
+                .unwrap()
+                .actions()
+                .next()
+                .unwrap()
+                .1
+                .status(),
+            ActionStatus::Uncertain
+        );
+        assert_eq!(
+            fs::read_link(workspace.path("home/.gitconfig")).unwrap(),
+            workspace.verified_source().path().as_ref()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_create_unavailable_postobservation_stays_uncertain_during_recovery() {
+        use crate::test_support::{ExecutionBoundary, on_execution_boundary};
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source");
+        let resolved = workspace.input();
+        let _hook = on_execution_boundary(ExecutionBoundary::BeforePostObservation, || {
+            Err(std::io::Error::other("observation unavailable"))
+        });
+        let result = workspace
+            .coordinator()
+            .apply_create_link(&resolved, |_| true)
+            .unwrap();
+        assert!(matches!(result, CreateLinkApplyResult::Uncertain { .. }));
+        let repository = workspace.repository();
+        let state = repository.load().unwrap();
+        assert!(state.known().resources().next().is_none());
+        assert_eq!(
+            state
+                .active_operation()
+                .unwrap()
+                .actions()
+                .next()
+                .unwrap()
+                .1
+                .status(),
+            ActionStatus::Uncertain
+        );
+        let mut locked = repository.acquire_exclusive().unwrap();
+        assert!(reconcile_active_operation(&mut locked, &workspace.path("home")).unwrap());
+        let (_, action) = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap();
+        assert_eq!(action.status(), ActionStatus::Uncertain);
+        assert_eq!(locked.state().known().resources().count(), 0);
+        assert!(
+            fs::symlink_metadata(workspace.path("home/.gitconfig"))
+                .unwrap()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_create_parent_moved_after_recheck_cannot_commit_handle_local_success() {
+        use crate::test_support::{ExecutionBoundary, on_execution_boundary};
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source");
+        let resolved = workspace.input();
+        let home = workspace.path("home");
+        let detached = workspace.path("detached");
+        let _hook = on_execution_boundary(ExecutionBoundary::AfterFinalRecheck, move || {
+            fs::rename(&home, &detached)?;
+            fs::create_dir(&home)
+        });
+        let result = workspace
+            .coordinator()
+            .apply_create_link(&resolved, |_| true)
+            .unwrap();
+        assert!(matches!(result, CreateLinkApplyResult::Uncertain { .. }));
+        assert!(
+            fs::symlink_metadata(workspace.path("detached/.gitconfig"))
+                .unwrap()
+                .is_symlink()
+        );
+        assert!(!workspace.path("home/.gitconfig").exists());
+        let state = workspace.repository().load().unwrap();
+        assert!(state.known().resources().next().is_none());
+        assert_eq!(
+            state
+                .active_operation()
+                .unwrap()
+                .actions()
+                .next()
+                .unwrap()
+                .1
+                .status(),
+            ActionStatus::Uncertain
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_create_before_commit_fault_stays_uncertain_during_recovery() {
+        use crate::test_support::{ExecutionBoundary, on_execution_boundary};
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source");
+        let resolved = workspace.input();
+        let repository = workspace.repository();
+        let target = workspace.path("home/.gitconfig");
+        let mut hook = None;
+        let result = workspace
+            .coordinator()
+            .apply_create_link_with_after_running(&resolved, |_| {
+                hook = Some(on_execution_boundary(
+                    ExecutionBoundary::BeforeCommit,
+                    move || {
+                        let state = repository.load().unwrap();
+                        assert_eq!(
+                            state
+                                .active_operation()
+                                .unwrap()
+                                .actions()
+                                .next()
+                                .unwrap()
+                                .1
+                                .status(),
+                            ActionStatus::Running
+                        );
+                        assert!(state.known().resources().next().is_none());
+                        assert!(fs::symlink_metadata(target).unwrap().is_symlink());
+                        Err(std::io::Error::other(
+                            "injected before verified Known commit",
+                        ))
+                    },
+                ));
+            });
+        assert!(matches!(
+            result,
+            Err(ApplyError::State(StateRepositoryError::Commit(_)))
+        ));
+        let repository = workspace.repository();
+        let state = repository.load().unwrap();
+        assert!(state.known().resources().next().is_none());
+        assert_eq!(
+            state
+                .active_operation()
+                .unwrap()
+                .actions()
+                .next()
+                .unwrap()
+                .1
+                .status(),
+            ActionStatus::Running
+        );
+        let mut locked = repository.acquire_exclusive().unwrap();
+        assert!(reconcile_active_operation(&mut locked, &workspace.path("home")).unwrap());
+        let (_, action) = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap();
+        assert_eq!(action.status(), ActionStatus::Uncertain);
+        assert_eq!(locked.state().known().resources().count(), 0);
+        drop(hook);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn stale_owned_link_removal_fails_preflight_without_an_operation_or_target_mutation() {
         let workspace = TestWorkspace::new();
         workspace.write("store/git/config", "[user]\nname = Example\n");
@@ -3596,7 +3952,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn recovery_commits_a_running_create_when_its_recorded_postcondition_is_present() {
+    fn recovery_keeps_a_running_create_with_matching_link_uncertain() {
         use std::os::unix::fs::symlink;
 
         let workspace = TestWorkspace::new();
@@ -3615,17 +3971,16 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            !reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap()
-        );
-        assert!(locked.state().active_operation().is_none());
-        assert!(
-            locked
-                .state()
-                .known()
-                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
-                .is_some()
-        );
+        assert!(reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap());
+        let (_, action) = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap();
+        assert_eq!(action.status(), ActionStatus::Uncertain);
+        assert!(locked.state().known().resources().next().is_none());
     }
 
     #[cfg(unix)]
@@ -3716,7 +4071,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn recovery_commits_a_corrected_durable_uncertain_action_when_its_postcondition_holds() {
+    fn recovery_keeps_an_uncertain_create_with_matching_link_open() {
         use std::os::unix::fs::symlink;
 
         let workspace = TestWorkspace::new();
@@ -3750,19 +4105,18 @@ mod tests {
         )
         .unwrap();
         let mut locked = repository.acquire_exclusive().unwrap();
-        assert!(
-            !reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap()
-        );
+        assert!(reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap());
         drop(locked);
 
         let persisted = repository.load().unwrap();
-        assert!(persisted.active_operation().is_none());
-        assert!(
-            persisted
-                .known()
-                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
-                .is_some()
-        );
+        let (_, action) = persisted
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap();
+        assert_eq!(action.status(), ActionStatus::Uncertain);
+        assert!(persisted.known().resources().next().is_none());
     }
 
     #[test]

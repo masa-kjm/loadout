@@ -50,40 +50,104 @@ impl FileLinkExecutor {
             .physical_target_path_for_execution(&target_path)
             .map_err(CreateLinkExecutionError::TargetInspection)?;
         self.ensure_create_capability(&target_path, &physical_target_path)?;
-        if let Err(source) = create_file_symbolic_link_no_replace(
-            self.inspector.canonical_home(),
-            &physical_target_path,
-            &link_target,
-        ) {
-            return match self
+        #[cfg(unix)]
+        {
+            use crate::filesystem::ExecutionTarget;
+            let inspection_error = |source| TargetInspectionError::TargetMetadata {
+                target_path: target_path.clone(),
+                source,
+            };
+            let context = ExecutionTarget::open_with_declared_root(
+                self.inspector.canonical_home(),
+                self.inspector.declared_home(),
+                &physical_target_path,
+            )
+            .map_err(|error| CreateLinkExecutionError::TargetInspection(inspection_error(error)))?;
+            // A rejected recheck is not an attempted create. In particular it
+            // cannot adopt an externally installed matching link as succeeded.
+            let checked = context
+                .prepare_create(source.physical_root(), &link_target)
+                .map_err(|error| {
+                    CreateLinkExecutionError::TargetInspection(inspection_error(error))
+                })?;
+            let attempt = checked.attempt();
+            let observation = context
+                .observe(&link_target)
+                .map_err(&inspection_error)
+                .and_then(|observation| {
+                    let declared = self
+                        .inspector
+                        .inspect_target_for_expected_link(&target_path, &link_target)?;
+                    if declared.observation() != &observation {
+                        return Err(inspection_error(io::Error::other(
+                            "recorded-path and retained-parent observations disagree",
+                        )));
+                    }
+                    context.check_association().map_err(&inspection_error)?;
+                    Ok(observation)
+                });
+            if let Err(source) = attempt {
+                return match observation {
+                    Ok(aftermath) => Err(CreateLinkExecutionError::CreateAttemptFailed {
+                        target_path,
+                        source,
+                        aftermath,
+                    }),
+                    Err(error) => Err(CreateLinkExecutionError::CreateAftermathUnproven {
+                        inspection: Box::new(error),
+                        target_path,
+                        source,
+                    }),
+                };
+            }
+            let observation =
+                observation.map_err(CreateLinkExecutionError::PostconditionInspection)?;
+            match observation {
+                TargetObservation::ExpectedLink { .. } => Ok(()),
+                observation => Err(CreateLinkExecutionError::PostconditionNotMet {
+                    target_path,
+                    observation,
+                }),
+            }
+        }
+        #[cfg(windows)]
+        {
+            if let Err(source) = create_file_symbolic_link_no_replace(
+                self.inspector.canonical_home(),
+                &physical_target_path,
+                &link_target,
+                source.physical_root(),
+            ) {
+                return match self
+                    .inspector
+                    .inspect_target_for_expected_link(&target_path, &link_target)
+                {
+                    Ok(after) => Err(CreateLinkExecutionError::CreateAttemptFailed {
+                        target_path,
+                        source,
+                        aftermath: after.observation().clone(),
+                    }),
+                    Err(inspection) => Err(CreateLinkExecutionError::CreateAftermathUnproven {
+                        target_path,
+                        source,
+                        inspection: Box::new(inspection),
+                    }),
+                };
+            }
+
+            let after = self
                 .inspector
                 .inspect_target_for_expected_link(&target_path, &link_target)
-            {
-                Ok(after) => Err(CreateLinkExecutionError::CreateAttemptFailed {
+                .map_err(CreateLinkExecutionError::PostconditionInspection)?;
+            match after.observation() {
+                TargetObservation::ExpectedLink {
+                    link_target: observed,
+                } if observed == &link_target => Ok(()),
+                observation => Err(CreateLinkExecutionError::PostconditionNotMet {
                     target_path,
-                    source,
-                    aftermath: after.observation().clone(),
+                    observation: observation.clone(),
                 }),
-                Err(inspection) => Err(CreateLinkExecutionError::CreateAftermathUnproven {
-                    target_path,
-                    source,
-                    inspection: Box::new(inspection),
-                }),
-            };
-        }
-
-        let after = self
-            .inspector
-            .inspect_target_for_expected_link(&target_path, &link_target)
-            .map_err(CreateLinkExecutionError::PostconditionInspection)?;
-        match after.observation() {
-            TargetObservation::ExpectedLink {
-                link_target: observed,
-            } if observed == &link_target => Ok(()),
-            observation => Err(CreateLinkExecutionError::PostconditionNotMet {
-                target_path,
-                observation: observation.clone(),
-            }),
+            }
         }
     }
 
@@ -162,6 +226,7 @@ impl FileLinkExecutor {
             self.inspector.canonical_home(),
             &temporary,
             facts.new_link_target(),
+            source.physical_root(),
         ) {
             return Err(self.replacement_attempt_aftermath(
                 &facts,
@@ -418,6 +483,7 @@ impl FileLinkExecutor {
             self.inspector.canonical_home(),
             &new_physical,
             facts.new_link_target(),
+            source.physical_root(),
         )
         .is_err()
         {

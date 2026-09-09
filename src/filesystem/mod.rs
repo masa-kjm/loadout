@@ -1,12 +1,16 @@
 //! Platform-specific, no-follow filesystem primitives.
 //!
-//! This module reports entry-kind facts only. Callers decide whether an entry is safe, owned, or eligible for a lifecycle action.
+//! This module reports physical entry and path-association facts. Callers decide ownership and lifecycle eligibility; execution primitives enforce the supplied physical predicates.
 
 use std::fs;
 use std::io;
+use std::path::{Component, Path, PathBuf};
 
 use crate::domain::file_link::LinkTarget;
-use crate::domain::paths::ResolvedPath;
+use crate::domain::paths::{ResolvedPath, ResolvedPathError};
+
+#[cfg(unix)]
+pub(crate) use unix::execution::ExecutionTarget;
 
 #[cfg(unix)]
 mod unix;
@@ -55,6 +59,7 @@ pub(crate) fn create_file_symbolic_link_no_replace(
     canonical_home: &ResolvedPath,
     physical_target_path: &ResolvedPath,
     link_target: &LinkTarget,
+    _source_root: &ResolvedPath,
 ) -> io::Result<()> {
     #[cfg(test)]
     crate::test_support::assert_mutation_allowed();
@@ -62,10 +67,12 @@ pub(crate) fn create_file_symbolic_link_no_replace(
         canonical_home,
         physical_target_path,
         link_target,
+        #[cfg(unix)]
+        _source_root,
     )
 }
 
-/// Replaces a rechecked target with its recorded sibling under the observational concurrency contract. Currently disabled pending the execution context and native evidence; direct calls also reject.
+/// Replaces a rechecked target with its recorded sibling under the observational concurrency contract. Currently disabled pending action integration and native evidence; direct calls also reject.
 pub(crate) fn replace_file_symbolic_link_from_temporary(
     canonical_home: &ResolvedPath,
     physical_target_path: &ResolvedPath,
@@ -80,7 +87,7 @@ pub(crate) fn replace_file_symbolic_link_from_temporary(
     )
 }
 
-/// Removes a freshly rechecked expected link by name under the observational concurrency contract. Currently disabled pending retained-parent checks and native evidence; no atomic entry-identity guarantee is claimed.
+/// Removes a freshly rechecked expected link by name under the observational concurrency contract. Currently disabled pending retained-context action integration and native evidence; no atomic entry-identity guarantee is claimed.
 pub(crate) fn remove_expected_file_symbolic_link_entry(
     canonical_home: &ResolvedPath,
     physical_target_path: &ResolvedPath,
@@ -111,11 +118,34 @@ pub(crate) fn ensure_file_symbolic_link_replacement_supported(
     platform::ensure_file_symbolic_link_replacement_supported(target_parent)
 }
 
-/// Rejects removal until the backend implements the required retained-parent rechecks, no-follow removal and recorded-path observations.
+/// Rejects removal until the executor integrates retained-parent rechecks, no-follow removal and recorded-path observations with native action evidence.
 pub(crate) fn ensure_file_symbolic_link_removal_supported(
     target_parent: &ResolvedPath,
 ) -> io::Result<()> {
     platform::ensure_file_symbolic_link_removal_supported(target_parent)
+}
+
+pub(crate) fn normalize_observed_absolute_path(
+    path: &Path,
+) -> Result<ResolvedPath, ResolvedPathError> {
+    if !path.is_absolute() {
+        return ResolvedPath::new(path.to_path_buf());
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(component) => normalized.push(component),
+        }
+    }
+
+    ResolvedPath::new(normalized)
 }
 
 #[cfg(test)]
@@ -223,7 +253,7 @@ mod tests {
             io::ErrorKind::Unsupported
         );
         assert_eq!(
-            create_file_symbolic_link_no_replace(&f.root(), &target, &source)
+            create_file_symbolic_link_no_replace(&f.root(), &target, &source, &f.root())
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::Unsupported
@@ -231,7 +261,7 @@ mod tests {
         assert!(fs::symlink_metadata(target.as_ref()).is_err());
         fs::write(target.as_ref(), "unmanaged").unwrap();
         assert_eq!(
-            create_file_symbolic_link_no_replace(&f.root(), &target, &source)
+            create_file_symbolic_link_no_replace(&f.root(), &target, &source, &f.root())
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::Unsupported

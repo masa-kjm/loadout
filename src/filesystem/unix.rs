@@ -44,6 +44,7 @@ pub(super) fn replace_file_symbolic_link_from_temporary(
     Err(expected_entry_replacement_unsupported())
 }
 
+#[allow(dead_code)]
 pub(super) fn remove_expected_file_symbolic_link_entry(
     _: &ResolvedPath,
     _: &ResolvedPath,
@@ -65,8 +66,8 @@ pub(super) fn ensure_file_symbolic_link_replacement_supported(_: &ResolvedPath) 
 }
 
 pub(super) fn ensure_file_symbolic_link_removal_supported(_: &ResolvedPath) -> io::Result<()> {
-    // Name-based deletion is permitted by the concurrency contract; enabling it still requires executor integration and native removal evidence.
-    Err(expected_entry_removal_unsupported())
+    // The executor retains and rechecks the parent handle immediately before the name-based removal. The external-concurrency contract deliberately does not claim final-entry identity between that recheck and unlinkat.
+    Ok(())
 }
 
 fn expected_entry_replacement_unsupported() -> io::Error {
@@ -76,6 +77,7 @@ fn expected_entry_replacement_unsupported() -> io::Error {
     )
 }
 
+#[allow(dead_code)]
 fn expected_entry_removal_unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,

@@ -297,6 +297,65 @@ mod unix {
     }
 
     #[test]
+    fn compiled_binary_removes_a_stale_owned_link_and_preserves_its_referent() {
+        let f = Fixture::new();
+        expect(
+            f.command().args(ARGS).arg("--yes").output().unwrap(),
+            0,
+            &["apply completed: 1"],
+        );
+        f.write(
+            "portable/profiles/base.yaml",
+            "schema_version: 1\nid: base\nresources: {}\n",
+        );
+
+        expect(
+            f.command().args(ARGS).arg("--yes").output().unwrap(),
+            0,
+            &["remove_link", "apply completed: 1"],
+        );
+        assert!(!f.path("home/target").exists());
+        assert_eq!(
+            fs::read_to_string(f.path("store/source")).unwrap(),
+            "content\n"
+        );
+        assert!(state(&f)["resources"].as_object().unwrap().is_empty());
+        assert!(state(&f)["active_operation"].is_null());
+    }
+
+    #[test]
+    fn compiled_binary_relocates_contiguously_and_commits_the_new_known_target() {
+        let f = Fixture::new();
+        expect(
+            f.command().args(ARGS).arg("--yes").output().unwrap(),
+            0,
+            &["apply completed: 1"],
+        );
+        fs::create_dir(f.path("home/moved")).unwrap();
+        f.profile("base", "item", "~/moved/target");
+
+        expect(
+            f.command().args(ARGS).arg("--yes").output().unwrap(),
+            0,
+            &["relocate_link", "apply completed: 1"],
+        );
+        assert!(!f.path("home/target").exists());
+        assert_eq!(
+            fs::read_link(f.path("home/moved/target")).unwrap(),
+            f.path("store/source")
+        );
+        assert_eq!(
+            fs::read_to_string(f.path("store/source")).unwrap(),
+            "content\n"
+        );
+        assert_eq!(
+            state(&f)["resources"]["base/item"]["file_link"]["target_path"],
+            json!(f.path("home/moved/target"))
+        );
+        assert!(state(&f)["active_operation"].is_null());
+    }
+
+    #[test]
     fn yes_and_dry_run_do_not_prompt_with_both_terminals() {
         for flags in [vec!["--yes"], vec!["--dry-run"], vec!["--dry-run", "--yes"]] {
             let f = Fixture::new();

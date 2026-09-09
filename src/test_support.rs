@@ -89,6 +89,7 @@ mod execution_hooks {
         AfterFinalRecheck,
         AfterMutationAttempt,
         AfterTemporaryCreation,
+        BeforeRelocateRemovalRecheck,
         BeforePostObservation,
         BeforeCommit,
     }

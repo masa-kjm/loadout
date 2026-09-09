@@ -1674,6 +1674,28 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn assert_relocation_recheck_failure_retains_old_known(workspace: &TestWorkspace) {
+        let state = workspace.repository().load().unwrap();
+        assert_eq!(
+            state
+                .active_operation()
+                .unwrap()
+                .actions()
+                .next()
+                .unwrap()
+                .1
+                .status(),
+            ActionStatus::Uncertain
+        );
+        assert!(
+            state
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn whole_plan_records_every_action_then_executes_in_plan_order_under_one_lock() {
         let workspace = TestWorkspace::new();
@@ -2118,25 +2140,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unsupported_later_phase_preflight_prevents_earlier_creation_and_confirmation() {
+    fn enabled_removal_and_creation_commit_in_deterministic_phases() {
         let workspace = TestWorkspace::new();
         workspace.write("store/git/config", "source\n");
         let initial = workspace.request(&[("stale", "stale")]);
         apply_request(&initial, |_| true).unwrap();
-        let before = fs::read(workspace.path("state/state.json")).unwrap();
         let request = workspace.request(&[("new", "new")]);
-        let failure =
-            apply_request(&request, |_| panic!("all preflight must pass first")).unwrap_err();
-        assert_eq!(failure.stage, ApplyStage::Preflight);
-        assert!(!workspace.path("home/new").exists());
+        let report = apply_request(&request, |plan| {
+            assert_eq!(plan.actions()[0].kind(), ActionKind::CreateLink);
+            assert_eq!(plan.actions()[1].kind(), ActionKind::RemoveLink);
+            true
+        })
+        .unwrap();
+        assert!(matches!(report, ApplyReport::Applied { committed, .. } if committed.len() == 2));
         assert_eq!(
-            fs::read(workspace.path("state/state.json")).unwrap(),
-            before
-        );
-        assert_eq!(
-            fs::read_link(workspace.path("home/stale")).unwrap(),
+            fs::read_link(workspace.path("home/new")).unwrap(),
             workspace.path("store/git/config")
         );
+        assert!(!workspace.path("home/stale").exists());
     }
 
     #[cfg(unix)]
@@ -2506,12 +2527,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn every_unsupported_phase_two_action_blocks_an_earlier_create() {
-        for kind in [
-            ActionKind::ReplaceLink,
-            ActionKind::ReplaceOwnership,
-            ActionKind::RelocateLink,
-        ] {
+    fn unsupported_replacement_actions_block_an_earlier_create() {
+        for kind in [ActionKind::ReplaceLink, ActionKind::ReplaceOwnership] {
             let workspace = TestWorkspace::new();
             workspace.write("store/git/config", "old\n");
             workspace.write("store/git/replacement", "new\n");
@@ -2524,17 +2541,12 @@ mod tests {
                 ActionKind::ReplaceOwnership => {
                     workspace.request(&[("renamed", "old"), ("create", "create")])
                 }
-                ActionKind::RelocateLink => {
-                    workspace.request(&[("old", "moved"), ("create", "create")])
-                }
                 _ => unreachable!(),
             };
-            if kind != ActionKind::RelocateLink {
-                let yaml = fs::read_to_string(workspace.path("profiles/base.yaml"))
-                    .unwrap()
-                    .replace("path: git/config", "path: git/replacement");
-                workspace.write("profiles/base.yaml", &yaml);
-            }
+            let yaml = fs::read_to_string(workspace.path("profiles/base.yaml"))
+                .unwrap()
+                .replace("path: git/config", "path: git/replacement");
+            workspace.write("profiles/base.yaml", &yaml);
             let before = workspace.snapshot();
             let failure = apply_request(&request, |_| panic!("unsupported plan must not confirm"))
                 .unwrap_err();
@@ -3026,7 +3038,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn relocation_blocks_before_confirmation_when_expected_entry_removal_is_unavailable() {
+    fn relocation_creates_the_new_link_removes_the_old_link_and_commits_known() {
         let workspace = TestWorkspace::new();
         workspace.write("store/git/config", "owned source\n");
         workspace
@@ -3036,24 +3048,20 @@ mod tests {
         fs::create_dir(workspace.path("home/.config")).unwrap();
         let relocation = workspace.relocation_input();
 
-        let error = workspace
+        let result = workspace
             .coordinator()
-            .apply_relocate_link(&relocation, |_| {
-                panic!("unsupported relocation must not request confirmation")
+            .apply_relocate_link(&relocation, |plan| {
+                assert_eq!(plan.actions()[0].kind(), ActionKind::RelocateLink);
+                true
             })
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(
-            error,
-            ApplyError::RelocatePreflight(RelocateLinkExecutionError::RemoveCapability(
-                RemoveLinkExecutionError::PlatformCapability { .. }
-            ))
-        ));
+        assert!(matches!(result, RelocateLinkApplyResult::Applied { .. }));
+        assert!(!workspace.path("home/.gitconfig").exists());
         assert_eq!(
-            fs::read_link(workspace.path("home/.gitconfig")).unwrap(),
+            fs::read_link(workspace.path("home/.config/gitconfig")).unwrap(),
             workspace.path("store/git/config")
         );
-        assert!(!workspace.path("home/.config/gitconfig").exists());
         let state = workspace.repository().load().unwrap();
         assert!(state.active_operation().is_none());
         assert!(
@@ -3062,6 +3070,187 @@ mod tests {
                 .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
                 .is_some()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relocate_keeps_the_old_link_when_the_new_link_changes_before_final_removal_recheck() {
+        use crate::test_support::{ExecutionBoundary, on_execution_boundary};
+
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "owned source\n");
+        workspace
+            .coordinator()
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        fs::create_dir(workspace.path("home/.config")).unwrap();
+        let new_target = workspace.path("home/.config/gitconfig");
+        let _hook =
+            on_execution_boundary(ExecutionBoundary::BeforeRelocateRemovalRecheck, move || {
+                fs::remove_file(&new_target)?;
+                fs::write(&new_target, "substituted unmanaged target")
+            });
+
+        let result = workspace
+            .coordinator()
+            .apply_relocate_link(&workspace.relocation_input(), |_| true)
+            .unwrap();
+
+        assert!(matches!(result, RelocateLinkApplyResult::Uncertain { .. }));
+        assert_eq!(
+            fs::read_link(workspace.path("home/.gitconfig")).unwrap(),
+            workspace.path("store/git/config")
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path("home/.config/gitconfig")).unwrap(),
+            "substituted unmanaged target"
+        );
+        assert_relocation_recheck_failure_retains_old_known(&workspace);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relocate_keeps_the_old_link_when_the_old_link_changes_before_final_removal_recheck() {
+        use crate::test_support::{ExecutionBoundary, on_execution_boundary};
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "owned source\n");
+        workspace.write("store/git/other", "unmanaged source\n");
+        workspace
+            .coordinator()
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        fs::create_dir(workspace.path("home/.config")).unwrap();
+        let old_target = workspace.path("home/.gitconfig");
+        let other = workspace.path("store/git/other");
+        let _hook =
+            on_execution_boundary(ExecutionBoundary::BeforeRelocateRemovalRecheck, move || {
+                fs::remove_file(&old_target)?;
+                symlink(other, old_target)
+            });
+
+        let result = workspace
+            .coordinator()
+            .apply_relocate_link(&workspace.relocation_input(), |_| true)
+            .unwrap();
+
+        assert!(matches!(result, RelocateLinkApplyResult::Uncertain { .. }));
+        assert_eq!(
+            fs::read_link(workspace.path("home/.gitconfig")).unwrap(),
+            workspace.path("store/git/other")
+        );
+        assert_relocation_recheck_failure_retains_old_known(&workspace);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relocate_keeps_the_old_link_when_the_source_changes_before_final_removal_recheck() {
+        use crate::test_support::{ExecutionBoundary, on_execution_boundary};
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "owned source\n");
+        workspace.write("store/git/other", "substituted source\n");
+        workspace
+            .coordinator()
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        fs::create_dir(workspace.path("home/.config")).unwrap();
+        let source = workspace.path("store/git/config");
+        let other = workspace.path("store/git/other");
+        let _hook =
+            on_execution_boundary(ExecutionBoundary::BeforeRelocateRemovalRecheck, move || {
+                fs::remove_file(&source)?;
+                symlink(other, source)
+            });
+
+        let result = workspace
+            .coordinator()
+            .apply_relocate_link(&workspace.relocation_input(), |_| true)
+            .unwrap();
+
+        assert!(matches!(result, RelocateLinkApplyResult::Uncertain { .. }));
+        assert_eq!(
+            fs::read_link(workspace.path("home/.gitconfig")).unwrap(),
+            workspace.path("store/git/config")
+        );
+        assert_relocation_recheck_failure_retains_old_known(&workspace);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relocate_keeps_the_old_link_when_the_new_parent_changes_before_final_removal_recheck() {
+        use crate::test_support::{ExecutionBoundary, on_execution_boundary};
+
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "owned source\n");
+        workspace
+            .coordinator()
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        fs::create_dir(workspace.path("home/.config")).unwrap();
+        let parent = workspace.path("home/.config");
+        let detached = workspace.path("home/detached-config");
+        let _hook =
+            on_execution_boundary(ExecutionBoundary::BeforeRelocateRemovalRecheck, move || {
+                fs::rename(&parent, &detached)?;
+                fs::create_dir(&parent)
+            });
+
+        let result = workspace
+            .coordinator()
+            .apply_relocate_link(&workspace.relocation_input(), |_| true)
+            .unwrap();
+
+        assert!(matches!(result, RelocateLinkApplyResult::Uncertain { .. }));
+        assert_eq!(
+            fs::read_link(workspace.path("home/.gitconfig")).unwrap(),
+            workspace.path("store/git/config")
+        );
+        assert!(
+            fs::symlink_metadata(workspace.path("home/detached-config/gitconfig"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_relocation_recheck_failure_retains_old_known(&workspace);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relocate_keeps_the_old_link_when_the_old_parent_changes_before_final_removal_recheck() {
+        use crate::test_support::{ExecutionBoundary, on_execution_boundary};
+
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "owned source\n");
+        workspace
+            .coordinator()
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        fs::create_dir(workspace.path("home/.config")).unwrap();
+        let home = workspace.path("home");
+        let detached = workspace.path("detached-home");
+        let _hook =
+            on_execution_boundary(ExecutionBoundary::BeforeRelocateRemovalRecheck, move || {
+                fs::rename(&home, &detached)?;
+                fs::create_dir(&home)
+            });
+
+        let result = workspace
+            .coordinator()
+            .apply_relocate_link(&workspace.relocation_input(), |_| true)
+            .unwrap();
+
+        assert!(matches!(result, RelocateLinkApplyResult::Uncertain { .. }));
+        assert!(
+            fs::symlink_metadata(workspace.path("detached-home/.gitconfig"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!workspace.path("home/.gitconfig").exists());
+        assert_relocation_recheck_failure_retains_old_known(&workspace);
     }
 
     #[cfg(unix)]
@@ -3660,7 +3849,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn stale_owned_link_removal_fails_preflight_without_an_operation_or_target_mutation() {
+    fn stale_owned_link_removal_removes_the_link_and_commits_known() {
         let workspace = TestWorkspace::new();
         workspace.write("store/git/config", "[user]\nname = Example\n");
         let current = workspace.input();
@@ -3670,31 +3859,23 @@ mod tests {
             .unwrap();
         let stale = workspace.stale_input();
 
-        let error = workspace
+        let result = workspace
             .coordinator()
             .apply_stale_link(&stale, |plan| {
                 assert_eq!(plan.actions()[0].kind(), ActionKind::RemoveLink);
-                panic!("an unsupported removal capability must not request confirmation")
+                true
             })
-            .unwrap_err();
+            .unwrap();
 
         assert!(matches!(
-            error,
-            ApplyError::StalePreflight(StaleLinkExecutionError::Remove(
-                RemoveLinkExecutionError::PlatformCapability { .. }
-            ))
+            result,
+            StaleLinkApplyResult::Applied {
+                kind: ActionKind::RemoveLink,
+                ..
+            }
         ));
         let target = workspace.path("home/.gitconfig");
-        assert!(
-            fs::symlink_metadata(&target)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(
-            fs::read_link(&target).unwrap(),
-            workspace.path("store/git/config")
-        );
+        assert!(!target.exists());
         assert!(
             fs::symlink_metadata(workspace.path("home"))
                 .unwrap()
@@ -3705,7 +3886,7 @@ mod tests {
             "[user]\nname = Example\n"
         );
         let state = workspace.repository().load().unwrap();
-        assert!(state.known().resources().next().is_some());
+        assert!(state.known().resources().next().is_none());
         assert!(state.active_operation().is_none());
     }
 
@@ -3878,7 +4059,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn stale_remove_capability_failure_does_not_invoke_the_after_running_hook() {
+    fn stale_remove_records_running_before_removing_the_link() {
         let workspace = TestWorkspace::new();
         workspace.write("store/git/config", "owned source\n");
         let current = workspace.input();
@@ -3888,33 +4069,39 @@ mod tests {
             .unwrap();
         let stale = workspace.stale_input();
 
-        let error = workspace
+        let result = workspace
             .coordinator()
             .apply_stale_link_with_after_running(&stale, |locked| {
-                let _ = locked;
-                panic!("preflight must reject before creating an operation")
+                assert_eq!(
+                    locked
+                        .state()
+                        .active_operation()
+                        .unwrap()
+                        .actions()
+                        .next()
+                        .unwrap()
+                        .1
+                        .status(),
+                    ActionStatus::Running
+                );
             })
-            .unwrap_err();
+            .unwrap();
 
         assert!(matches!(
-            error,
-            ApplyError::StalePreflight(StaleLinkExecutionError::Remove(
-                RemoveLinkExecutionError::PlatformCapability { .. }
-            ))
+            result,
+            StaleLinkApplyResult::Applied {
+                kind: ActionKind::RemoveLink,
+                ..
+            }
         ));
         let target = workspace.path("home/.gitconfig");
-        assert!(
-            fs::symlink_metadata(&target)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
+        assert!(!target.exists());
         let state = workspace.repository().load().unwrap();
         assert!(
             state
                 .known()
                 .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
-                .is_some()
+                .is_none()
         );
         assert!(state.active_operation().is_none());
     }

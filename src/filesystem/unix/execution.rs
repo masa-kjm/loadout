@@ -185,6 +185,12 @@ impl ExecutionTarget {
         Ok(CheckedRemove { target: self })
     }
 
+    /// Rechecks the declared-path association and expected final link without preparing a mutation.
+    pub(crate) fn recheck_expected_link(&self, expected: &LinkTarget) -> io::Result<()> {
+        self.check_association()?;
+        self.require_link(&self.name, expected)
+    }
+
     /// The repository supplies the exact recorded sibling; this boundary never generates a temporary name. Both names use one retained parent handle.
     #[allow(dead_code)] // S4 connects replacement after action integration evidence.
     pub(crate) fn prepare_replace<'a>(

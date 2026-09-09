@@ -85,10 +85,10 @@ Avoid speculative abstractions, but do not couple independent responsibilities m
 
 Preserve every applicable invariant:
 
-- Never delete, replace, follow, or adopt an unmanaged or unexpected filesystem entry.
+- Reject observed unmanaged or unexpected entries before mutation; never plan adoption or takeover. Apply the [external filesystem concurrency contract](docs/specs/file-link.md#external-filesystem-concurrency): substitutions after the last recheck can be deleted or replaced and may be indistinguishable from successful removal. Do not claim atomic entry identity or uninterrupted containment.
 - Remove or replace a file link only when both Known state and current Actual observation prove the expected owned link.
-- A conflict, invalid precondition, unsupported platform condition, failed preflight, validation failure, or dry run performs no target mutation.
-- Recheck containment, parent safety, target kind, source safety, and action-specific ownership immediately before filesystem mutation.
+- A blocked Plan, validation failure or failed preflight permits no new planned target mutation; dry run performs no mutation at all. A failed execution recheck prevents the next step, not earlier effects. Classify those effects and distinguish permitted prior recovery from new-plan execution.
+- Recheck containment, parent safety, target kind, source safety, and action-specific ownership immediately before each filesystem mutation step, including target and temporary checks after temporary creation and before rename. Verify required declared-path association; a retained parent handle alone does not prove it.
 - Write `running` before a mutation. Update Known state only after the exact post-condition has been verified and commit it atomically with `succeeded`.
 - After an attempted mutation, classify the result from recorded preconditions and post-conditions, not from an operating-system return value alone.
 - Treat an unprovable result as `uncertain`; do not retry the old action automatically.
@@ -98,6 +98,7 @@ Preserve every applicable invariant:
 ## Engineering and Tests
 
 - Write code, comments, user-facing documentation, commit messages, and pull-request text in English.
+- In comments and doc comments you write or touch, do not manually wrap a single sentence across multiple lines; keep one sentence per line instead.
 - Keep user-visible behavior, its owning specification, and its tests aligned in the same change.
 - Add evidence at the narrowest suitable layer: pure domain, filesystem contract, state durability, executor integration, CLI acceptance, or platform conformance.
 - Test every new mutation path for success, zero-mutation rejection, ownership protection, post-mutation failure, and recovery where applicable.

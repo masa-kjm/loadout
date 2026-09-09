@@ -6,7 +6,7 @@ Loadout is a local environment manager built around explicit desired state, owne
 
 v0.2.0 is a clean-break redesign and is not released yet.
 The repository implements `validate`, `diff`, `plan`, and `apply` (including confirmation and dry run) as described in the [CLI specification](docs/specs/cli.md).
-Platform support is incomplete: the current Unix backend supports link creation, while guarded replacement and removal are rejected during preflight; Windows mutation support remains unfinished.
+Platform support is incomplete: link creation remains enabled on all Unix builds under the [existing-create transition](docs/specs/file-link.md#existing-unix-create-transition), without filesystem-type filtering. Recorded native create evidence covers Linux/local ext4; macOS/APFS creation remains unverified. Other combinations are not claimed supported merely because creation is enabled. Guarded replacement and removal are rejected during preflight; Windows mutation support remains unfinished.
 The installer is not implemented yet.
 The published package's Rust library target is not yet a supported public API.
 
@@ -25,8 +25,9 @@ The core planning contract is:
 Resolved Desired + Known + Actual -> Plan
 ```
 
-Loadout never adopts, removes, or replaces an unmanaged target through the normal lifecycle.
-A destructive action is permitted only when durable Known state and a current no-follow filesystem observation both prove the required ownership condition.
+Loadout checks recorded ownership and filesystem safety immediately before mutations, but does not exclude concurrent external changes. An entry substituted after the last check can be deleted or replaced, and successful postcondition verification may not reveal the race. See the [file-link concurrency contract](docs/specs/file-link.md#external-filesystem-concurrency) for the scope and limits of these guarantees.
+
+The intended completion baseline is Linux/local ext4, macOS/local APFS and Windows/local NTFS for the complete file-link lifecycle. See [supported scope](docs/specs/file-link.md#intended-supported-scope) for exclusions and evidence gates; intended support is distinct from the current capability status above.
 
 ## Documentation
 

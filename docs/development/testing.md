@@ -27,8 +27,8 @@ The following matrix is the minimum evidence required before v0.2.0 is considere
 | --- | --- |
 | [Configuration](../specs/configuration.md) | Runtime and CLI configuration selection; path-base resolution; unknown-field rejection; duplicate profile IDs; store roots remain unchanged. |
 | [Profiles](../specs/profiles.md) | Include order; cycle and missing-ID rejection; deduplication through multiple paths; fully qualified identity; target-collision rejection; deterministic ordering independent of input-map iteration. |
-| [File Links](../specs/file-link.md) | Create, no-op, replace, relocate, remove, forget-missing, and managed identity-handoff outcomes; unmanaged-target protection; wrong-link and regular-file conflicts; parent-escape rejection; source and target containment; no parent removal. |
-| [Lifecycle](../specs/lifecycle.md) | Every Desired/Known/Actual table row; blocked plans make no mutation; preflight failure creates no operation record; executor recheck rejects a target changed after planning; phase ordering; contiguous relocation; and stop-after-failure behavior. |
+| [File Links](../specs/file-link.md) | Create, no-op, replace, relocate, remove, forget-missing, and managed identity-handoff outcomes; observed unmanaged-target rejection and the external-concurrency limits; wrong-link and regular-file conflicts; parent-escape rejection; source and target containment; no parent removal. |
+| [Lifecycle](../specs/lifecycle.md) | Every Desired/Known/Actual table row; blocked Plans and preflight failures perform no new planned target mutation; preflight failure creates no new operation record; permitted prior-operation recovery cleanup and state commits are asserted separately; executor recheck rejects observable changes since planning; phase ordering; contiguous relocation; and stop-after-failure behavior. |
 | [State and Recovery](../specs/state-and-recovery.md) | Corrupt-state rejection; canonical-hash fixtures; exclusive-lock contention; atomic-commit failure; every operation-status transition; same-source identity-handoff recovery; recovery to succeeded, failed, skipped, and uncertain; no rollback of verified earlier actions. |
 | [CLI](../specs/cli.md) | Positional root-profile selection; `validate` default-profile and `--all` behavior; `diff` Known-to-Actual reporting and zero mutation; `plan` and `apply` default-profile behavior; confirmation after successful preflight and before an operation record; non-interactive `--yes` requirement; dry-run zero mutation; all documented exit-status classes. |
 
@@ -52,7 +52,7 @@ They must never use the developer's real home directory, XDG directories, AppDat
 
 Each mutation test records the filesystem state before and after execution.
 For a successful file-link operation, it asserts the final entry kind and normalized link target.
-For a rejected operation, it asserts that the target, its parents, the store, and control files are unchanged.
+For rejection before any mutation step, it asserts that the target, its parents, the store and control files are unchanged. For a failed recheck after earlier steps or recovery, it asserts no effect from the rejected step and verifies the recorded aftermath of earlier effects separately.
 
 The required negative cases include:
 
@@ -64,11 +64,15 @@ The required negative cases include:
 - a target outside the home root or inside a store or control path; and
 - a replacement or removal whose actual link no longer matches Known state.
 
-Tests that simulate a filesystem change between planning and execution must prove that the executor aborts rather than changing its planned action.
+Tests that introduce changes observable at the immediate recheck must prove rejection before that mutation step without replanning. If an earlier action or temporary/relocation creation already ran, assert its recorded aftermath rather than zero mutation for the entire apply.
+
+Tests must separately inject changes after the final recheck to characterize the [concurrency contract](../specs/file-link.md#external-filesystem-concurrency). Cover target and temporary substitution, source changes, and parent/ancestor relocation before recheck, after recheck and before post-observation. Do not assert atomic protection for a substituted entry or use test-only knowledge to force a race diagnostic. Prove that raced removal with all required postconditions, including `missing`, can be classified `succeeded`, remove Known and ultimately exit 0. If required recorded facts or declared-path association cannot be established, assert uncertainty; a handle-local postcondition alone cannot prove success for a different path.
+
+Replacement tests require separate target, temporary, source and parent rechecks immediately before rename, after temporary creation. Recovery cleanup tests cover exact expected, missing, wrong-link, regular-file, unsafe-parent and denied/unprovable cleanup cases without sibling scanning. Preserve observed-change rejection cases when replacing old atomic-entry assertions.
 
 Managed identity-handoff tests cover both resolved-link-target cases.
 When the targets are equal, they prove that the target is untouched, no replacement temporary path is allocated, and only the Known identity changes.
-When the targets differ, they prove the Replace guarantees, including preservation of the old managed link on replacement failure.
+When the targets differ, they prove the Replace guarantees, including preservation of the old managed link when replacement itself fails, subject to the published external-concurrency limit.
 
 ## State Repository Durability Tests
 
@@ -102,7 +106,7 @@ They prove that no other action begins between a `relocate_link` action's verifi
 CLI acceptance tests invoke the compiled binary in an isolated environment.
 They assert behavior rather than exact prose formatting.
 For example, they check that a blocked plan identifies a conflict and exits with status `2`, not the precise English wording of that diagnostic.
-Apply confirmation tests prove that prompting follows successful preflight and that a declined or unavailable confirmation leaves no operation record or target mutation.
+Apply confirmation tests prove that prompting follows successful preflight and that declined or unavailable confirmation creates no new operation record or planned target mutation. Include prior-operation recovery effects separately.
 
 `diff` acceptance tests construct Known state and expected, missing, wrong-link, other-entry, unsafe-parent, and unfinished-operation observations.
 They assert that the command reports each category while leaving the target tree, state directory, store, configuration files, and operation record unchanged.
@@ -115,12 +119,16 @@ The snapshots must be identical.
 
 Platform-neutral tests may use a filesystem abstraction for deterministic failure injection, but they do not replace real platform evidence.
 
-Unix coverage must exercise symbolic-link inspection without following the final link, a symlinked-parent rejection, and atomic replacement of a managed link. For removal it must exercise either a primitive that binds deletion to the verified final entry, including a substituted-entry race test, or the documented zero-mutation preflight failure when no such primitive is available.
+The [intended supported scope](../specs/file-link.md#intended-supported-scope) requires the full action set on real Linux/ext4, macOS/APFS and Windows/NTFS runners. Record OS/version, filesystem, Rust target/toolchain, capability, tests/results and unrun cases. Native filesystem, executor/application, compiled-binary and applicable recovery success evidence is required before each capability is enabled, except for the explicitly retained [existing Unix create transition](../specs/file-link.md#existing-unix-create-transition). That path remains enabled beyond its verified Linux/ext4 evidence; its availability is not platform conformance. The transition does not waive revised create execution checks or final native evidence on every baseline combination. Safe unsupported rejection is required where a capability is unavailable, but does not complete the intended successful action. Baseline rejection tests remain until implementation enables that capability; then replace always-unsupported expectations with success and actual capability-failure cases.
+
+Unix coverage must exercise no-follow final-link inspection, symlinked-parent rejection, atomic same-filesystem replacement and successful name-based removal under the observational concurrency contract, including the separate before/after-recheck cases above. Verify referents and parents are preserved in ordinary success and observed rejection cases. No atomic final-entry identity guarantee is required.
 Windows coverage must exercise file symbolic-link behavior when available and reject junctions or unsupported reparse points.
 It must also cover a replacement or removal rejected by access control or sharing when the test environment can create that condition, proving that no delete-then-create fallback and no premature Known-state update occur.
 It must prove that a same-source managed identity handoff does not require replacement capability, while a source-changing handoff does require the documented replacement guarantee.
-When the host cannot create a file symbolic link, cannot provide the required replacement guarantee, or cannot provide the required expected-entry deletion guarantee, the test must prove the documented preflight failure rather than silently skipping the behavior.
+When the host cannot create a file symbolic link, cannot provide the required replacement guarantee, or cannot provide the required rechecked no-follow removal and observation guarantees, the test must prove the documented preflight failure rather than silently skipping the behavior.
 Replacement tests must cover interruption or failure after the action-local temporary link is created, proving that only the exact recorded temporary link may be cleaned up and that an unexpected or unremovable temporary entry leaves the action uncertain.
+
+Windows capability evidence requires settled path/state semantics and native policy/privilege availability and target sharing/ACL denial aftermath, separately from state-file sharing failures. Record conditions that could not be established as unverified.
 
 Platform-specific tests run only in disposable directories and must clean up only the directories they created.
 
@@ -131,6 +139,6 @@ Before a change is ready for review:
 1. Link the changed behavior to its architecture or specification owner.
 2. Add or update the required test-layer evidence from the contract matrix.
 3. Include at least one negative test for every new mutation path.
-4. Include a zero-mutation test for every new dry-run, validation, blocked-plan, or preflight-failure path.
+4. Include a zero-mutation test for every new dry-run or validation path. For blocked Plans and preflight failures, prove no new planned target mutation or new operation record, and assert permitted prior-operation recovery effects separately.
 5. Add platform evidence when a behavior depends on symbolic links, path normalization, locking, or replacement semantics.
 6. Record validation commands that could not run; do not claim unrun checks passed.

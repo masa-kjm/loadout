@@ -65,7 +65,7 @@ pub(crate) fn create_file_symbolic_link_no_replace(
     )
 }
 
-/// Replaces the expected target with its recorded sibling only when the backend can retain both entry proofs through atomic replacement. The primitive must reject unsupported guarantees even if a caller bypasses capability preflight.
+/// Replaces a rechecked target with its recorded sibling under the observational concurrency contract. Currently disabled pending the execution context and native evidence; direct calls also reject.
 pub(crate) fn replace_file_symbolic_link_from_temporary(
     canonical_home: &ResolvedPath,
     physical_target_path: &ResolvedPath,
@@ -80,7 +80,7 @@ pub(crate) fn replace_file_symbolic_link_from_temporary(
     )
 }
 
-/// Removes one final file symbolic-link entry only when the platform can bind the removal to the expected link entry. The executor establishes the expected-link ownership precondition, and this primitive must retain that proof through the mutation boundary rather than deleting by a subsequently resolved name.
+/// Removes a freshly rechecked expected link by name under the observational concurrency contract. Currently disabled pending retained-parent checks and native evidence; no atomic entry-identity guarantee is claimed.
 pub(crate) fn remove_expected_file_symbolic_link_entry(
     canonical_home: &ResolvedPath,
     physical_target_path: &ResolvedPath,
@@ -111,7 +111,7 @@ pub(crate) fn ensure_file_symbolic_link_replacement_supported(
     platform::ensure_file_symbolic_link_replacement_supported(target_parent)
 }
 
-/// Rejects a file-link removal when the platform cannot bind the final expected entry to its deletion while retaining no-follow handling through the mutation boundary.
+/// Rejects removal until the backend implements the required retained-parent rechecks, no-follow removal and recorded-path observations.
 pub(crate) fn ensure_file_symbolic_link_removal_supported(
     target_parent: &ResolvedPath,
 ) -> io::Result<()> {

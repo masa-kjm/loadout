@@ -204,6 +204,10 @@ The observation, rather than the operating system call's success or error result
 | The recorded precondition still holds exactly | Mark the action `failed`; leave Known state unchanged. |
 | Neither condition holds exactly, or observation is unsafe or unavailable | Mark the action `uncertain`; leave Known state unchanged. |
 
+The [external filesystem concurrency contract](file-link.md#external-filesystem-concurrency) applies to execution and recovery observations and cleanup. The state lock does not exclude unrelated filesystem mutation. After a removal race, `missing` at the recorded target can be indistinguishable from ordinary success: when every required recorded postcondition and path association holds, the result is `succeeded`, Known is removed, and apply can ultimately exit 0. This does not prove which entry was deleted and does not require a race diagnostic based on information unavailable to production observations.
+
+Required observations include the recorded path association, not just the contents of a retained parent handle. They are not a globally atomic snapshot. If required facts cannot be established, retain uncertainty; postcondition verification does not restore atomic entry-identity or continuous-containment guarantees.
+
 This rule covers permission, sharing, lock, read-only-filesystem, process-interruption, and other platform errors that occur after an action has been marked `running`.
 It also applies if an operating system call reports an error but a later observation proves the recorded post-condition.
 For a multi-step action such as `relocate_link`, the recorded precondition and post-condition include every required target observation; a partial relocation is therefore `uncertain`.
@@ -211,7 +215,7 @@ For a multi-step action such as `relocate_link`, the recorded precondition and p
 A `replace_link` action, and a `replace_ownership` action whose resolved link targets differ, also requires its recorded temporary sibling path to be `missing` as part of the complete post-condition.
 When its old-target precondition still holds and the recorded temporary path is the exact temporary link, the executor or recovery may remove that temporary entry only after a fresh no-follow safety recheck.
 It may mark the replacement `failed` only after that temporary path is `missing`.
-An unexpected, unsafe, or unremovable temporary entry makes the replacement `uncertain`; Loadout leaves that entry untouched.
+An observed unexpected or unsafe temporary entry MUST NOT be removed. An unremovable temporary or unprovable cleanup aftermath makes the replacement `uncertain`. Cleanup is limited to the exact recorded path, with no sibling scanning, and shares the recheck-to-syscall limitation. A failed recheck after temporary creation does not imply that no mutation occurred; existing effects are classified using the recorded predicates.
 
 ## Failure and Recovery
 

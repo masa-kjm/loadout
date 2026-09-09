@@ -111,7 +111,7 @@ Preflight MUST verify all planned actions without mutation:
 - the state repository is writable; and
 - the exclusive state lock is held.
 
-If preflight fails, apply reports blocking diagnostics and does not create an operation record or mutate a target.
+If preflight fails, apply reports blocking diagnostics and does not create a new operation record or perform new target mutation. Recovery of a prior operation occurs before this preflight and may already have performed its explicitly permitted cleanup or state commits.
 
 ## Apply
 
@@ -134,10 +134,10 @@ Apply MUST NOT resume a prior plan by its stored action sequence.
 After recovery, it always plans from current Resolved Desired, Known, and Actual state.
 
 Confirmation is requested only after successful preflight.
-If confirmation is declined or unavailable, apply creates no operation record and performs no target mutation.
+If confirmation is declined or unavailable, apply creates no new operation record and performs no new target mutation; this does not undo permitted earlier recovery effects.
 
 The executor must recheck filesystem safety immediately before each mutation.
-A failed recheck aborts the action and records failure or uncertainty; it never causes the executor to choose a different action.
+A failed recheck prevents the next mutation step and records failure or uncertainty from the recorded predicates; it never causes the executor to choose a different action. Earlier verified actions remain committed, and earlier steps such as temporary creation or relocation creation may have effects requiring classification. The [external filesystem concurrency contract](file-link.md#external-filesystem-concurrency) applies to all checks and attempts; rejection of observable changes does not exclude a race after the last recheck.
 
 ## Execution Order
 

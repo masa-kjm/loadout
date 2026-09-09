@@ -7,6 +7,16 @@ It defines declaration syntax, containment, ownership, observation, mutation pre
 
 Copy operations, directory resources, hard links, junctions, and remote stores are outside v0.2.0.
 
+## External Filesystem Concurrency
+
+Loadout requires recorded ownership and a fresh no-follow observation of the expected link before removal or replacement. It rechecks the applicable source, target, temporary, parent and containment conditions immediately before each mutation step and rejects changes it observes. Loadout does not synchronize with or exclude external filesystem changes by editors, synchronization tools, or other processes, including adversarial processes. Changes between the last recheck and the filesystem operation can cause a substituted unmanaged entry to be deleted or replaced. A retained parent handle can still refer to a directory that another process has moved; it does not guarantee continuous containment below home. Loadout verifies the required recorded postconditions and path association before committing success, but these observations are not an atomic snapshot. In particular, a missing target after removal can lead to `succeeded`, removal of Known state and exit 0 without proving which entry was deleted. Loadout does not guarantee detection of every race, reversal of unintended effects, or repair of external changes. Users are not required to prevent external changes for Loadout to perform its safety checks.
+
+These limits apply equally to final targets, recorded replacement temporaries, source-path observations, relevant parents and ancestors, and recovery cleanup. External inactivity is neither a safety precondition nor evidence that an action is safe. The state repository lock serializes cooperating Loadout sessions; it does not lock managed targets against unrelated processes.
+
+A retained parent handle binds an operation to a directory object, not continuously to its declared path or location below home. The executor MUST check the association with the recorded path and canonical home at immediate recheck and post-observation boundaries. A handle-local postcondition alone MUST NOT establish success for a different declared path. Required facts that cannot be established leave the result uncertain. No atomic compare-and-delete or uninterrupted physical-containment guarantee is provided between observations and syscalls.
+
+The ownership and containment requirements below apply at their specified observation boundaries, subject to this concurrency limit; they do not guarantee the identity of an entry substituted afterward.
+
 ## Declaration
 
 A file-link resource has `type: file` and the following properties:
@@ -91,7 +101,7 @@ It remains unmanaged and is reported as a conflict.
 Known state records an expected link target, but it is not sufficient by itself to authorize deletion.
 Loadout may remove a target only when current observation is `expected_link` for the resource's recorded link target.
 
-Loadout MUST NOT remove, replace, follow, or adopt an `other_link`, `other_entry`, or `unsafe_path` target.
+Loadout MUST reject a target observed as `other_link`, `other_entry`, or `unsafe_path` without removing, replacing, following, or adopting that observed entry. This rejection does not protect substitutions after the final recheck, as specified in [External Filesystem Concurrency](#external-filesystem-concurrency).
 It MUST NOT remove parent directories.
 
 If a stale resource target is `missing`, Loadout may remove its Known state record without a filesystem mutation.
@@ -103,7 +113,7 @@ The lifecycle may perform the internal managed-resource identity handoff defined
 ## Mutation Contract
 
 Every filesystem mutation occurs only after a fresh executable plan and a successful preflight.
-The executor MUST repeat the source, containment, parent, target-kind, and ownership checks immediately before the mutation.
+The executor MUST repeat the applicable source, containment, parent, target-kind, temporary and ownership checks immediately before each mutation step. A recheck failure prevents that step, not effects of earlier steps or actions; existing effects MUST be classified under [State and Recovery](state-and-recovery.md#mutation-result-classification), without replanning or automatic rollback.
 
 ### Create
 
@@ -118,13 +128,13 @@ It requires a verified source and an `expected_link` matching the old Known-stat
 The implementation MUST use a platform operation whose successful post-condition is the new expected link.
 It MUST NOT first delete the old link and then attempt an unrelated create.
 
-If the platform cannot perform this replacement while preserving the old link when the replacement fails, preflight MUST block the action before the target is changed.
+Replacement MUST use an atomic same-filesystem name replacement. If the platform cannot preserve the old link when the replacement operation itself fails, subject to the external-concurrency limit, preflight MUST block the action before new target mutation.
 
 ### Replace Ownership
 
 Replace Ownership is an internal handoff between two Loadout-managed resource identities at one target.
 It applies only when a stale old resource has a Known-state record, Actual observation proves the old resource's expected link, and the new resource source has validated.
-It MUST NOT adopt, replace, or otherwise take over an unmanaged target, including a `matching_unmanaged_link`.
+It MUST NOT select an action to adopt, replace, or otherwise take over an observed unmanaged target, including a `matching_unmanaged_link`. The external-concurrency limitation also applies to this action.
 
 If the old and new resolved link targets are equal, Loadout performs no filesystem mutation and allocates no replacement temporary path.
 After a fresh no-follow verification of the old resource's ownership and the shared expected link, the state repository atomically removes the old Known resource identity, records the new identity, and marks the action `succeeded`.
@@ -135,22 +145,35 @@ After the new expected link is verified, the state repository atomically replace
 
 ### Remove
 
-Remove requires `expected_link` matching the Known-state value and a platform primitive that binds that exact final entry to the deletion.
-It removes only that final symbolic-link entry and then verifies that the target is `missing`.
-No parent directory is removed. If the platform cannot retain the expected-entry proof through deletion, preflight MUST block without creating an operation record or changing the target or Known state.
+Remove requires Known ownership and a fresh no-follow `expected_link` observation matching the Known-state value. It uses the rechecked parent directory and final component for a name-based removal without following the final link, then verifies that the recorded target is `missing` and its required path association holds.
+The primitive MUST NOT remove the link referent or request parent-directory removal. A substituted final entry can nevertheless be removed after the recheck under the external-concurrency limit. If the required primitive and observations are unavailable, preflight MUST block without a new operation record or new target/Known mutation.
 
 ### Relocate
 
 Relocate changes a resource target path.
 It is planned as a create at the new missing target followed by a remove of the old expected link.
-The create and its verification must complete before the old target is removed.
+The create and its verification must complete before the old target is removed. Immediately before removal, the executor MUST repeat the applicable checks for both targets, source, containment and parents. A new link remaining together with the old link is partial relocation and is `uncertain`, with old Known unchanged and no automatic retry or rollback.
 If the new target is not missing or the old target is not an expected link, the plan is blocked.
 
 ## Platform Requirements
 
+### Intended Supported Scope
+
+The v0.2.0 completion baseline is Linux on local ext4 (including ext4 within WSL2), macOS on local APFS, and Windows on local NTFS. Each combination requires create, remove, replace, relocate, both ownership handoffs, noop and forget-missing. This is intended support, not a claim that the current backend implements or has verified every capability. The [README](../../README.md#status) reports current implementation status.
+
+Other operating systems and filesystems, network shares including SMB/NFS, WSL-mounted Windows volumes accessed through the Linux backend, and cross-filesystem replacement are outside the supported baseline. Accepted path spelling alone does not establish filesystem support. Unsupported capability requirements MUST be reported explicitly; an OS name alone is not evidence of the required filesystem guarantees.
+
+Except for the existing Unix create transition below, each capability MUST have native filesystem, executor/application, compiled-binary and applicable recovery evidence on its baseline combination before enablement, as required by [Testing Strategy](../development/testing.md#platform-conformance). Windows additionally requires settled path/state semantics and native privilege/policy and target sharing/ACL evidence. No minimum OS release or architecture promise is introduced here: concrete API, OS, Rust target and filesystem requirements MUST be recorded before capability enablement. Removing a baseline platform or action requires an explicit scoped project-owner decision before changing the contract.
+
+### Existing Unix Create Transition
+
+The Unix create capability already enabled before S1 may remain enabled while the execution boundary and conformance evidence are completed. This is a narrow exception to the pre-enablement evidence gate, not a claim that the existing implementation satisfies every revised execution requirement. The current `cfg(unix)` backend does not restrict creation to Linux or identify the filesystem type. Consequently, creation can be attempted on macOS and other Unix/filesystem combinations for which native evidence has not been established. Only Linux/local ext4 creation has recorded native evidence in the current work record; capability availability alone MUST NOT be reported as verified support.
+
+This exception preserves only the pre-S1 Unix create path. It does not authorize enabling currently rejected removal, replacement, source-changing handoff, relocation requiring removal, or Windows creation, and does not expand the supported baseline. The Unix execution-boundary work MUST bring create into the revised recheck and recorded-path observation contract. Before v0.2.0 completion, create still requires the full native evidence on every baseline combination, including macOS/APFS. The exception cannot be used to waive that completion requirement or infer support for excluded combinations.
+
 ### Supported Representation
 
-On Unix, the implementation MUST create and inspect the symbolic-link entry without following its final target. It MAY remove an entry only when its platform primitive can bind deletion to the final entry that passed the expected-link recheck.
+On Unix, the implementation MUST create and inspect the symbolic-link entry without following its final target. Removal uses the immediate expected-link recheck and name-based deletion under the external-concurrency contract.
 On Windows, it MUST create, replace, remove, and inspect a file symbolic link and MUST reject junctions and all unsupported reparse points.
 An implementation MUST NOT fall back to copy, hard link, junction, a delayed-at-reboot operation, or another untracked filesystem operation.
 
@@ -161,15 +184,17 @@ The following guarantees apply to a target whose parent path and final entry hav
 | Operation | Required guarantee |
 | --- | --- |
 | Create | Create only a file symbolic link at a target that is still `missing`. The implementation must not replace an entry that appeared after planning. |
-| Replace | Record a unique Loadout-owned temporary sibling path, construct a new file symbolic link there, then use one target-name replacement operation. The temporary path is action-local and is never a declared resource target. It MUST NOT implement replacement as deleting the managed link and later creating a new one. Success requires both the new expected target link and absence of the temporary entry. If the platform cannot preserve the old expected link when that replacement operation fails, it does not support `replace_link` and preflight MUST block the action. |
+| Replace | Record a unique Loadout-owned temporary sibling path, construct a new file symbolic link there, then use one target-name replacement operation. The temporary path is action-local and is never a declared resource target. It MUST NOT implement replacement as deleting the managed link and later creating a new one. Success requires both the new expected target link and absence of the temporary entry. Immediately before replacement, recheck both the expected old target and the expected recorded temporary under their shared safe parent, together with applicable source, containment and path-association predicates. If the platform cannot preserve the old expected link when the replacement operation itself fails, subject to external concurrency, it does not support `replace_link` and preflight MUST block the action. |
 | Source-changing Replace Ownership | Apply every Replace guarantee. It is required only when the old and new resolved link targets differ. |
-| Remove | Atomically bind deletion to the final expected file-symbolic-link entry. It must not follow the link, remove its referent, remove a parent directory, or delete an entry substituted after recheck. If that binding is unavailable, preflight must block. |
+| Remove | Use a fresh no-follow expected-link recheck and name-based removal through the same retained parent and final component. Do not follow the link, remove its referent, or request parent-directory removal. An entry substituted after the recheck can be deleted; no atomic entry-identity binding is promised. |
 
 The state repository allocates a unique temporary sibling path while it persists the operation record for every `replace_link` action and every `replace_ownership` action whose resolved link targets differ, before any mutation.
 This allocation is an execution-local nonce, not a planner decision, resource identity, or ordering input.
 The executor may use only the recorded path and MUST recheck that it is missing under the same safe parent immediately before creating the temporary link.
 
-On Unix, replacement must use an atomic same-filesystem name replacement. Generic POSIX `unlinkat` is not an expected-entry removal primitive: it deletes whichever entry currently has the supplied name. The current Unix backend therefore blocks `remove_link` until a platform-specific primitive can atomically bind the verified final entry to deletion.
+On Unix, replacement must use an atomic same-filesystem name replacement. A name-based primitive such as POSIX `unlinkat` deletes whichever entry currently has the supplied name; it is permitted only with the required immediate checks and observations under the external-concurrency contract. Checks and syscall MUST use the same retained parent context rather than re-resolving an absolute mutation pathname.
+
+Cleanup is restricted to the exact recorded temporary path with a freshly observed expected link and safe parent/path association. It uses the same rechecked removal contract and concurrency limit; sibling scanning or general cleanup is forbidden. An observed unexpected temporary is preserved. Failure to complete or prove cleanup leaves uncertainty.
 An open referent does not change the operation's ownership rule: removal and replacement are operations on the link entry, never on the referent.
 
 On Windows, symbolic-link creation may be unavailable because of policy, privilege, developer-mode configuration, filesystem support, or access control.
@@ -178,8 +203,8 @@ Loadout does not wait for the handle, schedule a later retry, or weaken the oper
 
 ### Capability, Permission, and Handle Failures
 
-Preflight MUST block without target mutation when it can determine that the platform cannot create a file symbolic link, cannot provide the required replacement guarantee for an action that requires replacement, or cannot provide the required expected-entry deletion guarantee for an action that requires removal.
-It must report the unsupported capability and affected action.
+Preflight MUST block without a new operation record or new planned target mutation when it can determine that the platform cannot create a file symbolic link, cannot provide the required replacement guarantee for an action that requires replacement, or cannot provide the required rechecked no-follow removal and observation guarantees for an action that requires removal.
+It must report the unsupported capability and affected action. Prior-operation recovery occurs before preflight and may already have performed its permitted temporary cleanup or state commits; these recovery effects are separate from execution of the new Plan, as defined by [Lifecycle](lifecycle.md#preflight).
 
 Permission and handle availability are mutable filesystem facts and cannot be established conclusively by a separate access check.
 An implementation MUST NOT treat a successful permission probe or an apparently unlocked target as authorization to skip the immediate safety recheck.

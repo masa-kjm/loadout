@@ -283,7 +283,8 @@ fn discover_profiles(
                     source,
                 }
             })?;
-            let file_path = ResolvedPath::new(profile_path).map_err(ResolverError::InvalidPath)?;
+            let file_path = ResolvedPath::from_platform_canonicalized(profile_path)
+                .map_err(ResolverError::InvalidPath)?;
             candidates.entry(id).or_default().push(DiscoveredProfile {
                 declaration,
                 file_path,
@@ -645,7 +646,7 @@ fn canonical_home_directory(home_directory: &ResolvedPath) -> Result<ResolvedPat
         });
     }
 
-    ResolvedPath::new(canonical_home).map_err(ResolverError::InvalidPath)
+    ResolvedPath::from_platform_canonicalized(canonical_home).map_err(ResolverError::InvalidPath)
 }
 
 fn resolve_home_alias(

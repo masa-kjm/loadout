@@ -677,8 +677,7 @@ mod windows {
     }
 
     #[test]
-    fn native_windows_prefix_mismatch_preserves_known_and_target() {
-        // Known records the exact observed DOS spelling. Resolver canonicalization produces a verbatim spelling; no ownership alias rule is assumed here.
+    fn native_windows_normal_representation_supports_noop_and_same_source_handoff() {
         let f = Fixture::new();
         if !owned_link_or_assert_rejection(
             &f,
@@ -686,23 +685,36 @@ mod windows {
         ) {
             return;
         }
-        f.state(json!({"base/old":f.known("target")}), Value::Null);
-        assert_ne!(
-            fs::canonicalize(f.path("store/source")).unwrap(),
-            fs::read_link(f.path("home/target")).unwrap()
-        );
-        let before = state(&f);
+        f.state(json!({"base/item":f.known("target")}), Value::Null);
         expect(
             f.command().args(ARGS).arg("--yes").output().unwrap(),
-            2,
-            &["Preflight", "replace_ownership"],
+            0,
+            &["noop", "base/item", "apply completed: 0"],
         );
-        assert_eq!(state(&f), before);
         assert_eq!(
             fs::read_link(f.path("home/target")).unwrap(),
             f.path("store/source")
         );
-        assert_eq!(fs::read_dir(f.path("home")).unwrap().count(), 1);
+        assert!(state(&f)["resources"]["base/item"].is_object());
+
+        f.profile("base", "renamed", "~/target");
+        expect(
+            f.command().args(ARGS).arg("--yes").output().unwrap(),
+            0,
+            &[
+                "replace_ownership",
+                "base/item",
+                "base/renamed",
+                "apply completed: 1 committed actions",
+            ],
+        );
+        assert_eq!(
+            fs::read_link(f.path("home/target")).unwrap(),
+            f.path("store/source")
+        );
+        assert!(state(&f)["resources"]["base/item"].is_null());
+        assert!(state(&f)["resources"]["base/renamed"].is_object());
+        assert!(state(&f)["active_operation"].is_null());
     }
 
     #[test]

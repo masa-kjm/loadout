@@ -68,8 +68,8 @@ pub(crate) fn resolve_store_root(
         });
     }
 
-    let path =
-        ResolvedPath::new(physical_root).map_err(SourceVerificationError::InvalidResolvedPath)?;
+    let path = ResolvedPath::from_platform_canonicalized(physical_root)
+        .map_err(SourceVerificationError::InvalidResolvedPath)?;
     Ok(PhysicalStoreRoot { path })
 }
 

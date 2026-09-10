@@ -184,12 +184,13 @@ impl MachinePaths {
             let filename = bound
                 .file_name()
                 .ok_or_else(|| LoadError::InvalidSelection(bound.clone()))?;
-            fs::canonicalize(parent)
-                .map_err(|source| LoadError::Read {
-                    path: parent.to_owned(),
-                    source,
-                })?
-                .join(filename)
+            let canonical_parent = fs::canonicalize(parent).map_err(|source| LoadError::Read {
+                path: parent.to_owned(),
+                source,
+            })?;
+            return ResolvedPath::from_platform_canonicalized(canonical_parent.join(filename))
+                .map(ResolvedPath::into_path_buf)
+                .map_err(LoadError::Path);
         } else {
             bound
         };

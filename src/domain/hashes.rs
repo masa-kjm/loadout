@@ -217,9 +217,13 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::domain::desired::ResolvedDesired;
+    #[cfg(windows)]
+    use crate::domain::ids::FullyQualifiedResourceId;
     #[cfg(unix)]
     use crate::domain::ids::{FullyQualifiedResourceId, ProfileId};
     #[cfg(unix)]
+    use crate::domain::paths::ResolvedPath;
+    #[cfg(windows)]
     use crate::domain::paths::ResolvedPath;
 
     #[cfg(unix)]
@@ -244,6 +248,36 @@ mod tests {
         assert_eq!(
             definition_hash(&resource).unwrap().as_str(),
             "sha256:1250e6bf4abdb529664c1444709aeae2ce814e8b97c3984e32d46d9c971b3a5e"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_definition_hash_fixture_preserves_case_and_normalized_separators() {
+        let resource = ResolvedFileLink::new(
+            FullyQualifiedResourceId::parse("base/git-config").unwrap(),
+            ResolvedPath::new("C:/Users/Example/Store/git/config").unwrap(),
+            ResolvedPath::new(r"C:\Users\Example\.gitconfig").unwrap(),
+        )
+        .unwrap();
+        let differently_cased = ResolvedFileLink::new(
+            FullyQualifiedResourceId::parse("base/git-config").unwrap(),
+            ResolvedPath::new(r"C:\Users\example\Store\git\config").unwrap(),
+            ResolvedPath::new(r"C:\Users\Example\.gitconfig").unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            canonical_json(&CanonicalFileLink::from_resolved(&resource).unwrap()),
+            br#"{"format":"loadout.resolved-file-link.v1","kind":"file","operation":"link","source_path":"C:\\Users\\Example\\Store\\git\\config","target_path":"C:\\Users\\Example\\.gitconfig","type":"file"}"#
+        );
+        assert_eq!(
+            definition_hash(&resource).unwrap().as_str(),
+            "sha256:97759c73c68d4ada4cd3be914351204cab1cf29a6ce7c91abb4214c0eec4e760"
+        );
+        assert_ne!(
+            definition_hash(&resource).unwrap(),
+            definition_hash(&differently_cased).unwrap()
         );
     }
 

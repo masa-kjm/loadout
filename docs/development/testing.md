@@ -73,6 +73,8 @@ Create recovery tests must cover both an externally created matching link after 
 
 Replacement tests require separate target, temporary, source and parent rechecks immediately before rename, after temporary creation. Recovery cleanup tests cover exact expected, missing, wrong-link, regular-file, unsafe-parent and denied/unprovable cleanup cases without sibling scanning. Preserve observed-change rejection cases when replacing old atomic-entry assertions.
 
+Windows path/state tests table-drive accepted normal DOS and ordinary UNC forms and rejected drive-relative, verbatim, device, reserved-name, trailing-space/period, dot-component, alternate-data-stream, and invalid-character forms. They prove separator canonicalization but case-exact collision, ownership, and hash behavior. They also reject nonconforming version-1 Known records and active operations before target observation or state rewrite; no test may accept them through migration or alias comparison.
+
 Managed identity-handoff tests cover both resolved-link-target cases.
 When the targets are equal, they prove that the target is untouched, no replacement temporary path is allocated, and only the Known identity changes.
 When the targets differ, they prove the Replace guarantees, including preservation of the old managed link when replacement itself fails, subject to the published external-concurrency limit.

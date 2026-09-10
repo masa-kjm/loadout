@@ -101,6 +101,7 @@ Loadout MUST NOT modify its contents while resolving, planning, applying, or rec
 Configuration-level paths are `config_path`, `profile_discovery.paths[*]`, and `stores.*.path`.
 They accept absolute paths, `~/` paths, and paths relative to the environment configuration file or runtime configuration file as specified above.
 Environment variables other than the leading `~/` form are not expanded.
+On Windows, an absolute configuration-level path uses the same normal DOS or ordinary UNC representation as resolved file-link paths; verbatim and device namespaces are rejected as defined in [Windows Path Representation](file-link.md#windows-path-representation).
 
 Resource-local paths have stricter rules and are defined by the File Links specification.
 A lexical path-prefix comparison is never sufficient to prove filesystem containment.

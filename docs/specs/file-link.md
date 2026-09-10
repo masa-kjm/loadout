@@ -72,6 +72,21 @@ The resolved target MUST NOT:
 
 These checks protect source assets and Loadout control data from resource mutation.
 
+### Windows Path Representation
+
+On Windows, v0.2.0 accepts only absolute normal DOS paths such as `C:\Users\example\file` and ordinary UNC paths such as `\\server\share\file`.
+It accepts either separator at the declaration or state-decoding boundary and stores the resulting normal Windows path representation with backslash separators.
+Drive-relative paths, verbatim DOS and UNC paths beginning with `\\?\`, device namespaces such as `\\.\` or `\\??\`, and every other prefixed namespace are rejected.
+The physical canonicalization boundary may convert only the verbatim DOS or UNC form returned by the operating system for an already existing, verified source, home directory, or discovered profile; it never makes that spelling valid in a declaration, state document, or link value.
+
+Every component after a DOS root or UNC server/share root must be non-empty, must not be `.` or `..`, must not end in a space or period, and must not name a reserved DOS device (`CON`, `PRN`, `AUX`, `NUL`, `COM1` through `COM9`, or `LPT1` through `LPT9`, including an extension).
+Alternate data-stream colons and Windows-reserved name characters are rejected.
+These lexical rules apply without target inspection, including to missing targets and dangling link values.
+
+Resolved paths, link targets, collision checks, Known ownership, and canonical hash inputs use the stored normal representation and compare it byte-for-byte, including case.
+Loadout does not case-fold, resolve a path or link merely to compare it, or treat differently cased paths as one owned resource.
+Filesystem observation and containment checks remain responsible for physical identity, safety, and external-change handling.
+
 ## Link Representation
 
 Loadout creates an absolute file symbolic link whose target is the verified resolved source path.

@@ -714,4 +714,62 @@ mod tests {
             }
         }
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_state_paths_require_the_normal_v1_representation() {
+        assert_eq!(
+            decode_path("C:/Users/Example/file".to_owned())
+                .unwrap()
+                .as_path(),
+            std::path::Path::new(r"C:\Users\Example\file")
+        );
+        for value in [
+            r"\\?\C:\Users\Example\file",
+            r"\\?\UNC\server\share\file",
+            r"\\.\C:\Users\Example\file",
+            r"C:\Users\CON",
+            "C:\\Users\\Example\\file\u{001F}",
+        ] {
+            assert!(
+                matches!(
+                    decode_path(value.to_owned()),
+                    Err(StateDecodeError::InvalidPath { .. })
+                ),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_nonconforming_v1_known_and_active_operation_paths_are_rejected() {
+        let mut known_fixture = document_fixture("create_link", "succeeded");
+        known_fixture["resources"]["base/config"]["file_link"]["target_path"] =
+            json!(r"\\?\C:\Users\Example\target");
+        let known_document = serde_json::from_value::<StateDocument>(known_fixture).unwrap();
+        assert!(matches!(
+            known_document.into_state(),
+            Err(StateDecodeError::InvalidPath { .. })
+        ));
+
+        let mut active_fixture = document_fixture("create_link", "running");
+        active_fixture["active_operation"]["actions"]["a1"]["target_path"] =
+            json!(r"\\.\C:\Users\Example\target");
+        let active_document = serde_json::from_value::<StateDocument>(active_fixture).unwrap();
+        assert!(matches!(
+            active_document.into_state(),
+            Err(StateDecodeError::InvalidPath { .. })
+        ));
+
+        let mut control_character_fixture = document_fixture("create_link", "succeeded");
+        control_character_fixture["resources"]["base/config"]["file_link"]["target_path"] =
+            json!("C:\\Users\\Example\\target\u{0001}");
+        let control_character_document =
+            serde_json::from_value::<StateDocument>(control_character_fixture).unwrap();
+        assert!(matches!(
+            control_character_document.into_state(),
+            Err(StateDecodeError::InvalidPath { .. })
+        ));
+    }
 }

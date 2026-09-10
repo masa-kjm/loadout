@@ -59,6 +59,9 @@ Each Known file-link resource contains:
 
 The key and `target_path` are unique across `resources`.
 All stored paths are absolute, normalized for the current platform, and contain no home shorthand or relative components.
+On Windows, every stored path and every path in an active operation must satisfy the normal DOS or ordinary UNC representation in [Windows Path Representation](file-link.md#windows-path-representation).
+Schema version 1 has no implicit path migration: a document whose Windows paths are not in that representation, or whose recorded hash no longer matches its exact normalized path values, is rejected before target inspection, planning, or state mutation.
+Loadout does not rewrite a state document, recalculate a hash, or reinterpret an active operation to accept an alias.
 
 Known state records only post-conditions that were verified after an operation.
 It is not a substitute for actual filesystem inspection before a later destructive action.

@@ -49,7 +49,7 @@ impl FileLinkInspector {
             });
         }
 
-        let canonical_home = ResolvedPath::new(physical_home)
+        let canonical_home = ResolvedPath::from_platform_canonicalized(physical_home)
             .map_err(TargetInspectionError::InvalidCanonicalHome)?;
         Ok(Self {
             declared_home,

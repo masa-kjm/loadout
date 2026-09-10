@@ -1236,7 +1236,7 @@ impl std::error::Error for ApplyError {
     }
 }
 
-/// Reconciles recorded facts only; it never executes an old plan or mutates a declared target. `true` means an uncertain record remains open.
+/// Reconciles recorded facts only; it never executes an old plan or mutates a declared target except for the expressly authorized exact replacement-temporary cleanup. `true` means an uncertain record remains open.
 fn reconcile_active_operation(
     locked: &mut LockedStateRepository,
     home_directory: &std::path::Path,
@@ -1284,10 +1284,22 @@ fn reconcile_active_operation_with_action(
                 .mark_without_known(&action_id, ActionStatus::Skipped)
                 .map_err(ApplyError::State)?,
             ActionStatus::Running | ActionStatus::Uncertain => {
+                // Recovery may remove only its recorded replacement temporary, and only if its executor rechecks can prove that cleanup is safe.
+                // Any failure leaves the action uncertain rather than allowing the later predicate-only decision to conceal an unproven cleanup.
+                let cleanup_failed = action.replacement_facts().is_some()
+                    && !FileLinkExecutor::new(home_directory).is_ok_and(|executor| {
+                        executor
+                            .cleanup_recorded_replacement_temporary(&action)
+                            .is_ok()
+                    });
                 // An unavailable or unsafe recorded-path observation cannot prove either recorded condition, so it remains uncertain.
-                let decision = inspector
-                    .as_ref()
-                    .and_then(|inspector| recovery_decision(inspector, &action).ok())
+                let decision = (!cleanup_failed)
+                    .then(|| {
+                        inspector
+                            .as_ref()
+                            .and_then(|inspector| recovery_decision(inspector, &action).ok())
+                    })
+                    .flatten()
                     .unwrap_or(RecoveryDecision::Uncertain);
                 match decision {
                     RecoveryDecision::Succeeded => locked
@@ -1693,6 +1705,46 @@ mod tests {
                 .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
                 .is_some()
         );
+    }
+
+    #[cfg(unix)]
+    fn assert_replacement_recheck_failure_retains_known(workspace: &TestWorkspace) {
+        let state = workspace.repository().load().unwrap();
+        assert_eq!(
+            state
+                .active_operation()
+                .unwrap()
+                .actions()
+                .next()
+                .unwrap()
+                .1
+                .status(),
+            ActionStatus::Uncertain
+        );
+        assert!(
+            state
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    fn recorded_replacement_temporary(workspace: &TestWorkspace) -> ResolvedPath {
+        workspace
+            .repository()
+            .load()
+            .unwrap()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap()
+            .1
+            .replacement_facts()
+            .unwrap()
+            .temporary_path()
+            .clone()
     }
 
     #[cfg(unix)]
@@ -2527,7 +2579,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unsupported_replacement_actions_block_an_earlier_create() {
+    fn enabled_replacement_actions_allow_an_earlier_create() {
         for kind in [ActionKind::ReplaceLink, ActionKind::ReplaceOwnership] {
             let workspace = TestWorkspace::new();
             workspace.write("store/git/config", "old\n");
@@ -2547,19 +2599,12 @@ mod tests {
                 .unwrap()
                 .replace("path: git/config", "path: git/replacement");
             workspace.write("profiles/base.yaml", &yaml);
-            let before = workspace.snapshot();
-            let failure = apply_request(&request, |_| panic!("unsupported plan must not confirm"))
-                .unwrap_err();
-            assert_eq!(failure.stage, ApplyStage::Preflight);
-            assert!(
-                failure
-                    .plan
-                    .unwrap()
-                    .actions()
-                    .iter()
-                    .any(|a| a.kind() == kind)
-            );
-            assert_eq!(workspace.snapshot(), before);
+            let report = apply_request(&request, |plan| {
+                assert!(plan.actions().iter().any(|action| action.kind() == kind));
+                true
+            })
+            .unwrap();
+            assert!(matches!(report, ApplyReport::Applied { .. }));
         }
     }
 
@@ -2785,7 +2830,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn replace_link_blocks_before_confirmation_without_touching_either_entry() {
+    fn replace_link_replaces_the_managed_link_and_commits_known() {
         let workspace = TestWorkspace::new();
         workspace.write("store/git/config", "old source\n");
         workspace.write("store/git/replacement", "new source\n");
@@ -2794,16 +2839,14 @@ mod tests {
             .apply_create_link(&workspace.input(), |_| true)
             .unwrap();
         let replacement = workspace.replacement_input();
-        let error = workspace
+        let result = workspace
             .coordinator()
-            .apply_replace_link(&replacement, |_| {
-                panic!("an unbound replacement must not request confirmation")
-            })
-            .unwrap_err();
-        assert!(matches!(error, ApplyError::ReplacePreflight(_)));
+            .apply_replace_link(&replacement, |_| true)
+            .unwrap();
+        assert!(matches!(result, ReplaceLinkApplyResult::Applied { .. }));
         assert_eq!(
             fs::read_link(workspace.path("home/.gitconfig")).unwrap(),
-            workspace.path("store/git/config")
+            workspace.path("store/git/replacement")
         );
         let state = workspace.repository().load().unwrap();
         assert!(state.active_operation().is_none());
@@ -2813,7 +2856,204 @@ mod tests {
             .unwrap();
         assert_eq!(
             known.link_target().as_path().as_ref(),
+            workspace.path("store/git/replacement")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_rejects_a_source_change_before_the_final_rename_recheck() {
+        use crate::test_support::{ExecutionBoundary, on_execution_boundary};
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "old source\n");
+        workspace.write("store/git/replacement", "new source\n");
+        workspace.write("store/git/other", "substituted source\n");
+        workspace
+            .coordinator()
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        let source = workspace.path("store/git/replacement");
+        let other = workspace.path("store/git/other");
+        let _hook = on_execution_boundary(
+            ExecutionBoundary::BeforeReplacementRenameRecheck,
+            move || {
+                fs::remove_file(&source)?;
+                symlink(other, source)
+            },
+        );
+
+        let result = workspace
+            .coordinator()
+            .apply_replace_link(&workspace.replacement_input(), |_| true)
+            .unwrap();
+
+        assert!(matches!(result, ReplaceLinkApplyResult::Uncertain { .. }));
+        assert_eq!(
+            fs::read_link(workspace.path("home/.gitconfig")).unwrap(),
             workspace.path("store/git/config")
+        );
+        assert_eq!(
+            fs::read_link(recorded_replacement_temporary(&workspace).as_path()).unwrap(),
+            workspace.path("store/git/replacement")
+        );
+        let state = workspace.repository().load().unwrap();
+        assert!(
+            state
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .is_some()
+        );
+        assert_eq!(
+            state
+                .active_operation()
+                .unwrap()
+                .actions()
+                .next()
+                .unwrap()
+                .1
+                .status(),
+            ActionStatus::Uncertain
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_rejects_a_target_change_before_the_final_rename_recheck() {
+        use crate::test_support::{ExecutionBoundary, on_execution_boundary};
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "old source\n");
+        workspace.write("store/git/replacement", "new source\n");
+        workspace.write("store/git/other", "substituted target\n");
+        workspace
+            .coordinator()
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        let target = workspace.path("home/.gitconfig");
+        let other = workspace.path("store/git/other");
+        let _hook = on_execution_boundary(
+            ExecutionBoundary::BeforeReplacementRenameRecheck,
+            move || {
+                fs::remove_file(&target)?;
+                symlink(other, target)
+            },
+        );
+
+        let result = workspace
+            .coordinator()
+            .apply_replace_link(&workspace.replacement_input(), |_| true)
+            .unwrap();
+
+        assert!(matches!(result, ReplaceLinkApplyResult::Uncertain { .. }));
+        assert_eq!(
+            fs::read_link(workspace.path("home/.gitconfig")).unwrap(),
+            workspace.path("store/git/other")
+        );
+        assert_replacement_recheck_failure_retains_known(&workspace);
+        assert_eq!(
+            fs::read_link(recorded_replacement_temporary(&workspace).as_path()).unwrap(),
+            workspace.path("store/git/replacement")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_rejects_a_recorded_temporary_change_before_the_final_rename_recheck() {
+        use crate::test_support::{ExecutionBoundary, on_execution_boundary};
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "old source\n");
+        workspace.write("store/git/replacement", "new source\n");
+        workspace.write("store/git/other", "substituted temporary\n");
+        workspace
+            .coordinator()
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        let repository = workspace.repository();
+        let other = workspace.path("store/git/other");
+        let _hook = on_execution_boundary(
+            ExecutionBoundary::BeforeReplacementRenameRecheck,
+            move || {
+                let temporary = repository
+                    .load()
+                    .map_err(|error| std::io::Error::other(error.to_string()))?
+                    .active_operation()
+                    .unwrap()
+                    .actions()
+                    .next()
+                    .unwrap()
+                    .1
+                    .replacement_facts()
+                    .unwrap()
+                    .temporary_path()
+                    .clone();
+                fs::remove_file(temporary.as_path())?;
+                symlink(other, temporary.as_path())
+            },
+        );
+
+        let result = workspace
+            .coordinator()
+            .apply_replace_link(&workspace.replacement_input(), |_| true)
+            .unwrap();
+
+        assert!(matches!(result, ReplaceLinkApplyResult::Uncertain { .. }));
+        assert_eq!(
+            fs::read_link(workspace.path("home/.gitconfig")).unwrap(),
+            workspace.path("store/git/config")
+        );
+        assert_replacement_recheck_failure_retains_known(&workspace);
+        assert_eq!(
+            fs::read_link(recorded_replacement_temporary(&workspace).as_path()).unwrap(),
+            workspace.path("store/git/other")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_rejects_a_parent_association_change_before_the_final_rename_recheck() {
+        use crate::test_support::{ExecutionBoundary, on_execution_boundary};
+
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "old source\n");
+        workspace.write("store/git/replacement", "new source\n");
+        workspace
+            .coordinator()
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        let home = workspace.path("home");
+        let detached = workspace.path("detached-home");
+        let _hook = on_execution_boundary(
+            ExecutionBoundary::BeforeReplacementRenameRecheck,
+            move || {
+                fs::rename(&home, &detached)?;
+                fs::create_dir(&home)
+            },
+        );
+
+        let result = workspace
+            .coordinator()
+            .apply_replace_link(&workspace.replacement_input(), |_| true)
+            .unwrap();
+
+        assert!(matches!(result, ReplaceLinkApplyResult::Uncertain { .. }));
+        assert_eq!(
+            fs::read_link(workspace.path("detached-home/.gitconfig")).unwrap(),
+            workspace.path("store/git/config")
+        );
+        assert!(fs::symlink_metadata(workspace.path("home/.gitconfig")).is_err());
+        assert_replacement_recheck_failure_retains_known(&workspace);
+        let temporary = recorded_replacement_temporary(&workspace);
+        let detached_temporary = workspace
+            .path("detached-home")
+            .join(temporary.as_path().file_name().unwrap());
+        assert_eq!(
+            fs::read_link(detached_temporary).unwrap(),
+            workspace.path("store/git/replacement")
         );
     }
 
@@ -2920,7 +3160,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn changed_source_ownership_handoff_blocks_without_recording_or_replacing() {
+    fn changed_source_ownership_handoff_replaces_and_commits_both_identities() {
         let workspace = TestWorkspace::new();
         workspace.write("store/git/config", "old source\n");
         workspace.write("store/git/replacement", "new source\n");
@@ -2929,16 +3169,17 @@ mod tests {
             .apply_create_link(&workspace.input(), |_| true)
             .unwrap();
         let replacement = workspace.ownership_input("base/git-config-renamed", "git/replacement");
-        let error = workspace
+        let result = workspace
             .coordinator()
-            .apply_replace_ownership(&replacement, |_| {
-                panic!("an unbound replacement must not request confirmation")
-            })
-            .unwrap_err();
-        assert!(matches!(error, ApplyError::ReplacePreflight(_)));
+            .apply_replace_ownership(&replacement, |_| true)
+            .unwrap();
+        assert!(matches!(
+            result,
+            ReplaceOwnershipApplyResult::Applied { .. }
+        ));
         assert_eq!(
             fs::read_link(workspace.path("home/.gitconfig")).unwrap(),
-            workspace.path("store/git/config")
+            workspace.path("store/git/replacement")
         );
         let state = workspace.repository().load().unwrap();
         assert!(state.active_operation().is_none());
@@ -2946,19 +3187,19 @@ mod tests {
             state
                 .known()
                 .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
-                .is_some()
+                .is_none()
         );
         assert!(
             state
                 .known()
                 .get(&FullyQualifiedResourceId::parse("base/git-config-renamed").unwrap())
-                .is_none()
+                .is_some()
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn changed_source_ownership_handoff_does_not_run_after_replacement_preflight_fails() {
+    fn changed_source_ownership_handoff_records_running_before_replacement() {
         let workspace = TestWorkspace::new();
         workspace.write("store/git/config", "old source\n");
         workspace.write("store/git/replacement", "new source\n");
@@ -2967,31 +3208,43 @@ mod tests {
             .apply_create_link(&workspace.input(), |_| true)
             .unwrap();
         let replacement = workspace.ownership_input("base/git-config-renamed", "git/replacement");
-        let error = workspace
+        let result = workspace
             .coordinator()
             .apply_replace_ownership_with_after_running(&replacement, |locked| {
-                let _ = locked;
-                panic!("preflight must reject before recording running")
+                assert_eq!(
+                    locked
+                        .state()
+                        .active_operation()
+                        .unwrap()
+                        .actions()
+                        .next()
+                        .unwrap()
+                        .1
+                        .status(),
+                    ActionStatus::Running
+                );
             })
-            .unwrap_err();
-
-        assert!(matches!(error, ApplyError::ReplacePreflight(_)));
+            .unwrap();
+        assert!(matches!(
+            result,
+            ReplaceOwnershipApplyResult::Applied { .. }
+        ));
         assert_eq!(
             fs::read_link(workspace.path("home/.gitconfig")).unwrap(),
-            workspace.path("store/git/config")
+            workspace.path("store/git/replacement")
         );
         let state = workspace.repository().load().unwrap();
         assert!(
             state
                 .known()
                 .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
-                .is_some()
+                .is_none()
         );
         assert!(
             state
                 .known()
                 .get(&FullyQualifiedResourceId::parse("base/git-config-renamed").unwrap())
-                .is_none()
+                .is_some()
         );
         assert!(state.active_operation().is_none());
     }
@@ -4418,6 +4671,62 @@ mod tests {
                 .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
                 .is_some()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_removes_only_the_recorded_expected_replacement_temporary() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "old\n");
+        workspace.write("store/git/replacement", "new\n");
+        workspace
+            .coordinator()
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        let resolved = workspace.replacement_input();
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let inspector = FileLinkInspector::new(workspace.path("home").as_path()).unwrap();
+        let actual = inspector
+            .inspect(resolved.desired(), locked.state().known())
+            .unwrap();
+        let action = plan(resolved.desired(), locked.state().known(), &actual).actions()[0].clone();
+        let action_id = locked
+            .begin_operation(desired_hash(resolved.desired()).unwrap(), &action)
+            .unwrap();
+        let temporary_path = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap()
+            .1
+            .replacement_facts()
+            .unwrap()
+            .temporary_path()
+            .clone();
+        locked.mark_running(&action_id).unwrap();
+        symlink(
+            workspace.path("store/git/replacement"),
+            temporary_path.as_path(),
+        )
+        .unwrap();
+
+        assert!(
+            !reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap()
+        );
+        assert!(fs::symlink_metadata(temporary_path.as_path()).is_err());
+        assert!(
+            locked
+                .state()
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .is_some()
+        );
+        assert!(locked.state().active_operation().is_none());
     }
 
     #[cfg(unix)]

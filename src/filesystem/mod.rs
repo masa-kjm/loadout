@@ -55,6 +55,7 @@ pub(crate) fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
 }
 
 /// Creates one file symbolic-link entry without replacing an existing final target. The executor owns all lifecycle and ownership decisions.
+#[cfg_attr(unix, allow(dead_code))]
 pub(crate) fn create_file_symbolic_link_no_replace(
     canonical_home: &ResolvedPath,
     physical_target_path: &ResolvedPath,
@@ -73,6 +74,7 @@ pub(crate) fn create_file_symbolic_link_no_replace(
 }
 
 /// Replaces a rechecked target with its recorded sibling under the observational concurrency contract. Currently disabled pending action integration and native evidence; direct calls also reject.
+#[cfg_attr(unix, allow(dead_code))]
 pub(crate) fn replace_file_symbolic_link_from_temporary(
     canonical_home: &ResolvedPath,
     physical_target_path: &ResolvedPath,
@@ -201,6 +203,9 @@ mod tests {
         }
         fs::write(target.as_ref(), "substituted unmanaged target").unwrap();
         fs::write(temporary.as_ref(), "substituted unmanaged temporary").unwrap();
+        #[cfg(unix)]
+        ensure_file_symbolic_link_replacement_supported(&root).unwrap();
+        #[cfg(windows)]
         assert_eq!(
             ensure_file_symbolic_link_replacement_supported(&root)
                 .unwrap_err()

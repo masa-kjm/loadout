@@ -10,10 +10,13 @@ use crate::domain::paths::ResolvedPath;
 use crate::domain::plan::{ActionKind, PlannedAction, TargetCondition};
 #[cfg(windows)]
 use crate::filesystem::remove_expected_file_symbolic_link_entry;
+#[cfg(windows)]
 use crate::filesystem::{
-    create_file_symbolic_link_no_replace, ensure_file_symbolic_link_creation_supported,
-    ensure_file_symbolic_link_removal_supported, ensure_file_symbolic_link_replacement_supported,
-    replace_file_symbolic_link_from_temporary,
+    create_file_symbolic_link_no_replace, replace_file_symbolic_link_from_temporary,
+};
+use crate::filesystem::{
+    ensure_file_symbolic_link_creation_supported, ensure_file_symbolic_link_removal_supported,
+    ensure_file_symbolic_link_replacement_supported,
 };
 use crate::inspection::file_link::{FileLinkInspector, TargetInspectionError};
 use crate::inspection::source::{SourceVerificationError, VerifiedSource};
@@ -224,36 +227,128 @@ impl FileLinkExecutor {
             .physical_target_path_for_execution(facts.temporary_path())
             .map_err(ReplaceLinkExecutionError::TemporaryInspection)?;
         self.ensure_replace_capability(facts.target_path(), &target)?;
-        if let Err(source) = create_file_symbolic_link_no_replace(
-            self.inspector.canonical_home(),
-            &temporary,
-            facts.new_link_target(),
-            source.physical_root(),
-        ) {
-            return Err(self.replacement_attempt_aftermath(
-                &facts,
-                source,
-                ReplacementMutation::TemporaryCreate,
-            ));
+        #[cfg(unix)]
+        {
+            use crate::filesystem::ExecutionTarget;
+            let target_context = ExecutionTarget::open_with_declared_root(
+                self.inspector.canonical_home(),
+                self.inspector.declared_home(),
+                &target,
+            )
+            .map_err(|source| {
+                ReplaceLinkExecutionError::TargetInspection(execution_target_inspection(
+                    facts.target_path(),
+                    source,
+                ))
+            })?;
+            let temporary_context = ExecutionTarget::open_with_declared_root(
+                self.inspector.canonical_home(),
+                self.inspector.declared_home(),
+                &temporary,
+            )
+            .map_err(|source| {
+                ReplaceLinkExecutionError::TemporaryInspection(execution_target_inspection(
+                    facts.temporary_path(),
+                    source,
+                ))
+            })?;
+            let create = temporary_context
+                .prepare_create(source.physical_root(), facts.new_link_target())
+                .and_then(|checked| checked.attempt_temporary());
+            if let Err(source) = create {
+                return Err(self.replacement_context_attempt_aftermath(
+                    &facts,
+                    source,
+                    ReplacementMutation::TemporaryCreate,
+                    &target_context,
+                    &temporary_context,
+                ));
+            }
+            if !matches!(
+                self.observe_execution_target(
+                    &temporary_context,
+                    facts.temporary_path(),
+                    facts.new_link_target()
+                )
+                .map_err(ReplaceLinkExecutionError::TemporaryInspection)?,
+                TargetObservation::ExpectedLink { .. }
+            ) {
+                return Err(self.replacement_context_aftermath_error(
+                    &facts,
+                    &target_context,
+                    &temporary_context,
+                )?);
+            }
+            #[cfg(test)]
+            crate::test_support::execution_boundary(
+                crate::test_support::ExecutionBoundary::BeforeReplacementRenameRecheck,
+            )
+            .map_err(|source| {
+                ReplaceLinkExecutionError::TargetInspection(execution_target_inspection(
+                    facts.target_path(),
+                    source,
+                ))
+            })?;
+            let rename = target_context
+                .prepare_replace(
+                    &temporary,
+                    facts.old_link_target(),
+                    facts.new_link_target(),
+                    source.physical_root(),
+                )
+                .and_then(|checked| checked.attempt());
+            if let Err(source) = rename {
+                return Err(self.replacement_context_attempt_aftermath(
+                    &facts,
+                    source,
+                    ReplacementMutation::Rename,
+                    &target_context,
+                    &temporary_context,
+                ));
+            }
+            let aftermath =
+                self.replacement_context_aftermath(&facts, &target_context, &temporary_context)?;
+            if aftermath.postcondition_holds() {
+                Ok(())
+            } else {
+                Err(ReplaceLinkExecutionError::Aftermath {
+                    aftermath: Box::new(aftermath),
+                })
+            }
         }
-        if let Err(source) = replace_file_symbolic_link_from_temporary(
-            self.inspector.canonical_home(),
-            &target,
-            &temporary,
-        ) {
-            return Err(self.replacement_attempt_aftermath(
-                &facts,
-                source,
-                ReplacementMutation::Rename,
-            ));
-        }
-        let aftermath = self.replacement_aftermath(&facts)?;
-        if aftermath.postcondition_holds() {
-            Ok(())
-        } else {
-            Err(ReplaceLinkExecutionError::Aftermath {
-                aftermath: Box::new(aftermath),
-            })
+        #[cfg(windows)]
+        {
+            if let Err(source) = create_file_symbolic_link_no_replace(
+                self.inspector.canonical_home(),
+                &temporary,
+                facts.new_link_target(),
+                source.physical_root(),
+            ) {
+                return Err(self.replacement_attempt_aftermath(
+                    &facts,
+                    source,
+                    ReplacementMutation::TemporaryCreate,
+                ));
+            }
+            if let Err(source) = replace_file_symbolic_link_from_temporary(
+                self.inspector.canonical_home(),
+                &target,
+                &temporary,
+            ) {
+                return Err(self.replacement_attempt_aftermath(
+                    &facts,
+                    source,
+                    ReplacementMutation::Rename,
+                ));
+            }
+            let aftermath = self.replacement_aftermath(&facts)?;
+            if aftermath.postcondition_holds() {
+                Ok(())
+            } else {
+                Err(ReplaceLinkExecutionError::Aftermath {
+                    aftermath: Box::new(aftermath),
+                })
+            }
         }
     }
 
@@ -739,6 +834,116 @@ impl FileLinkExecutor {
         }
     }
 
+    /// Removes only an exact, action-local replacement temporary during recovery.
+    ///
+    /// Recovery never resumes a replacement: it may perform this limited cleanup only while the recorded old link still proves the replacement did not occur.
+    pub(crate) fn cleanup_recorded_replacement_temporary(
+        &self,
+        recorded: &RecordedAction,
+    ) -> Result<(), ReplacementTemporaryCleanupError> {
+        let facts = recorded
+            .replacement_facts()
+            .ok_or(ReplacementTemporaryCleanupError::MissingRecordedFacts)?;
+        let target = self
+            .inspector
+            .physical_target_path_for_execution(facts.target_path())
+            .map_err(ReplacementTemporaryCleanupError::TargetInspection)?;
+        let temporary = self
+            .inspector
+            .physical_target_path_for_execution(facts.temporary_path())
+            .map_err(ReplacementTemporaryCleanupError::TemporaryInspection)?;
+        self.ensure_remove_capability(facts.temporary_path(), &temporary)
+            .map_err(ReplacementTemporaryCleanupError::RemoveCapability)?;
+
+        #[cfg(unix)]
+        {
+            use crate::filesystem::ExecutionTarget;
+            let target_context = ExecutionTarget::open_with_declared_root(
+                self.inspector.canonical_home(),
+                self.inspector.declared_home(),
+                &target,
+            )
+            .map_err(|source| {
+                ReplacementTemporaryCleanupError::TargetInspection(execution_target_inspection(
+                    facts.target_path(),
+                    source,
+                ))
+            })?;
+            let temporary_context = ExecutionTarget::open_with_declared_root(
+                self.inspector.canonical_home(),
+                self.inspector.declared_home(),
+                &temporary,
+            )
+            .map_err(|source| {
+                ReplacementTemporaryCleanupError::TemporaryInspection(execution_target_inspection(
+                    facts.temporary_path(),
+                    source,
+                ))
+            })?;
+
+            // A missing recorded temporary needs no cleanup. The following recovery
+            // classification decides whether the action can be marked failed.
+            if matches!(
+                self.observe_execution_target(
+                    &temporary_context,
+                    facts.temporary_path(),
+                    facts.new_link_target(),
+                )
+                .map_err(ReplacementTemporaryCleanupError::TemporaryInspection)?,
+                TargetObservation::Missing
+            ) {
+                return Ok(());
+            }
+
+            // Do not clean up after a replacement that may already have happened.
+            target_context
+                .recheck_expected_link(facts.old_link_target())
+                .map_err(|source| {
+                    ReplacementTemporaryCleanupError::TargetInspection(execution_target_inspection(
+                        facts.target_path(),
+                        source,
+                    ))
+                })?;
+            let attempt = temporary_context
+                .prepare_remove(facts.new_link_target())
+                .and_then(|checked| checked.attempt());
+            let aftermath = self
+                .observe_execution_target(
+                    &temporary_context,
+                    facts.temporary_path(),
+                    facts.new_link_target(),
+                )
+                .map_err(ReplacementTemporaryCleanupError::TemporaryInspection)?;
+            if matches!(aftermath, TargetObservation::Missing) {
+                // As with a normal removal, an OS error does not outweigh a proven
+                // recorded post-condition under the filesystem concurrency contract.
+                return Ok(());
+            }
+            match attempt {
+                Ok(()) => Err(ReplacementTemporaryCleanupError::PostconditionNotMet {
+                    temporary_path: facts.temporary_path().clone(),
+                    observation: aftermath,
+                }),
+                Err(source) => Err(ReplacementTemporaryCleanupError::RemoveAttemptFailed {
+                    temporary_path: facts.temporary_path().clone(),
+                    source,
+                    aftermath,
+                }),
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            let _ = target;
+            Err(ReplacementTemporaryCleanupError::RemoveCapability(
+                RemoveLinkExecutionError::PlatformCapability {
+                    target_path: facts.temporary_path().clone(),
+                    source: io::Error::other("replacement temporary cleanup is unavailable"),
+                },
+            ))
+        }
+    }
+
     #[cfg(unix)]
     fn observe_execution_target(
         &self,
@@ -773,6 +978,60 @@ impl FileLinkExecutor {
             .inspect_target_for_expected_link(target_path, link_target)?
             .observation()
             .clone())
+    }
+
+    #[cfg(unix)]
+    fn replacement_context_aftermath(
+        &self,
+        facts: &crate::state::operation::ReplacementFacts,
+        target: &crate::filesystem::ExecutionTarget,
+        temporary: &crate::filesystem::ExecutionTarget,
+    ) -> Result<ReplacementAftermath, ReplaceLinkExecutionError> {
+        Ok(ReplacementAftermath {
+            postcondition: self
+                .observe_execution_target(target, facts.target_path(), facts.new_link_target())
+                .map_err(ReplaceLinkExecutionError::PostconditionInspection)?,
+            precondition: self
+                .observe_execution_target(target, facts.target_path(), facts.old_link_target())
+                .map_err(ReplaceLinkExecutionError::TargetInspection)?,
+            temporary: self
+                .observe_execution_target(
+                    temporary,
+                    facts.temporary_path(),
+                    facts.new_link_target(),
+                )
+                .map_err(ReplaceLinkExecutionError::TemporaryInspection)?,
+        })
+    }
+
+    #[cfg(unix)]
+    fn replacement_context_aftermath_error(
+        &self,
+        facts: &crate::state::operation::ReplacementFacts,
+        target: &crate::filesystem::ExecutionTarget,
+        temporary: &crate::filesystem::ExecutionTarget,
+    ) -> Result<ReplaceLinkExecutionError, ReplaceLinkExecutionError> {
+        Ok(ReplaceLinkExecutionError::Aftermath {
+            aftermath: Box::new(self.replacement_context_aftermath(facts, target, temporary)?),
+        })
+    }
+
+    #[cfg(unix)]
+    fn replacement_context_attempt_aftermath(
+        &self,
+        facts: &crate::state::operation::ReplacementFacts,
+        source: io::Error,
+        mutation: ReplacementMutation,
+        target: &crate::filesystem::ExecutionTarget,
+        temporary: &crate::filesystem::ExecutionTarget,
+    ) -> ReplaceLinkExecutionError {
+        match self.replacement_context_aftermath(facts, target, temporary) {
+            Ok(aftermath) => ReplaceLinkExecutionError::MutationAttempt {
+                source,
+                aftermath: Box::new(aftermath),
+            },
+            Err(_) => ReplaceLinkExecutionError::MutationAftermathUnproven { mutation, source },
+        }
     }
 
     #[cfg(unix)]
@@ -1327,6 +1586,24 @@ pub(crate) enum ReplaceLinkExecutionError {
     PostconditionInspection(TargetInspectionError),
     Aftermath {
         aftermath: Box<ReplacementAftermath>,
+    },
+}
+
+/// The reason recovery could not safely clean up a recorded replacement temporary.
+#[derive(Debug)]
+pub(crate) enum ReplacementTemporaryCleanupError {
+    MissingRecordedFacts,
+    TargetInspection(TargetInspectionError),
+    TemporaryInspection(TargetInspectionError),
+    RemoveCapability(RemoveLinkExecutionError),
+    RemoveAttemptFailed {
+        temporary_path: ResolvedPath,
+        source: io::Error,
+        aftermath: TargetObservation,
+    },
+    PostconditionNotMet {
+        temporary_path: ResolvedPath,
+        observation: TargetObservation,
     },
 }
 

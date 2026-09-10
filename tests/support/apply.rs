@@ -202,7 +202,7 @@ mod unix {
     }
 
     #[test]
-    fn dry_run_leaves_recoverable_replacement_and_temporary_link_untouched() {
+    fn recovery_cleans_an_exact_recorded_temporary_after_dry_run_leaves_it_untouched() {
         let f = Fixture::new();
         f.write("store/new", "replacement");
         std::os::unix::fs::symlink(f.path("store/source"), f.path("home/target")).unwrap();
@@ -221,20 +221,71 @@ mod unix {
                 &["noop", "already satisfied"],
             );
         }
-        // This backend cannot authorize temporary-link removal: normal recovery records uncertainty.
+        // Normal apply may perform the narrowly authorized recovery cleanup before evaluating its fresh plan; the old target remains the declared desired link.
         expect(
             f.command().args(ARGS).output().unwrap(),
             2,
-            &["Recovery", "operation retained", "Uncertain"],
+            &["noop", "already satisfied", "confirmation unavailable"],
+        );
+        assert!(fs::symlink_metadata(f.path("home/recorded-temporary")).is_err());
+        assert!(state(&f)["active_operation"].is_null());
+    }
+
+    #[test]
+    fn compiled_binary_replaces_an_owned_link_without_delete_then_create() {
+        let f = Fixture::new();
+        f.write("store/new", "replacement");
+        std::os::unix::fs::symlink(f.path("store/source"), f.path("home/target")).unwrap();
+        f.state(json!({"base/item": f.known("target")}), Value::Null);
+        f.write(
+            "portable/profiles/base.yaml",
+            "schema_version: 1\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: new\n      target: ~/target\n",
+        );
+
+        expect(
+            f.command().args(ARGS).arg("--yes").output().unwrap(),
+            0,
+            &[
+                "replace_link",
+                "base/item",
+                "apply completed: 1 committed actions",
+            ],
         );
         assert_eq!(
-            fs::read_link(f.path("home/recorded-temporary")).unwrap(),
+            fs::read_link(f.path("home/target")).unwrap(),
             f.path("store/new")
         );
-        assert_eq!(
-            state(&f)["active_operation"]["actions"]["a1"]["status"],
-            "uncertain"
+        assert!(state(&f)["active_operation"].is_null());
+    }
+
+    #[test]
+    fn compiled_binary_replaces_an_owned_link_for_a_changed_source_handoff() {
+        let f = Fixture::new();
+        f.write("store/new", "replacement");
+        std::os::unix::fs::symlink(f.path("store/source"), f.path("home/target")).unwrap();
+        f.state(json!({"base/item": f.known("target")}), Value::Null);
+        f.write(
+            "portable/profiles/base.yaml",
+            "schema_version: 1\nid: base\nresources:\n  renamed:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: new\n      target: ~/target\n",
         );
+
+        expect(
+            f.command().args(ARGS).arg("--yes").output().unwrap(),
+            0,
+            &[
+                "replace_ownership",
+                "base/item",
+                "base/renamed",
+                "apply completed: 1 committed actions",
+            ],
+        );
+        assert_eq!(
+            fs::read_link(f.path("home/target")).unwrap(),
+            f.path("store/new")
+        );
+        assert!(state(&f)["resources"]["base/item"].is_null());
+        assert!(state(&f)["resources"]["base/renamed"].is_object());
+        assert!(state(&f)["active_operation"].is_null());
     }
 
     #[test]
@@ -429,21 +480,19 @@ mod unix {
     }
 
     #[test]
-    fn failed_preflight_never_prompts_or_creates_an_operation() {
+    fn blocked_replacement_never_prompts_or_creates_an_operation() {
         let f = Fixture::new();
         std::os::unix::fs::symlink(f.path("store/source"), f.path("home/target")).unwrap();
         f.state(json!({"base/item":f.known("target")}), Value::Null);
-        f.write("store/changed", "new source");
-        let profile = fs::read_to_string(f.path("portable/profiles/base.yaml"))
-            .unwrap()
-            .replace("path: source", "path: changed");
-        f.write("portable/profiles/base.yaml", &profile);
+        fs::remove_file(f.path("home/target")).unwrap();
+        f.write("home/target", "unmanaged target");
         let before = state(&f);
         for extra in [vec![], vec!["--yes"]] {
-            let mut session = Session::start(&f, true, true, &extra);
-            let (code, text) = session.finish();
+            let output = f.command().args(ARGS).args(extra).output().unwrap();
+            let code = output.status.code().unwrap();
+            let text = text(&output);
             assert_eq!(code, 2, "{text}");
-            assert!(text.contains("Preflight"));
+            assert!(text.contains("blocked"));
             assert!(text.contains("base/item"));
             assert!(!text.contains("Apply this plan?"));
             assert!(!text.contains("executable plan"));

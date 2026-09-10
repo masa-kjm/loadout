@@ -24,6 +24,7 @@ pub(super) fn classify_nofollow_entry(metadata: &fs::Metadata) -> NoFollowEntryK
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn create_file_symbolic_link_no_replace(
     canonical_home: &ResolvedPath,
     physical_target_path: &ResolvedPath,
@@ -35,6 +36,7 @@ pub(super) fn create_file_symbolic_link_no_replace(
         .attempt()
 }
 
+#[allow(dead_code)]
 pub(super) fn replace_file_symbolic_link_from_temporary(
     _: &ResolvedPath,
     _: &ResolvedPath,
@@ -61,8 +63,8 @@ pub(super) fn ensure_file_symbolic_link_creation_supported(_: &ResolvedPath) -> 
 }
 
 pub(super) fn ensure_file_symbolic_link_replacement_supported(_: &ResolvedPath) -> io::Result<()> {
-    // The observational contract permits name replacement, but executor integration and native action evidence are not complete yet.
-    Err(expected_entry_replacement_unsupported())
+    // The executor uses one retained parent context for the final rechecks and renameat.
+    Ok(())
 }
 
 pub(super) fn ensure_file_symbolic_link_removal_supported(_: &ResolvedPath) -> io::Result<()> {
@@ -70,6 +72,7 @@ pub(super) fn ensure_file_symbolic_link_removal_supported(_: &ResolvedPath) -> i
     Ok(())
 }
 
+#[allow(dead_code)]
 fn expected_entry_replacement_unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,

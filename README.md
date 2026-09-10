@@ -6,7 +6,7 @@ Loadout is a local environment manager built around explicit desired state, owne
 
 v0.2.0 is a clean-break redesign and is not released yet.
 The repository implements `validate`, `diff`, `plan`, and `apply` (including confirmation and dry run) as described in the [CLI specification](docs/specs/cli.md).
-Platform support is incomplete: create, remove, and relocate remain enabled on Unix builds without filesystem-type filtering. Recorded native evidence for these paths covers Linux/local ext4; macOS/APFS remains unverified. Other combinations are not claimed supported merely because a capability is enabled. Replacement and source-changing ownership handoff remain rejected during preflight; Windows mutation support remains unfinished.
+Platform support is incomplete: create, remove, relocate, replacement, and source-changing ownership handoff are enabled on Unix builds without filesystem-type filtering. Recorded native evidence for these paths covers Linux/local ext4; macOS/APFS remains unverified. Other combinations are not claimed supported merely because a capability is enabled. Windows mutation support remains unfinished.
 The installer is not implemented yet.
 The published package's Rust library target is not yet a supported public API.
 

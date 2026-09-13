@@ -11,6 +11,10 @@ use crate::domain::paths::{ResolvedPath, ResolvedPathError};
 
 #[cfg(unix)]
 pub(crate) use unix::execution::ExecutionTarget;
+#[cfg(windows)]
+#[allow(unused_imports)]
+// S6 retains the Windows context while executor integration remains fail-closed.
+pub(crate) use windows::execution::ExecutionTarget;
 
 #[cfg(unix)]
 mod unix;
@@ -55,7 +59,7 @@ pub(crate) fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
 }
 
 /// Creates one file symbolic-link entry without replacing an existing final target. The executor owns all lifecycle and ownership decisions.
-#[cfg_attr(unix, allow(dead_code))]
+#[allow(dead_code)]
 pub(crate) fn create_file_symbolic_link_no_replace(
     canonical_home: &ResolvedPath,
     physical_target_path: &ResolvedPath,
@@ -74,7 +78,7 @@ pub(crate) fn create_file_symbolic_link_no_replace(
 }
 
 /// Replaces a rechecked target with its recorded sibling under the observational concurrency contract. Currently disabled pending action integration and native evidence; direct calls also reject.
-#[cfg_attr(unix, allow(dead_code))]
+#[allow(dead_code)]
 pub(crate) fn replace_file_symbolic_link_from_temporary(
     canonical_home: &ResolvedPath,
     physical_target_path: &ResolvedPath,
@@ -90,7 +94,7 @@ pub(crate) fn replace_file_symbolic_link_from_temporary(
 }
 
 /// Removes a freshly rechecked expected link by name under the observational concurrency contract. Currently disabled pending retained-context action integration and native evidence; no atomic entry-identity guarantee is claimed.
-#[cfg_attr(unix, allow(dead_code))]
+#[allow(dead_code)]
 pub(crate) fn remove_expected_file_symbolic_link_entry(
     canonical_home: &ResolvedPath,
     physical_target_path: &ResolvedPath,
@@ -121,7 +125,7 @@ pub(crate) fn ensure_file_symbolic_link_replacement_supported(
     platform::ensure_file_symbolic_link_replacement_supported(target_parent)
 }
 
-/// Rejects removal until the executor integrates retained-parent rechecks, no-follow removal and recorded-path observations with native action evidence.
+/// Rejects removal when the platform lacks retained-parent rechecks, no-follow removal or recorded-path observations.
 pub(crate) fn ensure_file_symbolic_link_removal_supported(
     target_parent: &ResolvedPath,
 ) -> io::Result<()> {
@@ -206,21 +210,11 @@ mod tests {
         #[cfg(unix)]
         ensure_file_symbolic_link_replacement_supported(&root).unwrap();
         #[cfg(windows)]
-        assert_eq!(
-            ensure_file_symbolic_link_replacement_supported(&root)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::Unsupported
-        );
+        ensure_file_symbolic_link_replacement_supported(&root).unwrap();
         #[cfg(unix)]
         ensure_file_symbolic_link_removal_supported(&root).unwrap();
         #[cfg(windows)]
-        assert_eq!(
-            ensure_file_symbolic_link_removal_supported(&root)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::Unsupported
-        );
+        ensure_file_symbolic_link_removal_supported(&root).unwrap();
         assert_eq!(
             replace_file_symbolic_link_from_temporary(&root, &target, &temporary)
                 .unwrap_err()
@@ -251,16 +245,11 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_create_boundary_rejects_without_touching_missing_or_existing_targets() {
+    fn windows_retained_parent_capability_does_not_enable_direct_path_primitives() {
         let f = Fixture::new();
         let target = f.path("target");
         let source = LinkTarget::new(f.path("source"));
-        assert_eq!(
-            ensure_file_symbolic_link_creation_supported(&f.root())
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::Unsupported
-        );
+        ensure_file_symbolic_link_creation_supported(&f.root()).unwrap();
         assert_eq!(
             create_file_symbolic_link_no_replace(&f.root(), &target, &source, &f.root())
                 .unwrap_err()

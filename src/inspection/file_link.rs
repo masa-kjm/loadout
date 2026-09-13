@@ -115,7 +115,6 @@ impl FileLinkInspector {
     }
 
     /// The declared home spelling whose association execution must also retain.
-    #[cfg(unix)]
     pub(crate) fn declared_home(&self) -> &ResolvedPath {
         &self.declared_home
     }

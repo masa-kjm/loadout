@@ -8,12 +8,6 @@ use crate::domain::actual::TargetObservation;
 use crate::domain::file_link::LinkTarget;
 use crate::domain::paths::ResolvedPath;
 use crate::domain::plan::{ActionKind, PlannedAction, TargetCondition};
-#[cfg(windows)]
-use crate::filesystem::remove_expected_file_symbolic_link_entry;
-#[cfg(windows)]
-use crate::filesystem::{
-    create_file_symbolic_link_no_replace, replace_file_symbolic_link_from_temporary,
-};
 use crate::filesystem::{
     ensure_file_symbolic_link_creation_supported, ensure_file_symbolic_link_removal_supported,
     ensure_file_symbolic_link_replacement_supported,
@@ -28,6 +22,8 @@ pub(crate) struct FileLinkExecutor {
     inspector: FileLinkInspector,
     #[cfg(test)]
     force_capability_failure: bool,
+    #[cfg(test)]
+    force_capability_success: bool,
 }
 
 impl FileLinkExecutor {
@@ -37,6 +33,8 @@ impl FileLinkExecutor {
             inspector: FileLinkInspector::new(home_directory)?,
             #[cfg(test)]
             force_capability_failure: false,
+            #[cfg(test)]
+            force_capability_success: false,
         })
     }
 
@@ -55,7 +53,7 @@ impl FileLinkExecutor {
             .physical_target_path_for_execution(&target_path)
             .map_err(CreateLinkExecutionError::TargetInspection)?;
         self.ensure_create_capability(&target_path, &physical_target_path)?;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             use crate::filesystem::ExecutionTarget;
             let inspection_error = |source| TargetInspectionError::TargetMetadata {
@@ -112,45 +110,6 @@ impl FileLinkExecutor {
                 observation => Err(CreateLinkExecutionError::PostconditionNotMet {
                     target_path,
                     observation,
-                }),
-            }
-        }
-        #[cfg(windows)]
-        {
-            if let Err(source) = create_file_symbolic_link_no_replace(
-                self.inspector.canonical_home(),
-                &physical_target_path,
-                &link_target,
-                source.physical_root(),
-            ) {
-                return match self
-                    .inspector
-                    .inspect_target_for_expected_link(&target_path, &link_target)
-                {
-                    Ok(after) => Err(CreateLinkExecutionError::CreateAttemptFailed {
-                        target_path,
-                        source,
-                        aftermath: after.observation().clone(),
-                    }),
-                    Err(inspection) => Err(CreateLinkExecutionError::CreateAftermathUnproven {
-                        target_path,
-                        source,
-                        inspection: Box::new(inspection),
-                    }),
-                };
-            }
-
-            let after = self
-                .inspector
-                .inspect_target_for_expected_link(&target_path, &link_target)
-                .map_err(CreateLinkExecutionError::PostconditionInspection)?;
-            match after.observation() {
-                TargetObservation::ExpectedLink {
-                    link_target: observed,
-                } if observed == &link_target => Ok(()),
-                observation => Err(CreateLinkExecutionError::PostconditionNotMet {
-                    target_path,
-                    observation: observation.clone(),
                 }),
             }
         }
@@ -227,7 +186,7 @@ impl FileLinkExecutor {
             .physical_target_path_for_execution(facts.temporary_path())
             .map_err(ReplaceLinkExecutionError::TemporaryInspection)?;
         self.ensure_replace_capability(facts.target_path(), &target)?;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             use crate::filesystem::ExecutionTarget;
             let target_context = ExecutionTarget::open_with_declared_root(
@@ -279,7 +238,7 @@ impl FileLinkExecutor {
                     &temporary_context,
                 )?);
             }
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             crate::test_support::execution_boundary(
                 crate::test_support::ExecutionBoundary::BeforeReplacementRenameRecheck,
             )
@@ -308,40 +267,6 @@ impl FileLinkExecutor {
             }
             let aftermath =
                 self.replacement_context_aftermath(&facts, &target_context, &temporary_context)?;
-            if aftermath.postcondition_holds() {
-                Ok(())
-            } else {
-                Err(ReplaceLinkExecutionError::Aftermath {
-                    aftermath: Box::new(aftermath),
-                })
-            }
-        }
-        #[cfg(windows)]
-        {
-            if let Err(source) = create_file_symbolic_link_no_replace(
-                self.inspector.canonical_home(),
-                &temporary,
-                facts.new_link_target(),
-                source.physical_root(),
-            ) {
-                return Err(self.replacement_attempt_aftermath(
-                    &facts,
-                    source,
-                    ReplacementMutation::TemporaryCreate,
-                ));
-            }
-            if let Err(source) = replace_file_symbolic_link_from_temporary(
-                self.inspector.canonical_home(),
-                &target,
-                &temporary,
-            ) {
-                return Err(self.replacement_attempt_aftermath(
-                    &facts,
-                    source,
-                    ReplacementMutation::Rename,
-                ));
-            }
-            let aftermath = self.replacement_aftermath(&facts)?;
             if aftermath.postcondition_holds() {
                 Ok(())
             } else {
@@ -576,7 +501,7 @@ impl FileLinkExecutor {
             .inspector
             .physical_target_path_for_execution(facts.new_target_path())
             .map_err(RelocateLinkExecutionError::NewTargetInspection)?;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             use crate::filesystem::ExecutionTarget;
             let new_context = ExecutionTarget::open_with_declared_root(
@@ -630,7 +555,7 @@ impl FileLinkExecutor {
                     &new_context,
                 )?);
             }
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             crate::test_support::execution_boundary(
                 crate::test_support::ExecutionBoundary::BeforeRelocateRemovalRecheck,
             )
@@ -681,64 +606,6 @@ impl FileLinkExecutor {
                 })
             }
         }
-        #[cfg(windows)]
-        {
-            if create_file_symbolic_link_no_replace(
-                self.inspector.canonical_home(),
-                &new_physical,
-                facts.new_link_target(),
-                source.physical_root(),
-            )
-            .is_err()
-            {
-                return Err(self.relocation_aftermath_error(&facts)?);
-            }
-            let new_after = self
-                .inspector
-                .inspect_target_for_expected_link(facts.new_target_path(), facts.new_link_target())
-                .map_err(RelocateLinkExecutionError::NewTargetInspection)?;
-            if !matches!(
-                new_after.observation(),
-                TargetObservation::ExpectedLink { .. }
-            ) {
-                return Err(self.relocation_aftermath_error(&facts)?);
-            }
-
-            let old_after_create = self
-                .inspector
-                .inspect_target_for_expected_link(facts.old_target_path(), facts.old_link_target())
-                .map_err(RelocateLinkExecutionError::OldTargetInspection)?;
-            if !matches!(
-                old_after_create.observation(),
-                TargetObservation::ExpectedLink { .. }
-            ) {
-                return Err(self.relocation_aftermath_error(&facts)?);
-            }
-            let old_physical = self
-                .inspector
-                .physical_target_path_for_execution(facts.old_target_path())
-                .map_err(RelocateLinkExecutionError::OldTargetInspection)?;
-            if remove_expected_file_symbolic_link_entry(
-                self.inspector.canonical_home(),
-                &old_physical,
-                facts.old_link_target(),
-            )
-            .is_err()
-            {
-                return Err(self.relocation_aftermath_error(&facts)?);
-            }
-            let aftermath = self.relocation_observations(&facts)?;
-            if matches!(aftermath.0, TargetObservation::Missing)
-                && matches!(aftermath.1, TargetObservation::ExpectedLink { .. })
-            {
-                Ok(())
-            } else {
-                Err(RelocateLinkExecutionError::Aftermath {
-                    old_observation: aftermath.0,
-                    new_observation: aftermath.1,
-                })
-            }
-        }
     }
 
     /// Rechecks and removes exactly one planned `remove_link` action.
@@ -755,7 +622,7 @@ impl FileLinkExecutor {
             .map_err(RemoveLinkExecutionError::TargetInspection)?;
         self.ensure_remove_capability(&target_path, &physical_target_path)?;
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             use crate::filesystem::ExecutionTarget;
             let context = ExecutionTarget::open_with_declared_root(
@@ -795,43 +662,6 @@ impl FileLinkExecutor {
                 }),
             }
         }
-
-        #[cfg(windows)]
-        {
-            if let Err(source) = remove_expected_file_symbolic_link_entry(
-                self.inspector.canonical_home(),
-                &physical_target_path,
-                &link_target,
-            ) {
-                return match self
-                    .inspector
-                    .inspect_target_for_expected_link(&target_path, &link_target)
-                {
-                    Ok(after) => Err(RemoveLinkExecutionError::RemoveAttemptFailed {
-                        target_path,
-                        source,
-                        aftermath: after.observation().clone(),
-                    }),
-                    Err(inspection) => Err(RemoveLinkExecutionError::RemoveAftermathUnproven {
-                        target_path,
-                        source,
-                        inspection: Box::new(inspection),
-                    }),
-                };
-            }
-
-            let after = self
-                .inspector
-                .inspect_target_for_expected_link(&target_path, &link_target)
-                .map_err(RemoveLinkExecutionError::PostconditionInspection)?;
-            match after.observation() {
-                TargetObservation::Missing => Ok(()),
-                observation => Err(RemoveLinkExecutionError::PostconditionNotMet {
-                    target_path,
-                    observation: observation.clone(),
-                }),
-            }
-        }
     }
 
     /// Removes only an exact, action-local replacement temporary during recovery.
@@ -855,7 +685,7 @@ impl FileLinkExecutor {
         self.ensure_remove_capability(facts.temporary_path(), &temporary)
             .map_err(ReplacementTemporaryCleanupError::RemoveCapability)?;
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             use crate::filesystem::ExecutionTarget;
             let target_context = ExecutionTarget::open_with_declared_root(
@@ -931,20 +761,9 @@ impl FileLinkExecutor {
                 }),
             }
         }
-
-        #[cfg(windows)]
-        {
-            let _ = target;
-            Err(ReplacementTemporaryCleanupError::RemoveCapability(
-                RemoveLinkExecutionError::PlatformCapability {
-                    target_path: facts.temporary_path().clone(),
-                    source: io::Error::other("replacement temporary cleanup is unavailable"),
-                },
-            ))
-        }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn observe_execution_target(
         &self,
         context: &crate::filesystem::ExecutionTarget,
@@ -967,7 +786,7 @@ impl FileLinkExecutor {
         Ok(observation)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn inspect_target_for_execution(
         &self,
         target_path: &ResolvedPath,
@@ -980,7 +799,7 @@ impl FileLinkExecutor {
             .clone())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn replacement_context_aftermath(
         &self,
         facts: &crate::state::operation::ReplacementFacts,
@@ -1004,7 +823,7 @@ impl FileLinkExecutor {
         })
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn replacement_context_aftermath_error(
         &self,
         facts: &crate::state::operation::ReplacementFacts,
@@ -1016,7 +835,7 @@ impl FileLinkExecutor {
         })
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn replacement_context_attempt_aftermath(
         &self,
         facts: &crate::state::operation::ReplacementFacts,
@@ -1034,7 +853,7 @@ impl FileLinkExecutor {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn relocation_context_observations(
         &self,
         facts: &RelocationFacts,
@@ -1050,7 +869,7 @@ impl FileLinkExecutor {
         Ok((old, new))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn relocation_context_aftermath_error(
         &self,
         facts: &RelocationFacts,
@@ -1132,6 +951,10 @@ impl FileLinkExecutor {
                 ),
             });
         }
+        #[cfg(test)]
+        if self.force_capability_success {
+            return Ok(());
+        }
 
         ensure_file_symbolic_link_creation_supported(&parent_path).map_err(|source| {
             CreateLinkExecutionError::PlatformCapability {
@@ -1146,6 +969,20 @@ impl FileLinkExecutor {
         target_path: &ResolvedPath,
         physical_target_path: &ResolvedPath,
     ) -> Result<(), RemoveLinkExecutionError> {
+        #[cfg(test)]
+        if self.force_capability_failure {
+            return Err(RemoveLinkExecutionError::PlatformCapability {
+                target_path: target_path.clone(),
+                source: io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "injected file-symbolic-link capability failure",
+                ),
+            });
+        }
+        #[cfg(test)]
+        if self.force_capability_success {
+            return Ok(());
+        }
         let parent_path = physical_target_path
             .as_ref()
             .parent()
@@ -1166,6 +1003,20 @@ impl FileLinkExecutor {
         target_path: &ResolvedPath,
         physical_target_path: &ResolvedPath,
     ) -> Result<(), ReplaceLinkExecutionError> {
+        #[cfg(test)]
+        if self.force_capability_failure {
+            return Err(ReplaceLinkExecutionError::PlatformCapability {
+                target_path: target_path.clone(),
+                source: io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "injected file-symbolic-link capability failure",
+                ),
+            });
+        }
+        #[cfg(test)]
+        if self.force_capability_success {
+            return Ok(());
+        }
         let parent = physical_target_path
             .as_ref()
             .parent()
@@ -1306,7 +1157,16 @@ impl FileLinkExecutor {
 
     #[cfg(test)]
     pub(crate) fn with_forced_capability_failure_for_test(mut self) -> Self {
+        assert!(!self.force_capability_success);
         self.force_capability_failure = true;
+        self
+    }
+
+    /// Enables retained-token execution in a test without enabling the public platform capability.
+    #[cfg(test)]
+    pub(crate) fn with_forced_capability_success_for_test(mut self) -> Self {
+        assert!(!self.force_capability_failure);
+        self.force_capability_success = true;
         self
     }
 
@@ -1391,7 +1251,7 @@ fn create_conditions(
     Ok((pre_target.clone(), link_target.clone()))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn execution_target_inspection(
     target_path: &ResolvedPath,
     source: io::Error,

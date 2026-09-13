@@ -1072,18 +1072,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["base/git", "common/zsh", "workstation/shell"]
         );
-        assert_eq!(
-            desired.resources()[0].source_path().as_ref(),
-            fs::canonicalize(workspace.path("store/git/config")).unwrap()
-        );
+        let canonical_source = ResolvedPath::from_platform_canonicalized(
+            fs::canonicalize(workspace.path("store/git/config")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(desired.resources()[0].source_path(), &canonical_source);
         assert_eq!(
             resolved
                 .verified_sources()
                 .get(&FullyQualifiedResourceId::parse("base/git").unwrap())
                 .unwrap()
-                .path()
-                .as_ref(),
-            fs::canonicalize(workspace.path("store/git/config")).unwrap()
+                .path(),
+            &canonical_source
         );
         assert_eq!(
             desired.resources()[2].target_path().as_ref(),

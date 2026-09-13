@@ -73,6 +73,28 @@ fn apply_rejects_invalid_arguments_and_invalid_or_unreadable_input() {
     no_new_operation(&f);
 }
 
+#[cfg(windows)]
+#[test]
+fn compiled_binary_creates_an_owned_file_link_and_commits_known_state() {
+    let f = Fixture::new();
+
+    expect(
+        f.command().args(ARGS).arg("--yes").output().unwrap(),
+        0,
+        &[
+            "create_link",
+            "base/item",
+            "apply completed: 1 committed actions",
+        ],
+    );
+    assert_eq!(
+        fs::read_link(f.path("home/target")).unwrap(),
+        f.path("store/source")
+    );
+    assert!(state(&f)["resources"]["base/item"].is_object());
+    assert!(state(&f)["active_operation"].is_null());
+}
+
 #[cfg(unix)]
 mod unix {
     use super::*;
@@ -571,121 +593,97 @@ mod unix {
 #[cfg(windows)]
 mod windows {
     use super::*;
-    use std::os::windows::fs::symlink_file;
 
-    fn assert_create_rejected_without_mutation(f: &Fixture) {
-        let protected_snapshot = || {
-            f.snapshot()
-                .into_iter()
-                .filter(|(path, _)| !path.starts_with(f.path("state")))
-                .collect::<BTreeMap<_, _>>()
-        };
-        let before = protected_snapshot();
-        for flags in [vec![], vec!["--yes"]] {
-            let output = f.command().args(ARGS).args(flags).output().unwrap();
-            assert!(!text(&output).contains("Apply this plan?"));
-            expect(
-                output,
-                2,
-                &[
-                    "Preflight",
-                    "base/item",
-                    "target",
-                    "no-follow parent traversal",
-                ],
-            );
-            no_new_operation(f);
-            assert!(!f.path("state/loadout/state.json").exists());
-            assert_eq!(protected_snapshot(), before);
-        }
-    }
-
-    fn owned_link_or_assert_rejection(f: &Fixture, creation: std::io::Result<()>) -> bool {
-        match creation {
-            Ok(()) => true,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
-                ) || error.raw_os_error() == Some(1314) =>
-            {
-                eprintln!(
-                    "fixture symlink unavailable: {error}; verifying preflight rejection instead of owned-link execution"
-                );
-                assert_create_rejected_without_mutation(f);
-                false
-            }
-            Err(error) => panic!("unexpected fixture symlink creation failure: {error}"),
-        }
+    fn create_owned_link(f: &Fixture) {
+        expect(
+            f.command().args(ARGS).arg("--yes").output().unwrap(),
+            0,
+            &["create_link", "apply completed: 1 committed actions"],
+        );
     }
 
     #[test]
-    fn native_windows_create_is_blocked_before_confirmation_or_progress() {
-        assert_create_rejected_without_mutation(&Fixture::new());
-    }
-
-    #[test]
-    fn unavailable_fixture_privilege_still_exercises_binary_preflight_rejection() {
+    fn native_windows_create_reaches_confirmation_before_operation_progress() {
         let f = Fixture::new();
-        // Exercise the unavailable-capability branch even on privileged runners.
-        assert!(!owned_link_or_assert_rejection(
-            &f,
-            Err(std::io::Error::from_raw_os_error(1314))
-        ));
+        expect(
+            f.command().args(ARGS).output().unwrap(),
+            2,
+            &["create_link", "confirmation unavailable"],
+        );
+        no_new_operation(&f);
     }
 
     #[test]
-    fn native_windows_replacement_removal_and_relocation_reject_before_progress() {
+    fn privilege_is_not_reported_as_a_permanent_preflight_capability_probe() {
         let f = Fixture::new();
-        if !owned_link_or_assert_rejection(
-            &f,
-            symlink_file(f.path("store/source"), f.path("home/target")),
-        ) {
-            return;
-        }
-        f.state(json!({"base/item":f.known("target")}), Value::Null);
-        let before = state(&f);
-        let profile = fs::read_to_string(f.path("portable/profiles/base.yaml")).unwrap();
-        f.write("store/new", "new source");
-        for (declaration, action) in [
-            (profile.replace("path: source", "path: new"), "replace_link"),
+        expect(
+            f.command().args(ARGS).output().unwrap(),
+            2,
+            &["create_link", "confirmation unavailable"],
+        );
+        no_new_operation(&f);
+    }
+
+    #[test]
+    fn native_windows_replacement_removal_and_relocation_commit_through_the_binary() {
+        for (declaration, action, expected_target) in [
+            ("source: new\ntarget: ~/target", "replace_link", "target"),
             (
-                profile
-                    .replace("item:", "renamed:")
-                    .replace("path: source", "path: new"),
+                "source: new\ntarget: ~/target\nresource: renamed",
                 "replace_ownership",
+                "target",
             ),
-            (profile.replace("~/target", "~/moved"), "relocate_link"),
-            (
-                "schema_version: 1\nid: base\nresources: {}\n".to_string(),
-                "remove_link",
-            ),
+            ("source: source\ntarget: ~/moved", "relocate_link", "moved"),
+            ("", "remove_link", ""),
         ] {
-            f.write("portable/profiles/base.yaml", &declaration);
+            let f = Fixture::new();
+            create_owned_link(&f);
+            if declaration.is_empty() {
+                f.write(
+                    "portable/profiles/base.yaml",
+                    "schema_version: 1\nid: base\nresources: {}\n",
+                );
+            } else {
+                f.write("store/new", "new source");
+                let (source, target, resource) = if action == "replace_ownership" {
+                    ("new", "~/target", "renamed")
+                } else if action == "replace_link" {
+                    ("new", "~/target", "item")
+                } else {
+                    ("source", "~/moved", "item")
+                };
+                f.write(
+                    "portable/profiles/base.yaml",
+                    &format!("schema_version: 1\nid: base\nresources:\n  {resource}:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: {source}\n      target: {target}\n"),
+                );
+            }
             expect(
                 f.command().args(ARGS).arg("--yes").output().unwrap(),
-                2,
-                &["Preflight", action, "base/item"],
+                0,
+                &[action, "apply completed: 1 committed actions"],
             );
-            assert_eq!(state(&f), before);
-            assert_eq!(
-                fs::read_link(f.path("home/target")).unwrap(),
-                f.path("store/source")
-            );
-            assert_eq!(fs::read_dir(f.path("home")).unwrap().count(), 1);
+            assert!(state(&f)["active_operation"].is_null());
+            if action == "remove_link" {
+                assert!(fs::symlink_metadata(f.path("home/target")).is_err());
+                assert!(state(&f)["resources"].as_object().unwrap().is_empty());
+            } else {
+                let source = if action == "relocate_link" {
+                    "source"
+                } else {
+                    "new"
+                };
+                assert_eq!(
+                    fs::read_link(f.path(&format!("home/{expected_target}"))).unwrap(),
+                    f.path(&format!("store/{source}"))
+                );
+            }
         }
     }
 
     #[test]
     fn native_windows_normal_representation_supports_noop_and_same_source_handoff() {
         let f = Fixture::new();
-        if !owned_link_or_assert_rejection(
-            &f,
-            symlink_file(f.path("store/source"), f.path("home/target")),
-        ) {
-            return;
-        }
-        f.state(json!({"base/item":f.known("target")}), Value::Null);
+        create_owned_link(&f);
         expect(
             f.command().args(ARGS).arg("--yes").output().unwrap(),
             0,
@@ -718,15 +716,10 @@ mod windows {
     }
 
     #[test]
-    fn native_windows_forget_is_blocked_by_later_preflight_or_state_sharing_denial() {
+    fn native_windows_forget_and_remove_are_atomic_with_state_preflight() {
         use std::os::windows::fs::OpenOptionsExt;
         let f = Fixture::new();
-        if !owned_link_or_assert_rejection(
-            &f,
-            symlink_file(f.path("store/source"), f.path("home/target")),
-        ) {
-            return;
-        }
+        create_owned_link(&f);
         f.write(
             "portable/profiles/base.yaml",
             "schema_version: 1\nid: base\nresources: {}\n",
@@ -735,16 +728,22 @@ mod windows {
             json!({"base/a":f.known("missing"), "base/z":f.known("target")}),
             Value::Null,
         );
-        let before = state(&f);
         expect(
             f.command().args(ARGS).arg("--yes").output().unwrap(),
-            2,
-            &["Preflight", "forget_missing", "remove_link"],
+            0,
+            &[
+                "forget_missing",
+                "remove_link",
+                "apply completed: 2 committed actions",
+            ],
         );
-        assert_eq!(
-            state(&f),
-            before,
-            "later removal must block the earlier state-only action"
+        assert!(state(&f)["resources"].as_object().unwrap().is_empty());
+        assert!(fs::symlink_metadata(f.path("home/target")).is_err());
+
+        let f = Fixture::new();
+        f.write(
+            "portable/profiles/base.yaml",
+            "schema_version: 1\nid: base\nresources: {}\n",
         );
         f.state(json!({"base/a":f.known("missing")}), Value::Null);
         {
@@ -773,10 +772,6 @@ mod windows {
         );
         assert_eq!(state(&f)["resources"], json!({}));
         assert!(state(&f)["active_operation"].is_null());
-        assert_eq!(
-            fs::read_link(f.path("home/target")).unwrap(),
-            f.path("store/source")
-        );
-        assert_eq!(fs::read_dir(f.path("home")).unwrap().count(), 1);
+        assert!(fs::read_dir(f.path("home")).unwrap().next().is_none());
     }
 }

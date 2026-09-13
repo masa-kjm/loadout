@@ -285,9 +285,16 @@ mod tests {
         let base = std::env::temp_dir().join("loadout-resolved-path-test");
         let path_with_current_directory = base.join(".").join("nested");
 
-        let resolved = ResolvedPath::new(path_with_current_directory).unwrap();
-
-        assert_eq!(resolved.as_path(), base.join("nested"));
+        #[cfg(unix)]
+        {
+            let resolved = ResolvedPath::new(path_with_current_directory).unwrap();
+            assert_eq!(resolved.as_path(), base.join("nested"));
+        }
+        #[cfg(windows)]
+        assert!(matches!(
+            ResolvedPath::new(path_with_current_directory),
+            Err(ResolvedPathError::UnsupportedWindowsPath { .. })
+        ));
     }
 
     #[test]
@@ -309,9 +316,15 @@ mod tests {
             .join("..")
             .join("outside");
 
+        #[cfg(unix)]
         assert!(matches!(
             ResolvedPath::new(path_with_parent),
             Err(ResolvedPathError::ContainsParentComponent { .. })
+        ));
+        #[cfg(windows)]
+        assert!(matches!(
+            ResolvedPath::new(path_with_parent),
+            Err(ResolvedPathError::UnsupportedWindowsPath { .. })
         ));
     }
 

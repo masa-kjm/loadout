@@ -77,12 +77,13 @@ pub(crate) fn assert_desired_dependencies_allowed() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) use execution_hooks::*;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod execution_hooks {
     /// Semantic execution seams compiled only into tests. One-shot hooks are removed before invocation so callbacks may inspect the filesystem without reentrancy.
+    #[allow(dead_code)]
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) enum ExecutionBoundary {
         BeforeFinalRecheck,

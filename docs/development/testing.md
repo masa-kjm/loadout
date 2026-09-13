@@ -133,7 +133,7 @@ It must prove that a same-source managed identity handoff does not require repla
 When the host cannot create a file symbolic link, cannot provide the required replacement guarantee, or cannot provide the required rechecked no-follow removal and observation guarantees, the test must prove the documented preflight failure rather than silently skipping the behavior.
 Replacement tests must cover interruption or failure after the action-local temporary link is created, proving that only the exact recorded temporary link may be cleaned up and that an unexpected or unremovable temporary entry leaves the action uncertain.
 
-Windows capability evidence requires settled path/state semantics and native policy/privilege availability and target sharing/ACL denial aftermath, separately from state-file sharing failures. Record conditions that could not be established as unverified.
+Windows capability evidence requires settled path/state semantics, retained-parent operation evidence, and target sharing/ACL denial aftermath separately from state-file sharing failures when the runner can establish those conditions. Symbolic-link policy or privilege denial is an action-time condition and must be classified from its post-observation; it is not a permanent preflight capability probe. Record conditions that could not be established as unverified.
 
 Platform-specific tests run only in disposable directories and must clean up only the directories they created.
 

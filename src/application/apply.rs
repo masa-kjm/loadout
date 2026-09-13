@@ -286,6 +286,8 @@ pub(crate) struct ApplyCoordinator {
     state_repository: StateRepository,
     #[cfg(test)]
     force_capability_failure: bool,
+    #[cfg(test)]
+    force_capability_success: bool,
 }
 
 #[cfg(test)]
@@ -297,6 +299,8 @@ impl ApplyCoordinator {
             state_repository: StateRepository::new(state_directory),
             #[cfg(test)]
             force_capability_failure: false,
+            #[cfg(test)]
+            force_capability_success: false,
         }
     }
 
@@ -360,8 +364,10 @@ impl ApplyCoordinator {
                     resource_id: action.resource_id().clone(),
                 })?
                 .clone();
-            let executor = FileLinkExecutor::new(self.home_directory.as_ref())
-                .map_err(ApplyError::InitialInspection)?;
+            let executor = self.test_executor(
+                FileLinkExecutor::new(self.home_directory.as_ref())
+                    .map_err(ApplyError::InitialInspection)?,
+            );
             executor
                 .preflight_replace(&action, &source)
                 .map_err(ApplyError::ReplacePreflight)?;
@@ -422,8 +428,10 @@ impl ApplyCoordinator {
                         resource_id: action.resource_id().clone(),
                     })?
                     .clone();
-                let executor = FileLinkExecutor::new(self.home_directory.as_ref())
-                    .map_err(ApplyError::InitialInspection)?;
+                let executor = self.test_executor(
+                    FileLinkExecutor::new(self.home_directory.as_ref())
+                        .map_err(ApplyError::InitialInspection)?,
+                );
                 executor
                     .preflight_relocate(&action, &source)
                     .map_err(ApplyError::RelocatePreflight)?;
@@ -472,8 +480,10 @@ impl ApplyCoordinator {
                     resource_id: action.resource_id().clone(),
                 })?
                 .clone();
-            let executor = FileLinkExecutor::new(self.home_directory.as_ref())
-                .map_err(ApplyError::InitialInspection)?;
+            let executor = self.test_executor(
+                FileLinkExecutor::new(self.home_directory.as_ref())
+                    .map_err(ApplyError::InitialInspection)?,
+            );
             let changed_source = action.preconditions()[0] != action.postconditions()[0];
             if changed_source {
                 executor
@@ -533,8 +543,10 @@ impl ApplyCoordinator {
     {
         let result = self.apply_single_action(resolved, confirm, after_running, |plan| {
             let action = require_single_stale_action(plan)?.clone();
-            let executor = FileLinkExecutor::new(self.home_directory.as_ref())
-                .map_err(ApplyError::InitialInspection)?;
+            let executor = self.test_executor(
+                FileLinkExecutor::new(self.home_directory.as_ref())
+                    .map_err(ApplyError::InitialInspection)?,
+            );
             preflight_stale_action(&executor, &action).map_err(ApplyError::StalePreflight)?;
             Ok((action, move |action: &PlannedAction, _: RecordedAction| {
                 let result = match action.kind() {
@@ -581,14 +593,10 @@ impl ApplyCoordinator {
                     resource_id: action.resource_id().clone(),
                 })?
                 .clone();
-            let executor = FileLinkExecutor::new(self.home_directory.as_ref())
-                .map_err(ApplyError::InitialInspection)?;
-            #[cfg(test)]
-            let executor = if self.force_capability_failure {
-                executor.with_forced_capability_failure_for_test()
-            } else {
-                executor
-            };
+            let executor = self.test_executor(
+                FileLinkExecutor::new(self.home_directory.as_ref())
+                    .map_err(ApplyError::InitialInspection)?,
+            );
             executor
                 .preflight_create(&action, &source)
                 .map_err(ApplyError::Preflight)?;
@@ -736,7 +744,23 @@ impl ApplyCoordinator {
 
     #[cfg(test)]
     fn force_capability_failure_for_test(&mut self) {
+        assert!(!self.force_capability_success);
         self.force_capability_failure = true;
+    }
+
+    fn force_capability_success_for_test(&mut self) {
+        assert!(!self.force_capability_failure);
+        self.force_capability_success = true;
+    }
+
+    fn test_executor(&self, executor: FileLinkExecutor) -> FileLinkExecutor {
+        if self.force_capability_failure {
+            executor.with_forced_capability_failure_for_test()
+        } else if self.force_capability_success {
+            executor.with_forced_capability_success_for_test()
+        } else {
+            executor
+        }
     }
 }
 
@@ -1249,6 +1273,25 @@ fn reconcile_active_operation_with_action(
     home_directory: &std::path::Path,
     affected_action: &mut Option<ApplyAction>,
 ) -> Result<bool, ApplyError> {
+    reconcile_active_operation_with_action_and_cleanup(
+        locked,
+        home_directory,
+        affected_action,
+        || FileLinkExecutor::new(home_directory).ok(),
+    )
+}
+
+/// Reconciles recorded facts with an internal cleanup executor factory.
+/// The factory exists only to keep production capability gating and test-only retained-token evidence separate.
+fn reconcile_active_operation_with_action_and_cleanup<F>(
+    locked: &mut LockedStateRepository,
+    home_directory: &std::path::Path,
+    affected_action: &mut Option<ApplyAction>,
+    cleanup_executor: F,
+) -> Result<bool, ApplyError>
+where
+    F: Fn() -> Option<FileLinkExecutor>,
+{
     #[cfg(test)]
     crate::test_support::assert_mutation_allowed();
     let Some(operation) = locked.state().active_operation() else {
@@ -1287,7 +1330,7 @@ fn reconcile_active_operation_with_action(
                 // Recovery may remove only its recorded replacement temporary, and only if its executor rechecks can prove that cleanup is safe.
                 // Any failure leaves the action uncertain rather than allowing the later predicate-only decision to conceal an unproven cleanup.
                 let cleanup_failed = action.replacement_facts().is_some()
-                    && !FileLinkExecutor::new(home_directory).is_ok_and(|executor| {
+                    && !cleanup_executor().is_some_and(|executor| {
                         executor
                             .cleanup_recorded_replacement_temporary(&action)
                             .is_ok()
@@ -1344,6 +1387,18 @@ fn reconcile_active_operation_with_action(
         });
         Ok(true)
     }
+}
+
+#[cfg(test)]
+fn reconcile_active_operation_with_retained_token_capability_for_test(
+    locked: &mut LockedStateRepository,
+    home_directory: &std::path::Path,
+) -> Result<bool, ApplyError> {
+    reconcile_active_operation_with_action_and_cleanup(locked, home_directory, &mut None, || {
+        FileLinkExecutor::new(home_directory)
+            .ok()
+            .map(FileLinkExecutor::with_forced_capability_success_for_test)
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1457,8 +1512,12 @@ fn condition_holds(
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
+    #[cfg(windows)]
+    use std::fs::File;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(windows)]
+    use std::sync::mpsc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -1683,6 +1742,71 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[cfg(windows)]
+    fn begin_running_action(
+        workspace: &TestWorkspace,
+        resolved: &ResolvedApplyInput,
+    ) -> (StateRepository, PlannedAction, RecordedAction) {
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let inspector = FileLinkInspector::new(workspace.path("home").as_path()).unwrap();
+        let actual = inspector
+            .inspect(resolved.desired(), locked.state().known())
+            .unwrap();
+        let action = plan(resolved.desired(), locked.state().known(), &actual).actions()[0].clone();
+        let action_id = locked
+            .begin_operation(desired_hash(resolved.desired()).unwrap(), &action)
+            .unwrap();
+        locked.mark_running(&action_id).unwrap();
+        let recorded = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .action(&action_id)
+            .unwrap()
+            .clone();
+        drop(locked);
+        (repository, action, recorded)
+    }
+
+    #[cfg(windows)]
+    fn retained_token_executor(workspace: &TestWorkspace) -> FileLinkExecutor {
+        FileLinkExecutor::new(workspace.path("home").as_path())
+            .unwrap()
+            .with_forced_capability_success_for_test()
+    }
+
+    #[cfg(windows)]
+    fn hold_link_without_delete_sharing(path: PathBuf) -> std::io::Result<File> {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            OPEN_EXISTING,
+        };
+
+        let mut name = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        name.push(0);
+        // SAFETY: `name` is a NUL-terminated path buffer and all other arguments are valid for a synchronous handle open.
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: CreateFileW returned a newly owned file handle.
+        Ok(unsafe { File::from_raw_handle(handle as _) })
     }
 
     #[cfg(unix)]
@@ -3659,27 +3783,459 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_create_is_preflight_blocked_until_no_follow_parent_traversal_is_available() {
+    fn windows_create_preflight_uses_the_retained_parent_capability() {
         let workspace = TestWorkspace::new();
         workspace.write("store/git/config", "[user]\nname = Example\n");
         let resolved = workspace.input();
 
-        let error = workspace
+        let result = workspace
             .coordinator()
-            .apply_create_link(&resolved, |_| {
-                panic!("a Windows capability failure must not request confirmation")
-            })
-            .unwrap_err();
+            .apply_create_link(&resolved, |_| true)
+            .unwrap();
 
-        assert!(matches!(
-            error,
-            ApplyError::Preflight(CreateLinkExecutionError::PlatformCapability { .. })
-        ));
-        assert!(!workspace.path("home/.gitconfig").exists());
-        assert!(!workspace.path("state/state.json").exists());
+        assert!(matches!(result, CreateLinkApplyResult::Applied { .. }));
         assert_eq!(
-            fs::read_to_string(workspace.path("store/git/config")).unwrap(),
-            "[user]\nname = Example\n"
+            fs::read_link(workspace.path("home/.gitconfig")).unwrap(),
+            workspace.path("store/git/config")
+        );
+        assert!(
+            workspace
+                .repository()
+                .load()
+                .unwrap()
+                .active_operation()
+                .is_none()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_create_rejects_a_source_parent_reparse_point_before_mutation() {
+        use std::os::windows::fs::symlink_dir;
+
+        use crate::test_support::{ExecutionBoundary, on_execution_boundary};
+
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let resolved = workspace.input();
+        let source_parent = workspace.path("store/git");
+        let outside = workspace.path("outside-source");
+        let target = workspace.path("home/.gitconfig");
+        let moved_source_parent = outside.clone();
+        let _hook = on_execution_boundary(ExecutionBoundary::BeforeFinalRecheck, move || {
+            fs::rename(&source_parent, &moved_source_parent)?;
+            symlink_dir(&moved_source_parent, &source_parent)
+        });
+
+        let result = workspace
+            .coordinator()
+            .apply_create_link(&resolved, |_| true)
+            .unwrap();
+
+        assert!(matches!(result, CreateLinkApplyResult::Uncertain { .. }));
+        assert!(fs::symlink_metadata(target).is_err());
+        assert_eq!(
+            fs::read_to_string(outside.join("config")).unwrap(),
+            "source\n"
+        );
+        let state = workspace.repository().load().unwrap();
+        assert!(state.known().resources().next().is_none());
+        let (_, action) = state.active_operation().unwrap().actions().next().unwrap();
+        assert_eq!(action.status(), ActionStatus::Uncertain);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_retained_token_create_commits_known_state_with_test_only_capability_override() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "[user]\nname = Example\n");
+        let resolved = workspace.input();
+        let mut coordinator = workspace.coordinator();
+        coordinator.force_capability_success_for_test();
+
+        let result = coordinator.apply_create_link(&resolved, |_| true).unwrap();
+
+        assert!(matches!(result, CreateLinkApplyResult::Applied { .. }));
+        assert_eq!(
+            fs::read_link(workspace.path("home/.gitconfig")).unwrap(),
+            workspace.path("store/git/config")
+        );
+        let state = workspace.repository().load().unwrap();
+        assert!(state.active_operation().is_none());
+        assert!(
+            state
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .is_some()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_create_parent_moved_after_final_recheck_cannot_commit_handle_local_success() {
+        use crate::test_support::{ExecutionBoundary, on_execution_boundary};
+
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let resolved = workspace.input();
+        let home = workspace.path("home");
+        let detached = workspace.path("detached-home");
+        let _hook = on_execution_boundary(ExecutionBoundary::AfterFinalRecheck, move || {
+            fs::rename(&home, &detached)?;
+            fs::create_dir(&home)
+        });
+        let mut coordinator = workspace.coordinator();
+        coordinator.force_capability_success_for_test();
+
+        let result = coordinator.apply_create_link(&resolved, |_| true).unwrap();
+
+        assert!(matches!(result, CreateLinkApplyResult::Uncertain { .. }));
+        assert!(fs::symlink_metadata(workspace.path("home/.gitconfig")).is_err());
+        assert_eq!(
+            fs::read_link(workspace.path("detached-home/.gitconfig")).unwrap(),
+            workspace.path("store/git/config")
+        );
+        let state = workspace.repository().load().unwrap();
+        assert!(state.known().resources().next().is_none());
+        assert_eq!(
+            state
+                .active_operation()
+                .unwrap()
+                .actions()
+                .next()
+                .unwrap()
+                .1
+                .status(),
+            ActionStatus::Uncertain
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_retained_token_replace_then_remove_commits_each_state_transition() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "old\n");
+        workspace.write("store/git/replacement", "new\n");
+        let mut coordinator = workspace.coordinator();
+        coordinator.force_capability_success_for_test();
+        coordinator
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+
+        let replaced = coordinator
+            .apply_replace_link(&workspace.replacement_input(), |_| true)
+            .unwrap();
+        assert!(matches!(replaced, ReplaceLinkApplyResult::Applied { .. }));
+        assert_eq!(
+            fs::read_link(workspace.path("home/.gitconfig")).unwrap(),
+            workspace.path("store/git/replacement")
+        );
+        let replaced_state = workspace.repository().load().unwrap();
+        assert!(replaced_state.active_operation().is_none());
+        assert_eq!(
+            replaced_state
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .unwrap()
+                .source_path()
+                .as_ref(),
+            workspace.path("store/git/replacement").as_path()
+        );
+
+        let removed = coordinator
+            .apply_stale_link(&workspace.stale_input(), |_| true)
+            .unwrap();
+        assert!(matches!(
+            removed,
+            StaleLinkApplyResult::Applied {
+                kind: ActionKind::RemoveLink,
+                ..
+            }
+        ));
+        assert!(fs::symlink_metadata(workspace.path("home/.gitconfig")).is_err());
+        let state = workspace.repository().load().unwrap();
+        assert!(state.active_operation().is_none());
+        assert!(state.known().resources().next().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_retained_token_relocate_commits_new_target_state() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        fs::create_dir(workspace.path("home/.config")).unwrap();
+        let mut coordinator = workspace.coordinator();
+        coordinator.force_capability_success_for_test();
+        coordinator
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+
+        let relocated = coordinator
+            .apply_relocate_link(&workspace.relocation_input(), |_| true)
+            .unwrap();
+
+        assert!(matches!(relocated, RelocateLinkApplyResult::Applied { .. }));
+        assert!(fs::symlink_metadata(workspace.path("home/.gitconfig")).is_err());
+        assert_eq!(
+            fs::read_link(workspace.path("home/.config/gitconfig")).unwrap(),
+            workspace.path("store/git/config")
+        );
+        let state = workspace.repository().load().unwrap();
+        assert!(state.active_operation().is_none());
+        assert_eq!(
+            state
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .unwrap()
+                .target_path()
+                .as_ref(),
+            workspace.path("home/.config/gitconfig").as_path()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_recovery_keeps_an_interrupted_retained_token_create_uncertain() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let resolved = workspace.input();
+        let (repository, action, _) = begin_running_action(&workspace, &resolved);
+        let source = resolved
+            .verified_sources()
+            .get(action.resource_id())
+            .unwrap();
+        retained_token_executor(&workspace)
+            .execute_create(&action, source)
+            .unwrap();
+
+        let mut locked = repository.acquire_exclusive().unwrap();
+        assert!(reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap());
+        let (_, recorded) = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap();
+        assert_eq!(recorded.status(), ActionStatus::Uncertain);
+        assert!(locked.state().known().resources().next().is_none());
+        assert_eq!(
+            fs::read_link(workspace.path("home/.gitconfig")).unwrap(),
+            workspace.path("store/git/config")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_recovery_commits_retained_token_replace_remove_and_relocate() {
+        let replacement = TestWorkspace::new();
+        replacement.write("store/git/config", "old\n");
+        replacement.write("store/git/replacement", "new\n");
+        let mut coordinator = replacement.coordinator();
+        coordinator.force_capability_success_for_test();
+        coordinator
+            .apply_create_link(&replacement.input(), |_| true)
+            .unwrap();
+        let resolved = replacement.replacement_input();
+        let (repository, action, recorded) = begin_running_action(&replacement, &resolved);
+        let source = resolved
+            .verified_sources()
+            .get(action.resource_id())
+            .unwrap();
+        retained_token_executor(&replacement)
+            .execute_replace(&action, &recorded, source)
+            .unwrap();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        assert!(
+            !reconcile_active_operation_with_retained_token_capability_for_test(
+                &mut locked,
+                replacement.path("home").as_path(),
+            )
+            .unwrap()
+        );
+        assert!(locked.state().active_operation().is_none());
+        assert_eq!(
+            locked
+                .state()
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .unwrap()
+                .source_path()
+                .as_ref(),
+            replacement.path("store/git/replacement").as_path()
+        );
+
+        let removal = TestWorkspace::new();
+        removal.write("store/git/config", "source\n");
+        let mut coordinator = removal.coordinator();
+        coordinator.force_capability_success_for_test();
+        coordinator
+            .apply_create_link(&removal.input(), |_| true)
+            .unwrap();
+        let resolved = removal.stale_input();
+        let (repository, action, _) = begin_running_action(&removal, &resolved);
+        retained_token_executor(&removal)
+            .execute_remove(&action)
+            .unwrap();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        assert!(!reconcile_active_operation(&mut locked, removal.path("home").as_path()).unwrap());
+        assert!(locked.state().active_operation().is_none());
+        assert!(locked.state().known().resources().next().is_none());
+
+        let relocation = TestWorkspace::new();
+        relocation.write("store/git/config", "source\n");
+        fs::create_dir(relocation.path("home/.config")).unwrap();
+        let mut coordinator = relocation.coordinator();
+        coordinator.force_capability_success_for_test();
+        coordinator
+            .apply_create_link(&relocation.input(), |_| true)
+            .unwrap();
+        let resolved = relocation.relocation_input();
+        let (repository, action, recorded) = begin_running_action(&relocation, &resolved);
+        let source = resolved
+            .verified_sources()
+            .get(action.resource_id())
+            .unwrap();
+        retained_token_executor(&relocation)
+            .execute_relocate(&action, &recorded, source)
+            .unwrap();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        assert!(
+            !reconcile_active_operation(&mut locked, relocation.path("home").as_path()).unwrap()
+        );
+        assert!(locked.state().active_operation().is_none());
+        assert_eq!(
+            locked
+                .state()
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .unwrap()
+                .target_path()
+                .as_ref(),
+            relocation.path("home/.config/gitconfig").as_path()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_remove_sharing_denial_after_running_preserves_target_and_known_state() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let mut coordinator = workspace.coordinator();
+        coordinator.force_capability_success_for_test();
+        coordinator
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        let target = workspace.path("home/.gitconfig");
+        let source = workspace.path("store/git/config");
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let mut holder = None;
+
+        let result = coordinator
+            .apply_stale_link_with_after_running(&workspace.stale_input(), |_| {
+                let target = target.clone();
+                holder = Some(std::thread::spawn(move || {
+                    let _held = hold_link_without_delete_sharing(target)?;
+                    ready_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok::<_, std::io::Error>(())
+                }));
+                ready_rx.recv().unwrap();
+            })
+            .unwrap();
+
+        release_tx.send(()).unwrap();
+        holder.unwrap().join().unwrap().unwrap();
+        assert!(matches!(result, StaleLinkApplyResult::Failed { .. }));
+        assert_eq!(fs::read_link(&target).unwrap(), source);
+        let state = workspace.repository().load().unwrap();
+        assert!(state.active_operation().is_none());
+        assert!(
+            state
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .is_some()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replace_sharing_denial_after_running_preserves_target_and_known_state() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "old\n");
+        workspace.write("store/git/replacement", "new\n");
+        let mut coordinator = workspace.coordinator();
+        coordinator.force_capability_success_for_test();
+        coordinator
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        let target = workspace.path("home/.gitconfig");
+        let old_source = workspace.path("store/git/config");
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let mut holder = None;
+
+        let result = coordinator
+            .apply_replace_link_with_hooks(
+                &workspace.replacement_input(),
+                |_| true,
+                |_| {
+                    let target = target.clone();
+                    holder = Some(std::thread::spawn(move || {
+                        let _held = hold_link_without_delete_sharing(target)?;
+                        ready_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok::<_, std::io::Error>(())
+                    }));
+                    ready_rx.recv().unwrap();
+                },
+            )
+            .unwrap();
+
+        release_tx.send(()).unwrap();
+        holder.unwrap().join().unwrap().unwrap();
+        assert!(matches!(result, ReplaceLinkApplyResult::Uncertain { .. }));
+        assert_eq!(fs::read_link(&target).unwrap(), old_source);
+        let state = workspace.repository().load().unwrap();
+        let (_, action) = state.active_operation().unwrap().actions().next().unwrap();
+        assert_eq!(action.status(), ActionStatus::Uncertain);
+        let temporary = action.replacement_facts().unwrap().temporary_path().clone();
+        assert_eq!(
+            fs::read_link(temporary.as_path()).unwrap(),
+            workspace.path("store/git/replacement")
+        );
+        assert_eq!(
+            state
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .unwrap()
+                .source_path()
+                .as_ref(),
+            workspace.path("store/git/config").as_path()
+        );
+        drop(state);
+
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        assert!(
+            !reconcile_active_operation_with_retained_token_capability_for_test(
+                &mut locked,
+                workspace.path("home").as_path(),
+            )
+            .unwrap()
+        );
+        assert!(locked.state().active_operation().is_none());
+        assert!(fs::symlink_metadata(temporary.as_path()).is_err());
+        assert_eq!(
+            locked
+                .state()
+                .known()
+                .get(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+                .unwrap()
+                .source_path()
+                .as_ref(),
+            workspace.path("store/git/config").as_path()
         );
     }
 

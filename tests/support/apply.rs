@@ -593,6 +593,39 @@ mod unix {
 #[cfg(windows)]
 mod windows {
     use super::*;
+    use std::{
+        fs::OpenOptions,
+        os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
+    };
+    use windows_sys::Win32::{
+        Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx},
+        System::IO::OVERLAPPED,
+    };
+
+    fn hold_state_lock(f: &Fixture) -> fs::File {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0x7)
+            .open(f.path("state/loadout/state.lock"))
+            .unwrap();
+        let mut overlapped = OVERLAPPED::default();
+        // SAFETY: `file` remains open for the whole locked range and `overlapped` is valid for this synchronous call.
+        assert_ne!(
+            unsafe {
+                LockFileEx(
+                    file.as_raw_handle(),
+                    LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                    0,
+                    u32::MAX,
+                    u32::MAX,
+                    &mut overlapped,
+                )
+            },
+            0
+        );
+        file
+    }
 
     fn create_owned_link(f: &Fixture) {
         expect(
@@ -622,6 +655,25 @@ mod windows {
             &["create_link", "confirmation unavailable"],
         );
         no_new_operation(&f);
+    }
+
+    #[test]
+    fn independent_process_lock_contention_prevents_apply_before_target_observation() {
+        let f = Fixture::new();
+        f.write("state/loadout/state.lock", "");
+        let before = f.snapshot();
+        let held = hold_state_lock(&f);
+
+        expect(
+            f.command().args(ARGS).arg("--yes").output().unwrap(),
+            1,
+            &["LockAndState", "lock"],
+        );
+        no_new_operation(&f);
+
+        drop(held);
+        assert_eq!(f.snapshot(), before);
+        create_owned_link(&f);
     }
 
     #[test]

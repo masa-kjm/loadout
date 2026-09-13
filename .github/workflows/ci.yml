@@ -43,5 +43,41 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
-      - name: cargo test
+      - name: cargo test (non-macOS)
+        if: matrix.os != 'macos-latest'
         run: cargo test --locked
+
+      - name: cargo test (macOS APFS fixture)
+        id: macos_test
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          set -o pipefail
+          TMPDIR="$RUNNER_TEMP" cargo test --locked 2>&1 | tee macos-platform-test.log
+
+      - name: Record macOS platform evidence
+        if: always() && matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "runner_os=${RUNNER_OS}"
+            sw_vers
+            echo "fixture_tmpdir=${RUNNER_TEMP}"
+            echo "fixture_filesystem=$(stat -f '%T' "$RUNNER_TEMP")"
+            rustc -Vv
+            cargo -V
+            echo "command=TMPDIR=${RUNNER_TEMP} cargo test --locked"
+            echo "test_step_outcome=${{ steps.macos_test.outcome }}"
+          } | tee macos-platform-evidence.txt
+
+      - name: Upload macOS platform evidence
+        if: always() && matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-platform-evidence
+          path: |
+            macos-platform-evidence.txt
+            macos-platform-test.log
+          if-no-files-found: error
+          retention-days: 30

@@ -10,6 +10,23 @@ use std::{
 };
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(windows)]
+fn normal_existing_path(path: PathBuf) -> PathBuf {
+    let canonical = fs::canonicalize(path).unwrap();
+    let raw = canonical.to_str().unwrap();
+    if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{unc}"))
+    } else {
+        PathBuf::from(raw.strip_prefix(r"\\?\").unwrap_or(raw))
+    }
+}
+
+#[cfg(not(windows))]
+fn normal_existing_path(path: PathBuf) -> PathBuf {
+    fs::canonicalize(path).unwrap()
+}
+
 struct Fixture {
     root: PathBuf,
 }
@@ -21,6 +38,7 @@ impl Fixture {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&root).unwrap();
+        let root = normal_existing_path(root);
         let fixture = Self { root };
         for dir in [
             "home",

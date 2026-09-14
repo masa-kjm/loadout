@@ -127,6 +127,14 @@ mod unix {
             );
             // SAFETY: each successful openpty descriptor is owned exactly once.
             let master = unsafe { fs::File::from_raw_fd(master) };
+            // SAFETY: `master` is a valid terminal descriptor and the flags are read and updated atomically by fcntl.
+            let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+            assert_ne!(flags, -1);
+            // SAFETY: preserves the existing descriptor flags while enabling nonblocking reads for post-exit draining.
+            assert_ne!(
+                unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+                -1
+            );
             let slave = unsafe { fs::File::from_raw_fd(slave) };
             let mut command = f.command();
             command.args(ARGS).args(extra).stdout(Stdio::piped());
@@ -164,9 +172,13 @@ mod unix {
                 assert!(unsafe { libc::poll(&mut poll, 1, 100) } >= 0);
                 if poll.revents & libc::POLLIN != 0 {
                     let mut bytes = [0; 4096];
-                    let count = self.master.read(&mut bytes).unwrap();
-                    self.transcript
-                        .push_str(&String::from_utf8_lossy(&bytes[..count]));
+                    match self.master.read(&mut bytes) {
+                        Ok(count) => self
+                            .transcript
+                            .push_str(&String::from_utf8_lossy(&bytes[..count])),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => panic!("read prompt from terminal: {error}"),
+                    }
                 }
                 assert!(
                     self.child.try_wait().unwrap().is_none(),
@@ -197,22 +209,26 @@ mod unix {
             if let Some(mut stderr) = self.child.stderr.take() {
                 stderr.read_to_string(&mut output).unwrap();
             }
+            let deadline = Instant::now() + Duration::from_secs(1);
             loop {
-                let mut poll = libc::pollfd {
-                    fd: self.master.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                // SAFETY: one valid pollfd, nonblocking poll.
-                if unsafe { libc::poll(&mut poll, 1, 0) } <= 0
-                    || poll.revents & (libc::POLLIN | libc::POLLHUP) == 0
-                {
-                    break;
-                }
                 let mut bytes = [0; 4096];
                 match self.master.read(&mut bytes) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
                     Ok(count) => output.push_str(&String::from_utf8_lossy(&bytes[..count])),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        let mut poll = libc::pollfd {
+                            fd: self.master.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
+                        // SAFETY: one valid pollfd with a bounded wait for buffered terminal output.
+                        assert!(unsafe { libc::poll(&mut poll, 1, 100) } >= 0);
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                    Err(error) => panic!("drain terminal after child exit: {error}"),
                 }
             }
             (status.code().unwrap(), output)

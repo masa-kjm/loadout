@@ -462,7 +462,6 @@ mod tests {
         let root = fixture_root();
         let parent = root.join("parent");
         let moved = root.join("moved");
-        fs::create_dir(&root).unwrap();
         fs::create_dir(&parent).unwrap();
         let root = ResolvedPath::new(root).unwrap();
         let target = ResolvedPath::new(root.as_ref().join("parent/target")).unwrap();
@@ -479,7 +478,6 @@ mod tests {
         let root = fixture_root();
         let outside = root.join("outside");
         let parent = root.join("parent");
-        fs::create_dir(&root).unwrap();
         fs::create_dir(&outside).unwrap();
         symlink_dir(&outside, &parent).unwrap();
         let root = ResolvedPath::new(root).unwrap();
@@ -497,7 +495,6 @@ mod tests {
         let outside = root.join("outside");
         let source_parent = root.join("source-parent");
         let target_path = root.join("target");
-        fs::create_dir(&root).unwrap();
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("source"), "source").unwrap();
         symlink_dir(&outside, &source_parent).unwrap();
@@ -520,7 +517,6 @@ mod tests {
         let source = root.join("source");
         let other_source = root.join("other-source");
         let target_path = root.join("target");
-        fs::create_dir(&root).unwrap();
         fs::write(&source, "source").unwrap();
         fs::write(&other_source, "other").unwrap();
         if let Err(error) = symlink_file(&source, &target_path) {
@@ -558,7 +554,6 @@ mod tests {
         let root = fixture_root();
         let source = root.join("source");
         let target_path = root.join("target");
-        fs::create_dir(&root).unwrap();
         fs::write(&source, "source").unwrap();
         if let Err(error) = symlink_file(&source, &target_path) {
             if error.raw_os_error() == Some(1314) {
@@ -592,7 +587,6 @@ mod tests {
         let source = root.join("source");
         let other = root.join("other");
         let target_path = root.join("target");
-        fs::create_dir(&root).unwrap();
         fs::write(&source, "source").unwrap();
         fs::write(&other, "other").unwrap();
         if let Err(error) = symlink_file(&other, &target_path) {
@@ -623,7 +617,6 @@ mod tests {
         let root = fixture_root();
         let source = root.join("source");
         let target_path = root.join("target");
-        fs::create_dir(&root).unwrap();
         fs::write(&source, "source").unwrap();
         let root = ResolvedPath::new(root).unwrap();
         let target = ResolvedPath::new(target_path.clone()).unwrap();
@@ -656,7 +649,6 @@ mod tests {
         let root = fixture_root();
         let source = root.join("source");
         let target_path = root.join("target");
-        fs::create_dir(&root).unwrap();
         fs::create_dir(&source).unwrap();
         let root = ResolvedPath::new(root).unwrap();
         let target = ResolvedPath::new(target_path.clone()).unwrap();
@@ -676,7 +668,6 @@ mod tests {
         let new_source = root.join("new-source");
         let target_path = root.join("target");
         let temporary_path = root.join("temporary");
-        fs::create_dir(&root).unwrap();
         fs::write(&old_source, "old").unwrap();
         fs::write(&new_source, "new").unwrap();
         if let Err(error) = symlink_file(&old_source, &target_path)
@@ -718,7 +709,6 @@ mod tests {
         let other_source = root.join("other-source");
         let target_path = root.join("target");
         let temporary_path = root.join("temporary");
-        fs::create_dir(&root).unwrap();
         fs::write(&old_source, "old").unwrap();
         fs::write(&new_source, "new").unwrap();
         fs::write(&other_source, "other").unwrap();
@@ -755,9 +745,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time is after the Unix epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!(
+        let path = std::env::temp_dir().join(format!(
             "loadout-s6-execution-{}-{nanos}",
             std::process::id()
-        ))
+        ));
+        fs::create_dir(&path).unwrap();
+        fs::canonicalize(path).unwrap()
     }
 }

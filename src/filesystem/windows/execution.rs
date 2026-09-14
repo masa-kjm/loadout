@@ -750,6 +750,8 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir(&path).unwrap();
-        fs::canonicalize(path).unwrap()
+        ResolvedPath::from_platform_canonicalized(fs::canonicalize(path).unwrap())
+            .unwrap()
+            .into_path_buf()
     }
 }

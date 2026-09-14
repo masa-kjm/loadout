@@ -100,14 +100,17 @@ mod unix {
     use super::*;
     use std::{
         io::{Read, Write},
-        os::fd::{AsRawFd, FromRawFd},
+        os::fd::FromRawFd,
         process::{Child, Stdio},
+        sync::{Arc, Mutex},
+        thread::{self, JoinHandle},
         time::{Duration, Instant},
     };
     struct Session {
         child: Child,
         master: fs::File,
-        transcript: String,
+        transcript: Arc<Mutex<String>>,
+        reader: Option<JoinHandle<()>>,
     }
     impl Session {
         fn start(f: &Fixture, stdin_terminal: bool, stderr_terminal: bool, extra: &[&str]) -> Self {
@@ -127,14 +130,24 @@ mod unix {
             );
             // SAFETY: each successful openpty descriptor is owned exactly once.
             let master = unsafe { fs::File::from_raw_fd(master) };
-            // SAFETY: `master` is a valid terminal descriptor and the flags are read and updated atomically by fcntl.
-            let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
-            assert_ne!(flags, -1);
-            // SAFETY: preserves the existing descriptor flags while enabling nonblocking reads for post-exit draining.
-            assert_ne!(
-                unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
-                -1
-            );
+            let mut reader_master = master.try_clone().unwrap();
+            let transcript = Arc::new(Mutex::new(String::new()));
+            let reader_transcript = Arc::clone(&transcript);
+            let reader = thread::spawn(move || {
+                let mut bytes = [0; 4096];
+                loop {
+                    match reader_master.read(&mut bytes) {
+                        Ok(0) => break,
+                        Ok(count) => reader_transcript
+                            .lock()
+                            .unwrap()
+                            .push_str(&String::from_utf8_lossy(&bytes[..count])),
+                        Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => panic!("read terminal output: {error}"),
+                    }
+                }
+            });
             let slave = unsafe { fs::File::from_raw_fd(slave) };
             let mut command = f.command();
             command.args(ARGS).args(extra).stdout(Stdio::piped());
@@ -152,38 +165,23 @@ mod unix {
             Self {
                 child,
                 master,
-                transcript: String::new(),
+                transcript,
+                reader: Some(reader),
             }
         }
         fn prompt(&mut self) {
             let deadline = Instant::now() + Duration::from_secs(10);
-            while !self.transcript.contains("Apply this plan?") {
+            while !self.transcript.lock().unwrap().contains("Apply this plan?") {
                 assert!(
                     Instant::now() < deadline,
                     "prompt timeout: {}",
-                    self.transcript
+                    self.transcript.lock().unwrap()
                 );
-                let mut poll = libc::pollfd {
-                    fd: self.master.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                // SAFETY: one valid pollfd with a bounded timeout.
-                assert!(unsafe { libc::poll(&mut poll, 1, 100) } >= 0);
-                if poll.revents & libc::POLLIN != 0 {
-                    let mut bytes = [0; 4096];
-                    match self.master.read(&mut bytes) {
-                        Ok(count) => self
-                            .transcript
-                            .push_str(&String::from_utf8_lossy(&bytes[..count])),
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(error) => panic!("read prompt from terminal: {error}"),
-                    }
-                }
+                std::thread::sleep(Duration::from_millis(10));
                 assert!(
                     self.child.try_wait().unwrap().is_none(),
                     "exited before confirmation: {}",
-                    self.transcript
+                    self.transcript.lock().unwrap()
                 );
             }
         }
@@ -199,7 +197,8 @@ mod unix {
                 assert!(Instant::now() < deadline, "child timeout");
                 std::thread::sleep(Duration::from_millis(10));
             };
-            let mut output = self.transcript.clone();
+            self.reader.take().unwrap().join().unwrap();
+            let mut output = self.transcript.lock().unwrap().clone();
             self.child
                 .stdout
                 .take()
@@ -209,28 +208,6 @@ mod unix {
             if let Some(mut stderr) = self.child.stderr.take() {
                 stderr.read_to_string(&mut output).unwrap();
             }
-            let deadline = Instant::now() + Duration::from_secs(1);
-            loop {
-                let mut bytes = [0; 4096];
-                match self.master.read(&mut bytes) {
-                    Ok(0) => break,
-                    Ok(count) => output.push_str(&String::from_utf8_lossy(&bytes[..count])),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if Instant::now() >= deadline {
-                            break;
-                        }
-                        let mut poll = libc::pollfd {
-                            fd: self.master.as_raw_fd(),
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        // SAFETY: one valid pollfd with a bounded wait for buffered terminal output.
-                        assert!(unsafe { libc::poll(&mut poll, 1, 100) } >= 0);
-                    }
-                    Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
-                    Err(error) => panic!("drain terminal after child exit: {error}"),
-                }
-            }
             (status.code().unwrap(), output)
         }
     }
@@ -238,6 +215,9 @@ mod unix {
         fn drop(&mut self) {
             let _ = self.child.kill();
             let _ = self.child.wait();
+            if let Some(reader) = self.reader.take() {
+                let _ = reader.join();
+            }
         }
     }
 

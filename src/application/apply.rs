@@ -1553,7 +1553,9 @@ mod tests {
             fs::create_dir(&root).unwrap();
             fs::create_dir(root.join("home")).unwrap();
             fs::create_dir(root.join("store")).unwrap();
-            let root = fs::canonicalize(root).unwrap();
+            let root = ResolvedPath::from_platform_canonicalized(fs::canonicalize(root).unwrap())
+                .unwrap()
+                .into_path_buf();
             Self { root }
         }
 

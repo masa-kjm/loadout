@@ -204,7 +204,9 @@ mod unix {
                     revents: 0,
                 };
                 // SAFETY: one valid pollfd, nonblocking poll.
-                if unsafe { libc::poll(&mut poll, 1, 0) } <= 0 || poll.revents & libc::POLLIN == 0 {
+                if unsafe { libc::poll(&mut poll, 1, 0) } <= 0
+                    || poll.revents & (libc::POLLIN | libc::POLLHUP) == 0
+                {
                     break;
                 }
                 let mut bytes = [0; 4096];

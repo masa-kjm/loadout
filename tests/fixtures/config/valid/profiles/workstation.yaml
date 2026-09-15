@@ -1,0 +1,12 @@
+schema_version: 1
+id: workstation
+resources:
+  git-config:
+    type: file
+    properties:
+      kind: file
+      source:
+        store: dotfiles
+        path: gitconfig
+      target: ~/.gitconfig
+      operation: link

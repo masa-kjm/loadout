@@ -1,0 +1,11 @@
+schema_version: 1
+default_profile: workstation
+
+profile_discovery:
+  paths:
+    - ./profiles
+
+stores:
+  dotfiles:
+    type: local
+    path: ./stores/dotfiles

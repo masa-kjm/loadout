@@ -121,10 +121,16 @@ Do not claim an unrun check passed.
 
 ## Releases and External State
 
-No v0.2.0 release process is defined yet.
-The inherited `Release` and `Dev Release` workflows are disabled while CI and release automation are redesigned.
-Do not re-enable them, publish a crate, create a GitHub Release, or push a `v*` release tag until the v0.2.0 release contract, package layout, workflow, and validation have been reviewed and adopted.
+The v0.2.0 release contract is implemented by `.github/workflows/release.yml`.
 
-When release work is introduced, it must define the version source, package set, changelog policy, artifact matrix, crates.io publishing policy, tag trigger, release permissions, verification steps, and rollback or incident boundaries.
+- The release version has one source: `Cargo.toml`.
+- A release tag MUST be an exact `vX.Y.Z` spelling of that package version and MUST point to a commit reachable from `main`.
+- `CHANGELOG.md` MUST contain an exact `## vX.Y.Z` heading before the tag is pushed.
+- `workflow_dispatch` is an artifact-only release-candidate build. Its required `version` input MUST match the manifest and changelog; it never creates a GitHub Release.
+- A matching tag push validates the version, changelog, locked dependency resolution, provenance, and locked test suite before building artifacts.
+- The release package set is archive-only: `loadout` binaries plus `README.md`, `LICENSE`, and `CHANGELOG.md`. The matrix is Linux `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`, macOS `x86_64-apple-darwin` and `aarch64-apple-darwin`, and Windows `x86_64-pc-windows-msvc`. The Linux ARM64 build uses `cross`; every archive has a SHA-256 sidecar.
+- The workflow does not publish to crates.io and requires no registry token. Publishing a crate is a separate future decision and workflow.
+- The workflow has read-only repository permission by default. Only the GitHub Release job receives `contents: write`, and only after all validation and artifact jobs succeed.
+- A failed or partial release is an incident: do not move or recreate the tag, overwrite published assets, or rerun blindly. Inspect the workflow and release state, correct the cause, and publish a new patch version when a new immutable release is required.
 
 Do not move, replace, or force-push the archived `v0.1.0` or `legacy/v0.1-final` tags.

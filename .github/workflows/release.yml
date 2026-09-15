@@ -3,17 +3,81 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version to validate and package (for example, v0.2.0)
+        required: true
+        type: string
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'push' && github.ref || github.run_id }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+  BINARY_NAME: loadout
 
 jobs:
+  validate-release:
+    name: Validate release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.metadata.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Validate version, changelog, and tag provenance
+        id: metadata
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="${REQUESTED_VERSION}"
+          fi
+
+          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release version must be an exact vX.Y.Z tag: ${tag}" >&2
+            exit 1
+          fi
+
+          version="${tag#v}"
+          manifest_version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+
+          test -n "${manifest_version}"
+          test "${version}" = "${manifest_version}"
+          grep --fixed-strings --line-regexp "## ${tag}" CHANGELOG.md
+          cargo metadata --locked --no-deps --format-version 1 > /dev/null
+
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            git fetch --no-tags origin main
+            git merge-base --is-ancestor "${GITHUB_SHA}" origin/main
+          fi
+
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Run locked test suite
+        run: cargo test --locked
+
   build:
-    name: Build ${{ matrix.target }}
+    name: Build (${{ matrix.target }})
+    needs: validate-release
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -21,105 +85,136 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
+            archive: tar.gz
             use_cross: false
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
+            archive: tar.gz
             use_cross: true
           - target: x86_64-apple-darwin
             runner: macos-15-intel
+            archive: tar.gz
             use_cross: false
           - target: aarch64-apple-darwin
             runner: macos-latest
+            archive: tar.gz
             use_cross: false
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
+            archive: zip
             use_cross: false
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
         with:
-          channel: 1.95.0
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
           targets: ${{ matrix.target }}
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.target }}-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.target }}-release-
 
       - name: Install cross
         if: matrix.use_cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
-      - name: Build
-        shell: bash
-        run: |
-          if [[ "${{ matrix.use_cross }}" == "true" ]]; then
-            cross build --release --target ${{ matrix.target }}
-          else
-            cargo build --release --target ${{ matrix.target }}
-          fi
-
-      - name: Package (unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          VERSION="${GITHUB_REF_NAME}"
-          TARGET="${{ matrix.target }}"
-          ASSET="loadout-${VERSION}-${TARGET}"
-
-          mkdir -p "${ASSET}/bin" "${ASSET}/cmd"
-          cp "target/${TARGET}/release/loadout" "${ASSET}/bin/"
-          cp cmd/*.sh cmd/*.ps1 "${ASSET}/cmd/"
-          chmod +x "${ASSET}/bin/loadout" "${ASSET}/cmd/"*.sh
-
-          tar -czf "${ASSET}.tar.gz" "${ASSET}"
-          echo "ASSET_PATH=${ASSET}.tar.gz" >> "$GITHUB_ENV"
-          echo "ASSET_NAME=${ASSET}.tar.gz" >> "$GITHUB_ENV"
-
-      - name: Package (windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $Version = $env:GITHUB_REF_NAME
-          $Target  = "${{ matrix.target }}"
-          $Asset   = "loadout-${Version}-${Target}"
-
-          New-Item -ItemType Directory -Path "${Asset}/bin", "${Asset}/cmd" | Out-Null
-          Copy-Item "target/${Target}/release/loadout.exe" "${Asset}/bin/"
-          Copy-Item cmd/*.sh, cmd/*.ps1 "${Asset}/cmd/"
-
-          Compress-Archive -Path "${Asset}" -DestinationPath "${Asset}.zip"
-          "ASSET_PATH=${Asset}.zip"  | Out-File -Append $env:GITHUB_ENV
-          "ASSET_NAME=${Asset}.zip"  | Out-File -Append $env:GITHUB_ENV
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: taiki-e/install-action@v2
         with:
-          name: ${{ env.ASSET_NAME }}
-          path: ${{ env.ASSET_PATH }}
-          retention-days: 1
+          tool: cross
 
-  release:
+      - name: Build release binary (native)
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --locked --bin loadout --target ${{ matrix.target }}
+
+      - name: Build release binary (cross)
+        if: matrix.use_cross
+        run: cross build --release --locked --bin loadout --target ${{ matrix.target }}
+
+      - name: Package archive (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        env:
+          TAG: ${{ needs.validate-release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          staging="${BINARY_NAME}-${TAG}-${{ matrix.target }}"
+          asset="${staging}.tar.gz"
+
+          mkdir "${staging}"
+          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${staging}/"
+          cp README.md LICENSE CHANGELOG.md "${staging}/"
+          tar -czf "${asset}" "${staging}"
+          shasum -a 256 "${asset}" > "${asset}.sha256"
+
+          echo "ASSET=${asset}" >> "${GITHUB_ENV}"
+
+      - name: Package archive (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          TAG: ${{ needs.validate-release.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $staging = "$env:BINARY_NAME-$env:TAG-${{ matrix.target }}"
+          $asset = "$staging.zip"
+
+          New-Item -ItemType Directory -Path $staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/$env:BINARY_NAME.exe" "$staging/"
+          Copy-Item README.md, LICENSE, CHANGELOG.md "$staging/"
+          Compress-Archive -Path $staging -DestinationPath $asset
+
+          $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLowerInvariant()
+          "$hash  $asset" | Set-Content -NoNewline -Encoding ascii "$asset.sha256"
+          "ASSET=$asset" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  create-release:
     name: Create GitHub Release
-    needs: build
+    if: github.event_name == 'push'
+    needs: [validate-release, build]
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: write
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
 
-      - name: Create release and upload assets
+      - name: Verify archive checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          checksums=(artifacts/*.sha256)
+          test "${#checksums[@]}" -eq 5
+
+          for checksum in "${checksums[@]}"; do
+            (
+              cd artifacts
+              sha256sum --check "$(basename "${checksum}")"
+            )
+          done
+
+      - name: Create release and upload verified assets
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*
+          tag_name: ${{ needs.validate-release.outputs.tag }}
           generate_release_notes: true
+          files: artifacts/*
+          fail_on_unmatched_files: true

@@ -1,115 +1,114 @@
-# install.ps1 — Download and install loadout from GitHub Releases.
-#
-# Usage:
-#   irm https://raw.githubusercontent.com/massa-kj/loadout/main/install.ps1 | iex
-#   .\install.ps1 [-Version v0.1.0] [-Prefix $env:USERPROFILE\.local]
-#
-# Layout after install:
-#   <Prefix>\bin\loadout.exe   (binary)
+# Download and install a verified Loadout release archive.
+# Usage: irm https://raw.githubusercontent.com/masa-kjm/loadout/main/scripts/install.ps1 | iex
+#        .\install.ps1 [-Version vX.Y.Z] [-Prefix $env:USERPROFILE\.local]
 
 [CmdletBinding()]
 param(
     [string]$Version = "",
-    [string]$Prefix  = "$env:USERPROFILE\.local"
+    [string]$Prefix = "$env:USERPROFILE\.local"
 )
 
 $ErrorActionPreference = "Stop"
-
-$Repo = "massa-kj/loadout"
-
-# ── Platform detection ────────────────────────────────────────────────────────
+$Repository = "masa-kjm/loadout"
+$Headers = @{
+    Accept = "application/vnd.github+json"
+    "User-Agent" = "loadout-installer"
+}
 
 function Get-Target {
     if (-not $IsWindows -and $env:OS -ne "Windows_NT") {
-        Write-Error "error: this script is for Windows only. Use install.sh on Linux/macOS."
-        exit 1
+        throw "This script is for Windows only. Use scripts/install.sh on Linux or macOS."
     }
 
-    $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
-    switch ($arch) {
-        "X64"   { return "windows-x86_64" }
-        "Arm64" { return "windows-aarch64" }
-        default {
-            Write-Error "error: unsupported architecture: $arch"
-            exit 1
-        }
+    $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+    if ($architecture -ne "X64") {
+        throw "Unsupported architecture: $architecture. v0.2.0 publishes only x86_64-pc-windows-msvc for Windows."
+    }
+
+    return "x86_64-pc-windows-msvc"
+}
+
+function Get-LatestVersion {
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repository/releases/latest" -Headers $Headers
+    if ([string]::IsNullOrWhiteSpace($release.tag_name)) {
+        throw "The latest GitHub release has no tag name."
+    }
+
+    return $release.tag_name
+}
+
+function Test-Checksum {
+    param(
+        [Parameter(Mandatory = $true)][string]$AssetPath,
+        [Parameter(Mandatory = $true)][string]$ChecksumPath
+    )
+
+    $checksumText = Get-Content -Raw -Path $ChecksumPath
+    $expected = ($checksumText -split '\s+')[0]
+    if ($expected -notmatch '^[0-9a-fA-F]{64}$') {
+        throw "The downloaded checksum file is not a SHA-256 checksum."
+    }
+
+    $actual = (Get-FileHash -Algorithm SHA256 -Path $AssetPath).Hash
+    if ($actual -ne $expected.ToUpperInvariant()) {
+        throw "SHA-256 verification failed."
     }
 }
 
 $Target = Get-Target
-
-# ── Version resolution ────────────────────────────────────────────────────────
-
-if ($Version -eq "") {
-    Write-Host "Fetching latest release..."
-    try {
-        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -UseBasicParsing
-        $Version = $release.tag_name
-    } catch {
-        Write-Error "error: failed to fetch latest version: $_"
-        exit 1
-    }
-    if ($Version -eq "") {
-        Write-Error "error: failed to fetch latest version"
-        exit 1
-    }
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    Write-Host "Fetching the latest release..."
+    $Version = Get-LatestVersion
 }
 
-Write-Host "Installing loadout $Version ($Target)..."
+if ($Version -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+    throw "Version must be an exact vX.Y.Z release tag."
+}
 
-# ── Download ──────────────────────────────────────────────────────────────────
-
-$ZipName = "loadout-$Version-$Target.zip"
-$Url     = "https://github.com/$Repo/releases/download/$Version/$ZipName"
-$TmpDir  = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
-New-Item -ItemType Directory -Path $TmpDir | Out-Null
+$ArchiveRoot = "loadout-$Version-$Target"
+$Archive = "$ArchiveRoot.zip"
+$ReleaseUrl = "https://github.com/$Repository/releases/download/$Version/$Archive"
+$ChecksumUrl = "$ReleaseUrl.sha256"
+$TemporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
 
 try {
-    $ZipPath = Join-Path $TmpDir $ZipName
-    Write-Host "Downloading $Url..."
-    Invoke-WebRequest -Uri $Url -OutFile $ZipPath -UseBasicParsing
+    New-Item -ItemType Directory -Path $TemporaryDirectory | Out-Null
+    $archivePath = Join-Path $TemporaryDirectory $Archive
+    $checksumPath = "$archivePath.sha256"
 
-    # ── Install ───────────────────────────────────────────────────────────────
+    Write-Host "Installing loadout $Version ($Target)..."
+    Write-Host "Downloading $ReleaseUrl..."
+    Invoke-WebRequest -Uri $ReleaseUrl -OutFile $archivePath -Headers $Headers
+    Invoke-WebRequest -Uri $ChecksumUrl -OutFile $checksumPath -Headers $Headers
+    Test-Checksum -AssetPath $archivePath -ChecksumPath $checksumPath
 
-    $BinDir     = Join-Path $Prefix "bin"
-    $ExtractDir = Join-Path $TmpDir "extract"
-
-    # Create bin directory if needed
-    New-Item -ItemType Directory -Path $BinDir     -Force | Out-Null
-    New-Item -ItemType Directory -Path $ExtractDir -Force | Out-Null
-
-    # Extract zip
-    Expand-Archive -Path $ZipPath -DestinationPath $ExtractDir -Force
-
-    # Locate the binary (may be at the top level or inside a single subdirectory)
-    $BinarySrc = Get-ChildItem -Path $ExtractDir -Filter "loadout.exe" -Recurse | Select-Object -First 1
-    if ($null -eq $BinarySrc) {
-        Write-Error "error: loadout.exe not found in the downloaded archive"
-        exit 1
+    $extractDirectory = Join-Path $TemporaryDirectory "extract"
+    Expand-Archive -Path $archivePath -DestinationPath $extractDirectory
+    $entries = @(Get-ChildItem -Force -Path $extractDirectory)
+    if ($entries.Count -ne 1 -or $entries[0].Name -ne $ArchiveRoot -or -not ($entries[0].PSIsContainer)) {
+        throw "The downloaded archive has an unexpected layout."
     }
 
-    $BinaryDest = Join-Path $BinDir "loadout.exe"
-    Copy-Item -Path $BinarySrc.FullName -Destination $BinaryDest -Force
+    $binarySource = Join-Path (Join-Path $extractDirectory $ArchiveRoot) "loadout.exe"
+    if (-not (Test-Path -Path $binarySource -PathType Leaf)) {
+        throw "loadout.exe was not found in the downloaded archive."
+    }
 
-    # ── Done ──────────────────────────────────────────────────────────────────
+    $binaryDirectory = Join-Path $Prefix "bin"
+    $binaryDestination = Join-Path $binaryDirectory "loadout.exe"
+    New-Item -ItemType Directory -Force -Path $binaryDirectory | Out-Null
+    Copy-Item -Path $binarySource -Destination $binaryDestination -Force
 
     Write-Host ""
-    Write-Host "Installed loadout to $BinaryDest"
-    Write-Host ""
+    Write-Host "Installed loadout to $binaryDestination"
 
-    # Check PATH
-    $UserPath = [System.Environment]::GetEnvironmentVariable("PATH", "User")
-    if ($UserPath -notlike "*$BinDir*") {
-        Write-Host "NOTE: $BinDir is not in your PATH."
-        Write-Host "      Adding it to your user PATH..."
-        [System.Environment]::SetEnvironmentVariable(
-            "PATH",
-            "$BinDir;$UserPath",
-            "User"
-        )
-        Write-Host "      Done. Restart your shell for the change to take effect."
+    $userPath = [System.Environment]::GetEnvironmentVariable("PATH", "User")
+    if ($userPath -notlike "*$binaryDirectory*") {
+        Write-Host "NOTE: $binaryDirectory is not in your user PATH."
+        Write-Host "      Add it to PATH before invoking loadout from a new shell."
     }
 } finally {
-    # Cleanup temporary directory
-    Remove-Item -Path $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -Path $TemporaryDirectory) {
+        Remove-Item -Path $TemporaryDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }

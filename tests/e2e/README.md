@@ -1,92 +1,24 @@
-# Environment Tests
+# End-to-End Tests
 
-Full-stack integration tests that run the loadout system in isolated environments.
+This directory is reserved for black-box tests that execute the compiled Loadout CLI in a disposable environment.
 
-Unlike unit and integration tests, these tests execute real component scripts against
-a clean OS installation to verify end-to-end behavior.
+The v0.2 test environment must provide isolated home, configuration, state, and local-store directories. It must copy version-controlled fixtures into those directories and must never use a developer's real home, XDG directories, AppData directories, or repository-owned state.
 
-## Purpose
+## Current Scope
 
-Verify state guarantees in a realistic environment:
+The first scenario set is documented in [scenarios/README.md](scenarios/README.md). It covers the smallest useful v0.2 lifecycle: validate, plan, apply, repeated apply, diff, dry-run, and blocked plans.
 
-* State initialization correctness
-* Idempotent execution
-* Safe uninstall (no untracked files removed)
-* Version specification handling
-* Version upgrade behavior
+The Linux Docker and Windows Sandbox runners execute the v0.2 CLI directly. They share the same fixture and scenario contract; the platform-specific runner is responsible only for creating the disposable environment, transferring the binary and fixture, and collecting logs.
 
-## E2E Runner
+## Fixture Policy
 
-Scenarios are executed by the `loadout-e2e` binary (`tests/runtime/` crate).
+Shared deterministic inputs live in [../fixtures/](../fixtures/). Fixtures specific to a future sandbox bundle may live below `tests/e2e/fixtures/`, but generated copies, logs, temporary state, and generated sandbox definitions must remain outside version-controlled fixtures.
 
-`loadout-e2e` is a standalone binary copied into containers or Sandbox instances
-alongside `loadout`. It deserialises the state file using `model::state::State`
-for type-safe verification — no dependency on `jq` or other external tools.
+## Test Layers
 
-```bash
-# Inside the container
-loadout-e2e minimal
-loadout-e2e all
-```
+End-to-end scenarios complement, rather than replace, the focused tests described in [Testing Strategy](../../docs/development/testing.md):
 
-The Windows Sandbox environment still uses PowerShell scripts (`scenarios/*.ps1`).
-Migration to a cross-compiled `loadout-e2e.exe` (`x86_64-pc-windows-msvc`) is
-a future goal.
-
-## Test Environments
-
-### Linux — Docker
-
-`linux/docker/` provides Docker-based testing on Ubuntu.
-
-A four-stage Dockerfile manages the environment; scenarios are executed by
-the `loadout-e2e` binary.
-
-**Quick start:**
-
-```bash
-./tests/e2e/linux/docker/test.sh all
-```
-
-See [linux/docker/README.md](linux/docker/README.md) for full documentation.
-
-### Windows — Windows Sandbox
-
-`windows/` provides Windows Sandbox-based testing.
-
-Each test launches a disposable Sandbox instance, installs WinGet, copies the
-repository, and executes the scenario inside the Sandbox.
-
-**Quick start (Windows only):**
-
-```powershell
-cd tests\e2e\windows\sandbox
-.\test.ps1 all
-```
-
-See [windows/README.md](windows/README.md) for full documentation.
-
-## Test Scenarios
-
-Both environments cover the same set of scenarios:
-
-| Scenario            | What it verifies                                              |
-|---------------------|---------------------------------------------------------------|
-| `minimal`           | State created, version correct, no duplicates                 |
-| `idempotent`        | Second apply produces identical state                         |
-| `lifecycle`         | Full cycle: base → full → reapply → shrink → empty            |
-| `uninstall`         | Tracked files removed; untracked files preserved              |
-| `version-install`   | Version recorded in state after install                       |
-| `version-upgrade`   | Version mismatch triggers reinstall; state updated            |
-| `version-mixed`     | Versioned and unversioned components coexist correctly        |
-| `import-single`     | Bundle from imported file is applied correctly                |
-| `import-merge-order`| Later import overrides earlier at bundle-name level           |
-| `import-cycle`      | Circular import reference is rejected; state not created      |
-
-## Design Philosophy
-
-These are **black-box tests**. They verify observable guarantees (state structure
-and content), not internal implementation details.
-
-See [docs/development/testing.md](../../docs/development/testing.md) for the
-overall testing strategy.
+- CLI acceptance tests prove arguments, confirmation, dry-run behavior, output categories, and exit statuses.
+- Executor integration tests prove state and filesystem outcomes using disposable directories.
+- Platform conformance tests prove native Unix and Windows filesystem behavior.
+- Manual sandbox sessions are useful for platform investigation and debugging, but are not regression evidence by themselves.

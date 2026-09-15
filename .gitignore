@@ -5,5 +5,6 @@
 /.agents/
 
 # Test environment artifacts
-tests/e2e/windows/logs/
-tests/e2e/windows/sandbox/loadout.wsb
+tests/e2e/**/logs/
+tests/e2e/**/generated/
+tests/e2e/**/*.wsb

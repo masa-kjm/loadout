@@ -1,25 +1,17 @@
 <Configuration>
   <MappedFolders>
-    <!-- loadout repo (ReadOnly) -->
     <MappedFolder>
-      <HostFolder>__LOADOUT_ROOT__</HostFolder>
+      <HostFolder>__REPO_ROOT__</HostFolder>
       <SandboxFolder>C:\host-loadout</SandboxFolder>
       <ReadOnly>true</ReadOnly>
     </MappedFolder>
-
-    <!-- logs (ReadWrite) -->
     <MappedFolder>
-      <HostFolder>__LOGS_ROOT__</HostFolder>
-      <SandboxFolder>C:\logs</SandboxFolder>
+      <HostFolder>__LOG_ROOT__</HostFolder>
+      <SandboxFolder>C:\loadout-logs</SandboxFolder>
       <ReadOnly>false</ReadOnly>
     </MappedFolder>
   </MappedFolders>
-
   <LogonCommand>
-    <Command>__LOGON_COMMAND__</Command>
+    <Command>powershell.exe -ExecutionPolicy Bypass -File C:\host-loadout\tests\e2e\windows\sandbox\run-in-sandbox.ps1 -Scenario __SCENARIO__</Command>
   </LogonCommand>
-
-  <Networking>Enable</Networking>
-  <VGpu>Disable</VGpu>
-  <MemoryInMB>4096</MemoryInMB>
 </Configuration>

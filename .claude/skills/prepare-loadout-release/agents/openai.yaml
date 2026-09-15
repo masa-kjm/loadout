@@ -1,0 +1,4 @@
+interface:
+  display_name: "Prepare Loadout Release"
+  short_description: "Prepare and validate Loadout release candidates"
+  default_prompt: "Use $prepare-loadout-release to prepare Loadout release vX.Y.Z."

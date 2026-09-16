@@ -1,6 +1,6 @@
 # Specifications
 
-These documents define the observable v0.2.0 contracts.
+These documents define the observable v0.3.0 contracts.
 They are authoritative for behavior, data, safety rules, and failure aftermath.
 Architecture documents define responsibility boundaries; they do not replace these specifications.
 
@@ -11,12 +11,13 @@ Architecture documents define responsibility boundaries; they do not replace the
 - [File Links](file-link.md) defines the only v0.2.0 resource type and its ownership and filesystem-safety contract.
 - [Lifecycle](lifecycle.md) defines validation, planning, preflight, application, deterministic ordering, and the Desired/Known/Actual transition table.
 - [State and Recovery](state-and-recovery.md) defines durable Known state, operation records, locking, atomic commits, and crash recovery.
-- [CLI](cli.md) defines the v0.2.0 command surface, confirmation behavior, and exit status classes.
+- [CLI](cli.md) defines the v0.3.0 command surface, confirmation behavior, and exit status classes.
+- [Initialization](init.md) defines the v0.3.0 authoring command that creates an initial portable environment bundle.
 
 ## Normative Language
 
 The terms **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, and **MAY** describe the strength of a requirement.
-An implementation that does not satisfy a MUST or MUST NOT requirement is not a v0.2.0 implementation.
+An implementation that does not satisfy a MUST or MUST NOT requirement is not a v0.3.0 implementation.
 
 ## Version Scope
 

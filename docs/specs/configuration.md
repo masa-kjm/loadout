@@ -45,6 +45,13 @@ For `--config`, a relative path is resolved from the current working directory.
 An absolute path and a home-relative path beginning with `~/` are also allowed.
 The CLI option takes precedence over `loadout.yaml`.
 
+### Initial Portable Bundle
+
+`loadout init` creates a portable environment bundle at `./.loadout` below the current working directory.
+Its exact layout and creation safety contract are defined by [Initialization](init.md).
+The generated environment configuration uses `..` as the local-store root, so native assets remain beside rather than inside the Loadout control directory.
+Initialization does not select the generated configuration; use `--config ./.loadout/config.yaml` when invoking a declaration command.
+
 ```yaml
 schema_version: 1
 default_profile: workstation

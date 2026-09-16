@@ -7,6 +7,9 @@ use clap::{
 
 #[derive(Debug, PartialEq)]
 pub(super) enum Command {
+    Init {
+        dry_run: bool,
+    },
     Validate {
         config: Option<OsString>,
         root: Option<String>,
@@ -39,6 +42,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum ParsedCommand {
+    #[command(about = "Create an initial portable environment bundle in the current directory.")]
+    Init(InitArgs),
     #[command(about = "Validate declarations without inspecting managed targets.")]
     Validate(ValidateArgs),
     #[command(about = "Show the actions needed to converge a profile.")]
@@ -47,6 +52,15 @@ enum ParsedCommand {
     Apply(ApplyArgs),
     #[command(about = "Report drift between recorded state and managed targets.")]
     Diff,
+}
+
+#[derive(Args)]
+struct InitArgs {
+    #[arg(
+        long,
+        help = "Show the files that init would create without writing them."
+    )]
+    dry_run: bool,
 }
 
 #[derive(Args)]
@@ -89,6 +103,9 @@ struct ApplyArgs {
 pub(super) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, clap::Error> {
     let cli = Cli::try_parse_from(std::iter::once(OsString::from("loadout")).chain(args))?;
     let command = match cli.command {
+        ParsedCommand::Init(args) => Command::Init {
+            dry_run: args.dry_run,
+        },
         ParsedCommand::Validate(args) => Command::Validate {
             config: args.profile.config,
             root: args.profile.root,
@@ -124,7 +141,7 @@ impl Command {
             Self::Validate { config, .. }
             | Self::Plan { config, .. }
             | Self::Apply { config, .. } => config.as_ref(),
-            Self::Diff => None,
+            Self::Init { .. } | Self::Diff => None,
         }
     }
 }
@@ -172,6 +189,10 @@ mod tests {
             }
         );
         assert_eq!(parse_strings(&["diff"]).unwrap(), Command::Diff);
+        assert_eq!(
+            parse_strings(&["init", "--dry-run"]).unwrap(),
+            Command::Init { dry_run: true }
+        );
     }
 
     #[test]

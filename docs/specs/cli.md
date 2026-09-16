@@ -2,8 +2,8 @@
 
 ## Scope
 
-This specification defines the complete v0.2.0 command surface.
-Commands not listed here are not part of v0.2.0.
+This specification defines the complete v0.3.0 command surface.
+Commands not listed here are not part of v0.3.0.
 
 The CLI parses input, presents diagnostics and plans, obtains confirmation, and maps outcomes to exit status.
 It does not make ownership, planner, filesystem, or state decisions outside the lifecycle.
@@ -44,6 +44,15 @@ More than one positional profile ID is an input error.
 `diff` has no declaration-selection options because it inspects the platform state repository rather than a portable desired state.
 
 ## Commands
+
+### `loadout init`
+
+```text
+loadout init [--dry-run]
+```
+
+`init` creates an initial portable environment bundle in the current working directory without modifying machine-local runtime configuration.
+It is an authoring command, not a lifecycle command, and its complete creation, collision, durability, dry-run, and exit-status contract is defined by [Initialization](init.md).
 
 ### `loadout validate`
 
@@ -139,4 +148,4 @@ It never reports success merely because some earlier actions were committed. A f
 
 ## Excluded Commands
 
-v0.2.0 does not provide `init`, configuration editing, profile listing or display, resource listing or display, resource import, partial apply, task execution, copy materialization, directory materialization, remote store management, forceful takeover, rollback, or parallel execution.
+v0.3.0 does not provide configuration editing, profile listing or display, resource listing or display, resource import, partial apply, task execution, copy materialization, directory materialization, remote store management, forceful takeover, rollback, or parallel execution.

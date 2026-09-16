@@ -2,7 +2,7 @@
 
 ## Scope
 
-This document defines how an implementation demonstrates conformance with the v0.2.0 architecture and specifications.
+This document defines how an implementation demonstrates conformance with the v0.3.0 architecture and specifications.
 It does not add runtime behavior, change an error outcome, or replace a specification.
 
 Every behavior change must identify its owning specification and add evidence at the narrowest test layer that can prove the contract.
@@ -21,7 +21,7 @@ An observable CLI or filesystem contract also requires an integration or accepta
 
 ## Contract Matrix
 
-The following matrix is the minimum evidence required before v0.2.0 is considered complete.
+The following matrix is the minimum evidence required before v0.3.0 is considered complete.
 
 | Contract owner | Required evidence |
 | --- | --- |
@@ -31,6 +31,7 @@ The following matrix is the minimum evidence required before v0.2.0 is considere
 | [Lifecycle](../specs/lifecycle.md) | Every Desired/Known/Actual table row; blocked Plans and preflight failures perform no new planned target mutation; preflight failure creates no new operation record; permitted prior-operation recovery cleanup and state commits are asserted separately; executor recheck rejects observable changes since planning; phase ordering; contiguous relocation; and stop-after-failure behavior. |
 | [State and Recovery](../specs/state-and-recovery.md) | Corrupt-state rejection; canonical-hash fixtures; exclusive-lock contention; atomic-commit failure; every operation-status transition; same-source identity-handoff recovery; recovery to succeeded, failed, skipped, and uncertain; no rollback of verified earlier actions. |
 | [CLI](../specs/cli.md) | Positional root-profile selection; `validate` default-profile and `--all` behavior; `diff` Known-to-Actual reporting and zero mutation; `plan` and `apply` default-profile behavior; confirmation after successful preflight and before an operation record; non-interactive `--yes` requirement; dry-run zero mutation; all documented exit-status classes. |
+| [Initialization](../specs/init.md) | A compiled-binary `init` creates the exact valid `.loadout` bundle; dry run changes no entry, state, store, or runtime configuration; every existing final entry kind is preserved; and staging write, validation, flush, publication, and external-collision failures never publish a partial bundle or replace an external entry. |
 
 ## Pure Domain Tests
 

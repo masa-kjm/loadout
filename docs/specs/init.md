@@ -27,7 +27,7 @@ On success, `init` creates this complete directory tree:
     └── base.yaml
 ```
 
-The generated `config.yaml` is a version-1 environment configuration that selects `base`, discovers `./profiles`, and declares the current directory as the `native` local store through the relative path `..`.
+The generated `config.yaml` is a version-2 environment configuration that selects `base`, discovers `./profiles`, and declares the current directory as the `native` local store through `properties.path: ..`.
 The generated `base.yaml` is a version-1 profile with ID `base` and an empty resource set.
 
 The bundle contains Loadout control metadata.

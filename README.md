@@ -12,11 +12,11 @@ The published package's Rust library target is not yet a supported public API.
 
 v0.1 is retired and unsupported.
 The published `loadout` v0.1.0 crate is preserved by the `v0.1.0` archive tag, and the final legacy source snapshot is preserved by `legacy/v0.1-final`.
-v0.2.0 does not provide compatibility with v0.1 configuration, state, commands, resources, or behavior.
+v0.3.0 does not provide compatibility with v0.1 configuration, state, commands, resources, or behavior.
 
-## v0.2.0 Direction
+## v0.3.0 Direction
 
-v0.2.0 begins with one complete, safe resource lifecycle: materializing a regular file from a local store as a file symbolic link below the current user's home directory.
+v0.3.0 retains one complete, safe resource lifecycle: materializing a regular file from a local store as a file symbolic link below the current user's home directory.
 It provides profile composition, validation, planning, drift inspection, conflict detection, state locking, verified application, and crash recovery.
 
 The core planning contract is:
@@ -45,7 +45,7 @@ Both installers accept an exact release tag through `--version vX.Y.Z` or `-Vers
 
 ## Basic Usage
 
-Loadout v0.2.0 uses an environment configuration and one or more profile files. The local store can live anywhere; it does not need to be inside the directory containing the configuration. For example:
+Loadout v0.3.0 uses an environment configuration and one or more profile files. The local store can live anywhere; it does not need to be inside the directory containing the configuration. For example:
 
 ```text
 loadout-config/
@@ -60,7 +60,7 @@ loadout-config/
 `config.yaml`:
 
 ```yaml
-schema_version: 1
+schema_version: 2
 default_profile: workstation
 
 profile_discovery:
@@ -70,7 +70,8 @@ profile_discovery:
 stores:
   dotfiles:
     type: local
-    path: ~/src/dotfiles
+    properties:
+      path: ~/src/dotfiles
 ```
 
 `profiles/workstation.yaml`:

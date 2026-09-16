@@ -83,7 +83,7 @@ fn init_creates_a_bundle_that_validate_can_select_explicitly() {
     assert_eq!(
         snapshot(&fixture.root.join(".loadout")),
         vec![
-            (PathBuf::from("config.yaml"), b"schema_version: 1\ndefault_profile: base\n\nprofile_discovery:\n  paths:\n    - ./profiles\n\nstores:\n  native:\n    type: local\n    path: ..\n".to_vec()),
+            (PathBuf::from("config.yaml"), b"schema_version: 2\ndefault_profile: base\n\nprofile_discovery:\n  paths:\n    - ./profiles\n\nstores:\n  native:\n    type: local\n    properties:\n      path: ..\n".to_vec()),
             (PathBuf::from("profiles"), b"directory".to_vec()),
             (PathBuf::from("profiles/base.yaml"), b"schema_version: 1\nid: base\nresources: {}\n".to_vec()),
         ]

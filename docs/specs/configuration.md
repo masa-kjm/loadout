@@ -2,7 +2,7 @@
 
 ## Scope
 
-This specification defines the machine-local runtime configuration, the portable environment configuration, local stores, and path syntax for v0.2.0.
+This specification defines the machine-local runtime configuration, the portable environment configuration, local stores, and path syntax for v0.3.0.
 It does not define profile files or resource behavior; see [Profiles](profiles.md) and [File Links](file-link.md).
 
 ## Runtime Locations
@@ -53,7 +53,7 @@ The generated environment configuration uses `..` as the local-store root, so na
 Initialization does not select the generated configuration; use `--config ./.loadout/config.yaml` when invoking a declaration command.
 
 ```yaml
-schema_version: 1
+schema_version: 2
 default_profile: workstation
 
 profile_discovery:
@@ -63,10 +63,12 @@ profile_discovery:
 stores:
   dotfiles:
     type: local
-    path: .
+    properties:
+      path: .
 ```
 
-`schema_version`, `profile_discovery`, and `stores` are REQUIRED.
+`schema_version` is REQUIRED and must be `2`.
+`profile_discovery` and `stores` are REQUIRED.
 `default_profile` is optional.
 Unknown fields are errors at every object level.
 
@@ -87,25 +89,30 @@ A duplicate profile ID is an error that reports every defining file.
 
 `stores` is an object keyed by store ID.
 A store ID uses the same identifier grammar as a profile ID.
-The only v0.2.0 store type is `local`.
+The only v0.3.0 store type is `local`.
 
 ```yaml
 stores:
   dotfiles:
     type: local
-    path: ~/src/dotfiles
+    properties:
+      path: ~/src/dotfiles
 ```
 
-For `type: local`, `path` is REQUIRED and identifies an existing directory.
+Every store declaration has a REQUIRED `type` and a REQUIRED `properties` object.
+`properties` is type-specific: unknown fields are errors, and a property valid for one type is not implicitly valid for another type.
+Unknown store types are errors.
+
+For `type: local`, `properties.path` is REQUIRED and identifies an existing directory.
 The store path may be absolute, home-relative, or relative to the environment configuration file.
 It may contain `..` because it is a configuration-level root path.
 
 The resolved store root is used only to read source assets.
-Loadout MUST NOT modify its contents while resolving, planning, applying, or recovering a v0.2.0 resource.
+Loadout MUST NOT modify its contents while resolving, planning, applying, or recovering a v0.3.0 resource.
 
 ## Path Syntax
 
-Configuration-level paths are `config_path`, `profile_discovery.paths[*]`, and `stores.*.path`.
+Configuration-level paths are `config_path`, `profile_discovery.paths[*]`, and `stores.*.properties.path` for a local store.
 They accept absolute paths, `~/` paths, and paths relative to the environment configuration file or runtime configuration file as specified above.
 Environment variables other than the leading `~/` form are not expanded.
 On Windows, an absolute configuration-level path uses the same normal DOS or ordinary UNC representation as resolved file-link paths; verbatim and device namespaces are rejected as defined in [Windows Path Representation](file-link.md#windows-path-representation).

@@ -25,7 +25,7 @@ The following matrix is the minimum evidence required before v0.3.0 is considere
 
 | Contract owner | Required evidence |
 | --- | --- |
-| [Configuration](../specs/configuration.md) | Runtime and CLI configuration selection; path-base resolution; unknown-field rejection; duplicate profile IDs; store roots remain unchanged. |
+| [Configuration](../specs/configuration.md) | Runtime and CLI configuration selection; path-base resolution; store-type-specific property validation and unknown-field rejection; duplicate profile IDs; store roots remain unchanged. |
 | [Profiles](../specs/profiles.md) | Include order; cycle and missing-ID rejection; deduplication through multiple paths; fully qualified identity; target-collision rejection; deterministic ordering independent of input-map iteration. |
 | [File Links](../specs/file-link.md) | Create, no-op, replace, relocate, remove, forget-missing, and managed identity-handoff outcomes; observed unmanaged-target rejection and the external-concurrency limits; wrong-link and regular-file conflicts; parent-escape rejection; source and target containment; no parent removal. |
 | [Lifecycle](../specs/lifecycle.md) | Every Desired/Known/Actual table row; blocked Plans and preflight failures perform no new planned target mutation; preflight failure creates no new operation record; permitted prior-operation recovery cleanup and state commits are asserted separately; executor recheck rejects observable changes since planning; phase ordering; contiguous relocation; and stop-after-failure behavior. |

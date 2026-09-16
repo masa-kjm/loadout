@@ -8,7 +8,7 @@ Architecture documents define responsibility boundaries; they do not replace the
 
 - [Configuration](configuration.md) defines machine-local runtime configuration, portable environment configuration, stores, and path syntax.
 - [Profiles](profiles.md) defines profile discovery, profile composition, resource declarations, and semantic validation.
-- [File Links](file-link.md) defines the only v0.2.0 resource type and its ownership and filesystem-safety contract.
+- [File Links](file-link.md) defines the only v0.3.0 resource type and its ownership and filesystem-safety contract.
 - [Lifecycle](lifecycle.md) defines validation, planning, preflight, application, deterministic ordering, and the Desired/Known/Actual transition table.
 - [State and Recovery](state-and-recovery.md) defines durable Known state, operation records, locking, atomic commits, and crash recovery.
 - [CLI](cli.md) defines the v0.3.0 command surface, confirmation behavior, and exit status classes.
@@ -21,4 +21,5 @@ An implementation that does not satisfy a MUST or MUST NOT requirement is not a 
 
 ## Version Scope
 
-All schemas in this directory begin at version `1`.
+Runtime configuration and profile documents use schema version `1`.
+Portable environment configuration uses schema version `2`.

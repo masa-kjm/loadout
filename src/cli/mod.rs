@@ -217,7 +217,7 @@ mod tests {
                 fs::create_dir(root.join(dir)).unwrap();
             }
             fs::write(root.join("store/source"), "source").unwrap();
-            fs::write(root.join("config.yaml"), "schema_version: 1\ndefault_profile: base\nprofile_discovery:\n  paths: [profiles]\nstores:\n  files:\n    type: local\n    path: store\n").unwrap();
+            fs::write(root.join("config.yaml"), "schema_version: 2\ndefault_profile: base\nprofile_discovery:\n  paths: [profiles]\nstores:\n  files:\n    type: local\n    properties:\n      path: store\n").unwrap();
             fs::write(root.join("profiles/base.yaml"), "schema_version: 1\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/absent-parent/target\n").unwrap();
             Self { root }
         }

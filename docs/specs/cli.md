@@ -8,6 +8,22 @@ Commands not listed here are not part of v0.2.0.
 The CLI parses input, presents diagnostics and plans, obtains confirmation, and maps outcomes to exit status.
 It does not make ownership, planner, filesystem, or state decisions outside the lifecycle.
 
+## Help and Version
+
+```text
+loadout --help
+loadout help [<command>]
+loadout <command> --help
+loadout --version
+```
+
+The help forms write a human-readable command summary to standard output and exit with status `0`.
+They do not read configuration, profiles, stores, targets, state, or runtime locations, and they perform no mutation.
+Help wording and layout are not machine-readable contracts.
+
+`--version` writes `loadout <package-version>` followed by a newline to standard output and exits with status `0`.
+It performs no configuration, state, or filesystem access.
+
 ## Declaration-Selection Options
 
 The commands that operate on portable declarations accept:

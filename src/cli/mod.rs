@@ -9,6 +9,7 @@ use crate::application::queries::{
 use crate::loader::{LoadError, MachinePaths, StatePaths};
 use crate::state::repository::StateRepository;
 use args::Command;
+use clap::error::ErrorKind;
 use std::{
     io::{self, IsTerminal, Write},
     process::ExitCode,
@@ -33,9 +34,16 @@ fn run_with(
 ) -> io::Result<u8> {
     let command = match args::parse(args) {
         Ok(command) => command,
-        Err(message) => {
-            writeln!(err, "input error: {message}")?;
-            return Ok(2);
+        Err(error) => {
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) {
+                write!(out, "{error}")?;
+                return Ok(0);
+            }
+            writeln!(err, "input error: {error}")?;
+            return Ok(error.exit_code() as u8);
         }
     };
     if command == Command::Diff {
@@ -331,5 +339,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn help_and_version_are_successful_stdout_only_requests() {
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+        assert_eq!(
+            run_with(
+                ["--help"].into_iter().map(std::ffi::OsString::from),
+                &mut output,
+                &mut errors,
+            )
+            .unwrap(),
+            0
+        );
+        let help = String::from_utf8(output).unwrap();
+        assert!(help.contains("validate"));
+        assert!(help.contains("plan"));
+        assert!(help.contains("apply"));
+        assert!(help.contains("diff"));
+        assert!(errors.is_empty());
+
+        for (arguments, expected_usage) in [
+            (vec!["help", "plan"], "Usage: loadout plan"),
+            (vec!["validate", "--help"], "Usage: loadout validate"),
+        ] {
+            let mut output = Vec::new();
+            assert_eq!(
+                run_with(
+                    arguments.into_iter().map(std::ffi::OsString::from),
+                    &mut output,
+                    &mut errors,
+                )
+                .unwrap(),
+                0
+            );
+            assert!(String::from_utf8(output).unwrap().contains(expected_usage));
+            assert!(errors.is_empty());
+        }
+
+        let mut output = Vec::new();
+        assert_eq!(
+            run_with(
+                ["--version"].into_iter().map(std::ffi::OsString::from),
+                &mut output,
+                &mut errors,
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            format!("loadout {}\n", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(errors.is_empty());
     }
 }

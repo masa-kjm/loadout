@@ -1,5 +1,10 @@
 use std::ffi::OsString;
 
+use clap::{
+    Args, ColorChoice, Parser, Subcommand,
+    error::{Error, ErrorKind},
+};
+
 #[derive(Debug, PartialEq)]
 pub(super) enum Command {
     Validate {
@@ -20,78 +25,168 @@ pub(super) enum Command {
     Diff,
 }
 
-pub(super) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
-    let mut args = args.into_iter();
-    let command = args
-        .next()
-        .ok_or("expected validate, diff, plan, or apply")?;
-    let name = command.to_str().ok_or("command must be UTF-8")?;
-    if name == "diff" {
-        return if args.next().is_none() {
-            Ok(Command::Diff)
-        } else {
-            Err("diff accepts no arguments".into())
-        };
+#[derive(Parser)]
+#[command(
+    name = "loadout",
+    version,
+    about = "Converge local environments from explicit desired state.",
+    color = ColorChoice::Never
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: ParsedCommand,
+}
+
+#[derive(Subcommand)]
+enum ParsedCommand {
+    #[command(about = "Validate declarations without inspecting managed targets.")]
+    Validate(ValidateArgs),
+    #[command(about = "Show the actions needed to converge a profile.")]
+    Plan(ProfileArgs),
+    #[command(about = "Converge a profile after safety checks and confirmation.")]
+    Apply(ApplyArgs),
+    #[command(about = "Report drift between recorded state and managed targets.")]
+    Diff,
+}
+
+#[derive(Args)]
+struct ProfileArgs {
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Select the portable environment configuration file."
+    )]
+    config: Option<OsString>,
+    #[arg(value_name = "PROFILE-ID", help = "Select the root profile by its ID.")]
+    root: Option<String>,
+}
+
+#[derive(Args)]
+struct ValidateArgs {
+    #[command(flatten)]
+    profile: ProfileArgs,
+    #[arg(
+        long,
+        conflicts_with = "root",
+        help = "Validate every discovered profile as a root."
+    )]
+    all: bool,
+}
+
+#[derive(Args)]
+struct ApplyArgs {
+    #[command(flatten)]
+    profile: ProfileArgs,
+    #[arg(long, help = "Proceed without an interactive confirmation prompt.")]
+    yes: bool,
+    #[arg(
+        long,
+        help = "Run the apply lifecycle without changing persistent state."
+    )]
+    dry_run: bool,
+}
+
+pub(super) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, clap::Error> {
+    let cli = Cli::try_parse_from(std::iter::once(OsString::from("loadout")).chain(args))?;
+    let command = match cli.command {
+        ParsedCommand::Validate(args) => Command::Validate {
+            config: args.profile.config,
+            root: args.profile.root,
+            all: args.all,
+        },
+        ParsedCommand::Plan(args) => Command::Plan {
+            config: args.config,
+            root: args.root,
+        },
+        ParsedCommand::Apply(args) => Command::Apply {
+            config: args.profile.config,
+            root: args.profile.root,
+            yes: args.yes,
+            dry_run: args.dry_run,
+        },
+        ParsedCommand::Diff => Command::Diff,
+    };
+    if command
+        .config()
+        .is_some_and(|config| config.as_os_str().is_empty())
+    {
+        return Err(Error::raw(
+            ErrorKind::InvalidValue,
+            "--config requires a path",
+        ));
     }
-    if name != "validate" && name != "plan" && name != "apply" {
-        return Err(format!("unknown command: {name}"));
-    }
-    let mut config = None;
-    let mut root = None;
-    let mut all = false;
-    let mut yes = false;
-    let mut dry_run = false;
-    while let Some(arg) = args.next() {
-        if arg == "--config" {
-            if config.is_some() {
-                return Err("--config may only be specified once".into());
-            }
-            let value = args.next().ok_or("--config requires a path")?;
-            if value.is_empty() || value.to_str().is_some_and(|v| v.starts_with("--")) {
-                return Err("--config requires a path".into());
-            }
-            config = Some(value);
-        } else if arg == "--all" && name == "validate" {
-            if all {
-                return Err("--all may only be specified once".into());
-            }
-            all = true;
-        } else if name == "apply" && (arg == "--yes" || arg == "--dry-run") {
-            let flag = if arg == "--yes" {
-                &mut yes
-            } else {
-                &mut dry_run
-            };
-            if *flag {
-                return Err(format!(
-                    "{} may only be specified once",
-                    arg.to_string_lossy()
-                ));
-            }
-            *flag = true;
-        } else {
-            let value = arg.into_string().map_err(|_| "profile ID must be UTF-8")?;
-            if value.starts_with('-') {
-                return Err(format!("unknown option: {value}"));
-            }
-            if root.replace(value).is_some() {
-                return Err("only one root profile ID is allowed".into());
-            }
+    Ok(command)
+}
+
+impl Command {
+    fn config(&self) -> Option<&OsString> {
+        match self {
+            Self::Validate { config, .. }
+            | Self::Plan { config, .. }
+            | Self::Apply { config, .. } => config.as_ref(),
+            Self::Diff => None,
         }
     }
-    if all && root.is_some() {
-        return Err("--all cannot be combined with a root profile ID".into());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_strings(args: &[&str]) -> Result<Command, clap::Error> {
+        parse(args.iter().map(OsString::from))
     }
-    Ok(if name == "validate" {
-        Command::Validate { config, root, all }
-    } else if name == "apply" {
-        Command::Apply {
-            config,
-            root,
-            yes,
-            dry_run,
+
+    #[test]
+    fn parses_each_supported_command() {
+        assert_eq!(
+            parse_strings(&["validate", "--config", "config.yaml", "base"]).unwrap(),
+            Command::Validate {
+                config: Some(OsString::from("config.yaml")),
+                root: Some("base".into()),
+                all: false,
+            }
+        );
+        assert_eq!(
+            parse_strings(&["validate", "--all"]).unwrap(),
+            Command::Validate {
+                config: None,
+                root: None,
+                all: true,
+            }
+        );
+        assert_eq!(
+            parse_strings(&["plan", "base", "--config", "config.yaml"]).unwrap(),
+            Command::Plan {
+                config: Some(OsString::from("config.yaml")),
+                root: Some("base".into()),
+            }
+        );
+        assert_eq!(
+            parse_strings(&["apply", "--yes", "--dry-run"]).unwrap(),
+            Command::Apply {
+                config: None,
+                root: None,
+                yes: true,
+                dry_run: true,
+            }
+        );
+        assert_eq!(parse_strings(&["diff"]).unwrap(), Command::Diff);
+    }
+
+    #[test]
+    fn rejects_invalid_command_shapes() {
+        for args in [
+            vec![],
+            vec!["unknown"],
+            vec!["diff", "--config", "config.yaml"],
+            vec!["validate", "--all", "base"],
+            vec!["validate", "--config"],
+            vec!["validate", "--config", ""],
+            vec!["plan", "first", "second"],
+            vec!["apply", "--yes", "--yes"],
+        ] {
+            assert!(parse_strings(&args).is_err(), "{args:?} must reject");
         }
-    } else {
-        Command::Plan { config, root }
-    })
+    }
 }

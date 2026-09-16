@@ -3,7 +3,7 @@
 ## Purpose
 
 These boundaries keep safety decisions in one place and prevent the command layer, resource implementations, and persistence code from making incompatible decisions.
-They apply to every v0.2 implementation, including tests and future resource types.
+They apply to every v0.3 implementation, including tests, authoring commands, and future resource types.
 
 ## Decision Ownership
 
@@ -38,7 +38,7 @@ For example, a planned create must not become a replacement because an unexpecte
 ## Ownership and Removal
 
 Known state alone never authorizes a destructive filesystem action.
-For the v0.2.0 file-link resource, removal or replacement is permitted only when both conditions hold:
+For the v0.3.0 file-link resource, removal or replacement is permitted only when both conditions hold:
 
 1. Known state records Loadout's expected link for the resource.
 2. Actual inspection confirms that the target is that expected link.
@@ -48,7 +48,7 @@ The executor must reject that observed condition before the next mutation step. 
 
 The [File Links](../specs/file-link.md) specification defines which target-parent conditions are unsafe and the required no-follow proof on each supported platform.
 
-v0.2.0 has no forceful takeover of an unmanaged target.
+v0.3.0 has no forceful takeover of an unmanaged target.
 Explicit transfer-of-ownership behavior, if ever introduced, requires its own specification and confirmation contract.
 
 ## Filesystem Mutation
@@ -63,6 +63,15 @@ The detailed algorithms and supported platform behavior belong to the file-link 
 The executor must address only the resolved target and exact recorded temporary named by the action. This addressing constraint does not promise protection against external substitution or parent movement after the last recheck.
 It must not write to Loadout control files, state files, lock files, profiles, or store contents as a side effect of materializing a resource.
 
+## Authoring Boundary
+
+An authoring command is outside the Desired/Known/Actual lifecycle and must not use that status to authorize a control-file write.
+It has its own explicit filesystem, collision, durability, and failure-after-effects contract.
+
+`init` is the only v0.3.0 authoring command.
+It may create a complete, previously absent `.loadout` bundle in the current directory, but it must not edit an existing control file, initialize version control, modify native assets, acquire the state lock, or write state.
+All lifecycle commands, resource implementations, and the state repository remain forbidden from writing Loadout control files.
+
 ## State and Failure Boundaries
 
 The state repository is the only authority that writes durable Known state.
@@ -72,7 +81,7 @@ Apply records durable progress before a resource mutation and commits Known stat
 If execution stops, a resource without a confirmed post-condition is uncertain rather than successful.
 The next apply observes actual state and creates a new plan; it does not blindly resume an old plan.
 
-v0.2.0 does not promise rollback of already verified resource actions.
+v0.3.0 does not promise rollback of already verified resource actions.
 Failure cleanup must not remove user-visible artifacts other than Loadout's own temporary files.
 
 ## Schema-Version Boundary
@@ -82,7 +91,7 @@ A command must reject an unsupported version before an inspection, planning deci
 A command need not read or validate a persisted control document that its operation does not depend on.
 It must not ignore unknown ordering, ownership, recovery, or resource-effect data in order to continue.
 
-Schema migration is outside the v0.2.0 executable surface.
+Schema migration is outside the v0.3.0 executable surface.
 When introduced, it must be an explicit operation rather than an implicit step of validation, planning, application, or inspection.
 State migration must hold the state repository's exclusive lock and require `active_operation == null`.
 An active or uncertain operation must be recovered and closed by the binary that implements its original state contract before migration.
@@ -104,4 +113,4 @@ Future resource types must use the same ownership, inspection, planning, executi
 They may not add a shortcut from command code to filesystem mutation or from a resource handler to durable state.
 
 The architecture does not require every future concept to be an abstraction today.
-v0.2.0 implements the file-link lifecycle completely first and adds a shared abstraction only when multiple implemented resource types need it.
+v0.3.0 implements the file-link lifecycle completely first and adds a shared abstraction only when multiple implemented resource types need it.

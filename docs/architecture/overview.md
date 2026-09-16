@@ -8,13 +8,13 @@ It converges a machine toward the desired resource set produced by one composed 
 Loadout owns profile composition, resource lifecycle planning, local state, conflict detection, and the safe mutation of supported resources.
 It does not reimplement package managers, runtime version resolution, secret management, or the side-effect guarantees of arbitrary commands.
 
-## v0.2.0 Core
+## v0.3.0 Core
 
-v0.2.0 establishes the lifecycle architecture with one supported resource implementation: a single file from a local store materialized as a link at a target path.
-The architecture is intentionally prepared for additional resource types, but task resources, copy operations, directory resources, remote stores, and parameters are not part of the v0.2.0 executable surface.
+v0.3.0 retains the lifecycle architecture with one supported resource implementation: a single file from a local store materialized as a link at a target path.
+The architecture is intentionally prepared for additional resource types, but task resources, copy operations, directory resources, remote stores, and parameters are not part of the v0.3.0 executable surface.
 
 The first implementation must prefer a narrow, complete file-link lifecycle over generic extension mechanisms.
-In particular, v0.2.0 does not expose an external resource-plugin API.
+In particular, v0.3.0 does not expose an external resource-plugin API.
 
 ## System Model
 
@@ -46,7 +46,7 @@ Resolved Desired ----+---- Known State Repository
 ```
 
 The command layer invokes this flow, presents diagnostics, obtains confirmation when required, and maps results to output and exit status.
-The application workflow coordinates the lifecycle calls in the required [Lifecycle](../specs/lifecycle.md) order. v0.2.0 does not require this coordination to be a separate subsystem: it may remain in the command implementation or move to an internal use case. In either form, coordination does not make resource-ownership, path-safety, planning, or durable-state decisions.
+The application workflow coordinates the lifecycle calls in the required [Lifecycle](../specs/lifecycle.md) order. v0.3.0 does not require this coordination to be a separate subsystem: it may remain in the command implementation or move to an internal use case. In either form, coordination does not make resource-ownership, path-safety, planning, or durable-state decisions.
 The read-only `diff` command uses the same Actual observation model to compare Known and Actual state without resolving Desired state or invoking the planner.
 
 ## Core Data Model
@@ -108,10 +108,10 @@ If a recheck fails, the executor aborts the action; it does not reinterpret the 
 
 ### Determinism
 
-Apply is sequential in v0.2.0.
+Apply is sequential in v0.3.0.
 Execution order must not depend on a YAML mapping iteration order or an implementation collection order.
 The lifecycle specification will define the stable phase order and the fully qualified resource-ID ordering within each phase.
-v0.2.0 does not expose resource IDs or declaration position as an ordering control.
+v0.3.0 does not expose resource IDs or declaration position as an ordering control.
 A future dependency model may constrain action order, but independent actions must retain a canonical deterministic tie-breaker.
 
 ## Responsibilities

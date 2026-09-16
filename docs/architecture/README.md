@@ -1,6 +1,6 @@
 # Architecture
 
-This directory defines the v0.2 system model and the boundaries that keep its planning, mutation, and durable-state responsibilities separate.
+This directory defines the v0.3 system model and the boundaries that keep its planning, mutation, durable-state, and authoring responsibilities separate.
 It is authoritative for architecture only; it does not define YAML schemas, CLI syntax, filesystem algorithms, or the state format.
 
 ## Documents
@@ -10,7 +10,7 @@ It is authoritative for architecture only; it does not define YAML schemas, CLI 
 
 ## Architecture Commitments
 
-The following commitments apply throughout v0.2:
+The following commitments apply throughout v0.3:
 
 - The planner derives a plan from Resolved Desired, Known, and Actual state without performing I/O or mutation.
 - The executor performs only actions present in a plan and does not make a new planning decision.

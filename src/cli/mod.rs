@@ -6,6 +6,7 @@ mod render;
 use crate::application::queries::{
     self, DeclarationRequest, QueryError, ValidationRequest, ValidationSelection,
 };
+use crate::authoring::init;
 use crate::loader::{LoadError, MachinePaths, StatePaths};
 use crate::state::repository::StateRepository;
 use args::Command;
@@ -46,6 +47,29 @@ fn run_with(
             return Ok(error.exit_code() as u8);
         }
     };
+    if let Command::Init { dry_run } = command {
+        let current_directory = match std::env::current_dir() {
+            Ok(path) => path,
+            Err(error) => {
+                writeln!(err, "error: cannot determine current directory: {error}")?;
+                return Ok(1);
+            }
+        };
+        return match init::initialize(&current_directory, dry_run) {
+            Ok(report) => {
+                if report.dry_run() {
+                    writeln!(out, "would create {}", report.root().display())?;
+                } else {
+                    writeln!(out, "initialized {}", report.root().display())?;
+                }
+                Ok(0)
+            }
+            Err(error) => {
+                writeln!(err, "error: {error}")?;
+                Ok(error.exit_code())
+            }
+        };
+    }
     if command == Command::Diff {
         let paths = match StatePaths::from_environment() {
             Ok(paths) => paths,
@@ -71,6 +95,7 @@ fn run_command(
     err: &mut impl Write,
 ) -> io::Result<u8> {
     let result = match command {
+        Command::Init { .. } => unreachable!("init returns before machine path selection"),
         Command::Diff => queries::diff(
             &machine.home,
             &StateRepository::new(machine.state_directory.clone()),

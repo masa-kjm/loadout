@@ -1,14 +1,14 @@
 # Contributing to Loadout
 
-Loadout is being rebuilt for v0.2.0.
-Keep the default branch internally consistent, reviewable, and aligned with the authoritative v0.2.0 documentation.
+Loadout is being developed for v0.3.0.
+Keep the default branch internally consistent, reviewable, and aligned with the authoritative v0.3.0 documentation.
 
 v0.1 is retired and unsupported.
-The `v0.1.0` and `legacy/v0.1-final` tags are immutable historical archives, not compatibility targets or starting points for v0.2.0 work.
+The `v0.1.0` and `legacy/v0.1-final` tags are immutable historical archives, not compatibility targets or starting points for v0.3.0 work.
 
 ## Sources of Truth
 
-Before proposing or implementing a v0.2.0 behavior change, read the documents that own it:
+Before proposing or implementing a v0.3.0 behavior change, read the documents that own it:
 
 - [`docs/README.md`](docs/README.md) defines document authority and scope.
 - [`docs/architecture/`](docs/architecture/README.md) defines system responsibilities and architectural invariants.
@@ -16,7 +16,7 @@ Before proposing or implementing a v0.2.0 behavior change, read the documents th
 - [`docs/development/testing.md`](docs/development/testing.md) defines required test evidence.
 
 Architecture and specifications are authoritative.
-`docs/future/` is non-binding; it records constraints and promotion work for later capabilities but does not modify v0.2.0 behavior.
+`docs/future/` is non-binding; it records constraints and promotion work for later capabilities but does not modify v0.3.0 behavior.
 Draft material is exploratory and cannot override published documentation.
 
 ## Issues
@@ -45,7 +45,7 @@ Describe the observed failure or required behavior and its impact.
 ```
 
 For a filesystem mutation, state the target and source scope, ownership proof, preconditions, post-condition, dry-run behavior, failure aftermath, recovery behavior, and Unix/Windows expectations.
-Link the owning v0.2.0 specification and name intentional non-goals.
+Link the owning v0.3.0 specification and name intentional non-goals.
 
 ## Branches
 
@@ -56,11 +56,11 @@ Use lowercase kebab-case names and choose a prefix that describes the work:
 | --- | --- | --- |
 | User-visible feature | `feat/<description>` | `feat/file-link-create` |
 | Bug fix | `fix/<description>` | `fix/parent-safety-check` |
-| Documentation | `docs/<description>` | `docs/v0.2-cutover` |
+| Documentation | `docs/<description>` | `docs/v0.3-cutover` |
 | Refactoring | `refactor/<description>` | `refactor/planner-inputs` |
 | Tests | `test/<description>` | `test/recovery-contract` |
-| Tooling or maintenance | `chore/<description>` | `chore/v0.2-ci` |
-| Release preparation | `release/vX.Y.Z` | `release/v0.2.0` |
+| Tooling or maintenance | `chore/<description>` | `chore/v0.3-ci` |
+| Release preparation | `release/vX.Y.Z` | `release/v0.3.0` |
 
 Do not mix unrelated behavior changes in one branch.
 
@@ -78,10 +78,10 @@ Use scopes for responsibility or behavior areas, not issue numbers.
 Examples:
 
 ```text
-docs: promote v0.2 documentation and retire v0.1 docs
+docs: promote v0.3 documentation and retain v0.2 release docs
 feat(file-link): create a verified managed link
 test(recovery): retain an unprovable operation as uncertain
-ci: add v0.2 contract checks
+ci: add v0.3 contract checks
 ```
 
 Make each commit coherent and avoid drive-by formatting or unrelated refactors.
@@ -109,7 +109,7 @@ Before requesting review:
 
 For documentation-only work, at minimum run `git diff --check` and verify affected relative links.
 
-Once the v0.2.0 Rust package exists, run the relevant commands before handoff when the environment permits:
+Once the v0.3.0 Rust package exists, run the relevant commands before handoff when the environment permits:
 
 ```sh
 cargo fmt --all -- --check
@@ -121,7 +121,7 @@ Do not claim an unrun check passed.
 
 ## Releases and External State
 
-The v0.2.0 release contract is implemented by `.github/workflows/release.yml`.
+The v0.3.0 release contract is implemented by `.github/workflows/release.yml`.
 
 - The release version has one source: `Cargo.toml`.
 - A release tag MUST be an exact `vX.Y.Z` spelling of that package version and MUST point to a commit reachable from `main`.

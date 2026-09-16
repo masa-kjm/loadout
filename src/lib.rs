@@ -1,4 +1,4 @@
-//! Core contracts and lifecycle implementation for Loadout v0.2.
+//! Core contracts, lifecycle implementation, and authoring commands for Loadout v0.3.
 //!
 //! This library target does not yet provide a supported public Rust API.
 
@@ -30,6 +30,7 @@ mod state;
 #[cfg(test)]
 mod test_support;
 
+mod authoring;
 mod cli;
 mod loader;
 

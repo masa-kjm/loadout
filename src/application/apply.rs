@@ -1599,7 +1599,7 @@ mod tests {
         }
 
         fn request(&self, resources: &[(&str, &str)]) -> super::super::queries::DeclarationRequest {
-            self.write("config/environment.yaml", "schema_version: 1\ndefault_profile: base\nprofile_discovery:\n  paths: [../profiles]\nstores:\n  dotfiles:\n    type: local\n    path: ../store\n");
+            self.write("config/environment.yaml", "schema_version: 2\ndefault_profile: base\nprofile_discovery:\n  paths: [../profiles]\nstores:\n  dotfiles:\n    type: local\n    properties:\n      path: ../store\n");
             let mut profile = String::from("schema_version: 1\nid: base\nresources:");
             if resources.is_empty() {
                 profile.push_str(" {}\n");
@@ -1733,7 +1733,7 @@ mod tests {
             )
             .unwrap();
             let environment = EnvironmentConfig::parse(
-                "schema_version: 1\ndefault_profile: workstation\nprofile_discovery:\n  paths:\n    - ../profiles\nstores:\n  dotfiles:\n    type: local\n    path: ../store\n",
+                "schema_version: 2\ndefault_profile: workstation\nprofile_discovery:\n  paths:\n    - ../profiles\nstores:\n  dotfiles:\n    type: local\n    properties:\n      path: ../store\n",
             )
             .unwrap();
 

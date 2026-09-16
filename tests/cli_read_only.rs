@@ -67,7 +67,7 @@ impl Fixture {
         let default = default
             .map(|id| format!("default_profile: {id}\n"))
             .unwrap_or_default();
-        self.write("portable/config.yaml", &format!("schema_version: 1\n{default}profile_discovery:\n  paths: [profiles]\nstores:\n  files:\n    type: local\n    path: ../store\n"));
+        self.write("portable/config.yaml", &format!("schema_version: 2\n{default}profile_discovery:\n  paths: [profiles]\nstores:\n  files:\n    type: local\n    properties:\n      path: ../store\n"));
     }
     fn profile(&self, id: &str, resource: &str, target: &str) {
         self.write(&format!("portable/profiles/{id}.yaml"), &format!("schema_version: 1\nid: {id}\nresources:\n  {resource}:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: {target}\n"));
@@ -195,7 +195,7 @@ fn runtime_selection_and_default_config_fallback_resolve_their_own_bases() {
     );
     expect(f.run(&["validate"]), 0, &["base"]);
     // Default config files have their own relative store/discovery bases.
-    let environment = "schema_version: 1\ndefault_profile: base\nprofile_discovery:\n  paths: [../../portable/profiles]\nstores:\n  files:\n    type: local\n    path: ../../store\n";
+    let environment = "schema_version: 2\ndefault_profile: base\nprofile_discovery:\n  paths: [../../portable/profiles]\nstores:\n  files:\n    type: local\n    properties:\n      path: ../../store\n";
     f.write("config/loadout/config.yaml", environment);
     f.write("config/loadout/loadout.yaml", "schema_version: 1\n");
     expect(f.run(&["validate"]), 0, &["base"]);
@@ -446,6 +446,15 @@ fn selected_configuration_errors_are_reported_without_creating_state() {
         2,
         &["environment configuration"],
     );
+    f.write(
+        "portable/config.yaml",
+        "schema_version: 2\ndefault_profile: base\nprofile_discovery:\n  paths: [profiles]\nstores:\n  files:\n    type: local\n    path: ../store\n",
+    );
+    expect(
+        f.run(&["validate", "--config", "../portable/config.yaml"]),
+        2,
+        &["environment configuration"],
+    );
     expect(
         f.run(&["plan", "--config", "../missing.yaml"]),
         1,
@@ -460,9 +469,9 @@ fn native_absolute_store_and_discovery_paths_and_home_relative_selection_work() 
     f.write(
         "portable/config.yaml",
         &serde_yaml::to_string(&json!({
-            "schema_version":1,"default_profile":"base",
+            "schema_version":2,"default_profile":"base",
             "profile_discovery":{"paths":[f.path("portable/profiles")]},
-            "stores":{"files":{"type":"local","path":f.path("store")}}
+            "stores":{"files":{"type":"local","properties":{"path":f.path("store")}}}
         }))
         .unwrap(),
     );
@@ -487,7 +496,7 @@ fn native_absolute_store_and_discovery_paths_and_home_relative_selection_work() 
 fn dangling_runtime_selection_is_an_error_and_does_not_fall_back() {
     use std::os::unix::fs::symlink;
     let f = Fixture::new();
-    f.write("config/loadout/config.yaml", "schema_version: 1\ndefault_profile: base\nprofile_discovery:\n  paths: [../../portable/profiles]\nstores:\n  files:\n    type: local\n    path: ../../store\n");
+    f.write("config/loadout/config.yaml", "schema_version: 2\ndefault_profile: base\nprofile_discovery:\n  paths: [../../portable/profiles]\nstores:\n  files:\n    type: local\n    properties:\n      path: ../../store\n");
     symlink(
         f.path("missing-runtime"),
         f.path("config/loadout/loadout.yaml"),

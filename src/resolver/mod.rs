@@ -989,7 +989,7 @@ mod tests {
             .map(|path| format!("    - {path}\n"))
             .collect::<String>();
         EnvironmentConfig::parse(&format!(
-            "schema_version: 1\n{default_profile}profile_discovery:\n  paths:\n{discovery_paths}stores:\n  dotfiles:\n    type: local\n    path: {store_path}\n"
+            "schema_version: 2\n{default_profile}profile_discovery:\n  paths:\n{discovery_paths}stores:\n  dotfiles:\n    type: local\n    properties:\n      path: {store_path}\n"
         ))
         .unwrap()
     }
@@ -1003,7 +1003,7 @@ mod tests {
             .map(|path| format!("    - {path}\n"))
             .collect::<String>();
         EnvironmentConfig::parse(&format!(
-            "schema_version: 1\ndefault_profile: {default_profile}\nprofile_discovery:\n  paths:\n{discovery_paths}stores: {{}}\n"
+            "schema_version: 2\ndefault_profile: {default_profile}\nprofile_discovery:\n  paths:\n{discovery_paths}stores: {{}}\n"
         ))
         .unwrap()
     }

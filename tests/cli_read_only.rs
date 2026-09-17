@@ -510,5 +510,82 @@ fn dangling_runtime_selection_is_an_error_and_does_not_fall_back() {
     );
 }
 
+#[test]
+fn config_read_commands_report_selected_values_without_mutation() {
+    let f = Fixture::new();
+    f.write(
+        "config/loadout/loadout.yaml",
+        "schema_version: 1\nconfig_path: ../../portable/config.yaml\n",
+    );
+    let portable_path = f.path("portable/config.yaml");
+    let output = f.run(&["config", "path"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert_eq!(
+        output.stdout,
+        format!("{}\n", portable_path.display()).into_bytes()
+    );
+    assert!(output.stderr.is_empty());
+    expect(
+        f.run(&["config", "list"]),
+        0,
+        &[
+            &format!("configuration: {}", portable_path.display()),
+            "default_profile: base",
+            &format!(
+                "stores.files.properties.path: {}",
+                f.path("store").display()
+            ),
+        ],
+    );
+    expect(
+        f.run(&["config", "get", "default_profile"]),
+        0,
+        &["default_profile: base"],
+    );
+    expect(
+        f.run(&[
+            "config",
+            "get",
+            "--config",
+            "../portable/config.yaml",
+            "stores.files.properties.path",
+        ]),
+        0,
+        &[
+            &format!("configuration: {}", portable_path.display()),
+            &format!(
+                "stores.files.properties.path: {}",
+                f.path("store").display()
+            ),
+        ],
+    );
+    expect(
+        f.run(&["config", "get", "profile_discovery.paths"]),
+        2,
+        &["unsupported configuration field"],
+    );
+    expect(
+        f.run(&[
+            "config",
+            "path",
+            "--system",
+            "--config",
+            "../portable/config.yaml",
+        ]),
+        2,
+        &["input error"],
+    );
+    f.write("config/loadout/loadout.yaml", "invalid");
+    f.write("portable/config.yaml", "invalid");
+    let system_path = f.path("config/loadout/loadout.yaml");
+    let output = f.run(&["config", "path", "--system"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert_eq!(
+        output.stdout,
+        format!("{}\n", system_path.display()).into_bytes()
+    );
+    assert!(output.stderr.is_empty());
+}
+
 #[path = "support/apply.rs"]
 mod apply;

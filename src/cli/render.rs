@@ -1,11 +1,16 @@
-use crate::application::queries::{DiffReport, PlanReport, QueryError, ValidationReport};
+use crate::application::queries::{
+    ConfigurationReport, ConfigurationValue, DiffReport, PlanReport, QueryError, ValidationReport,
+};
 use crate::domain::{
     actual::TargetObservation,
     diagnostic::Diagnostic,
     plan::{ActionKind, ActionReason, Plan},
 };
 use crate::state::operation::ActionStatus;
-use std::io::{self, Write};
+use std::{
+    io::{self, Write},
+    path::Path,
+};
 
 pub(super) fn action_name(kind: ActionKind) -> &'static str {
     match kind {
@@ -203,5 +208,39 @@ pub(super) fn query_error(error: &QueryError) -> String {
         QueryError::Resolution(error) => error.to_string(),
         QueryError::State(error) => error.to_string(),
         QueryError::Inspection(error) => error.to_string(),
+        QueryError::ConfigField(field) => format!("unsupported configuration field: {field}"),
     }
+}
+
+pub(super) fn config_path(out: &mut impl Write, path: &Path) -> io::Result<u8> {
+    writeln!(out, "{}", path.display())?;
+    Ok(0)
+}
+
+pub(super) fn config_list(out: &mut impl Write, report: &ConfigurationReport) -> io::Result<u8> {
+    writeln!(out, "configuration: {}", report.configuration_path)?;
+    match &report.default_profile {
+        Some(profile) => writeln!(out, "default_profile: {profile}")?,
+        None => writeln!(out, "default_profile: <unset>")?,
+    }
+    for (store_id, path) in &report.stores {
+        writeln!(out, "stores.{store_id}.properties.path: {path}")?;
+    }
+    Ok(0)
+}
+
+pub(super) fn config_get(
+    out: &mut impl Write,
+    report: crate::application::queries::ConfigurationValueReport,
+    field: &str,
+) -> io::Result<u8> {
+    writeln!(out, "configuration: {}", report.configuration_path)?;
+    match report.value {
+        ConfigurationValue::DefaultProfile(profile) => match profile {
+            Some(profile) => writeln!(out, "default_profile: {profile}"),
+            None => writeln!(out, "default_profile: <unset>"),
+        },
+        ConfigurationValue::StorePath(path) => writeln!(out, "{field}: {path}"),
+    }?;
+    Ok(0)
 }

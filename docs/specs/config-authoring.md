@@ -9,16 +9,19 @@ They are not lifecycle commands and do not materialize resources.
 ## Commands
 
 ~~~
-loadout config path [--config <path>]
+loadout config path [--config <path> | --system]
 loadout config list [--config <path>]
 loadout config get [--config <path>] <field>
 loadout config use <path> [--yes]
 loadout config set [--config <path>] <field> <value> [--yes]
 ~~~
 
-config path reports the platform runtime loadout.yaml path and the effective portable configuration path.
-With --config, the reported portable path is that explicit path.
-It does not require either file to exist.
+config path writes exactly one resolved absolute path followed by a newline to standard output, with no label or other success output.
+By default, it reports the effective portable configuration path.
+With --config, it reports that explicit portable path.
+With --system, it reports the platform runtime loadout.yaml path without reading either configuration document.
+--system and --config conflict.
+Its output is a machine-readable path contract and is suitable for shell command substitution.
 
 config list and config get read the effective portable environment configuration, or the --config path when supplied.
 They parse and validate the complete document before reporting values.
@@ -57,7 +60,7 @@ config set applies the one typed change to the parsed document and validates the
 config path, config list, and config get do not acquire the state lock, inspect a resource target, create a directory, write state, recover an operation, or mutate any filesystem entry.
 They return status 0 on success, 2 for invalid input or an invalid/missing required configuration document, and 1 for an I/O failure.
 
-The output identifies the inspected file.
+The output identifies the inspected file, except that config path has the machine-readable single-path output defined above.
 config get identifies the field and typed resolved value.
 The default human-readable output is not a machine-readable API.
 

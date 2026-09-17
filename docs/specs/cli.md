@@ -57,7 +57,7 @@ It is an authoring command, not a lifecycle command, and its complete creation, 
 ### `loadout config`
 
 ```text
-loadout config path [--config <path>]
+loadout config path [--config <path> | --system]
 loadout config list [--config <path>]
 loadout config get [--config <path>] <field>
 loadout config use <path> [--yes]

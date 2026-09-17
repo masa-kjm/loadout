@@ -1,18 +1,18 @@
 ---
 name: test-design-loadout-v0-2
-description: Design Loadout v0.2 test evidence from authoritative contracts. Use when planning tests for lifecycle behavior, filesystem safety, state durability, recovery, CLI acceptance, or Unix and Windows conformance.
+description: Design Loadout v0.3 test evidence from authoritative contracts. Use when planning tests for lifecycle behavior, filesystem safety, state durability, recovery, CLI acceptance, or Unix and Windows conformance.
 ---
 
-# Design Loadout v0.2 Tests
+# Design Loadout v0.3 Tests
 
 Design evidence from contracts, not from the current implementation shape. Do not change code or tests unless the task explicitly requests implementation.
 
 ## Establish the contract
 
-1. Read `docs/README.md`, then the architecture, specification, and testing documents that own the requested behavior. Architecture and specifications are authoritative; `future/` and draft material do not define v0.2 behavior.
+1. Read `docs/README.md`, then the architecture, specification, and testing documents that own the requested behavior. Architecture and specifications are authoritative; `future/` and draft material do not define v0.3 behavior.
 2. Identify the observable outcome, owner, preconditions, post-condition, zero-mutation requirements, durable-state effect, failure aftermath, recovery behavior, and platform assumptions that apply.
 3. Select the narrowest test layer that proves the contract. Add executor integration or CLI acceptance evidence when behavior is observable through the lifecycle or command interface.
-4. Treat legacy tests and fixtures as historical material. Do not derive v0.2 expectations from them.
+4. Treat legacy tests and fixtures as historical material. Do not derive v0.3 expectations from them.
 
 ## Read the relevant design lenses
 

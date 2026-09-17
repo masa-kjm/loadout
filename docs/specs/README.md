@@ -13,6 +13,7 @@ Architecture documents define responsibility boundaries; they do not replace the
 - [State and Recovery](state-and-recovery.md) defines durable Known state, operation records, locking, atomic commits, and crash recovery.
 - [CLI](cli.md) defines the v0.3.0 command surface, confirmation behavior, and exit status classes.
 - [Initialization](init.md) defines the v0.3.0 authoring command that creates an initial portable environment bundle.
+- [Configuration Authoring](config-authoring.md) defines v0.3.0 configuration inspection, selection, and typed editing commands.
 
 ## Normative Language
 

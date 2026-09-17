@@ -2,7 +2,7 @@
 
 ## Scope
 
-This specification defines profile files, identifiers, include composition, resource declarations, and static validation for v0.2.0.
+This specification defines profile files, identifiers, include composition, resource declarations, and static validation for v0.3.0.
 It defines only the file-link resource declaration; see [File Links](file-link.md) for its runtime behavior.
 
 ## Identifiers
@@ -48,7 +48,7 @@ Unknown fields are errors at every object level.
 
 `resources` is an object keyed by resource ID.
 The resource value MUST contain `type` and `properties`.
-The only valid v0.2.0 type is `file`.
+The only valid v0.3.0 type is `file`.
 The `properties` object for that type is defined in [File Links](file-link.md).
 
 ## Includes
@@ -61,7 +61,7 @@ includes:
 ```
 
 `id` names a discovered profile.
-Includes do not accept parameters, aliases, conditional expressions, filesystem paths, or override directives in v0.2.0.
+Includes do not accept parameters, aliases, conditional expressions, filesystem paths, or override directives in v0.3.0.
 
 Loadout resolves includes with a depth-first traversal in the order written.
 It adds the including profile after its included profiles.

@@ -68,8 +68,10 @@ It must not write to Loadout control files, state files, lock files, profiles, o
 An authoring command is outside the Desired/Known/Actual lifecycle and must not use that status to authorize a control-file write.
 It has its own explicit filesystem, collision, durability, and failure-after-effects contract.
 
-`init` is the only v0.3.0 authoring command.
-It may create a complete, previously absent `.loadout` bundle in the current directory, but it must not edit an existing control file, initialize version control, modify native assets, acquire the state lock, or write state.
+`init`, `config use`, and `config set` are v0.3.0 authoring commands.
+`init` may create a complete, previously absent `.loadout` bundle in the current directory, but it must not edit an existing control file, initialize version control, modify native assets, acquire the state lock, or write state.
+`config use` may change only the machine-local runtime selection, and `config set` may change only the one portable configuration field authorized by the Configuration Authoring specification.
+Neither command may acquire the state lock, write state, mutate a store or resource target, or authorize ownership adoption.
 All lifecycle commands, resource implementations, and the state repository remain forbidden from writing Loadout control files.
 
 ## State and Failure Boundaries

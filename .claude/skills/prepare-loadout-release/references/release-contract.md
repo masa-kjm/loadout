@@ -16,7 +16,7 @@ The target tag must be an exact `vX.Y.Z` spelling of the package version and poi
 
 ## Distribution boundary
 
-The v0.2.0 workflow publishes archive assets only. It builds the `loadout` binary and includes `README.md`, `LICENSE`, and `CHANGELOG.md` for these targets:
+The v0.3.0 workflow publishes archive assets only. It builds the `loadout` binary and includes `README.md`, `LICENSE`, and `CHANGELOG.md` for these targets:
 
 - `x86_64-unknown-linux-gnu`
 - `aarch64-unknown-linux-gnu`

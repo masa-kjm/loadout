@@ -2,8 +2,8 @@
 
 ## Scope
 
-This specification defines v0.2.0 durable state, operation records, exclusive locking, atomic commits, and recovery after interruption.
-It applies only to the v0.2.0 file-link lifecycle.
+This specification defines v0.3.0 durable state, operation records, exclusive locking, atomic commits, and recovery after interruption.
+It applies only to the v0.3.0 file-link lifecycle.
 
 ## State Files
 
@@ -15,7 +15,7 @@ state.lock
 ```
 
 `state.json` is UTF-8 JSON.
-If it does not exist, Loadout starts with an empty v0.2.0 state.
+If it does not exist, Loadout starts with an empty v0.3.0 state.
 The state directory and lock file may be created by a non-dry-run apply.
 
 If `state.json` is unreadable, invalid JSON, has an unsupported schema version, or violates an invariant, Loadout MUST abort before it inspects a managed target or creates a mutation.
@@ -72,7 +72,7 @@ It is not a substitute for actual filesystem inspection before a later destructi
 Their hash input is the UTF-8 encoding of a JSON Canonicalization Scheme (JCS; RFC 8785) value.
 They MUST NOT be derived from YAML, JSON, or other source-document serialization.
 
-For a v0.2.0 file-link resource, the canonical value for `definition_hash` is exactly this object, using the resource's resolved values:
+For a v0.3.0 file-link resource, the canonical value for `definition_hash` is exactly this object, using the resource's resolved values:
 
 ```json
 {
@@ -113,7 +113,7 @@ Its `resources` array contains resource objects sorted lexicographically by `res
 
 `resource_id` is the fully qualified resource ID and is a `desired_hash` input only.
 Document schema versions, store IDs, profile-discovery order, raw declaration syntax, and source file content are not hash inputs.
-The v0.2.0 state schema fixes these canonical representations.
+The v0.3.0 state schema fixes these canonical representations.
 Changing either representation requires a new state schema and explicit migration; Loadout MUST NOT silently recalculate an existing hash with a different representation.
 
 ## Operation Record
@@ -254,4 +254,4 @@ An operator may correct the filesystem manually.
 A later apply re-runs recovery and proceeds only if every formerly uncertain action can then be proven successful or failed by its recorded conditions. For `create_link`, only the recorded missing precondition can close an uncertain action; a matching link remains open.
 
 Verified actions from before a failure remain in Known state.
-v0.2.0 does not roll them back.
+v0.3.0 does not roll them back.

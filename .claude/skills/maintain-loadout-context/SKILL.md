@@ -1,11 +1,11 @@
 ---
 name: maintain-loadout-context
-description: Maintain Loadout v0.2 documentation and project skills without changing their authority boundaries. Use when updating docs, navigation, agent instructions, or source skills and their generated discovery copies.
+description: Maintain Loadout v0.3 documentation and project skills without changing their authority boundaries. Use when updating docs, navigation, agent instructions, or source skills and their generated discovery copies.
 ---
 
-# Maintain Loadout Context
+# Maintain Loadout v0.3 Context
 
-Keep documentation and project skills accurate, discoverable, and derived from the authoritative v0.2 contracts. Do not use this skill to choose an unresolved product behavior or to implement a code-only change with no documentation or skill impact.
+Keep documentation and project skills accurate, discoverable, and derived from the authoritative v0.3 contracts. Do not use this skill to choose an unresolved product behavior or to implement a code-only change with no documentation or skill impact.
 
 ## Identify the maintenance surface
 
@@ -23,7 +23,7 @@ Keep documentation and project skills accurate, discoverable, and derived from t
 ## Update project skills
 
 - Treat `.claude/skills/` as source and `.agents/skills/` as generated Codex discovery output. Do not edit generated copies directly.
-- Keep `AGENTS.md` and `CONTRIBUTING.md` as derived guidance. They may explain authority and workflow but must not redefine v0.2 behavior.
+- Keep `AGENTS.md` and `CONTRIBUTING.md` as derived guidance. They may explain authority and workflow but must not redefine v0.3 behavior.
 - Keep a skill narrow. It may route to authoritative documents, but it must not duplicate or silently alter their normative rules.
 - When creating or materially restructuring a skill, use the active environment's skill-creation guidance when available. Keep only references and scripts that improve a real recurring workflow.
 - Synchronize source skills with `scripts/sync-codex-skills.sh`. Do not use `--prune` unless removal of each managed generated skill is in scope.

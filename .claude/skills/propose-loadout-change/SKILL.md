@@ -1,6 +1,6 @@
 ---
 name: propose-loadout-change
-description: Draft evidence-based Loadout v0.2 issue, commit, and pull-request text. Use when proposing an issue or its acceptance criteria, naming a commit or branch, or preparing a pull-request title and body.
+description: Draft evidence-based Loadout v0.3 issue, commit, and pull-request text. Use when proposing an issue or its acceptance criteria, naming a commit or branch, or preparing a pull-request title and body.
 ---
 
 # Propose Loadout Changes
@@ -11,7 +11,7 @@ Git is required when the requested text describes an existing change. GitHub loo
 
 ## Gather evidence
 
-1. Read `CONTRIBUTING.md` and the documents that own the proposed behavior. For v0.2 behavior, architecture, and test evidence, start from `docs/README.md`.
+1. Read `CONTRIBUTING.md` and the documents that own the proposed behavior. For v0.3 behavior, architecture, and test evidence, start from `docs/README.md`.
 2. For a commit, branch, or pull-request proposal, read the current branch name, supplied title, and diff against the proposed base. Inspect changed paths and relevant diff; do not infer intent from a branch name alone.
 3. For an issue proposal, establish the problem, affected contract, intended user-visible outcome, safety or compatibility implications, and testable non-goals. Do not invent an implementation, test result, or issue number.
 4. When an actual linked issue is supplied, inspect it read-only before claiming that a change addresses it. Invoke `gh` through `bash -lic` as required by `AGENTS.md`. If it is unavailable, unauthenticated, or the issue cannot be read, state that limitation and continue from the available local evidence.

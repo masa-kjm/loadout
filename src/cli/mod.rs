@@ -142,6 +142,49 @@ fn run_command(
             queries::plan_request(&DeclarationRequest { context, root })
                 .map(|report| render::plan(out, err, &report))
         }
+        Command::Config(command) => return run_config(command, machine, out, err),
+    };
+    render_result(result, err)
+}
+
+fn run_config(
+    command: args::ConfigCommand,
+    machine: &MachinePaths,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> io::Result<u8> {
+    let result = match command {
+        args::ConfigCommand::Path { config, system } => {
+            if system {
+                return render::config_path(
+                    out,
+                    &machine.runtime_directory.as_ref().join("loadout.yaml"),
+                );
+            }
+            let context = match machine.select(config.as_deref()) {
+                Ok(context) => context,
+                Err(error) => return load_error(err, error),
+            };
+            Ok(render::config_path(
+                out,
+                context.environment_config_path().as_ref(),
+            ))
+        }
+        args::ConfigCommand::List { config } => {
+            let context = match machine.select(config.as_deref()) {
+                Ok(context) => context,
+                Err(error) => return load_error(err, error),
+            };
+            queries::configuration_report(&context).map(|report| render::config_list(out, &report))
+        }
+        args::ConfigCommand::Get { config, field } => {
+            let context = match machine.select(config.as_deref()) {
+                Ok(context) => context,
+                Err(error) => return load_error(err, error),
+            };
+            queries::configuration_value(&context, &field)
+                .map(|value| render::config_get(out, value, &field))
+        }
     };
     render_result(result, err)
 }
@@ -175,7 +218,7 @@ fn query_exit_code(error: &QueryError) -> u8 {
             1
         }
         QueryError::Resolution(error) => resolver_exit_code(error),
-        QueryError::Configuration(_) => 2,
+        QueryError::Configuration(_) | QueryError::ConfigField(_) => 2,
     }
 }
 

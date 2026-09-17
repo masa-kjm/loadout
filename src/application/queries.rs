@@ -46,6 +46,25 @@ pub(crate) struct PlanReport {
 }
 
 #[derive(Debug)]
+pub(crate) struct ConfigurationReport {
+    pub(crate) configuration_path: crate::domain::paths::ResolvedPath,
+    pub(crate) default_profile: Option<String>,
+    pub(crate) stores: Vec<(String, crate::domain::paths::ResolvedPath)>,
+}
+
+#[derive(Debug)]
+pub(crate) enum ConfigurationValue {
+    DefaultProfile(Option<String>),
+    StorePath(crate::domain::paths::ResolvedPath),
+}
+
+#[derive(Debug)]
+pub(crate) struct ConfigurationValueReport {
+    pub(crate) configuration_path: crate::domain::paths::ResolvedPath,
+    pub(crate) value: ConfigurationValue,
+}
+
+#[derive(Debug)]
 pub(crate) enum QueryError {
     ConfigurationRead {
         path: crate::domain::paths::ResolvedPath,
@@ -55,6 +74,7 @@ pub(crate) enum QueryError {
     Resolution(ResolverError),
     State(StateRepositoryError),
     Inspection(TargetInspectionError),
+    ConfigField(String),
 }
 
 fn load_environment(context: &ResolverContext) -> Result<EnvironmentConfig, QueryError> {
@@ -68,6 +88,61 @@ fn load_environment(context: &ResolverContext) -> Result<EnvironmentConfig, Quer
             }
         })?;
     EnvironmentConfig::parse(&yaml).map_err(QueryError::Configuration)
+}
+
+/// Reads and structurally validates the selected portable configuration without lifecycle access.
+pub(crate) fn configuration(context: &ResolverContext) -> Result<EnvironmentConfig, QueryError> {
+    let configuration = load_environment(context)?;
+    resolver::discovered_roots(context, &configuration).map_err(QueryError::Resolution)?;
+    if let Some(default_profile) = configuration.default_profile() {
+        resolver::resolve(context, &configuration, Some(default_profile))
+            .map_err(QueryError::Resolution)?;
+    }
+    Ok(configuration)
+}
+
+pub(crate) fn configuration_report(
+    context: &ResolverContext,
+) -> Result<ConfigurationReport, QueryError> {
+    let configuration = configuration(context)?;
+    Ok(ConfigurationReport {
+        configuration_path: context.environment_config_path().clone(),
+        default_profile: configuration.default_profile().map(str::to_owned),
+        stores: resolver::resolved_store_paths(context, &configuration)
+            .map_err(QueryError::Resolution)?,
+    })
+}
+
+pub(crate) fn configuration_value(
+    context: &ResolverContext,
+    field: &str,
+) -> Result<ConfigurationValueReport, QueryError> {
+    let configuration = configuration(context)?;
+    if field == "default_profile" {
+        return Ok(ConfigurationValueReport {
+            configuration_path: context.environment_config_path().clone(),
+            value: ConfigurationValue::DefaultProfile(
+                configuration.default_profile().map(str::to_owned),
+            ),
+        });
+    }
+    let Some(store_id) = field
+        .strip_prefix("stores.")
+        .and_then(|tail| tail.strip_suffix(".properties.path"))
+    else {
+        return Err(QueryError::ConfigField(field.into()));
+    };
+    let Some((_, path)) = resolver::resolved_store_paths(context, &configuration)
+        .map_err(QueryError::Resolution)?
+        .into_iter()
+        .find(|(id, _)| id == store_id)
+    else {
+        return Err(QueryError::ConfigField(field.into()));
+    };
+    Ok(ConfigurationValueReport {
+        configuration_path: context.environment_config_path().clone(),
+        value: ConfigurationValue::StorePath(path),
+    })
 }
 
 pub(super) fn resolve_request(

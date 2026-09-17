@@ -104,6 +104,17 @@ pub(crate) fn discovered_roots(
     Ok(profiles.into_keys().collect())
 }
 
+/// Resolves every declared local-store root for a read-only configuration view.
+pub(crate) fn resolved_store_paths(
+    context: &ResolverContext,
+    environment: &EnvironmentConfig,
+) -> Result<Vec<(String, ResolvedPath)>, ResolverError> {
+    Ok(resolve_stores(context, environment)?
+        .into_iter()
+        .map(|(id, store)| (id.to_string(), store.root.as_path().clone()))
+        .collect())
+}
+
 /// Resolves one selected root profile to canonical Desired resources.
 ///
 /// The resolver reads only environment/profile declarations and verified local store sources. It never observes a managed target or performs mutation.

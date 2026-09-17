@@ -6,6 +6,6 @@ Project skill sources are direct children of `.claude/skills/`. Each source skil
 
 Keep `SKILL.md` concise and discriminating. The description determines when a skill is selected; instructions should provide only Loadout-specific decisions, authority routing, safety boundaries, and necessary validation. Put conditional procedures in a linked reference instead of duplicating a specification.
 
-Skills are derived guidance. They must not create a v0.2 contract, authorize GitHub or Git mutation, expand a task's scope, or override `docs/architecture/` or `docs/specs/`.
+Skills are derived guidance. They must not create a v0.3 contract, authorize GitHub or Git mutation, expand a task's scope, or override `docs/architecture/` or `docs/specs/`.
 
 After source changes, validate each changed skill with the active environment's skill validator when available. Then compare source and generated copy while excluding `.loadout-codex-adapter`.

@@ -2,7 +2,7 @@
 
 ## Scope
 
-This specification defines the v0.2.0 lifecycle for validating declarations, inspecting drift, producing a plan, and applying a plan.
+This specification defines the v0.3.0 lifecycle for validating declarations, inspecting drift, producing a plan, and applying a plan.
 It owns planning decisions and the Desired/Known/Actual transition table.
 The File Links and State and Recovery specifications define the filesystem and durable-state mechanics used by those decisions.
 
@@ -49,7 +49,7 @@ Conflicts are not actions.
 
 ### Planned Actions
 
-The v0.2.0 planner may produce these actions:
+The v0.3.0 planner may produce these actions:
 
 | Action | Meaning |
 | --- | --- |
@@ -96,7 +96,7 @@ In either case, it updates Known state from the old resource ID to the new one o
 The File Links and State and Recovery specifications define the corresponding mutation, no-mutation, and recovery-record requirements.
 
 A source file content change at the same resolved source path does not create an action.
-A file link always exposes the current source content; v0.2.0 does not fingerprint source content for link resources.
+A file link always exposes the current source content; v0.3.0 does not fingerprint source content for link resources.
 
 ## Preflight
 
@@ -141,13 +141,13 @@ A failed recheck prevents the next mutation step and records failure or uncertai
 
 ## Execution Order
 
-Apply is sequential in v0.2.0.
+Apply is sequential in v0.3.0.
 Within every phase, actions are ordered lexicographically by their fully qualified resource ID.
 For `replace_ownership`, the sort key is `<old-resource-id>\u0000<new-resource-id>`.
 
-v0.2.0 has no user-configurable per-resource execution order.
+v0.3.0 has no user-configurable per-resource execution order.
 Fully qualified resource ID ordering is a deterministic tie-breaker, not an ordering interface; resource IDs express identity and users MUST NOT choose or rename them to control execution order.
-Future ordering constraints require a separate dependency contract and must not change the meaning of the v0.2.0 profile declaration order.
+Future ordering constraints require a separate dependency contract and must not change the meaning of the v0.3.0 profile declaration order.
 
 The phases are:
 
@@ -159,7 +159,7 @@ A `relocate_link` action creates and verifies the new target, then removes and v
 No other action begins between those steps.
 
 An action in a later phase is not attempted after an earlier action fails.
-Verified actions from earlier phases remain committed; v0.2.0 does not roll them back.
+Verified actions from earlier phases remain committed; v0.3.0 does not roll them back.
 
 ## Dry Run
 

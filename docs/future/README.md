@@ -1,10 +1,10 @@
 # Future Considerations
 
-This directory records design work that is explicitly outside v0.2.0.
+This directory records design work that is explicitly outside v0.3.0.
 It is not a specification, implementation plan, compatibility promise, or user-facing command reference.
 
 Future documents may identify risks, prerequisites, and candidate constraints.
-They must not weaken or reinterpret the published v0.2.0 architecture or specifications.
+They must not weaken or reinterpret the published v0.3.0 architecture or specifications.
 Before a future capability is implemented, its final behavior must move into architecture and specification documents with test evidence.
 
 ## Topics
@@ -14,7 +14,7 @@ Before a future capability is implemented, its final behavior must move into arc
 - [Remote Stores](remote-stores.md) considers reproducible, cache-backed source acquisition and supply-chain boundaries.
 - [Profile Parameters](profile-parameters.md) considers reusable profiles with explicit, typed inputs and stable instance identities.
 - [Resource Import](resource-import.md) considers the deliberately strong operation of importing an unmanaged target into a source store.
-- [Inspection and Authoring Commands](inspection-and-authoring.md) considers read-only discovery, drift inspection, environment setup, and explicit configuration editing.
+- [Inspection and Authoring Commands](inspection-and-authoring.md) considers future read-only discovery and authoring beyond the v0.3.0 configuration command surface.
 - [Resource Dependencies and Ordering](resource-dependencies-and-ordering.md) considers explicit ordering constraints without overloading declaration order or resource IDs.
 - [Stages and Execution Ordering](stages-and-execution-ordering.md) considers coarse execution barriers that expand into a resource action graph without changing resource effects.
 - [Schema Evolution and Migration](schema-evolution-and-migration.md) defines the future policy for strict schema versioning and safe, explicit data migration.

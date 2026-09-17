@@ -54,6 +54,19 @@ loadout init [--dry-run]
 `init` creates an initial portable environment bundle in the current working directory without modifying machine-local runtime configuration.
 It is an authoring command, not a lifecycle command, and its complete creation, collision, durability, dry-run, and exit-status contract is defined by [Initialization](init.md).
 
+### `loadout config`
+
+```text
+loadout config path [--config <path>]
+loadout config list [--config <path>]
+loadout config get [--config <path>] <field>
+loadout config use <path> [--yes]
+loadout config set [--config <path>] <field> <value> [--yes]
+```
+
+These are configuration inspection and authoring commands, not lifecycle commands.
+Their selection rules, typed field model, confirmation, publication, failure aftermath, and non-goals are defined by [Configuration Authoring](config-authoring.md).
+
 ### `loadout validate`
 
 ```text
@@ -121,7 +134,7 @@ This explanation adds no confirmation step and does not change `--yes` semantics
 ## Output
 
 The default output is human-readable text.
-Its wording and column layout are not a machine-readable output contract in v0.2.0.
+Its wording and column layout are not a machine-readable output contract in v0.3.0.
 
 For `plan` and `apply`, output identifies:
 
@@ -134,6 +147,8 @@ For `validate`, output identifies the profile or profiles checked and every diag
 
 For `diff`, output identifies every inspected Known resource, its target, its observation result, and every unfinished or uncertain operation.
 Observed drift is reportable state, not a `diff` runtime failure.
+
+For `config`, output identifies the inspected or changed configuration file and the selected field or path when applicable.
 
 ## Exit Status
 
@@ -148,4 +163,4 @@ It never reports success merely because some earlier actions were committed. A f
 
 ## Excluded Commands
 
-v0.3.0 does not provide configuration editing, profile listing or display, resource listing or display, resource import, partial apply, task execution, copy materialization, directory materialization, remote store management, forceful takeover, rollback, or parallel execution.
+v0.3.0 does not provide configuration reset, generic YAML editing, profile listing or display, resource listing or display, resource import, partial apply, task execution, copy materialization, directory materialization, remote store management, forceful takeover, rollback, or parallel execution.

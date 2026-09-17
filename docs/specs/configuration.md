@@ -110,6 +110,9 @@ It may contain `..` because it is a configuration-level root path.
 The resolved store root is used only to read source assets.
 Loadout MUST NOT modify its contents while resolving, planning, applying, or recovering a v0.3.0 resource.
 
+The [Configuration Authoring](config-authoring.md) specification defines the separate v0.3.0 commands that inspect or deliberately edit configuration.
+Those commands do not change the schema or make store contents writable.
+
 ## Path Syntax
 
 Configuration-level paths are `config_path`, `profile_discovery.paths[*]`, and `stores.*.properties.path` for a local store.

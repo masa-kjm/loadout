@@ -3,7 +3,7 @@
 ## Status
 
 This is a non-binding design note.
-Except for the v0.2.0 `diff` command defined by the [CLI specification](../specs/cli.md), the commands described here are not part of v0.2.0 and this document defines no final command syntax, output format, or exit-status contract.
+Except for the v0.3.0 `diff`, `init`, and `config` commands defined by the [specifications](../specs/README.md), the commands described here are not part of v0.3.0 and this document defines no final command syntax, output format, or exit-status contract.
 
 ## Purpose
 
@@ -23,8 +23,8 @@ The following commands are likely future capabilities:
 - `profile list` and `profile show` inspect discovered portable declarations; and
 - `resource list` and `resource show` inspect either resolved desired resources for an explicit root profile or Known managed resources, with that scope made unambiguous by the command contract.
 
-`config path`, `config list`, and `config get` are also read-only inspection commands.
-They should disclose only configuration information that is safe to print and must redact any future sensitive fields.
+The v0.3.0 [Configuration Authoring](../specs/config-authoring.md) specification owns `config path`, `config list`, and `config get`.
+Future inspection commands should disclose only configuration information that is safe to print and must redact any future sensitive fields.
 
 The v0.2.0 `diff` command is not a second planner and does not imply a repair action.
 A future inspection capability may present Desired-to-Known or Desired-to-Actual views, but each comparison must be labeled precisely and must preserve the no-follow observation and structured diagnostic rules used by planning.
@@ -34,7 +34,8 @@ If an active operation is uncertain, their output must report that fact rather t
 
 ## Candidate Authoring Commands
 
-`init` may create an initial portable environment layout, and configuration commands such as `config use`, `config reset`, and `config set` may deliberately change machine-local or portable configuration.
+`init`, `config use`, and the typed `config set` are v0.3.0 commands.
+Configuration commands such as `config reset` or structural configuration editing remain future work.
 They are authoring helpers, not prerequisites for using `--config`, nor part of normal environment convergence.
 
 Schema migration is a separate authoring operation.

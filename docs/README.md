@@ -19,9 +19,9 @@ Each published document is authoritative only for the subject it owns.
 v0.3.0 retains the safe core for converging a composed profile to a local environment.
 Its only resource implementation is a local-store source linked to a single-file target.
 The core includes profile composition, validation, drift inspection, planning, conflict detection, state locking, safe application, and durable state recording.
-It also provides `init`, a narrow authoring command that creates a previously absent portable environment bundle without changing runtime configuration or native assets.
+It also provides narrow authoring commands: `init` creates a previously absent portable environment bundle, and `config` explicitly inspects or edits configuration without entering the resource lifecycle.
 
-Task resources, copy operations, directory resources, remote stores, profile parameters, imports, secret handling, ACL management, rollback, parallel execution, and configuration editing are outside v0.3.0.
+Task resources, copy operations, directory resources, remote stores, profile parameters, imports, secret handling, ACL management, rollback, and parallel execution are outside v0.3.0.
 
 ## Documentation Rules
 

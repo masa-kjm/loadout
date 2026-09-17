@@ -138,6 +138,12 @@ enum ParsedConfigCommand {
         #[arg(value_name = "FIELD")]
         field: String,
     },
+    Use {
+        #[arg(value_name = "PATH")]
+        path: OsString,
+        #[arg(long, help = "Proceed without an interactive confirmation prompt.")]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -152,6 +158,10 @@ pub(super) enum ConfigCommand {
     Get {
         config: Option<OsString>,
         field: String,
+    },
+    Use {
+        path: OsString,
+        yes: bool,
     },
 }
 
@@ -188,6 +198,7 @@ pub(super) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
                 config: config.config,
                 field,
             },
+            ParsedConfigCommand::Use { path, yes } => ConfigCommand::Use { path, yes },
         }),
         ParsedCommand::Diff => Command::Diff,
     };
@@ -198,6 +209,12 @@ pub(super) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
         return Err(Error::raw(
             ErrorKind::InvalidValue,
             "--config requires a path",
+        ));
+    }
+    if matches!(&command, Command::Config(ConfigCommand::Use { path, .. }) if path.is_empty()) {
+        return Err(Error::raw(
+            ErrorKind::InvalidValue,
+            "config use requires a path",
         ));
     }
     Ok(command)
@@ -221,6 +238,7 @@ impl ConfigCommand {
             Self::Path { config, .. } | Self::List { config } | Self::Get { config, .. } => {
                 config.as_ref()
             }
+            Self::Use { .. } => None,
         }
     }
 }
@@ -242,6 +260,13 @@ mod tests {
                 root: Some("base".into()),
                 all: false,
             }
+        );
+        assert_eq!(
+            parse_strings(&["config", "use", "config.yaml", "--yes"]).unwrap(),
+            Command::Config(ConfigCommand::Use {
+                path: OsString::from("config.yaml"),
+                yes: true,
+            })
         );
         assert_eq!(
             parse_strings(&["validate", "--all"]).unwrap(),
@@ -296,6 +321,7 @@ mod tests {
             vec!["diff", "--config", "config.yaml"],
             vec!["config", "path", "unexpected"],
             vec!["config", "get"],
+            vec!["config", "use", ""],
             vec!["validate", "--all", "base"],
             vec!["validate", "--config"],
             vec!["validate", "--config", ""],

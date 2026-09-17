@@ -6,13 +6,13 @@ mod render;
 use crate::application::queries::{
     self, DeclarationRequest, QueryError, ValidationRequest, ValidationSelection,
 };
-use crate::authoring::init;
+use crate::authoring::{config_use, init};
 use crate::loader::{LoadError, MachinePaths, StatePaths};
 use crate::state::repository::StateRepository;
 use args::Command;
 use clap::error::ErrorKind;
 use std::{
-    io::{self, IsTerminal, Write},
+    io::{self, BufRead, IsTerminal, Write},
     process::ExitCode,
 };
 
@@ -185,8 +185,80 @@ fn run_config(
             queries::configuration_value(&context, &field)
                 .map(|value| render::config_get(out, value, &field))
         }
+        args::ConfigCommand::Use { path, yes } => {
+            return run_config_use(machine, path, yes, out, err);
+        }
     };
     render_result(result, err)
+}
+
+fn run_config_use(
+    machine: &MachinePaths,
+    path: std::ffi::OsString,
+    yes: bool,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> io::Result<u8> {
+    let context = match machine.select(Some(&path)) {
+        Ok(context) => context,
+        Err(error) => return load_error(err, error),
+    };
+    if let Err(error) = queries::configuration(&context) {
+        return render_result(Err(error), err);
+    }
+    let destination = machine.runtime_directory.as_ref().join("loadout.yaml");
+    let preparation = match config_use::prepare(destination, context.environment_config_path()) {
+        Ok(preparation) => preparation,
+        Err(error) => return config_use_error(err, error),
+    };
+    writeln!(
+        out,
+        "runtime configuration: {}",
+        preparation.destination().display()
+    )?;
+    match preparation.prior() {
+        Some(prior) => writeln!(out, "prior config_path: {prior}")?,
+        None => writeln!(out, "prior config_path: <absent>")?,
+    }
+    writeln!(
+        out,
+        "resulting config_path: {}",
+        preparation.selected_path()
+    )?;
+    out.flush()?;
+    if !yes {
+        if !(io::stdin().is_terminal() && io::stderr().is_terminal()) {
+            writeln!(
+                err,
+                "confirmation unavailable: non-interactive config use requires --yes"
+            )?;
+            return Ok(2);
+        }
+        write!(err, "Use this portable configuration? [y/N] ")?;
+        err.flush()?;
+        let mut response = String::new();
+        io::stdin().lock().read_line(&mut response)?;
+        if !matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            writeln!(err, "config use cancelled: confirmation not granted")?;
+            return Ok(2);
+        }
+    }
+    match config_use::publish(&preparation) {
+        Ok(()) => {
+            writeln!(
+                out,
+                "selected portable configuration: {}",
+                preparation.selected_path()
+            )?;
+            Ok(0)
+        }
+        Err(error) => config_use_error(err, error),
+    }
+}
+
+fn config_use_error(err: &mut impl Write, error: config_use::ConfigUseError) -> io::Result<u8> {
+    writeln!(err, "error: {error}")?;
+    Ok(error.exit_code())
 }
 
 fn render_result(

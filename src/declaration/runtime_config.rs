@@ -1,6 +1,6 @@
 //! Strict raw DTO for the machine-local runtime configuration.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::declaration::schema::{SchemaVersionV1, deserialize_optional_string};
 
@@ -25,6 +25,20 @@ impl RuntimeConfig {
     /// The optional raw portable environment configuration path.
     pub(crate) fn config_path(&self) -> Option<&str> {
         self.config_path.as_deref()
+    }
+
+    /// Renders a complete version-1 runtime configuration selecting an absolute portable path.
+    pub(crate) fn selected_config(path: &str) -> Result<String, serde_yaml::Error> {
+        #[derive(Serialize)]
+        struct SelectedConfig<'a> {
+            schema_version: u8,
+            config_path: &'a str,
+        }
+
+        serde_yaml::to_string(&SelectedConfig {
+            schema_version: 1,
+            config_path: path,
+        })
     }
 }
 
@@ -64,5 +78,14 @@ mod tests {
         ] {
             assert!(RuntimeConfig::parse(yaml).is_err(), "{fixture} must reject");
         }
+    }
+
+    #[test]
+    fn selected_config_is_a_complete_parseable_version_one_document() {
+        let yaml = RuntimeConfig::selected_config("/absolute/config.yaml").unwrap();
+        assert_eq!(
+            RuntimeConfig::parse(&yaml).unwrap().config_path(),
+            Some("/absolute/config.yaml")
+        );
     }
 }

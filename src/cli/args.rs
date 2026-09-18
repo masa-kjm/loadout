@@ -144,6 +144,16 @@ enum ParsedConfigCommand {
         #[arg(long, help = "Proceed without an interactive confirmation prompt.")]
         yes: bool,
     },
+    Set {
+        #[command(flatten)]
+        config: ConfigSelectionArgs,
+        #[arg(value_name = "FIELD")]
+        field: String,
+        #[arg(value_name = "VALUE")]
+        value: String,
+        #[arg(long, help = "Proceed without an interactive confirmation prompt.")]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -161,6 +171,12 @@ pub(super) enum ConfigCommand {
     },
     Use {
         path: OsString,
+        yes: bool,
+    },
+    Set {
+        config: Option<OsString>,
+        field: String,
+        value: String,
         yes: bool,
     },
 }
@@ -199,6 +215,17 @@ pub(super) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
                 field,
             },
             ParsedConfigCommand::Use { path, yes } => ConfigCommand::Use { path, yes },
+            ParsedConfigCommand::Set {
+                config,
+                field,
+                value,
+                yes,
+            } => ConfigCommand::Set {
+                config: config.config,
+                field,
+                value,
+                yes,
+            },
         }),
         ParsedCommand::Diff => Command::Diff,
     };
@@ -239,6 +266,7 @@ impl ConfigCommand {
                 config.as_ref()
             }
             Self::Use { .. } => None,
+            Self::Set { config, .. } => config.as_ref(),
         }
     }
 }
@@ -265,6 +293,24 @@ mod tests {
             parse_strings(&["config", "use", "config.yaml", "--yes"]).unwrap(),
             Command::Config(ConfigCommand::Use {
                 path: OsString::from("config.yaml"),
+                yes: true,
+            })
+        );
+        assert_eq!(
+            parse_strings(&[
+                "config",
+                "set",
+                "--config",
+                "config.yaml",
+                "default_profile",
+                "work",
+                "--yes",
+            ])
+            .unwrap(),
+            Command::Config(ConfigCommand::Set {
+                config: Some(OsString::from("config.yaml")),
+                field: "default_profile".into(),
+                value: "work".into(),
                 yes: true,
             })
         );

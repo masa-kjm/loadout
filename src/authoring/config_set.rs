@@ -126,17 +126,51 @@ pub(crate) fn prepare(
 
 /// Atomically replaces the exact prepared portable configuration document.
 pub(crate) fn publish(preparation: &SetPreparation) -> Result<(), ConfigSetError> {
+    publish_with(preparation, replace, || Ok(()))
+}
+
+fn publish_with<F, G>(
+    preparation: &SetPreparation,
+    replace_file: F,
+    after_publication: G,
+) -> Result<(), ConfigSetError>
+where
+    F: FnOnce(&Path, &Path) -> Result<(), ConfigSetError>,
+    G: FnOnce() -> Result<(), ConfigSetError>,
+{
     let destination = preparation.destination();
     let parent = destination.parent().expect("resolved path has a parent");
     verify_parent(parent)?;
     verify_original(destination, &preparation.original)?;
     let temporary = create_temporary(parent, &preparation.candidate)?;
     verify_parent(parent)?;
+    verify_temporary(&temporary, &preparation.candidate)?;
     verify_original(destination, &preparation.original)?;
-    replace(&temporary, destination)?;
+    replace_file(&temporary, destination)?;
+    after_publication()?;
     verify_published(destination, &preparation.candidate)?;
     sync_parent(parent)?;
     verify_published(destination, &preparation.candidate)
+}
+
+fn verify_temporary(path: &Path, candidate: &str) -> Result<(), ConfigSetError> {
+    verify_parent(path.parent().expect("temporary has a parent"))?;
+    verify_regular(path)?;
+    let observed = fs::read_to_string(path)
+        .map_err(|source| io_error("re-read configuration temporary", path, source))?;
+    if observed != candidate {
+        return Err(ConfigSetError::Io {
+            action: "recheck configuration temporary",
+            path: path.to_owned(),
+            source: io::Error::other("temporary contents differ from the candidate document"),
+        });
+    }
+    EnvironmentConfig::parse(&observed).map_err(|source| ConfigSetError::Io {
+        action: "recheck configuration temporary",
+        path: path.to_owned(),
+        source: io::Error::other(source),
+    })?;
+    Ok(())
 }
 
 fn edit(
@@ -513,6 +547,8 @@ fn io_error(action: &'static str, path: &Path, source: io::Error) -> ConfigSetEr
 mod tests {
     use super::*;
 
+    static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
     const DOCUMENT: &str = "# heading\nschema_version: 2 # schema note\ndefault_profile: base # selected profile\nprofile_discovery:\n  paths: [profiles]\nstores:\n  files:\n    type: local\n    properties:\n      path: ../store # source root\n";
 
     #[test]
@@ -551,5 +587,127 @@ mod tests {
         let config = EnvironmentConfig::parse(&document).unwrap();
 
         assert!(edit(&document, &config, "stores.files.properties.path", "other").is_err());
+    }
+
+    #[test]
+    fn substituted_temporary_is_rejected_before_replacement() {
+        let root = std::env::temp_dir().join(format!(
+            "loadout-config-set-test-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let temporary = create_temporary(&root, DOCUMENT).unwrap();
+        fs::write(&temporary, "schema_version: 2\nstores: {}\n").unwrap();
+
+        assert!(matches!(
+            verify_temporary(&temporary, DOCUMENT),
+            Err(ConfigSetError::Io { .. })
+        ));
+        assert_eq!(
+            fs::read_to_string(&temporary).unwrap(),
+            "schema_version: 2\nstores: {}\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changed_destination_before_replacement_is_preserved() {
+        let root = std::env::temp_dir().join(format!(
+            "loadout-config-set-test-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let destination = root.join("config.yaml");
+        fs::write(&destination, DOCUMENT).unwrap();
+        let preparation = prepare(
+            ResolvedPath::new(destination.clone()).unwrap(),
+            "default_profile",
+            "work",
+        )
+        .unwrap();
+        fs::write(&destination, "external document").unwrap();
+
+        assert!(matches!(
+            publish(&preparation),
+            Err(ConfigSetError::Input { .. })
+        ));
+        assert_eq!(
+            fs::read_to_string(&destination).unwrap(),
+            "external document"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn post_publication_substitution_is_reported_and_preserved() {
+        let root = std::env::temp_dir().join(format!(
+            "loadout-config-set-test-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let destination = root.join("config.yaml");
+        fs::write(&destination, DOCUMENT).unwrap();
+        let preparation = prepare(
+            ResolvedPath::new(destination.clone()).unwrap(),
+            "default_profile",
+            "work",
+        )
+        .unwrap();
+        let external = destination.clone();
+
+        let result = publish_with(
+            &preparation,
+            |temporary, path| {
+                fs::rename(temporary, path).map_err(|source| io_error("publish", path, source))
+            },
+            || {
+                fs::write(&external, "external document").unwrap();
+                Ok(())
+            },
+        );
+
+        assert!(matches!(result, Err(ConfigSetError::Published { .. })));
+        assert_eq!(
+            fs::read_to_string(&destination).unwrap(),
+            "external document"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replacement_failure_preserves_the_prior_document() {
+        let root = std::env::temp_dir().join(format!(
+            "loadout-config-set-test-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let destination = root.join("config.yaml");
+        fs::write(&destination, DOCUMENT).unwrap();
+        let preparation = prepare(
+            ResolvedPath::new(destination.clone()).unwrap(),
+            "default_profile",
+            "work",
+        )
+        .unwrap();
+
+        let result = publish_with(
+            &preparation,
+            |_, path| {
+                Err(io_error(
+                    "replace configuration",
+                    path,
+                    io::Error::other("injected failure"),
+                ))
+            },
+            || Ok(()),
+        );
+
+        assert!(matches!(result, Err(ConfigSetError::Io { .. })));
+        assert_eq!(fs::read_to_string(&destination).unwrap(), DOCUMENT);
+        fs::remove_dir_all(root).unwrap();
     }
 }

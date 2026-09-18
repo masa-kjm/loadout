@@ -167,6 +167,7 @@ where
             .parent()
             .expect("prepared destination has a parent"),
     )?;
+    verify_temporary(&temporary, preparation.selected_path())?;
     recheck_destination(preparation)?;
     if preparation.prior_document.is_some() {
         publish_existing(&temporary, preparation.destination())?;
@@ -183,6 +184,17 @@ where
     )?;
     validate_published(preparation.destination(), preparation.selected_path())?;
     Ok(())
+}
+
+fn verify_temporary(path: &Path, selected: &str) -> Result<(), ConfigUseError> {
+    validate_published(path, selected).map_err(|error| match error {
+        ConfigUseError::InvalidPublished { path, message } => ConfigUseError::Io {
+            action: "recheck runtime configuration temporary",
+            path,
+            source: io::Error::other(message),
+        },
+        other => other,
+    })
 }
 
 fn recheck_destination(preparation: &UsePreparation) -> Result<(), ConfigUseError> {
@@ -609,6 +621,26 @@ mod tests {
         assert!(fixture.root.join("runtime").is_dir());
         assert!(fixture.root.join("runtime/nested").is_dir());
         assert!(fs::symlink_metadata(destination).is_err());
+    }
+
+    #[test]
+    fn substituted_temporary_is_rejected_before_publication() {
+        let fixture = Fixture::new();
+        let parent = fixture.root.join("runtime");
+        fs::create_dir(&parent).unwrap();
+        let candidate = RuntimeConfig::selected_config(&fixture.selected.to_string()).unwrap();
+        let temporary =
+            create_temporary(&parent, &candidate, &fixture.selected.to_string()).unwrap();
+        fs::write(&temporary, "schema_version: 1\n").unwrap();
+
+        assert!(matches!(
+            verify_temporary(&temporary, &fixture.selected.to_string()),
+            Err(ConfigUseError::Io { .. })
+        ));
+        assert_eq!(
+            fs::read_to_string(temporary).unwrap(),
+            "schema_version: 1\n"
+        );
     }
 
     #[test]

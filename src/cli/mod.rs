@@ -6,7 +6,7 @@ mod render;
 use crate::application::queries::{
     self, DeclarationRequest, QueryError, ValidationRequest, ValidationSelection,
 };
-use crate::authoring::{config_use, init};
+use crate::authoring::{config_set, config_use, init};
 use crate::loader::{LoadError, MachinePaths, StatePaths};
 use crate::state::repository::StateRepository;
 use args::Command;
@@ -188,6 +188,12 @@ fn run_config(
         args::ConfigCommand::Use { path, yes } => {
             return run_config_use(machine, path, yes, out, err);
         }
+        args::ConfigCommand::Set {
+            config,
+            field,
+            value,
+            yes,
+        } => return run_config_set(machine, config, field, value, yes, out, err),
     };
     render_result(result, err)
 }
@@ -257,6 +263,67 @@ fn run_config_use(
 }
 
 fn config_use_error(err: &mut impl Write, error: config_use::ConfigUseError) -> io::Result<u8> {
+    writeln!(err, "error: {error}")?;
+    Ok(error.exit_code())
+}
+
+fn run_config_set(
+    machine: &MachinePaths,
+    config: Option<std::ffi::OsString>,
+    field: String,
+    value: String,
+    yes: bool,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> io::Result<u8> {
+    let context = match machine.select(config.as_deref()) {
+        Ok(context) => context,
+        Err(error) => return load_error(err, error),
+    };
+    let preparation =
+        match config_set::prepare(context.environment_config_path().clone(), &field, &value) {
+            Ok(preparation) => preparation,
+            Err(error) => return config_set_error(err, error),
+        };
+    if let Err(error) = queries::configuration_candidate(&context, preparation.candidate()) {
+        return render_result(Err(error), err);
+    }
+    writeln!(
+        out,
+        "configuration: {}",
+        preparation.destination().display()
+    )?;
+    writeln!(out, "field: {}", preparation.field())?;
+    writeln!(out, "prior value: {}", preparation.prior())?;
+    writeln!(out, "resulting value: {}", preparation.result())?;
+    out.flush()?;
+    if !yes {
+        if !(io::stdin().is_terminal() && io::stderr().is_terminal()) {
+            writeln!(
+                err,
+                "confirmation unavailable: non-interactive config set requires --yes"
+            )?;
+            return Ok(2);
+        }
+        write!(err, "Set this configuration value? [y/N] ")?;
+        err.flush()?;
+        let mut response = String::new();
+        io::stdin().lock().read_line(&mut response)?;
+        if !matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            writeln!(err, "config set cancelled: confirmation not granted")?;
+            return Ok(2);
+        }
+    }
+    match config_set::publish(&preparation) {
+        Ok(()) => {
+            writeln!(out, "updated {}", preparation.field())?;
+            Ok(0)
+        }
+        Err(error) => config_set_error(err, error),
+    }
+}
+
+fn config_set_error(err: &mut impl Write, error: config_set::ConfigSetError) -> io::Result<u8> {
     writeln!(err, "error: {error}")?;
     Ok(error.exit_code())
 }

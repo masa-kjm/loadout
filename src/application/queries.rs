@@ -93,6 +93,23 @@ fn load_environment(context: &ResolverContext) -> Result<EnvironmentConfig, Quer
 /// Reads and structurally validates the selected portable configuration without lifecycle access.
 pub(crate) fn configuration(context: &ResolverContext) -> Result<EnvironmentConfig, QueryError> {
     let configuration = load_environment(context)?;
+    validate_configuration(context, configuration)
+}
+
+/// Validates a complete candidate document without writing it.
+pub(crate) fn configuration_candidate(
+    context: &ResolverContext,
+    yaml: &str,
+) -> Result<EnvironmentConfig, QueryError> {
+    let configuration = EnvironmentConfig::parse(yaml).map_err(QueryError::Configuration)?;
+    validate_configuration(context, configuration)
+}
+
+fn validate_configuration(
+    context: &ResolverContext,
+    configuration: EnvironmentConfig,
+) -> Result<EnvironmentConfig, QueryError> {
+    resolver::resolved_store_paths(context, &configuration).map_err(QueryError::Resolution)?;
     resolver::discovered_roots(context, &configuration).map_err(QueryError::Resolution)?;
     if let Some(default_profile) = configuration.default_profile() {
         resolver::resolve(context, &configuration, Some(default_profile))

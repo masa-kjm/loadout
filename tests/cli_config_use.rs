@@ -187,6 +187,77 @@ fn invalid_existing_runtime_configuration_is_rejected_without_mutation() {
     assert_eq!(fixture.snapshot(), before);
 }
 
+#[test]
+fn set_updates_one_scalar_and_preserves_unrelated_yaml_presentation() {
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.root.join("store-two")).unwrap();
+    let configuration = "# heading\nschema_version: 2 # schema note\ndefault_profile: base # selected profile\nprofile_discovery:\n  paths: [profiles]\nstores:\n  files:\n    type: local\n    properties:\n      path: ../store # source root\n";
+    fs::write(fixture.root.join("portable/config.yaml"), configuration).unwrap();
+
+    let output = fixture.run(&[
+        "config",
+        "set",
+        "--config",
+        "../portable/config.yaml",
+        "stores.files.properties.path",
+        "../store-two",
+        "--yes",
+    ]);
+
+    assert!(output.status.success(), "{}", text(&output));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("portable/config.yaml")).unwrap(),
+        "# heading\nschema_version: 2 # schema note\ndefault_profile: base # selected profile\nprofile_discovery:\n  paths: [profiles]\nstores:\n  files:\n    type: local\n    properties:\n      path: \"../store-two\" # source root\n"
+    );
+    assert!(!fixture.root.join("state/loadout").exists());
+}
+
+#[test]
+fn set_rejects_noninteractive_and_unsupported_fields_without_mutation() {
+    let fixture = Fixture::new();
+    let before = fixture.snapshot();
+
+    let unavailable = fixture.run(&[
+        "config",
+        "set",
+        "--config",
+        "../portable/config.yaml",
+        "default_profile",
+        "base",
+    ]);
+    assert_eq!(unavailable.status.code(), Some(2), "{}", text(&unavailable));
+    assert_eq!(fixture.snapshot(), before);
+
+    let unsupported = fixture.run(&[
+        "config",
+        "set",
+        "--config",
+        "../portable/config.yaml",
+        "profile_discovery.paths",
+        "profiles",
+        "--yes",
+    ]);
+    assert_eq!(unsupported.status.code(), Some(2), "{}", text(&unsupported));
+    assert_eq!(fixture.snapshot(), before);
+
+    let invalid_value = fixture.run(&[
+        "config",
+        "set",
+        "--config",
+        "../portable/config.yaml",
+        "stores.files.properties.path",
+        "../missing-store",
+        "--yes",
+    ]);
+    assert_eq!(
+        invalid_value.status.code(),
+        Some(2),
+        "{}",
+        text(&invalid_value)
+    );
+    assert_eq!(fixture.snapshot(), before);
+}
+
 #[cfg(unix)]
 #[test]
 fn use_rejects_a_symlinked_runtime_parent_without_touching_the_referent() {

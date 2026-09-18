@@ -315,8 +315,8 @@ fn validate_directory(path: &Path, metadata: fs::Metadata) -> Result<(), ConfigU
             source,
         )
     })?;
-    let declared =
-        ResolvedPath::new(path.to_owned()).map_err(|source| invalid(path, source.to_string()))?;
+    let declared = ResolvedPath::from_platform_existing(path.to_owned())
+        .map_err(|source| invalid(path, source.to_string()))?;
     let observed = ResolvedPath::from_platform_canonicalized(canonical)
         .map_err(|source| invalid(path, source.to_string()))?;
     if observed != declared {

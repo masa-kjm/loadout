@@ -51,6 +51,18 @@ impl ResolvedPath {
         Self::new(path)
     }
 
+    /// Converts an already-existing ordinary platform path into the supported resolved representation.
+    ///
+    /// This is only for filesystem boundaries that have separately established the entry's safety and need a stable spelling for comparison with an OS-canonicalized path.
+    pub(crate) fn from_platform_existing(
+        path: impl Into<PathBuf>,
+    ) -> Result<Self, ResolvedPathError> {
+        let path = path.into();
+        #[cfg(windows)]
+        let path = long_windows_path(&path).unwrap_or(path);
+        Self::new(path)
+    }
+
     /// Returns the normalized path without allowing mutation of the value.
     pub(crate) fn as_path(&self) -> &Path {
         &self.0
@@ -488,7 +500,7 @@ mod tests {
 
         assert_eq!(
             ResolvedPath::from_platform_canonicalized(canonicalized).unwrap(),
-            ResolvedPath::new(temporary).unwrap()
+            ResolvedPath::from_platform_existing(temporary).unwrap()
         );
     }
 }

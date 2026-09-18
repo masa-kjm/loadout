@@ -4,15 +4,15 @@ Loadout is a local environment manager built around explicit desired state, owne
 
 ## Status
 
-v0.2.0 is released. v0.3.0 development adds `init` while retaining the v0.2 lifecycle contracts.
-The repository implements `init`, `validate`, `diff`, `plan`, and `apply` (including confirmation and dry run) as described in the [CLI specification](docs/specs/cli.md).
-Platform support is incomplete: create, remove, relocate, replacement, and source-changing ownership handoff are enabled on Unix builds without filesystem-type filtering, with recorded native evidence on Linux/local ext4. The same action set is enabled through retained-parent primitives on Windows/local NTFS, with recorded native Windows evidence. macOS/APFS remains unverified. Other combinations are not claimed supported merely because a capability is enabled.
+v0.2.0 is released. v0.3.0 is the next release and has not yet been tagged.
+The repository implements `init`, `config`, `validate`, `diff`, `plan`, and `apply` (including confirmation and dry run) as described in the [CLI specification](docs/specs/cli.md).
+Platform conformance for v0.3.0 requires recorded native evidence for the complete lifecycle on Linux/local ext4, macOS/local APFS, and Windows/local NTFS. CI is configured to validate those baseline filesystems and record the operating system, filesystem, Rust toolchain, and test result for review before release. Other combinations are not claimed supported merely because a capability is enabled.
 Release archives can be installed with the Unix and Windows installer scripts in `scripts/`.
 The published package's Rust library target is not yet a supported public API.
 
 v0.1 is retired and unsupported.
 The published `loadout` v0.1.0 crate is preserved by the `v0.1.0` archive tag, and the final legacy source snapshot is preserved by `legacy/v0.1-final`.
-v0.3.0 does not provide compatibility with v0.1 configuration, state, commands, resources, or behavior.
+v0.3.0 does not provide compatibility with v0.1 or v0.2 configuration, state, commands, resources, or behavior.
 
 ## v0.3.0 Direction
 
@@ -31,7 +31,7 @@ The intended completion baseline is Linux/local ext4, macOS/local APFS and Windo
 
 ## Installation
 
-After a v0.2.0 GitHub Release is published, install its latest archive with one of the following commands:
+After a v0.3.0 GitHub Release is published, install its latest archive with one of the following commands:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/masa-kjm/loadout/main/scripts/install.sh | bash

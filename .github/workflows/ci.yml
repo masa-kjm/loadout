@@ -53,6 +53,7 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: cargo test (non-macOS)
+        id: non_macos_test
         if: matrix.os != 'macos-latest'
         run: cargo test --locked
 
@@ -64,29 +65,70 @@ jobs:
           set -o pipefail
           TMPDIR="$RUNNER_TEMP" cargo test --locked 2>&1 | tee macos-platform-test.log
 
+      - name: Record Linux platform evidence
+        if: always() && matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture_filesystem="$(findmnt --noheadings --output FSTYPE --target "$RUNNER_TEMP")"
+          test "$fixture_filesystem" = ext4
+          {
+            echo "runner_os=${RUNNER_OS}"
+            uname -a
+            echo "fixture_tmpdir=${RUNNER_TEMP}"
+            echo "fixture_filesystem=${fixture_filesystem}"
+            rustc -Vv
+            cargo -V
+            echo "command=cargo test --locked"
+            echo "test_step_outcome=${{ steps.non_macos_test.outcome }}"
+          } | tee linux-platform-evidence.txt
+
       - name: Record macOS platform evidence
         if: always() && matrix.os == 'macos-latest'
         shell: bash
         run: |
           set -euo pipefail
+          fixture_filesystem="$(diskutil info -plist "$RUNNER_TEMP" | plutil -extract FilesystemType raw -)"
+          test "$fixture_filesystem" = APFS
           {
             echo "runner_os=${RUNNER_OS}"
             sw_vers
             echo "fixture_tmpdir=${RUNNER_TEMP}"
-            echo "fixture_filesystem=$(stat -f '%T' "$RUNNER_TEMP")"
+            echo "fixture_filesystem=${fixture_filesystem}"
             rustc -Vv
             cargo -V
             echo "command=TMPDIR=${RUNNER_TEMP} cargo test --locked"
             echo "test_step_outcome=${{ steps.macos_test.outcome }}"
           } | tee macos-platform-evidence.txt
 
-      - name: Upload macOS platform evidence
-        if: always() && matrix.os == 'macos-latest'
+      - name: Record Windows platform evidence
+        if: always() && matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $fixture = Get-Item $env:RUNNER_TEMP
+          $volume = Get-Volume -DriveLetter $fixture.PSDrive.Name
+          if ($volume.FileSystem -ne 'NTFS') {
+            throw "expected NTFS fixture filesystem, found $($volume.FileSystem)"
+          }
+          @(
+            "runner_os=$env:RUNNER_OS"
+            (Get-ComputerInfo | Select-Object -ExpandProperty WindowsVersion | ForEach-Object { "windows_version=$_" })
+            "fixture_tmpdir=$env:RUNNER_TEMP"
+            "fixture_filesystem=$($volume.FileSystem)"
+            (rustc -Vv)
+            (cargo -V)
+            'command=cargo test --locked'
+            'test_step_outcome=${{ steps.non_macos_test.outcome }}'
+          ) | Set-Content -Encoding utf8 windows-platform-evidence.txt
+
+      - name: Upload platform evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: macos-platform-evidence
+          name: ${{ matrix.os }}-platform-evidence
           path: |
-            macos-platform-evidence.txt
+            *-platform-evidence.txt
             macos-platform-test.log
           if-no-files-found: error
           retention-days: 30

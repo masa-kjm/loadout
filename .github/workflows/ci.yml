@@ -88,7 +88,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          fixture_filesystem="$(diskutil info "$RUNNER_TEMP" | awk -F: '/Type \(Bundle\)/ { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print tolower($2); exit }')"
+          fixture_device="$(df -P "$RUNNER_TEMP" | awk 'NR == 2 { print $1 }')"
+          fixture_filesystem="$(diskutil info "$fixture_device" | awk -F: '/Type \(Bundle\)/ { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print tolower($2); exit }')"
           test "$fixture_filesystem" = apfs
           {
             echo "runner_os=${RUNNER_OS}"

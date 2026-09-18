@@ -88,8 +88,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          fixture_filesystem="$(diskutil info -plist "$RUNNER_TEMP" | plutil -extract FilesystemType raw -)"
-          test "$fixture_filesystem" = APFS
+          fixture_filesystem="$(diskutil info "$RUNNER_TEMP" | awk -F: '/Type \(Bundle\)/ { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print tolower($2); exit }')"
+          test "$fixture_filesystem" = apfs
           {
             echo "runner_os=${RUNNER_OS}"
             sw_vers

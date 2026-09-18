@@ -359,7 +359,7 @@ fn verify_parent(parent: &Path) -> Result<(), ConfigSetError> {
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err(input(&component, "expected a non-symlink directory"));
         }
-        let declared = ResolvedPath::new(component.clone())
+        let declared = ResolvedPath::from_platform_existing(component.clone())
             .map_err(|source| input(&component, source.to_string()))?;
         let observed = ResolvedPath::from_platform_canonicalized(
             fs::canonicalize(&component).map_err(|source| {

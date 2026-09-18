@@ -63,6 +63,13 @@ impl ResolvedPath {
 }
 
 #[cfg(windows)]
+use std::ffi::OsString;
+#[cfg(windows)]
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::GetLongPathNameW;
+
+#[cfg(windows)]
 fn normalize_windows_path(original: PathBuf) -> Result<PathBuf, ResolvedPathError> {
     let raw = original
         .to_str()
@@ -114,13 +121,41 @@ fn normal_windows_path_from_canonicalize(
         .ok_or_else(|| ResolvedPathError::UnsupportedWindowsPath {
             path: canonicalized.clone(),
         })?;
-    if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
-        return Ok(PathBuf::from(format!(r"\\{unc}")));
+    let normal = if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{unc}"))
+    } else if let Some(dos) = raw.strip_prefix(r"\\?\") {
+        PathBuf::from(dos)
+    } else {
+        canonicalized
+    };
+    Ok(long_windows_path(&normal).unwrap_or(normal))
+}
+
+#[cfg(windows)]
+fn long_windows_path(path: &Path) -> Option<PathBuf> {
+    let input = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let required = unsafe { GetLongPathNameW(input.as_ptr(), std::ptr::null_mut(), 0) };
+    if required == 0 {
+        return None;
     }
-    if let Some(dos) = raw.strip_prefix(r"\\?\") {
-        return Ok(PathBuf::from(dos));
+    let mut output = vec![0; required as usize];
+    let written = unsafe {
+        GetLongPathNameW(
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            output.len().try_into().ok()?,
+        )
+    };
+    if written == 0 || written as usize >= output.len() {
+        return None;
     }
-    Ok(canonicalized)
+    Some(PathBuf::from(OsString::from_wide(
+        &output[..written as usize],
+    )))
 }
 
 #[cfg(windows)]
@@ -443,5 +478,17 @@ mod tests {
             Path::new(r"\\server\share\file")
         );
         assert!(ResolvedPath::from_platform_canonicalized(r"\\?\Volume{1234}\file").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonicalize_boundary_restores_an_existing_path_to_its_long_normal_spelling() {
+        let temporary = std::env::temp_dir();
+        let canonicalized = std::fs::canonicalize(&temporary).unwrap();
+
+        assert_eq!(
+            ResolvedPath::from_platform_canonicalized(canonicalized).unwrap(),
+            ResolvedPath::new(temporary).unwrap()
+        );
     }
 }

@@ -27,6 +27,12 @@ pub(super) enum Command {
     },
     Config(ConfigCommand),
     Diff,
+    Status {
+        config: Option<OsString>,
+        root: Option<String>,
+    },
+    Profile(ProfileCommand),
+    Resource(ResourceCommand),
 }
 
 #[derive(Parser)]
@@ -58,6 +64,18 @@ enum ParsedCommand {
     },
     #[command(about = "Report drift between recorded state and managed targets.")]
     Diff,
+    #[command(about = "Report Desired, Known, and observed target facts without planning.")]
+    Status(ProfileArgs),
+    #[command(about = "Inspect discovered portable profile declarations.")]
+    Profile {
+        #[command(subcommand)]
+        command: ParsedProfileCommand,
+    },
+    #[command(about = "Inspect resolved Desired resources or validated Known records.")]
+    Resource {
+        #[command(subcommand)]
+        command: ParsedResourceCommand,
+    },
 }
 
 #[derive(Args)]
@@ -129,6 +147,45 @@ struct ApplyArgs {
 }
 
 #[derive(Subcommand)]
+enum ParsedProfileCommand {
+    List(ConfigSelectionArgs),
+    Show {
+        #[command(flatten)]
+        selection: ConfigSelectionArgs,
+        #[arg(value_name = "PROFILE-ID")]
+        profile_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ParsedResourceCommand {
+    List(ResourceListArgs),
+    Show(ResourceShowArgs),
+}
+
+#[derive(Args)]
+struct ResourceListArgs {
+    #[command(flatten)]
+    profile: ProfileArgs,
+    #[arg(
+        long,
+        conflicts_with = "config",
+        help = "Inspect only persisted Known records."
+    )]
+    known: bool,
+}
+
+#[derive(Args)]
+struct ResourceShowArgs {
+    #[arg(long, value_name = "PATH", conflicts_with = "known")]
+    config: Option<OsString>,
+    #[arg(long, help = "Inspect only a persisted Known record.")]
+    known: bool,
+    #[arg(value_name = "ID", num_args = 1..=2)]
+    ids: Vec<String>,
+}
+
+#[derive(Subcommand)]
 enum ParsedConfigCommand {
     Path(ConfigPathArgs),
     List(ConfigSelectionArgs),
@@ -181,6 +238,34 @@ pub(super) enum ConfigCommand {
     },
 }
 
+#[derive(Debug, PartialEq)]
+pub(super) enum ProfileCommand {
+    List {
+        config: Option<OsString>,
+    },
+    Show {
+        config: Option<OsString>,
+        profile_id: String,
+    },
+}
+
+#[derive(Debug, PartialEq)]
+pub(super) enum ResourceCommand {
+    DesiredList {
+        config: Option<OsString>,
+        root: Option<String>,
+    },
+    DesiredShow {
+        config: Option<OsString>,
+        root: Option<String>,
+        resource_id: String,
+    },
+    KnownList,
+    KnownShow {
+        resource_id: String,
+    },
+}
+
 pub(super) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, clap::Error> {
     let cli = Cli::try_parse_from(std::iter::once(OsString::from("loadout")).chain(args))?;
     let command = match cli.command {
@@ -228,6 +313,63 @@ pub(super) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
             },
         }),
         ParsedCommand::Diff => Command::Diff,
+        ParsedCommand::Status(args) => Command::Status {
+            config: args.config,
+            root: args.root,
+        },
+        ParsedCommand::Profile { command } => Command::Profile(match command {
+            ParsedProfileCommand::List(args) => ProfileCommand::List {
+                config: args.config,
+            },
+            ParsedProfileCommand::Show {
+                selection,
+                profile_id,
+            } => ProfileCommand::Show {
+                config: selection.config,
+                profile_id,
+            },
+        }),
+        ParsedCommand::Resource { command } => Command::Resource(match command {
+            ParsedResourceCommand::List(args) if args.known && args.profile.root.is_none() => {
+                ResourceCommand::KnownList
+            }
+            ParsedResourceCommand::List(args) if args.known => {
+                return Err(Error::raw(
+                    ErrorKind::ArgumentConflict,
+                    "resource list --known does not accept a profile ID",
+                ));
+            }
+            ParsedResourceCommand::List(args) => ResourceCommand::DesiredList {
+                config: args.profile.config,
+                root: args.profile.root,
+            },
+            ParsedResourceCommand::Show(args) if args.known && args.ids.len() == 1 => {
+                ResourceCommand::KnownShow {
+                    resource_id: args.ids.into_iter().next().unwrap(),
+                }
+            }
+            ParsedResourceCommand::Show(args) if !args.known && args.ids.len() == 1 => {
+                ResourceCommand::DesiredShow {
+                    config: args.config,
+                    root: None,
+                    resource_id: args.ids.into_iter().next().unwrap(),
+                }
+            }
+            ParsedResourceCommand::Show(args) if !args.known && args.ids.len() == 2 => {
+                let mut ids = args.ids.into_iter();
+                ResourceCommand::DesiredShow {
+                    config: args.config,
+                    root: Some(ids.next().unwrap()),
+                    resource_id: ids.next().unwrap(),
+                }
+            }
+            ParsedResourceCommand::Show(_) => {
+                return Err(Error::raw(
+                    ErrorKind::ArgumentConflict,
+                    "resource show --known requires exactly one resource ID",
+                ));
+            }
+        }),
     };
     if command
         .config()
@@ -252,9 +394,17 @@ impl Command {
         match self {
             Self::Validate { config, .. }
             | Self::Plan { config, .. }
-            | Self::Apply { config, .. } => config.as_ref(),
+            | Self::Apply { config, .. }
+            | Self::Status { config, .. } => config.as_ref(),
             Self::Config(command) => command.config(),
-            Self::Init { .. } | Self::Diff => None,
+            Self::Profile(ProfileCommand::List { config })
+            | Self::Profile(ProfileCommand::Show { config, .. }) => config.as_ref(),
+            Self::Resource(ResourceCommand::DesiredList { config, .. })
+            | Self::Resource(ResourceCommand::DesiredShow { config, .. }) => config.as_ref(),
+            Self::Init { .. }
+            | Self::Diff
+            | Self::Resource(ResourceCommand::KnownList)
+            | Self::Resource(ResourceCommand::KnownShow { .. }) => None,
         }
     }
 }
@@ -340,6 +490,34 @@ mod tests {
         );
         assert_eq!(parse_strings(&["diff"]).unwrap(), Command::Diff);
         assert_eq!(
+            parse_strings(&["status", "--config", "config.yaml", "base"]).unwrap(),
+            Command::Status {
+                config: Some(OsString::from("config.yaml")),
+                root: Some("base".into()),
+            }
+        );
+        assert_eq!(
+            parse_strings(&["profile", "show", "--config", "config.yaml", "base"]).unwrap(),
+            Command::Profile(ProfileCommand::Show {
+                config: Some(OsString::from("config.yaml")),
+                profile_id: "base".into(),
+            })
+        );
+        assert_eq!(
+            parse_strings(&["resource", "show", "base", "base/item"]).unwrap(),
+            Command::Resource(ResourceCommand::DesiredShow {
+                config: None,
+                root: Some("base".into()),
+                resource_id: "base/item".into(),
+            })
+        );
+        assert_eq!(
+            parse_strings(&["resource", "show", "--known", "base/item"]).unwrap(),
+            Command::Resource(ResourceCommand::KnownShow {
+                resource_id: "base/item".into(),
+            })
+        );
+        assert_eq!(
             parse_strings(&[
                 "config",
                 "get",
@@ -365,6 +543,9 @@ mod tests {
             vec![],
             vec!["unknown"],
             vec!["diff", "--config", "config.yaml"],
+            vec!["resource", "list", "--known", "base"],
+            vec!["resource", "list", "--known", "--config", "config.yaml"],
+            vec!["resource", "show", "--known", "base", "base/item"],
             vec!["config", "path", "unexpected"],
             vec!["config", "get"],
             vec!["config", "use", ""],

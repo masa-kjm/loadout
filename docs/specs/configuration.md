@@ -2,8 +2,10 @@
 
 ## Scope
 
-This specification defines the machine-local runtime configuration, the portable environment configuration, local stores, and path syntax for v0.3.0.
+This specification defines the machine-local runtime configuration, the portable environment configuration, local stores, and path syntax for the v0.3.0 core retained by v0.4.0.
 It does not define profile files or resource behavior; see [Profiles](profiles.md) and [File Links](file-link.md).
+
+Every normative v0.3.0 requirement in this document remains a v0.4.0 requirement under the [retained baseline](README.md#retained-v030-baseline).
 
 ## Runtime Locations
 

@@ -2,8 +2,8 @@
 
 ## Scope
 
-This specification defines the complete v0.3.0 command surface.
-Commands not listed here are not part of v0.3.0.
+This specification defines the complete v0.4.0 command surface.
+Commands not listed here are not part of v0.4.0.
 
 The CLI parses input, presents diagnostics and plans, obtains confirmation, and maps outcomes to exit status.
 It does not make ownership, planner, filesystem, or state decisions outside the lifecycle.
@@ -35,13 +35,13 @@ The commands that operate on portable declarations accept:
 It selects the portable environment configuration as defined by [Configuration](configuration.md).
 When omitted, Loadout uses `loadout.yaml` or the platform default configuration path.
 
-For `validate`, `plan`, and `apply`, the optional positional `<profile-id>` selects exactly one discovered root profile.
+For `status`, `validate`, `plan`, `apply`, and desired-resource inspection, the optional positional `<profile-id>` selects exactly one discovered root profile.
 It is a profile ID, not a file path.
 
 These commands do not accept `--profile`.
 More than one positional profile ID is an input error.
 
-`diff` has no declaration-selection options because it inspects the platform state repository rather than a portable desired state.
+`diff` and Known-resource inspection have no declaration-selection options because they inspect the platform state repository rather than a portable desired state.
 
 ## Commands
 
@@ -98,6 +98,41 @@ It also reports any active operation and each action with `pending`, `running`, 
 `diff` does not produce an executable Plan, plan a repair, reconcile an operation, acquire the exclusive state lock, write state, create a directory, or mutate a target.
 An absent state file represents an empty Known set and produces a successful empty report.
 
+### `loadout status`
+
+```text
+loadout status [--config <path>] [<profile-id>]
+```
+
+`status` reports the selected profile's Desired state, Known state, and safe Actual observations without producing an executable Plan.
+It also reports an active operation without reconciling it.
+Its complete input, comparison, observation, partial-report, and no-mutation contract is defined by [Inspection](inspection.md).
+
+### `loadout profile`
+
+```text
+loadout profile list [--config <path>]
+loadout profile show [--config <path>] <profile-id>
+```
+
+These commands inspect discovered portable profile declarations.
+They do not resolve a root profile, inspect a source or target, read state, or report an active operation.
+Their complete contract is defined by [Inspection](inspection.md).
+
+### `loadout resource`
+
+```text
+loadout resource list [--config <path>] [<profile-id>]
+loadout resource show [--config <path>] [<profile-id>] <resource-id>
+loadout resource list --known
+loadout resource show --known <resource-id>
+```
+
+Without `--known`, these commands inspect one selected root profile's Resolved Desired resources.
+With `--known`, they inspect only validated Known records and do not accept `--config` or a profile ID.
+They do not inspect a target or report an active operation.
+Their complete contract is defined by [Inspection](inspection.md).
+
 ### `loadout plan`
 
 ```text
@@ -134,7 +169,7 @@ This explanation adds no confirmation step and does not change `--yes` semantics
 ## Output
 
 The default output is human-readable text.
-Its wording and column layout are not a machine-readable output contract in v0.3.0.
+Its wording and column layout are not a machine-readable output contract in v0.4.0.
 
 For `plan` and `apply`, output identifies:
 
@@ -146,6 +181,9 @@ For `plan` and `apply`, output identifies:
 For `validate`, output identifies the profile or profiles checked and every diagnostic.
 
 For `diff`, output identifies every inspected Known resource, its target, its observation result, and every unfinished or uncertain operation.
+
+For `status`, output labels Desired-to-Known, Known-to-Actual, and Desired-only Actual facts separately, and identifies every unfinished or uncertain operation.
+For profile and resource inspection, output identifies the declaration, Resolved Desired, or Known view selected by the command; it does not imply ownership or target conformance.
 Observed drift is reportable state, not a `diff` runtime failure.
 
 For `config`, output identifies the inspected or changed configuration file and the selected field or path when applicable.
@@ -163,4 +201,4 @@ It never reports success merely because some earlier actions were committed. A f
 
 ## Excluded Commands
 
-v0.3.0 does not provide configuration reset, generic YAML editing, profile listing or display, resource listing or display, resource import, partial apply, task execution, copy materialization, directory materialization, remote store management, forceful takeover, rollback, or parallel execution.
+v0.4.0 does not provide configuration reset, generic YAML editing, resource import, partial apply, task execution, copy materialization, directory materialization, remote store management, forceful takeover, rollback, parallel execution, state repair, operation recovery on inspection, or machine-readable inspection output.

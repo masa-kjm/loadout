@@ -2,8 +2,10 @@
 
 ## Scope
 
-This specification defines profile files, identifiers, include composition, resource declarations, and static validation for v0.3.0.
+This specification defines profile files, identifiers, include composition, resource declarations, and static validation for the v0.3.0 core retained by v0.4.0.
 It defines only the file-link resource declaration; see [File Links](file-link.md) for its runtime behavior.
+
+Every normative v0.3.0 requirement in this document remains a v0.4.0 requirement under the [retained baseline](README.md#retained-v030-baseline).
 
 ## Identifiers
 

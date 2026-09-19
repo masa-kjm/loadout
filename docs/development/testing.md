@@ -2,7 +2,7 @@
 
 ## Scope
 
-This document defines how an implementation demonstrates conformance with the v0.3.0 architecture and specifications.
+This document defines how an implementation demonstrates conformance with the v0.4.0 architecture and specifications.
 It does not add runtime behavior, change an error outcome, or replace a specification.
 
 Every behavior change must identify its owning specification and add evidence at the narrowest test layer that can prove the contract.
@@ -21,7 +21,7 @@ An observable CLI or filesystem contract also requires an integration or accepta
 
 ## Contract Matrix
 
-The following matrix is the minimum evidence required before v0.3.0 is considered complete.
+The following matrix is the minimum evidence required before v0.4.0 is considered complete.
 
 | Contract owner | Required evidence |
 | --- | --- |
@@ -33,6 +33,7 @@ The following matrix is the minimum evidence required before v0.3.0 is considere
 | [CLI](../specs/cli.md) | Positional root-profile selection; `validate` default-profile and `--all` behavior; `diff` Known-to-Actual reporting and zero mutation; `plan` and `apply` default-profile behavior; confirmation after successful preflight and before an operation record; non-interactive `--yes` requirement; dry-run zero mutation; all documented exit-status classes. |
 | [Initialization](../specs/init.md) | A compiled-binary `init` creates the exact valid `.loadout` bundle; dry run changes no entry, state, store, or runtime configuration; every existing final entry kind is preserved; and staging write, validation, flush, publication, and external-collision failures never publish a partial bundle or replace an external entry. |
 | [Configuration Authoring](../specs/config-authoring.md) | Read-only config commands leave configuration, state, store, and targets unchanged; typed-path and value rejection; complete-document validation; confirmation; runtime-selection creation and replacement; portable-configuration presentation preservation or rejection; publication failure and external-substitution aftermath; and Unix/Windows behavior. |
+| [Inspection](../specs/inspection.md) | Every `status`, profile, and resource grammar and selection conflict; declaration/Desired/Known/Actual read-set boundaries; deterministic ordering; active-operation display for `status` and existing `diff` only; Desired-only, Known-only, definition-changed, expected, drifted, unsafe, and unavailable status rows; invalid declaration/state behavior; partial status report behavior; and snapshots proving no target, store, configuration, state, lock, operation, or directory mutation. |
 
 ## Pure Domain Tests
 
@@ -118,6 +119,17 @@ Apply confirmation tests prove that prompting follows successful preflight and t
 `diff` acceptance tests construct Known state and expected, missing, wrong-link, other-entry, unsafe-parent, and unfinished-operation observations.
 They assert that the command reports each category while leaving the target tree, state directory, store, configuration files, and operation record unchanged.
 They also prove that `diff` neither needs nor reads a portable environment configuration.
+
+Inspection acceptance tests invoke every v0.4.0 inspection command with disposable home, state, configuration, and store directories.
+They assert command selection and output categories rather than exact human-readable prose.
+They snapshot the complete target tree, state directory, store, runtime configuration, portable configuration, and control files before and after each command; every snapshot must be identical.
+They also prove that no inspection command acquires the exclusive lock, creates a lock or state directory, writes an operation record, or invokes recovery.
+
+`profile list` and `profile show` tests prove that no source, target, or state access is necessary.
+Desired-resource tests prove canonical resolution and no target/state access.
+Known-resource tests prove that no declaration, source, or target access occurs and that an active operation is neither reported nor used to make a lifecycle decision.
+`status` tests cover equal and different Desired/Known definitions, Desired-only and Known-only identities, no-follow observations for the union of relevant targets, active-operation reporting, declaration failure after a readable state, and the requirement that an invalid state prevents target observation.
+An unsafe target/parent observation is asserted as reportable output; an unestablishable observation is asserted as status `1` with the documented partial report.
 
 Dry-run acceptance tests compare snapshots of the target tree, state directory, store, and control files before and after the command.
 The snapshots must be identical.

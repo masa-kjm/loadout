@@ -2,8 +2,10 @@
 
 ## Scope
 
-This specification defines the only v0.3.0 resource implementation: a regular file from a local store materialized as a file symbolic link below the current user's home directory.
+This specification defines the only v0.3.0 resource implementation retained by v0.4.0: a regular file from a local store materialized as a file symbolic link below the current user's home directory.
 It defines declaration syntax, containment, ownership, observation, mutation preconditions, and platform requirements.
+
+Every normative v0.3.0 requirement in this document remains a v0.4.0 requirement under the [retained baseline](README.md#retained-v030-baseline), including the no-follow observations used by v0.4.0 inspection.
 
 Copy operations, directory resources, hard links, junctions, and remote stores are outside v0.3.0.
 

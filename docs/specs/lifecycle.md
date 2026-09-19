@@ -2,9 +2,11 @@
 
 ## Scope
 
-This specification defines the v0.3.0 lifecycle for validating declarations, inspecting drift, producing a plan, and applying a plan.
+This specification defines the v0.3.0 lifecycle retained by v0.4.0 for validating declarations, inspecting drift, producing a plan, and applying a plan.
 It owns planning decisions and the Desired/Known/Actual transition table.
 The File Links and State and Recovery specifications define the filesystem and durable-state mechanics used by those decisions.
+
+Every normative v0.3.0 requirement in this document remains a v0.4.0 requirement under the [retained baseline](README.md#retained-v030-baseline).
 
 ## Inputs
 

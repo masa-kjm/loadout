@@ -3,7 +3,7 @@
 ## Purpose
 
 These boundaries keep safety decisions in one place and prevent the command layer, resource implementations, and persistence code from making incompatible decisions.
-They apply to every v0.3 implementation, including tests, authoring commands, and future resource types.
+They apply to every v0.4 implementation, including tests, authoring commands, inspection commands, and future resource types.
 
 ## Decision Ownership
 
@@ -16,6 +16,7 @@ They apply to every v0.3 implementation, including tests, authoring commands, an
 | Immediate precondition recheck, mutation, and post-condition verification | Executor | Create an unplanned action or reclassify an action after planning. |
 | State lock, operation progress, Known state, and atomic commit | State repository | Delegate authoritative state writes to command or resource code. |
 | Platform-specific path and filesystem primitives | Filesystem implementation | Decide ownership, desired state, or user-visible policy. |
+| Read-only inspection report assembly | Inspection query | Plan, recover, mutate state, acquire the apply lock, or infer ownership from a target match. |
 
 ## Planning and Execution
 
@@ -73,6 +74,19 @@ It has its own explicit filesystem, collision, durability, and failure-after-eff
 `config use` may change only the machine-local runtime selection, and `config set` may change only the one portable configuration field authorized by the Configuration Authoring specification.
 Neither command may acquire the state lock, write state, mutate a store or resource target, or authorize ownership adoption.
 All lifecycle commands, resource implementations, and the state repository remain forbidden from writing Loadout control files.
+
+## Inspection Boundary
+
+Inspection commands are query boundaries, not reduced forms of `apply`.
+They may load only the inputs their command contract names, and they must use the canonical declaration loader, resolver, state decoder, and no-follow inspector for those inputs.
+They must not create an alternative parser, path normalization rule, ownership model, or target observation model for presentation.
+
+`status` may compare a selected Resolved Desired set, Known state, and Actual observations, but it does not produce a Plan or select an action.
+Desired and Known records associate only through their fully qualified resource ID and recorded typed definition facts; a shared target path, matching link, or matching source path never establishes ownership or adoption.
+
+Inspection commands MUST NOT acquire the apply lock; reconcile, close, or modify an active operation; create a state directory, operation record, temporary entry, or target parent; write configuration or state; or mutate a source, store, or target.
+An active operation is reportable state for the commands whose contract reads it, including `status` and `diff`.
+Reporting it does not authorize recovery.
 
 ## State and Failure Boundaries
 

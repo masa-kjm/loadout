@@ -2,8 +2,10 @@
 
 ## Scope
 
-This specification defines v0.3.0 durable state, operation records, exclusive locking, atomic commits, and recovery after interruption.
-It applies only to the v0.3.0 file-link lifecycle.
+This specification defines v0.3.0 durable state, operation records, exclusive locking, atomic commits, and recovery after interruption retained by v0.4.0.
+It applies only to the v0.3.0 file-link lifecycle retained by v0.4.0.
+
+Every normative v0.3.0 requirement in this document remains a v0.4.0 requirement under the [retained baseline](README.md#retained-v030-baseline), including state validation before v0.4.0 inspection relies on state facts.
 
 ## State Files
 
@@ -173,6 +175,7 @@ The lock implementation must not rely on a stale-file heuristic.
 Process termination releases the operating-system lock according to platform semantics.
 
 `validate`, `diff`, `plan`, and dry-run apply do not acquire this exclusive lock.
+The v0.4.0 inspection commands also do not acquire it, create a lock file, recover an operation, or write state.
 
 ## Commit Protocol
 

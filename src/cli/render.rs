@@ -1,5 +1,8 @@
 use crate::application::queries::{
-    ConfigurationReport, ConfigurationValue, DiffReport, PlanReport, QueryError, ValidationReport,
+    ConfigurationReport, ConfigurationValue, DesiredResourcesReport, DiffReport,
+    KnownResourcesReport, PlanReport, ProfileListReport, ProfileShowReport, QueryError,
+    StatusActual, StatusDesired, StatusRelationship, StatusReport, StatusUnavailable,
+    ValidationReport,
 };
 use crate::domain::{
     actual::TargetObservation,
@@ -110,6 +113,206 @@ pub(super) fn diff(out: &mut impl Write, report: &DiffReport) -> io::Result<u8> 
         }
     }
     Ok(0)
+}
+
+pub(super) fn profile_list(out: &mut impl Write, report: &ProfileListReport) -> io::Result<()> {
+    writeln!(out, "Profiles: {}", report.profiles.len())?;
+    for profile in &report.profiles {
+        writeln!(out, "{}", profile.id())?;
+    }
+    Ok(())
+}
+
+pub(super) fn profile_show(out: &mut impl Write, report: &ProfileShowReport) -> io::Result<()> {
+    let profile = &report.profile;
+    writeln!(out, "profile: {}", profile.id())?;
+    for include in profile.includes() {
+        writeln!(out, "include: {include}")?;
+    }
+    for resource in profile.resources() {
+        writeln!(
+            out,
+            "resource {}: file link: store {}: source {}: target {}",
+            resource.resource_id(),
+            resource.store_id(),
+            resource.source_path(),
+            resource.target_path()
+        )?;
+    }
+    Ok(())
+}
+
+pub(super) fn desired_resources(
+    out: &mut impl Write,
+    report: &DesiredResourcesReport,
+) -> io::Result<()> {
+    writeln!(
+        out,
+        "Desired resources for {}: {}",
+        report.root_profile,
+        report.resources.len()
+    )?;
+    for resource in &report.resources {
+        render_resolved_resource(out, resource)?;
+    }
+    Ok(())
+}
+
+pub(super) fn desired_resource(
+    out: &mut impl Write,
+    root_profile: &crate::domain::ids::ProfileId,
+    resource: &crate::domain::file_link::ResolvedFileLink,
+) -> io::Result<()> {
+    writeln!(out, "Desired resource for {root_profile}:")?;
+    render_resolved_resource(out, resource)
+}
+
+pub(super) fn known_resources(
+    out: &mut impl Write,
+    report: &KnownResourcesReport,
+) -> io::Result<()> {
+    writeln!(out, "Known resources: {}", report.resources.len())?;
+    for resource in &report.resources {
+        writeln!(
+            out,
+            "{}: file link: source {}: target {}",
+            resource.resource_id(),
+            resource.source_path(),
+            resource.target_path()
+        )?;
+    }
+    Ok(())
+}
+
+pub(super) fn known_resource(
+    out: &mut impl Write,
+    resource: &crate::domain::known::KnownFileLink,
+) -> io::Result<()> {
+    writeln!(
+        out,
+        "{}: file link: source {}: target {}",
+        resource.resource_id(),
+        resource.source_path(),
+        resource.target_path()
+    )
+}
+
+pub(super) fn status(out: &mut impl Write, report: &StatusReport) -> io::Result<()> {
+    match &report.desired {
+        StatusDesired::Available {
+            root_profile,
+            resources,
+        } => {
+            writeln!(out, "status profile: {root_profile}")?;
+            for resource in resources {
+                let relationship = match resource.relationship() {
+                    StatusRelationship::DesiredOnly => "desired_only",
+                    StatusRelationship::KnownOnly => "known_only",
+                    StatusRelationship::DefinitionChanged => "definition_changed",
+                    StatusRelationship::DefinitionsMatch => "definitions_match",
+                };
+                writeln!(
+                    out,
+                    "{}: desired-to-known: {relationship}",
+                    resource.resource_id
+                )?;
+                match &resource.actual {
+                    StatusActual::Available(actual) => {
+                        let (comparison, category) = match resource.relationship() {
+                            StatusRelationship::DesiredOnly => {
+                                ("desired-to-actual", "desired_target_observation")
+                            }
+                            StatusRelationship::DefinitionsMatch
+                                if matches!(
+                                    actual.observation(),
+                                    TargetObservation::ExpectedLink { .. }
+                                ) =>
+                            {
+                                ("known-to-actual", "recorded_and_expected")
+                            }
+                            _ if matches!(
+                                actual.observation(),
+                                TargetObservation::ExpectedLink { .. }
+                            ) =>
+                            {
+                                ("known-to-actual", "expected_link")
+                            }
+                            _ => ("known-to-actual", "drifted"),
+                        };
+                        writeln!(
+                            out,
+                            "  {comparison}: {category}: {}: {}",
+                            actual.target_path(),
+                            observation(actual.observation())
+                        )?;
+                    }
+                    StatusActual::Unavailable(StatusUnavailable::InspectorInitialization) => {
+                        let (comparison, category) = unavailable_status_category(resource);
+                        writeln!(
+                            out,
+                            "  {comparison}: {category}: unavailable: inspector initialization failed"
+                        )?;
+                    }
+                    StatusActual::Unavailable(StatusUnavailable::Observation(error)) => {
+                        let (comparison, category) = unavailable_status_category(resource);
+                        writeln!(out, "  {comparison}: {category}: unavailable: {error}")?;
+                    }
+                }
+            }
+        }
+        StatusDesired::Unavailable(error) => {
+            writeln!(out, "desired_unavailable: {}", query_error(error))?;
+        }
+    }
+    if let Some(error) = &report.inspection_initialization_error {
+        writeln!(out, "inspection unavailable: {error}")?;
+    }
+    if let Some(operation) = &report.active_operation {
+        writeln!(out, "active_operation: {}", operation.id().as_str())?;
+        for (id, action) in operation.actions() {
+            if !action.status().closes_operation() {
+                let status = match action.status() {
+                    ActionStatus::Pending => "pending",
+                    ActionStatus::Running => "running",
+                    ActionStatus::Uncertain => "uncertain",
+                    _ => unreachable!("only unfinished actions are rendered"),
+                };
+                writeln!(
+                    out,
+                    "  {}: {} {}: {}: {status}",
+                    id.as_str(),
+                    action_name(action.kind()),
+                    action.resource_id(),
+                    action.target_path(),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unavailable_status_category(
+    resource: &crate::application::queries::StatusResource,
+) -> (&'static str, &'static str) {
+    match resource.relationship() {
+        StatusRelationship::DesiredOnly => ("desired-to-actual", "desired_target_observation"),
+        StatusRelationship::KnownOnly
+        | StatusRelationship::DefinitionChanged
+        | StatusRelationship::DefinitionsMatch => ("known-to-actual", "drifted"),
+    }
+}
+
+fn render_resolved_resource(
+    out: &mut impl Write,
+    resource: &crate::domain::file_link::ResolvedFileLink,
+) -> io::Result<()> {
+    writeln!(
+        out,
+        "{}: file link: source {}: target {}: operation link",
+        resource.resource_id(),
+        resource.source_path(),
+        resource.target_path()
+    )
 }
 
 pub(super) fn plan(
@@ -243,4 +446,99 @@ pub(super) fn config_get(
         ConfigurationValue::StorePath(path) => writeln!(out, "{field}: {path}"),
     }?;
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        application::queries::StatusResource,
+        domain::{
+            actual::{ActualFileLink, TargetObservation},
+            file_link::ResolvedFileLink,
+            ids::FullyQualifiedResourceId,
+            known::KnownFileLink,
+            paths::ResolvedPath,
+        },
+    };
+
+    #[test]
+    fn status_renders_a_desired_only_unavailable_observation_without_claiming_known_drift() {
+        let temporary = std::env::temp_dir();
+        let resource = ResolvedFileLink::new(
+            FullyQualifiedResourceId::parse("base/item").unwrap(),
+            ResolvedPath::new(temporary.join("loadout-render-source")).unwrap(),
+            ResolvedPath::new(temporary.join("loadout-render-target")).unwrap(),
+        )
+        .unwrap();
+        let report = StatusReport {
+            active_operation: None,
+            desired: StatusDesired::Available {
+                root_profile: crate::domain::ids::ProfileId::parse("base").unwrap(),
+                resources: vec![StatusResource {
+                    resource_id: resource.resource_id().clone(),
+                    desired: Some(resource),
+                    known: None,
+                    actual: StatusActual::Unavailable(StatusUnavailable::InspectorInitialization),
+                }],
+            },
+            has_unavailable_observation: true,
+            inspection_initialization_error: None,
+        };
+
+        let mut output = Vec::new();
+        status(&mut output, &report).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("desired-to-actual: desired_target_observation: unavailable"));
+        assert!(!output.contains("known-to-actual: drifted"));
+    }
+
+    #[test]
+    fn status_renders_definition_changed_and_expected_known_observation_separately() {
+        let temporary = std::env::temp_dir();
+        let resource_id = FullyQualifiedResourceId::parse("base/item").unwrap();
+        let target_path = ResolvedPath::new(temporary.join("loadout-render-target")).unwrap();
+        let desired = ResolvedFileLink::new(
+            resource_id.clone(),
+            ResolvedPath::new(temporary.join("loadout-render-desired-source")).unwrap(),
+            target_path.clone(),
+        )
+        .unwrap();
+        let known_definition = ResolvedFileLink::new(
+            resource_id.clone(),
+            ResolvedPath::new(temporary.join("loadout-render-known-source")).unwrap(),
+            target_path.clone(),
+        )
+        .unwrap();
+        let known = KnownFileLink::from_resolved(&known_definition);
+        let actual = ActualFileLink::new(
+            target_path,
+            TargetObservation::ExpectedLink {
+                link_target: known.link_target().clone(),
+            },
+        )
+        .unwrap();
+        let report = StatusReport {
+            active_operation: None,
+            desired: StatusDesired::Available {
+                root_profile: crate::domain::ids::ProfileId::parse("base").unwrap(),
+                resources: vec![StatusResource {
+                    resource_id,
+                    desired: Some(desired),
+                    known: Some(known),
+                    actual: StatusActual::Available(actual),
+                }],
+            },
+            has_unavailable_observation: false,
+            inspection_initialization_error: None,
+        };
+
+        let mut output = Vec::new();
+        status(&mut output, &report).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("desired-to-known: definition_changed"));
+        assert!(output.contains("known-to-actual: expected_link:"));
+        assert!(output.contains("expected_link"));
+        assert!(!output.contains("drifted"));
+    }
 }

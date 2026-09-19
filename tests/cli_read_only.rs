@@ -587,5 +587,100 @@ fn config_read_commands_report_selected_values_without_mutation() {
     assert!(output.stderr.is_empty());
 }
 
+#[test]
+fn inspection_commands_render_the_selected_declaration_desired_known_and_status_views() {
+    let f = Fixture::new();
+    f.profile("work", "work-item", "~/work-target");
+    expect(
+        f.run(&["profile", "list", "--config", "../portable/config.yaml"]),
+        0,
+        &["Profiles: 2", "base", "work"],
+    );
+    expect(
+        f.run(&[
+            "profile",
+            "show",
+            "--config",
+            "../portable/config.yaml",
+            "base",
+        ]),
+        0,
+        &[
+            "profile: base",
+            "resource item",
+            "store files",
+            "target ~/target",
+        ],
+    );
+    expect(
+        f.run(&["resource", "list", "--config", "../portable/config.yaml"]),
+        0,
+        &[
+            "Desired resources for base: 1",
+            "base/item",
+            "operation link",
+        ],
+    );
+    expect(
+        f.run(&[
+            "resource",
+            "show",
+            "--config",
+            "../portable/config.yaml",
+            "base/item",
+        ]),
+        0,
+        &["Desired resource for base", "base/item", "source", "target"],
+    );
+    f.state(json!({"base/item":f.known("target")}), Value::Null);
+    expect(
+        f.run(&["resource", "list", "--known"]),
+        0,
+        &["Known resources: 1", "base/item"],
+    );
+    expect(
+        f.run(&["resource", "show", "--known", "base/item"]),
+        0,
+        &["base/item", "source", "target"],
+    );
+    expect(
+        f.run(&["status", "--config", "../portable/config.yaml"]),
+        0,
+        &[
+            "status profile: base",
+            "desired-to-known: definitions_match",
+            "drifted",
+            "missing",
+        ],
+    );
+    f.state(
+        json!({"base/item":f.known("target")}),
+        json!({
+            "id":"interrupted-operation",
+            "desired_hash":format!("sha256:{}", "a".repeat(64)),
+            "actions": {
+                "a1": {
+                    "kind":"create_link",
+                    "resource_id":"base/pending",
+                    "target_path":f.path("home/pending"),
+                    "precondition":{"target":"missing"},
+                    "postcondition":{"target":"expected_link","link_target":f.path("store/source")},
+                    "status":"pending"
+                }
+            }
+        }),
+    );
+    expect(
+        f.run(&["status", "--config", "../portable/config.yaml"]),
+        0,
+        &["active_operation: interrupted-operation", "a1", "pending"],
+    );
+    expect(
+        f.run(&["resource", "show", "--known", "base/unknown"]),
+        2,
+        &["unknown resource ID"],
+    );
+}
+
 #[path = "support/apply.rs"]
 mod apply;

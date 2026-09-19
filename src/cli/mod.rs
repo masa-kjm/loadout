@@ -4,9 +4,10 @@ mod apply;
 mod args;
 mod render;
 use crate::application::queries::{
-    self, DeclarationRequest, QueryError, ValidationRequest, ValidationSelection,
+    self, DeclarationRequest, QueryError, StatusDesired, ValidationRequest, ValidationSelection,
 };
 use crate::authoring::{config_set, config_use, init};
+use crate::domain::ids::{FullyQualifiedResourceId, ProfileId};
 use crate::loader::{LoadError, MachinePaths, StatePaths};
 use crate::state::repository::StateRepository;
 use args::Command;
@@ -142,9 +143,144 @@ fn run_command(
             queries::plan_request(&DeclarationRequest { context, root })
                 .map(|report| render::plan(out, err, &report))
         }
+        Command::Status { config, root } => {
+            let context = match machine.select(config.as_deref()) {
+                Ok(context) => context,
+                Err(error) => return load_error(err, error),
+            };
+            queries::status(
+                &DeclarationRequest { context, root },
+                &StateRepository::new(machine.state_directory.clone()),
+            )
+            .map(|report| {
+                let code = status_exit_code(&report);
+                render::status(out, &report).map(|()| code)
+            })
+        }
+        Command::Profile(command) => return run_profile(command, machine, out, err),
+        Command::Resource(command) => return run_resource(command, machine, out, err),
         Command::Config(command) => return run_config(command, machine, out, err),
     };
     render_result(result, err)
+}
+
+fn run_profile(
+    command: args::ProfileCommand,
+    machine: &MachinePaths,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> io::Result<u8> {
+    match command {
+        args::ProfileCommand::List { config } => {
+            let context = match machine.select(config.as_deref()) {
+                Ok(context) => context,
+                Err(error) => return load_error(err, error),
+            };
+            render_result(
+                queries::profiles(&context)
+                    .map(|report| render::profile_list(out, &report).map(|()| 0)),
+                err,
+            )
+        }
+        args::ProfileCommand::Show { config, profile_id } => {
+            let profile_id = match ProfileId::parse(profile_id) {
+                Ok(profile_id) => profile_id,
+                Err(error) => return input_error(err, error),
+            };
+            let context = match machine.select(config.as_deref()) {
+                Ok(context) => context,
+                Err(error) => return load_error(err, error),
+            };
+            match queries::profile(&context, &profile_id) {
+                Ok(Some(report)) => render::profile_show(out, &report).map(|()| 0),
+                Ok(None) => input_error(err, format!("unknown profile ID: {profile_id}")),
+                Err(error) => render_result(Err(error), err),
+            }
+        }
+    }
+}
+
+fn run_resource(
+    command: args::ResourceCommand,
+    machine: &MachinePaths,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> io::Result<u8> {
+    match command {
+        args::ResourceCommand::KnownList => render_result(
+            queries::known_resources(&StateRepository::new(machine.state_directory.clone()))
+                .map(|report| render::known_resources(out, &report).map(|()| 0)),
+            err,
+        ),
+        args::ResourceCommand::KnownShow { resource_id } => {
+            let resource_id = match FullyQualifiedResourceId::parse(&resource_id) {
+                Ok(resource_id) => resource_id,
+                Err(error) => return input_error(err, error),
+            };
+            match queries::known_resources(&StateRepository::new(machine.state_directory.clone())) {
+                Ok(report) => match report
+                    .resources
+                    .into_iter()
+                    .find(|resource| resource.resource_id() == &resource_id)
+                {
+                    Some(resource) => render::known_resource(out, &resource).map(|()| 0),
+                    None => input_error(err, format!("unknown resource ID: {resource_id}")),
+                },
+                Err(error) => render_result(Err(error), err),
+            }
+        }
+        args::ResourceCommand::DesiredList { config, root } => {
+            let context = match machine.select(config.as_deref()) {
+                Ok(context) => context,
+                Err(error) => return load_error(err, error),
+            };
+            render_result(
+                queries::desired_resources(&DeclarationRequest { context, root })
+                    .map(|report| render::desired_resources(out, &report).map(|()| 0)),
+                err,
+            )
+        }
+        args::ResourceCommand::DesiredShow {
+            config,
+            root,
+            resource_id,
+        } => {
+            let resource_id = match FullyQualifiedResourceId::parse(&resource_id) {
+                Ok(resource_id) => resource_id,
+                Err(error) => return input_error(err, error),
+            };
+            let context = match machine.select(config.as_deref()) {
+                Ok(context) => context,
+                Err(error) => return load_error(err, error),
+            };
+            match queries::desired_resources(&DeclarationRequest { context, root }) {
+                Ok(report) => match report
+                    .resources
+                    .iter()
+                    .find(|resource| resource.resource_id() == &resource_id)
+                {
+                    Some(resource) => {
+                        render::desired_resource(out, &report.root_profile, resource).map(|()| 0)
+                    }
+                    None => input_error(err, format!("unknown resource ID: {resource_id}")),
+                },
+                Err(error) => render_result(Err(error), err),
+            }
+        }
+    }
+}
+
+fn status_exit_code(report: &queries::StatusReport) -> u8 {
+    match &report.desired {
+        StatusDesired::Unavailable(error) => query_exit_code(error),
+        StatusDesired::Available { .. } if report.has_unavailable_observation => 1,
+        StatusDesired::Available { .. } => 0,
+    }
+}
+
+fn input_error(err: &mut impl Write, error: impl std::fmt::Display) -> io::Result<u8> {
+    writeln!(err, "input error: {error}")?;
+    Ok(2)
 }
 
 fn run_config(

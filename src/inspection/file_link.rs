@@ -102,6 +102,21 @@ impl FileLinkInspector {
         )
     }
 
+    /// Observes one declared Desired target without treating a matching link as owned.
+    pub(crate) fn inspect_target_for_desired_link(
+        &self,
+        target_path: &ResolvedPath,
+        desired_link_target: &LinkTarget,
+    ) -> Result<ActualFileLink, TargetInspectionError> {
+        self.inspect_target(
+            target_path.clone(),
+            TargetExpectations {
+                desired_link_target: Some(desired_link_target.clone()),
+                known_link_target: None,
+            },
+        )
+    }
+
     /// Resolves the physical target name anchored at the canonical home used by this inspector. The executor passes this to the filesystem boundary only after the no-follow recheck has established a safe parent path.
     pub(crate) fn physical_target_path_for_execution(
         &self,

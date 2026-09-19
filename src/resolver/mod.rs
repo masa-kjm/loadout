@@ -104,6 +104,106 @@ pub(crate) fn discovered_roots(
     Ok(profiles.into_keys().collect())
 }
 
+/// One strictly parsed portable profile declaration for read-only inspection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeclaredProfile {
+    id: ProfileId,
+    includes: Vec<String>,
+    resources: Vec<DeclaredFileLink>,
+}
+
+impl DeclaredProfile {
+    /// The validated profile identity.
+    pub(crate) fn id(&self) -> &ProfileId {
+        &self.id
+    }
+
+    /// Included profile IDs in declaration order.
+    pub(crate) fn includes(&self) -> &[String] {
+        &self.includes
+    }
+
+    /// File-link declarations in resource-ID order.
+    pub(crate) fn resources(&self) -> &[DeclaredFileLink] {
+        &self.resources
+    }
+}
+
+/// One strictly parsed file-link declaration before store and path binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeclaredFileLink {
+    resource_id: ResourceId,
+    store_id: String,
+    source_path: String,
+    target_path: String,
+}
+
+impl DeclaredFileLink {
+    /// The validated resource ID within its declaring profile.
+    pub(crate) fn resource_id(&self) -> &ResourceId {
+        &self.resource_id
+    }
+
+    /// The raw store ID declaration.
+    pub(crate) fn store_id(&self) -> &str {
+        &self.store_id
+    }
+
+    /// The raw store-relative source-path declaration.
+    pub(crate) fn source_path(&self) -> &str {
+        &self.source_path
+    }
+
+    /// The raw target-path declaration.
+    pub(crate) fn target_path(&self) -> &str {
+        &self.target_path
+    }
+}
+
+/// Discovers and strictly parses profile declarations without resolving includes, stores, sources, or targets.
+pub(crate) fn declared_profiles(
+    context: &ResolverContext,
+    environment: &EnvironmentConfig,
+) -> Result<Vec<DeclaredProfile>, ResolverError> {
+    discover_profiles(context, environment)?
+        .into_values()
+        .map(|profile| {
+            let resources = profile
+                .declaration
+                .resources()
+                .map(|(raw_resource_id, resource)| {
+                    let resource_id =
+                        ResourceId::parse(raw_resource_id.to_owned()).map_err(|source| {
+                            ResolverError::InvalidIdentifier {
+                                role: "resource ID",
+                                value: raw_resource_id.to_owned(),
+                                source,
+                            }
+                        })?;
+                    let properties = resource.properties();
+                    Ok(DeclaredFileLink {
+                        resource_id,
+                        store_id: properties.source().store().to_owned(),
+                        source_path: properties.source().path().to_owned(),
+                        target_path: properties.target().to_owned(),
+                    })
+                })
+                .collect::<Result<Vec<_>, ResolverError>>()?;
+            Ok(DeclaredProfile {
+                id: ProfileId::parse(profile.declaration.id().to_owned())
+                    .expect("discovered profiles have validated IDs"),
+                includes: profile
+                    .declaration
+                    .includes()
+                    .iter()
+                    .map(|include| include.id().to_owned())
+                    .collect(),
+                resources,
+            })
+        })
+        .collect()
+}
+
 /// Resolves every declared local-store root for a read-only configuration view.
 pub(crate) fn resolved_store_paths(
     context: &ResolverContext,
@@ -115,16 +215,21 @@ pub(crate) fn resolved_store_paths(
         .collect())
 }
 
-/// Resolves one selected root profile to canonical Desired resources.
+/// Resolves one selected root profile to canonical Desired resources without final-source verification.
 ///
-/// The resolver reads only environment/profile declarations and verified local store sources. It never observes a managed target or performs mutation.
+/// This binds declarations, store roots, source-path syntax, and targets, but permits an absent or changed final source so read-only Desired inspection remains available.
 pub(crate) fn resolve(
     context: &ResolverContext,
     environment: &EnvironmentConfig,
     selected_root_profile: Option<&str>,
 ) -> Result<ResolvedDesired, ResolverError> {
-    resolve_for_apply(context, environment, selected_root_profile)
-        .map(ResolvedApplyInput::into_desired)
+    let (root_profile, resources) =
+        resolve_resource_inputs(context, environment, selected_root_profile)?;
+    ResolvedDesired::new(
+        root_profile,
+        resources.into_iter().map(|resource| resource.resolved),
+    )
+    .map_err(ResolverError::InvalidDesired)
 }
 
 /// Resolves one selected root profile and retains the verified source facts required by a later non-dry-run apply.
@@ -135,6 +240,44 @@ pub(crate) fn resolve_for_apply(
     environment: &EnvironmentConfig,
     selected_root_profile: Option<&str>,
 ) -> Result<ResolvedApplyInput, ResolverError> {
+    let (root_profile, resources) =
+        resolve_resource_inputs(context, environment, selected_root_profile)?;
+    let mut resolved_resources = Vec::new();
+    let mut verified_sources = BTreeMap::new();
+    for resource in resources {
+        let verified_source = verify_regular_source(&resource.store_root, &resource.source_path)
+            .map_err(|source| ResolverError::SourceVerification {
+                resource_id: resource.resolved.resource_id().clone(),
+                source,
+            })?;
+        let resolved = ResolvedFileLink::new(
+            resource.resolved.resource_id().clone(),
+            verified_source.path().clone(),
+            resource.resolved.target_path().clone(),
+        )
+        .map_err(ResolverError::InvalidResolvedFileLink)?;
+        verified_sources.insert(resolved.resource_id().clone(), verified_source);
+        resolved_resources.push(resolved);
+    }
+    let desired = ResolvedDesired::new(root_profile, resolved_resources)
+        .map_err(ResolverError::InvalidDesired)?;
+    Ok(ResolvedApplyInput {
+        desired,
+        verified_sources,
+    })
+}
+
+struct ResolvedResourceInput {
+    resolved: ResolvedFileLink,
+    store_root: PhysicalStoreRoot,
+    source_path: SourceRelativePath,
+}
+
+fn resolve_resource_inputs(
+    context: &ResolverContext,
+    environment: &EnvironmentConfig,
+    selected_root_profile: Option<&str>,
+) -> Result<(ProfileId, Vec<ResolvedResourceInput>), ResolverError> {
     let profiles = discover_profiles(context, environment)?;
     let root_profile = select_root_profile(environment, selected_root_profile, &profiles)?;
     let composed_profiles = compose_profiles(&root_profile, &profiles)?;
@@ -146,7 +289,6 @@ pub(crate) fn resolve_for_apply(
     let protected_paths = ProtectedPaths::new(context, profile_paths)?;
 
     let mut resources = Vec::new();
-    let mut verified_sources = BTreeMap::new();
     for profile_id in composed_profiles {
         let profile = profiles
             .get(&profile_id)
@@ -176,33 +318,19 @@ pub(crate) fn resolve_for_apply(
                     store_id,
                 })?;
             let source_components = parse_source_path(properties.source().path())?;
-            let verified_source =
-                verify_regular_source(&store.root, &source_components).map_err(|source| {
-                    ResolverError::SourceVerification {
-                        resource_id: resource_id.clone(),
-                        source,
-                    }
-                })?;
             let target_path = bind_target_path(properties.target(), context)?;
             protected_paths.ensure_target_allowed(&target_path, &stores)?;
-
-            let resolved = ResolvedFileLink::new(
-                resource_id.clone(),
-                verified_source.path().clone(),
-                target_path,
-            )
-            .map_err(ResolverError::InvalidResolvedFileLink)?;
-            resources.push(resolved);
-            verified_sources.insert(resource_id, verified_source);
+            let source_path = bind_source_path(&store.root, &source_components)?;
+            let resolved = ResolvedFileLink::new(resource_id, source_path, target_path)
+                .map_err(ResolverError::InvalidResolvedFileLink)?;
+            resources.push(ResolvedResourceInput {
+                resolved,
+                store_root: store.root.clone(),
+                source_path: source_components,
+            });
         }
     }
-
-    let desired =
-        ResolvedDesired::new(root_profile, resources).map_err(ResolverError::InvalidDesired)?;
-    Ok(ResolvedApplyInput {
-        desired,
-        verified_sources,
-    })
+    Ok((root_profile, resources))
 }
 
 #[derive(Debug)]
@@ -477,6 +605,18 @@ fn parse_source_path(raw_path: &str) -> Result<SourceRelativePath, ResolverError
     SourceRelativePath::parse(raw_path).map_err(|_| ResolverError::InvalidSourcePath {
         value: raw_path.to_owned(),
     })
+}
+
+/// Binds syntactically valid source components beneath a verified store root without inspecting the final source entry.
+fn bind_source_path(
+    store_root: &PhysicalStoreRoot,
+    source_path: &SourceRelativePath,
+) -> Result<ResolvedPath, ResolverError> {
+    let mut path = store_root.as_path().as_ref().to_path_buf();
+    for component in source_path.components() {
+        path.push(component);
+    }
+    ResolvedPath::new(path).map_err(ResolverError::InvalidPath)
 }
 
 fn bind_target_path(
@@ -1207,7 +1347,7 @@ mod tests {
                 &file_resource("directory", "a-directory", "~/.uncreated/target"),
             ),
         );
-        let non_regular_error = resolve(&context, &environment, None).unwrap_err();
+        let non_regular_error = resolve_for_apply(&context, &environment, None).unwrap_err();
         assert!(matches!(
             non_regular_error,
             ResolverError::SourceVerification {
@@ -1299,7 +1439,7 @@ mod tests {
         let context = workspace.context();
         let environment = environment(Some("workstation"), &["../profiles"], "../store");
 
-        let error = resolve(&context, &environment, None).unwrap_err();
+        let error = resolve_for_apply(&context, &environment, None).unwrap_err();
 
         assert!(matches!(
             error,
@@ -1334,7 +1474,7 @@ mod tests {
         let context = workspace.context();
         let environment = environment(Some("workstation"), &["../profiles"], "../store");
 
-        let error = resolve(&context, &environment, None).unwrap_err();
+        let error = resolve_for_apply(&context, &environment, None).unwrap_err();
 
         assert!(matches!(
             error,

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased v0.4.0
+## v0.4.0
 
 - Added read-only `status`, `profile`, and `resource` inspection commands for declared profiles, Resolved Desired resources, validated Known records, active operations, and no-follow Actual observations.
 

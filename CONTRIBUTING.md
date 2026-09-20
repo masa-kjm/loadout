@@ -1,6 +1,6 @@
 # Contributing to Loadout
 
-v0.3.0 is released and Loadout is being developed for v0.4.0.
+v0.3.0 and v0.4.0 are released.
 Keep the default branch internally consistent, reviewable, and aligned with the authoritative v0.4.0 documentation.
 
 v0.1 is retired and unsupported.

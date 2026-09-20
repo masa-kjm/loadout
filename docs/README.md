@@ -1,7 +1,7 @@
 # Loadout Documentation
 
-This directory contains the released v0.3.0 baseline and the v0.4.0 contract under development.
-The v0.4.0 documents define required behavior for that release; they do not claim that an unreleased command is installed or available.
+This directory contains the released v0.3.0 baseline and v0.4.0 contract.
+The v0.4.0 documents define required behavior for that release.
 It describes a resource-oriented local environment manager.
 
 ## Status and Authority

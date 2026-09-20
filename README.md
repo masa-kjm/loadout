@@ -4,8 +4,8 @@ Loadout is a local environment manager built around explicit desired state, owne
 
 ## Status
 
-v0.3.0 is released. v0.4.0 is under development and has not yet been tagged.
-The development branch implements `init`, `config`, `validate`, `diff`, `plan`, `apply`, `status`, `profile`, and `resource` as described in the [CLI specification](docs/specs/cli.md). The unreleased inspection commands are not a promise that they are available in a published archive.
+v0.3.0 and v0.4.0 are released.
+The v0.4.0 release implements `init`, `config`, `validate`, `diff`, `plan`, `apply`, `status`, `profile`, and `resource` as described in the [CLI specification](docs/specs/cli.md).
 Platform conformance for v0.4.0 requires recorded native evidence for the complete lifecycle and inspection observations on Linux/local ext4, macOS/local APFS, and Windows/local NTFS. Other combinations are not claimed supported merely because a capability is enabled.
 Release archives can be installed with the Unix and Windows installer scripts in `scripts/`.
 The published package's Rust library target is not yet a supported public API.

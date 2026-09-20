@@ -4,7 +4,7 @@ Follow these instructions for every change in this repository.
 
 ## Project Status
 
-v0.3.0 is released and v0.4.0 is under development.
+v0.3.0 and v0.4.0 are released.
 v0.1 and v0.2 are retired, unsupported, and have no compatibility contract with v0.4.0.
 The `v0.1.0` and `legacy/v0.1-final` tags preserve the historical implementation; do not change them.
 

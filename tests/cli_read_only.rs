@@ -391,6 +391,76 @@ fn read_only_processes_do_not_acquire_the_exclusive_state_lock() {
             &["base"],
         );
     }
+    expect(
+        f.run(&["status", "--config", "../portable/config.yaml"]),
+        0,
+        &["status profile: base"],
+    );
+    expect(
+        f.run(&["resource", "list", "--known"]),
+        0,
+        &["Known resources: 0"],
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn status_reports_a_symlinked_parent_as_unsafe_without_changing_any_fixture_entry() {
+    use std::os::unix::fs::symlink;
+
+    let f = Fixture::new();
+    fs::create_dir(f.path("outside")).unwrap();
+    symlink(f.path("outside"), f.path("home/unsafe")).unwrap();
+    f.profile("base", "item", "~/unsafe/target");
+    f.state(json!({"base/item":f.known("unsafe/target")}), Value::Null);
+
+    expect(
+        f.run(&["status", "--config", "../portable/config.yaml"]),
+        0,
+        &[
+            "desired-to-known: definitions_match",
+            "known-to-actual: drifted",
+            "unsafe_path",
+        ],
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn status_returns_partial_report_after_an_unavailable_desired_target_observation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = Fixture::new();
+    f.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 1\nid: base\nresources:\n  available:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.available\n  unavailable:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.blocked/target\n",
+    );
+    let blocked = f.path("home/.blocked");
+    fs::create_dir(&blocked).unwrap();
+    let before = f.snapshot();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+    let output = f
+        .command()
+        .args(["status", "--config", "../portable/config.yaml"])
+        .output()
+        .unwrap();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        f.snapshot(),
+        before,
+        "status changed the unavailable fixture"
+    );
+
+    expect(
+        output,
+        1,
+        &[
+            "base/available",
+            "missing",
+            "base/unavailable",
+            "desired-to-actual: desired_target_observation: unavailable",
+        ],
+    );
 }
 
 #[test]
@@ -679,6 +749,43 @@ fn inspection_commands_render_the_selected_declaration_desired_known_and_status_
         f.run(&["resource", "show", "--known", "base/unknown"]),
         2,
         &["unknown resource ID"],
+    );
+}
+
+#[test]
+fn status_reports_active_operation_when_valid_state_precedes_an_invalid_declaration() {
+    let f = Fixture::new();
+    f.state(
+        json!({}),
+        json!({
+            "id":"interrupted-operation",
+            "desired_hash":format!("sha256:{}", "a".repeat(64)),
+            "actions": {
+                "a1": {
+                    "kind":"create_link",
+                    "resource_id":"base/pending",
+                    "target_path":f.path("home/pending"),
+                    "precondition":{"target":"missing"},
+                    "postcondition":{"target":"expected_link","link_target":f.path("store/source")},
+                    "status":"pending"
+                }
+            }
+        }),
+    );
+    f.write(
+        "portable/profiles/base.yaml",
+        "not: a valid profile declaration\n",
+    );
+
+    expect(
+        f.run(&["status", "--config", "../portable/config.yaml"]),
+        2,
+        &[
+            "desired_unavailable",
+            "active_operation: interrupted-operation",
+            "a1",
+            "pending",
+        ],
     );
 }
 

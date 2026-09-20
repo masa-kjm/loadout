@@ -674,6 +674,56 @@ mod tests {
     }
 
     #[test]
+    fn status_retains_active_operation_and_skips_target_observation_when_desired_is_unavailable() {
+        let workspace = Workspace::new();
+        fs::write(
+            workspace.root.join("state/state.json"),
+            serde_json::json!({
+                "schema_version": 1,
+                "resources": {},
+                "active_operation": {
+                    "id": "interrupted-operation",
+                    "desired_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                    "actions": {
+                        "a1": {
+                            "kind": "create_link",
+                            "resource_id": "base/pending",
+                            "target_path": workspace.root.join("home/.pending"),
+                            "precondition": { "target": "missing" },
+                            "postcondition": {
+                                "target": "expected_link",
+                                "link_target": workspace.root.join("store/source"),
+                            },
+                            "status": "pending",
+                        },
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            workspace.root.join("portable/profiles/base.yaml"),
+            "not: a valid profile declaration\n",
+        )
+        .unwrap();
+        let _no_target_inspection = forbid_target_inspection();
+
+        let report = status(
+            &DeclarationRequest {
+                context: workspace.context(),
+                root: None,
+            },
+            &workspace.repository(),
+        )
+        .unwrap();
+
+        assert!(report.active_operation.is_some());
+        assert!(matches!(report.desired, StatusDesired::Unavailable(_)));
+        assert!(!report.has_unavailable_observation);
+    }
+
+    #[test]
     fn status_classifies_matching_changed_and_known_only_definitions() {
         let workspace = Workspace::new();
         fs::write(

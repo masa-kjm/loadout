@@ -653,6 +653,75 @@ mod tests {
     }
 
     #[test]
+    fn inspection_adapters_preserve_their_declared_read_boundaries() {
+        let fixture = Fixture::new();
+        let config = Some(fixture.root.join("config.yaml").into_os_string());
+        fs::write(fixture.root.join("state"), "not a directory").unwrap();
+        let _read_only = test_support::forbid_mutation();
+        let _no_targets = test_support::forbid_target_inspection();
+        for command in [
+            Command::Profile(args::ProfileCommand::List {
+                config: config.clone(),
+            }),
+            Command::Profile(args::ProfileCommand::Show {
+                config: config.clone(),
+                profile_id: "base".into(),
+            }),
+            Command::Resource(args::ResourceCommand::DesiredList {
+                config: config.clone(),
+                root: None,
+            }),
+            Command::Resource(args::ResourceCommand::DesiredShow {
+                config,
+                root: None,
+                resource_id: "base/item".into(),
+            }),
+        ] {
+            assert_eq!(
+                run_command(
+                    command,
+                    &fixture.machine(),
+                    &mut Vec::new(),
+                    &mut Vec::new()
+                )
+                .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn known_resource_adapters_do_not_read_declarations_or_targets() {
+        let fixture = Fixture::new();
+        let _read_only = test_support::forbid_mutation();
+        let _no_desired = test_support::forbid_desired_dependencies();
+        let _no_targets = test_support::forbid_target_inspection();
+        assert_eq!(
+            run_command(
+                Command::Resource(args::ResourceCommand::KnownList),
+                &fixture.machine(),
+                &mut Vec::new(),
+                &mut Vec::new()
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            run_command(
+                Command::Resource(args::ResourceCommand::KnownShow {
+                    resource_id: "base/item".into(),
+                }),
+                &fixture.machine(),
+                &mut Vec::new(),
+                &mut Vec::new()
+            )
+            .unwrap(),
+            2
+        );
+        assert!(!fixture.root.join("state").exists());
+    }
+
+    #[test]
     fn state_dependent_adapters_reject_invalid_state_before_target_observation() {
         let fixture = Fixture::new();
         fs::create_dir(fixture.root.join("state")).unwrap();
@@ -666,6 +735,10 @@ mod tests {
             for command in [
                 Command::Diff,
                 Command::Plan {
+                    config: Some(fixture.root.join("config.yaml").into_os_string()),
+                    root: None,
+                },
+                Command::Status {
                     config: Some(fixture.root.join("config.yaml").into_os_string()),
                     root: None,
                 },

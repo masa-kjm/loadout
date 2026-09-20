@@ -511,6 +511,11 @@ mod tests {
                 "schema_version: 1\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.item\n",
             )
             .unwrap();
+            let root = crate::domain::paths::ResolvedPath::from_platform_canonicalized(
+                fs::canonicalize(root).unwrap(),
+            )
+            .unwrap()
+            .into_path_buf();
             Self { root }
         }
 

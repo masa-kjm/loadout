@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased v0.4.0
+
+- Added read-only `status`, `profile`, and `resource` inspection commands for declared profiles, Resolved Desired resources, validated Known records, active operations, and no-follow Actual observations.
+
 ## v0.3.0
 
 - Added portable environment initialization and explicit configuration authoring commands.

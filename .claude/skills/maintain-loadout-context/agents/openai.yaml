@@ -1,4 +1,4 @@
 interface:
   display_name: "Maintain Loadout Context"
-  short_description: "Update v0.3 docs and project skills safely"
+  short_description: "Update v0.4 docs and project skills safely"
   default_prompt: "Use $maintain-loadout-context to update this Loadout documentation or skill change."

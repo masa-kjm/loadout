@@ -4,20 +4,20 @@ Loadout is a local environment manager built around explicit desired state, owne
 
 ## Status
 
-v0.2.0 is released. v0.3.0 is the next release and has not yet been tagged.
-The repository implements `init`, `config`, `validate`, `diff`, `plan`, and `apply` (including confirmation and dry run) as described in the [CLI specification](docs/specs/cli.md).
-Platform conformance for v0.3.0 requires recorded native evidence for the complete lifecycle on Linux/local ext4, macOS/local APFS, and Windows/local NTFS. CI is configured to validate those baseline filesystems and record the operating system, filesystem, Rust toolchain, and test result for review before release. Other combinations are not claimed supported merely because a capability is enabled.
+v0.3.0 is released. v0.4.0 is under development and has not yet been tagged.
+The development branch implements `init`, `config`, `validate`, `diff`, `plan`, `apply`, `status`, `profile`, and `resource` as described in the [CLI specification](docs/specs/cli.md). The unreleased inspection commands are not a promise that they are available in a published archive.
+Platform conformance for v0.4.0 requires recorded native evidence for the complete lifecycle and inspection observations on Linux/local ext4, macOS/local APFS, and Windows/local NTFS. Other combinations are not claimed supported merely because a capability is enabled.
 Release archives can be installed with the Unix and Windows installer scripts in `scripts/`.
 The published package's Rust library target is not yet a supported public API.
 
 v0.1 is retired and unsupported.
 The published `loadout` v0.1.0 crate is preserved by the `v0.1.0` archive tag, and the final legacy source snapshot is preserved by `legacy/v0.1-final`.
-v0.3.0 does not provide compatibility with v0.1 or v0.2 configuration, state, commands, resources, or behavior.
+v0.4.0 retains the v0.3.0 safe core and does not provide compatibility with v0.1 or v0.2 configuration, state, commands, resources, or behavior.
 
-## v0.3.0 Direction
+## v0.4.0 Direction
 
-v0.3.0 retains one complete, safe resource lifecycle: materializing a regular file from a local store as a file symbolic link below the current user's home directory.
-It provides profile composition, validation, planning, drift inspection, conflict detection, state locking, verified application, and crash recovery.
+v0.4.0 retains one complete, safe resource lifecycle: materializing a regular file from a local store as a file symbolic link below the current user's home directory.
+It provides profile composition, validation, planning, drift inspection, conflict detection, state locking, verified application, crash recovery, and read-only inspection of declarations, Desired resources, Known state, and Actual observations.
 
 The core planning contract is:
 
@@ -31,7 +31,7 @@ The intended completion baseline is Linux/local ext4, macOS/local APFS and Windo
 
 ## Installation
 
-After a v0.3.0 GitHub Release is published, install its latest archive with one of the following commands:
+After a GitHub Release is published, install its latest archive with one of the following commands:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/masa-kjm/loadout/main/scripts/install.sh | bash
@@ -45,7 +45,7 @@ Both installers accept an exact release tag through `--version vX.Y.Z` or `-Vers
 
 ## Basic Usage
 
-Loadout v0.3.0 uses an environment configuration and one or more profile files. The local store can live anywhere; it does not need to be inside the directory containing the configuration. For example:
+Loadout v0.4.0 retains the same environment configuration and profile-file model. The local store can live anywhere; it does not need to be inside the directory containing the configuration. For example:
 
 ```text
 loadout-config/
@@ -110,6 +110,15 @@ Use `--yes` when running `apply` non-interactively. `--dry-run` performs the app
 loadout diff
 ```
 
+The v0.4.0 development branch also provides read-only inspection commands. They report facts and never plan or repair a resource:
+
+```sh
+loadout status --config ./config.yaml
+loadout profile list --config ./config.yaml
+loadout resource list --config ./config.yaml
+loadout resource list --known
+```
+
 ### Initialize a portable environment
 
 To start an empty environment repository, run this command from its root:
@@ -123,12 +132,12 @@ loadout validate --config ./.loadout/config.yaml
 
 ## Documentation
 
-The authoritative v0.3 documentation is in [`docs/`](docs/README.md).
+The authoritative v0.4 documentation is in [`docs/`](docs/README.md).
 
 - [Architecture](docs/architecture/README.md) defines system responsibilities and boundaries.
-- [Specifications](docs/specs/README.md) define the v0.3.0 observable contracts.
+- [Specifications](docs/specs/README.md) define the v0.4.0 observable contracts.
 - [Testing Strategy](docs/development/testing.md) defines the required evidence for those contracts.
-- [Future Considerations](docs/future/README.md) records non-binding work outside v0.3.0.
+- [Future Considerations](docs/future/README.md) records non-binding work outside v0.4.0.
 
-`docs/architecture/` and `docs/specs/` are authoritative for v0.3.0.
-Future and draft material may inform a later design, but it cannot change a published v0.3.0 contract.
+`docs/architecture/` and `docs/specs/` are authoritative for v0.4.0.
+Future and draft material may inform a later design, but it cannot change a published v0.4.0 contract.

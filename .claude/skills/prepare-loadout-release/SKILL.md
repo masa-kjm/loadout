@@ -1,11 +1,11 @@
 ---
 name: prepare-loadout-release
-description: Prepare or validate a Loadout v0.3 release candidate and matching vX.Y.Z tag. Use for release metadata, candidate readiness, tag readiness, or release-workflow follow-up; not for ordinary feature work.
+description: Prepare or validate a Loadout v0.4 release candidate and matching vX.Y.Z tag. Use for release metadata, candidate readiness, tag readiness, or release-workflow follow-up; not for ordinary feature work.
 ---
 
 # Prepare Loadout Release
 
-Prepare a focused, reviewable v0.3 release candidate. Do not infer a target version or perform a merge, tag, push, publication, workflow dispatch, or other external action unless the user explicitly requests it.
+Prepare a focused, reviewable v0.4 release candidate. Do not infer a target version or perform a merge, tag, push, publication, workflow dispatch, or other external action unless the user explicitly requests it.
 
 ## Establish the release stage
 
@@ -20,11 +20,11 @@ Read [the release contract](references/release-contract.md) before deciding whic
 
 Use the adjacent metadata checker for the intended tag. Read [release validation](references/release-validation.md) before running it or interpreting its result.
 
-Use `review-loadout-v0-2` when the candidate changes v0.3 behavior, platform claims, or release automation. A metadata-only candidate is reviewed against the release contract and its complete diff.
+Use `review-loadout-v0-2` when the candidate changes v0.4 behavior, platform claims, or release automation. A metadata-only candidate is reviewed against the release contract and its complete diff.
 
 ## Complete only with explicit authority
 
-After the release pull request is reviewed and required checks pass, merging, tagging, pushing, and dispatching a workflow each require explicit user authorization. Do not publish a crate manually: v0.3.0 release automation distributes archives only.
+After the release pull request is reviewed and required checks pass, merging, tagging, pushing, and dispatching a workflow each require explicit user authorization. Do not publish a crate manually: release automation distributes archives only.
 
 After an authorized tag push, inspect the Release workflow before reporting the release as available.
 

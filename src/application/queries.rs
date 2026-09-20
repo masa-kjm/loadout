@@ -540,23 +540,13 @@ mod tests {
         }
     }
 
-    fn persisted_known_file_link(
-        resource_id: &str,
-        source_path: std::path::PathBuf,
-        target_path: std::path::PathBuf,
-    ) -> serde_json::Value {
-        let resource = ResolvedFileLink::new(
-            FullyQualifiedResourceId::parse(resource_id).unwrap(),
-            crate::domain::paths::ResolvedPath::new(source_path.clone()).unwrap(),
-            crate::domain::paths::ResolvedPath::new(target_path.clone()).unwrap(),
-        )
-        .unwrap();
+    fn persisted_known_file_link(resource: &ResolvedFileLink) -> serde_json::Value {
         serde_json::json!({
-            "definition_hash": crate::domain::hashes::definition_hash(&resource).unwrap().as_str(),
+            "definition_hash": crate::domain::hashes::definition_hash(resource).unwrap().as_str(),
             "file_link": {
-                "source_path": source_path.clone(),
-                "target_path": target_path,
-                "link_target": source_path,
+                "source_path": resource.source_path().as_ref(),
+                "target_path": resource.target_path().as_ref(),
+                "link_target": resource.link_target().as_path().as_ref(),
             },
         })
     }
@@ -583,6 +573,20 @@ mod tests {
         .unwrap();
         assert_eq!(desired.root_profile.as_str(), "base");
         assert_eq!(desired.resources[0].resource_id().as_str(), "base/item");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn workspace_root_uses_the_canonical_windows_spelling() {
+        let workspace = Workspace::new();
+
+        assert_eq!(
+            crate::domain::paths::ResolvedPath::new(workspace.root.clone()).unwrap(),
+            crate::domain::paths::ResolvedPath::from_platform_canonicalized(
+                fs::canonicalize(&workspace.root).unwrap()
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -736,29 +740,46 @@ mod tests {
             "schema_version: 1\nid: base\nresources:\n  changed:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.changed\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.item\n",
         )
         .unwrap();
+        let desired_item = desired_resources(&DeclarationRequest {
+            context: workspace.context(),
+            root: None,
+        })
+        .unwrap()
+        .resources
+        .into_iter()
+        .find(|resource| resource.resource_id().as_str() == "base/item")
+        .unwrap();
         let mut resources = serde_json::Map::new();
         resources.insert(
             "base/item".to_owned(),
-            persisted_known_file_link(
-                "base/item",
-                workspace.root.join("store/source"),
-                workspace.root.join("home/.item"),
-            ),
+            persisted_known_file_link(&desired_item),
         );
         resources.insert(
             "base/changed".to_owned(),
             persisted_known_file_link(
-                "base/changed",
-                workspace.root.join("store/previous-source"),
-                workspace.root.join("home/.changed"),
+                &ResolvedFileLink::new(
+                    FullyQualifiedResourceId::parse("base/changed").unwrap(),
+                    crate::domain::paths::ResolvedPath::new(
+                        workspace.root.join("store/previous-source"),
+                    )
+                    .unwrap(),
+                    crate::domain::paths::ResolvedPath::new(workspace.root.join("home/.changed"))
+                        .unwrap(),
+                )
+                .unwrap(),
             ),
         );
         resources.insert(
             "base/legacy".to_owned(),
             persisted_known_file_link(
-                "base/legacy",
-                workspace.root.join("store/source"),
-                workspace.root.join("home/.legacy"),
+                &ResolvedFileLink::new(
+                    FullyQualifiedResourceId::parse("base/legacy").unwrap(),
+                    crate::domain::paths::ResolvedPath::new(workspace.root.join("store/source"))
+                        .unwrap(),
+                    crate::domain::paths::ResolvedPath::new(workspace.root.join("home/.legacy"))
+                        .unwrap(),
+                )
+                .unwrap(),
             ),
         );
         fs::write(
@@ -823,21 +844,12 @@ mod tests {
         .resources
         .pop()
         .unwrap();
-        let source_path = workspace.root.join("store/source");
-        let target_path = workspace.root.join("home/.item");
         fs::write(
             workspace.root.join("state/state.json"),
             serde_json::json!({
                 "schema_version": 1,
                 "resources": {
-                    "base/item": {
-                        "definition_hash": crate::domain::hashes::definition_hash(&desired).unwrap().as_str(),
-                        "file_link": {
-                            "source_path": source_path,
-                            "target_path": target_path,
-                            "link_target": workspace.root.join("store/source"),
-                        },
-                    },
+                    "base/item": persisted_known_file_link(&desired),
                 },
                 "active_operation": {
                     "id": "interrupted-operation",

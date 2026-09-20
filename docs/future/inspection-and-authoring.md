@@ -20,18 +20,19 @@ They must not create a parallel interpretation of profiles, state, or ownership.
 The v0.4.0 [Inspection](../specs/inspection.md) specification owns `status`, `profile list/show`, and `resource list/show`.
 Future inspection capabilities may add a separately specified machine-readable output format, but must not make the v0.4.0 human-readable output an accidental automation contract.
 
-The v0.3.0 [Configuration Authoring](../specs/config-authoring.md) specification owns `config path`, `config list`, and `config get`.
+The v0.4.0 [Configuration Authoring](../specs/config-authoring.md) specification retains `config path`, `config list`, and `config get`.
 Future inspection commands should disclose only configuration information that is safe to print and must redact any future sensitive fields.
 
 The v0.4.0 `diff` command is not a second planner and does not imply a repair action.
-A future inspection capability may present Desired-to-Known or Desired-to-Actual views, but each comparison must be labeled precisely and must preserve the no-follow observation and structured diagnostic rules used by planning.
+The v0.4.0 `status` command already presents explicitly labeled Desired-to-Known, Known-to-Actual, and Desired-only Actual facts.
+A future inspection capability may add a distinct view only with equally precise comparison labels and the no-follow observation and structured diagnostic rules used by planning.
 
 Inspection commands are read-only: they must not acquire the apply lock, write state, reconcile an incomplete operation, create directories, or mutate a target.
 The v0.4.0 command contracts define which commands read and report active operations.
 
 ## Candidate Authoring Commands
 
-`init`, `config use`, and the typed `config set` are v0.3.0 commands.
+`init`, `config use`, and the typed `config set` are v0.4.0 retained commands.
 Configuration commands such as `config reset` or structural configuration editing remain future work.
 They are authoring helpers, not prerequisites for using `--config`, nor part of normal environment convergence.
 

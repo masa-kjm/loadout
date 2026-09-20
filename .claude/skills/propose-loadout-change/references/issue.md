@@ -24,5 +24,5 @@ Use this structure from `CONTRIBUTING.md`:
 
 For a filesystem mutation, state the target and source scope, ownership proof, preconditions, post-condition, dry-run behavior, failure aftermath, recovery behavior, Unix and Windows expectations, and intentional non-goals.
 
-Link the owning v0.3 architecture or specification document. Do not substitute a preferred implementation for a behavioral acceptance criterion.
+Link the owning v0.4 architecture or specification document. Do not substitute a preferred implementation for a behavioral acceptance criterion.
 Do not include a `Closes #N` reference in an issue proposal.

@@ -3,8 +3,9 @@
 ## Status
 
 This is a non-binding design note.
-v0.2.0 implements only version-1 schemas and provides no migration command.
-This document defines the required direction before a future release changes any portable or machine-local schema.
+v0.5.0 deliberately makes a breaking profile/state schema change while no supported environments require preservation.
+It provides no migration command or old-schema reader.
+This document defines the required direction before a future compatibility release changes a portable or machine-local schema.
 
 ## Principle
 
@@ -34,7 +35,7 @@ When a lifecycle or inspection command encounters an unsupported schema version,
 It reports the document type, location, encountered version, and required migration direction.
 `plan`, `apply`, `validate`, and `diff` never perform an implicit migration.
 
-A newer implementation may contain readers for older schema versions solely to support migration.
+A newer implementation may contain readers for older schema versions solely to support an explicitly specified migration.
 It must not use such a reader to execute the normal lifecycle against an older document.
 An older implementation encountering a newer document must also fail safely; it must not ignore newer fields or preserve them while applying an older lifecycle.
 

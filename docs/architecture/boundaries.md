@@ -3,7 +3,7 @@
 ## Purpose
 
 These boundaries keep safety decisions in one place and prevent the command layer, resource implementations, and persistence code from making incompatible decisions.
-They apply to every v0.4 implementation, including tests, authoring commands, inspection commands, and future resource types.
+They apply to every v0.5 implementation, including tests, authoring commands, inspection commands, and future resource types.
 
 ## Decision Ownership
 
@@ -39,15 +39,15 @@ For example, a planned create must not become a replacement because an unexpecte
 ## Ownership and Removal
 
 Known state alone never authorizes a destructive filesystem action.
-For the v0.3.0 file-link resource, removal or replacement is permitted only when both conditions hold:
+For each v0.5 resource effect, removal or replacement is permitted only when both conditions hold:
 
-1. Known state records Loadout's expected link for the resource.
-2. Actual inspection confirms that the target is that expected link.
+1. Known state records Loadout's effect-specific ownership evidence for the resource.
+2. Actual inspection confirms that exact expected effect.
 
 Any missing proof, wrong link, regular file, directory, unsafe target-parent path, or other unexpected entry is a conflict or safety failure.
 The executor must reject that observed condition before the next mutation step. The [external filesystem concurrency contract](../specs/file-link.md#external-filesystem-concurrency) limits this protection: a later substituted unmanaged entry can be removed or replaced, and post-observations may be indistinguishable from success.
 
-The [File Links](../specs/file-link.md) specification defines which target-parent conditions are unsafe and the required no-follow proof on each supported platform.
+The [File Links](../specs/file-link.md) and [File Copies](../specs/file-copy.md) specifications define effect-specific ownership and mutation proof.
 
 v0.3.0 has no forceful takeover of an unmanaged target.
 Explicit transfer-of-ownership behavior, if ever introduced, requires its own specification and confirmation contract.
@@ -107,11 +107,9 @@ A command must reject an unsupported version before an inspection, planning deci
 A command need not read or validate a persisted control document that its operation does not depend on.
 It must not ignore unknown ordering, ownership, recovery, or resource-effect data in order to continue.
 
-Schema migration is outside the v0.3.0 executable surface.
-When introduced, it must be an explicit operation rather than an implicit step of validation, planning, application, or inspection.
-State migration must hold the state repository's exclusive lock and require `active_operation == null`.
-An active or uncertain operation must be recovered and closed by the binary that implements its original state contract before migration.
-The future migration protocol is described in [Schema Evolution and Migration](../future/schema-evolution-and-migration.md).
+v0.5.0 deliberately provides no schema migration or old-schema reader.
+It rejects an unsupported version rather than transforming it during validation, planning, application, recovery, or inspection.
+A future compatibility release must specify an explicit migration operation before it accepts an older schema.
 
 ## Diagnostics and Errors
 

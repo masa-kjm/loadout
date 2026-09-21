@@ -1,6 +1,6 @@
 # Architecture
 
-This directory defines the v0.4 system model and the boundaries that keep its planning, mutation, durable-state, authoring, and inspection responsibilities separate.
+This directory defines the v0.5 system model and the boundaries that keep its planning, mutation, durable-state, authoring, and inspection responsibilities separate.
 It is authoritative for architecture only; it does not define YAML schemas, CLI syntax, filesystem algorithms, or the state format.
 
 ## Documents
@@ -10,12 +10,12 @@ It is authoritative for architecture only; it does not define YAML schemas, CLI 
 
 ## Architecture Commitments
 
-The following commitments apply throughout v0.4:
+The following commitments apply throughout v0.5:
 
 - The planner derives a plan from Resolved Desired, Known, and Actual state without performing I/O or mutation.
 - The executor performs only actions present in a plan and does not make a new planning decision.
 - Filesystem mutation and durable state commits are separate responsibilities, connected by post-condition verification.
 - A resource is never removed solely because it appears in Known state; ownership and the current filesystem entry must both satisfy the applicable contract.
-- A command validates every persisted control-document schema version on which it depends before a target inspection, planning decision, or durable-state mutation relies on that document; a future migration operation is the only boundary allowed to transform an unsupported version.
+- A command validates every persisted control-document schema version on which it depends before a target inspection, planning decision, or durable-state mutation relies on that document; v0.5 rejects unsupported versions and provides no transformation path.
 - A future resource type may extend well-defined lifecycle boundaries, but it must not bypass ownership, state, or diagnostic boundaries.
 - Inspection queries use resolved declarations, validated Known state, and no-follow Actual observations without invoking planning, execution, recovery, or durable-state mutation.

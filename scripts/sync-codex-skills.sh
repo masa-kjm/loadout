@@ -73,9 +73,12 @@ done
 # Report planned changes without modifying generated skills when requested.
 if [[ "$dry_run" == true ]]; then
   for skill_name in "${source_names[@]}"; do
+    source_dir="$source_root/$skill_name"
     target_dir="$target_root/$skill_name"
     if [[ -e "$target_dir" || -L "$target_dir" ]]; then
-      printf 'Would update %s\n' "$target_dir"
+      if ! diff -qr --exclude="$adapter_marker" "$source_dir" "$target_dir" > /dev/null; then
+        printf 'Would update %s\n' "$target_dir"
+      fi
     else
       printf 'Would install %s\n' "$target_dir"
     fi

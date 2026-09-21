@@ -1,9 +1,9 @@
 ---
 name: review-loadout-v0-2
-description: Review Loadout v0.4 changes and pull requests against authoritative contracts, architecture boundaries, safety invariants, and required test evidence. Use especially for filesystem mutation, ownership, recovery, paths, schema, state, or CLI changes.
+description: Review Loadout v0.5 changes and pull requests against authoritative contracts, architecture boundaries, safety invariants, and required test evidence. Use especially for filesystem mutation, ownership, recovery, paths, schema, state, or CLI changes.
 ---
 
-# Review Loadout v0.4 Changes
+# Review Loadout v0.5 Changes
 
 Review evidence, not intent. Do not edit the reviewed implementation unless the task explicitly requests changes.
 

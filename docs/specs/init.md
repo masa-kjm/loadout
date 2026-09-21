@@ -28,7 +28,7 @@ On success, `init` creates this complete directory tree:
 ```
 
 The generated `config.yaml` is a version-2 environment configuration that selects `base`, discovers `./profiles`, and declares the current directory as the `native` local store through `properties.path: ..`.
-The generated `base.yaml` is a version-1 profile with ID `base` and an empty resource set.
+The generated `base.yaml` is a version-2 profile with ID `base` and an empty resource set.
 
 The bundle contains Loadout control metadata.
 Native source assets remain outside `.loadout` and Loadout lifecycle commands MUST NOT create, edit, remove, or otherwise mutate control files.

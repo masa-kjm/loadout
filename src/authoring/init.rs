@@ -14,7 +14,7 @@ use std::fs::File;
 
 const CONTROL_DIRECTORY: &str = ".loadout";
 const CONFIG_YAML: &str = "schema_version: 2\ndefault_profile: base\n\nprofile_discovery:\n  paths:\n    - ./profiles\n\nstores:\n  native:\n    type: local\n    properties:\n      path: ..\n";
-const BASE_YAML: &str = "schema_version: 1\nid: base\nresources: {}\n";
+const BASE_YAML: &str = "schema_version: 2\nid: base\nresources: {}\n";
 
 static NEXT_STAGING_ID: AtomicU64 = AtomicU64::new(0);
 

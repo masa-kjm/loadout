@@ -4,14 +4,14 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-use crate::declaration::schema::SchemaVersionV1;
+use crate::declaration::schema::ProfileSchemaVersionV2;
 
 /// One profile file before identifier validation, include composition, and path binding.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProfileDeclaration {
     #[allow(dead_code)]
-    schema_version: SchemaVersionV1,
+    schema_version: ProfileSchemaVersionV2,
     id: String,
     #[serde(default)]
     includes: Vec<IncludeDeclaration>,
@@ -19,7 +19,7 @@ pub(crate) struct ProfileDeclaration {
 }
 
 impl ProfileDeclaration {
-    /// Parses only the strict version-1 profile declaration schema.
+    /// Parses only the strict version-2 profile declaration schema.
     pub(crate) fn parse(yaml: &str) -> Result<Self, serde_yaml::Error> {
         serde_yaml::from_str(yaml)
     }
@@ -90,8 +90,7 @@ pub(crate) struct FileLinkProperties {
     kind: FileKind,
     source: SourceDeclaration,
     target: String,
-    #[allow(dead_code)]
-    operation: LinkOperation,
+    operation: FileOperation,
 }
 
 impl FileLinkProperties {
@@ -103,6 +102,11 @@ impl FileLinkProperties {
     /// The raw target declaration before home binding.
     pub(crate) fn target(&self) -> &str {
         &self.target
+    }
+
+    /// The declared closed file materialization effect.
+    pub(crate) fn operation(&self) -> FileOperation {
+        self.operation
     }
 }
 
@@ -135,16 +139,18 @@ enum FileKind {
 
 /// The only permitted file-link operation.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-enum LinkOperation {
+pub(crate) enum FileOperation {
     #[serde(rename = "link")]
     Link,
+    #[serde(rename = "copy")]
+    Copy,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const VALID_PROFILE: &str = "schema_version: 1\nid: workstation\nincludes:\n  - id: base\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/.gitconfig\n      operation: link\n";
+    const VALID_PROFILE: &str = "schema_version: 2\nid: workstation\nincludes:\n  - id: base\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/.gitconfig\n      operation: link\n";
 
     #[test]
     fn profile_declaration_preserves_raw_profile_resource_and_path_syntax() {
@@ -165,31 +171,31 @@ mod tests {
             ("missing schema version", "id: workstation\nresources: {}\n"),
             (
                 "unsupported schema version",
-                "schema_version: 2\nid: workstation\nresources: {}\n",
+                "schema_version: 1\nid: workstation\nresources: {}\n",
             ),
             (
                 "unknown top-level field",
-                "schema_version: 1\nid: workstation\nresources: {}\nname: workstation\n",
+                "schema_version: 2\nid: workstation\nresources: {}\nname: workstation\n",
             ),
             (
                 "unknown include field",
-                "schema_version: 1\nid: workstation\nincludes:\n  - id: base\n    path: profiles/base.yaml\nresources: {}\n",
+                "schema_version: 2\nid: workstation\nincludes:\n  - id: base\n    path: profiles/base.yaml\nresources: {}\n",
             ),
             (
                 "unsupported resource type",
-                "schema_version: 1\nid: workstation\nresources:\n  install:\n    type: task\n    properties: {}\n",
+                "schema_version: 2\nid: workstation\nresources:\n  install:\n    type: task\n    properties: {}\n",
             ),
             (
                 "unknown resource field",
-                "schema_version: 1\nid: workstation\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/.gitconfig\n      operation: link\n    optional: true\n",
+                "schema_version: 2\nid: workstation\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/.gitconfig\n      operation: link\n    optional: true\n",
             ),
             (
                 "unknown properties field",
-                "schema_version: 1\nid: workstation\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/.gitconfig\n      operation: link\n      mode: 0600\n",
+                "schema_version: 2\nid: workstation\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/.gitconfig\n      operation: link\n      mode: 0600\n",
             ),
             (
                 "unknown source field",
-                "schema_version: 1\nid: workstation\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n        revision: main\n      target: ~/.gitconfig\n      operation: link\n",
+                "schema_version: 2\nid: workstation\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n        revision: main\n      target: ~/.gitconfig\n      operation: link\n",
             ),
         ] {
             assert!(
@@ -202,7 +208,7 @@ mod tests {
     #[test]
     fn profile_declaration_defaults_includes_to_empty() {
         let profile =
-            ProfileDeclaration::parse("schema_version: 1\nid: workstation\nresources: {}\n")
+            ProfileDeclaration::parse("schema_version: 2\nid: workstation\nresources: {}\n")
                 .unwrap();
 
         assert!(profile.includes().is_empty());

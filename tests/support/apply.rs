@@ -259,7 +259,7 @@ mod unix {
         f.state(json!({"base/item": f.known("target")}), Value::Null);
         f.write(
             "portable/profiles/base.yaml",
-            "schema_version: 1\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: new\n      target: ~/target\n",
+            "schema_version: 2\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: new\n      target: ~/target\n",
         );
 
         expect(
@@ -286,7 +286,7 @@ mod unix {
         f.state(json!({"base/item": f.known("target")}), Value::Null);
         f.write(
             "portable/profiles/base.yaml",
-            "schema_version: 1\nid: base\nresources:\n  renamed:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: new\n      target: ~/target\n",
+            "schema_version: 2\nid: base\nresources:\n  renamed:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: new\n      target: ~/target\n",
         );
 
         expect(
@@ -377,7 +377,7 @@ mod unix {
         );
         f.write(
             "portable/profiles/base.yaml",
-            "schema_version: 1\nid: base\nresources: {}\n",
+            "schema_version: 2\nid: base\nresources: {}\n",
         );
 
         expect(
@@ -420,7 +420,7 @@ mod unix {
             "content\n"
         );
         assert_eq!(
-            state(&f)["resources"]["base/item"]["file_link"]["target_path"],
+            state(&f)["resources"]["base/item"]["effect"]["target_path"],
             json!(f.path("home/moved/target"))
         );
         assert!(state(&f)["active_operation"].is_null());
@@ -691,7 +691,7 @@ mod windows {
             if declaration.is_empty() {
                 f.write(
                     "portable/profiles/base.yaml",
-                    "schema_version: 1\nid: base\nresources: {}\n",
+                    "schema_version: 2\nid: base\nresources: {}\n",
                 );
             } else {
                 f.write("store/new", "new source");
@@ -704,7 +704,7 @@ mod windows {
                 };
                 f.write(
                     "portable/profiles/base.yaml",
-                    &format!("schema_version: 1\nid: base\nresources:\n  {resource}:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: {source}\n      target: {target}\n"),
+                    &format!("schema_version: 2\nid: base\nresources:\n  {resource}:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: {source}\n      target: {target}\n"),
                 );
             }
             expect(
@@ -772,7 +772,7 @@ mod windows {
         create_owned_link(&f);
         f.write(
             "portable/profiles/base.yaml",
-            "schema_version: 1\nid: base\nresources: {}\n",
+            "schema_version: 2\nid: base\nresources: {}\n",
         );
         f.state(
             json!({"base/a":f.known("missing"), "base/z":f.known("target")}),
@@ -793,7 +793,7 @@ mod windows {
         let f = Fixture::new();
         f.write(
             "portable/profiles/base.yaml",
-            "schema_version: 1\nid: base\nresources: {}\n",
+            "schema_version: 2\nid: base\nresources: {}\n",
         );
         f.state(json!({"base/a":f.known("missing")}), Value::Null);
         {

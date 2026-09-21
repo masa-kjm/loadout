@@ -1514,7 +1514,7 @@ mod tests {
 
         for json in [
             b"not JSON".as_slice(),
-            br#"{"schema_version":2,"resources":{},"active_operation":null}"#,
+            br#"{"schema_version":3,"resources":{},"active_operation":null}"#,
             br#"{"schema_version":1,"resources":{},"active_operation":null,"extra":true}"#,
             br#"{"schema_version":1,"resources":{"base/git":{"definition_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","file_link":{"source_path":"/tmp/source","target_path":"/tmp/./target","link_target":"/tmp/source"}}},"active_operation":null}"#,
         ] {
@@ -1614,7 +1614,7 @@ mod tests {
 
         let json: serde_json::Value =
             serde_json::from_slice(&fs::read(directory.state_file()).unwrap()).unwrap();
-        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["schema_version"], 2);
         assert!(
             json["resources"]["base/git"]["definition_hash"]
                 .as_str()
@@ -1762,7 +1762,8 @@ mod tests {
         .unwrap();
         document["resources"]["base/git-renamed"] = serde_json::json!({
             "definition_hash": definition_hash(&destination).unwrap().as_str(),
-            "file_link": {
+            "effect": {
+                "kind": "file_link",
                 "source_path": destination.source_path().as_ref(),
                 "target_path": destination.target_path().as_ref(),
                 "link_target": destination.link_target().as_path().as_ref(),
@@ -1935,7 +1936,8 @@ mod tests {
                     serde_json::json!({
                         "base/git": {
                             "definition_hash": definition_hash(&replacement).unwrap().as_str(),
-                            "file_link": {
+                            "effect": {
+                                "kind": "file_link",
                                 "source_path": replacement.source_path().as_ref(),
                                 "target_path": replacement.target_path().as_ref(),
                                 "link_target": replacement.link_target().as_path().as_ref(),

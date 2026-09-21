@@ -24,6 +24,11 @@ pub(crate) enum Diagnostic {
         resource_id: FullyQualifiedResourceId,
         action_kind: ActionKind,
     },
+    UnsupportedResourceEffect {
+        resource_id: FullyQualifiedResourceId,
+        target_path: ResolvedPath,
+        effect: &'static str,
+    },
     IdentityHandoffPrecondition {
         old_resource_id: FullyQualifiedResourceId,
         new_resource_id: FullyQualifiedResourceId,

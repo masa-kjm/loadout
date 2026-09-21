@@ -20,7 +20,7 @@ use crate::state::operation::{
 };
 use crate::state::repository::{CommitError, PersistedState};
 
-const STATE_SCHEMA_VERSION: u32 = 1;
+const STATE_SCHEMA_VERSION: u32 = 2;
 
 /// A strict on-disk representation of `state.json`.
 #[derive(Debug, Deserialize, Serialize)]
@@ -78,7 +78,22 @@ impl StateDocument {
 #[serde(deny_unknown_fields)]
 struct PersistedKnownResource {
     definition_hash: String,
-    file_link: PersistedFileLink,
+    effect: PersistedKnownEffect,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum PersistedKnownEffect {
+    FileLink {
+        source_path: String,
+        target_path: String,
+        link_target: String,
+    },
+    FileCopy {
+        source_path: String,
+        target_path: String,
+        content_fingerprint: String,
+    },
 }
 
 impl PersistedKnownResource {
@@ -86,7 +101,11 @@ impl PersistedKnownResource {
         let definition_hash = definition_hash_for_known(resource).map_err(CommitError::Hash)?;
         Ok(Self {
             definition_hash: definition_hash.as_str().to_owned(),
-            file_link: PersistedFileLink::from_known(resource)?,
+            effect: PersistedKnownEffect::FileLink {
+                source_path: encode_path(resource.source_path())?,
+                target_path: encode_path(resource.target_path())?,
+                link_target: encode_path(resource.link_target().as_path())?,
+            },
         })
     }
 
@@ -103,7 +122,21 @@ impl PersistedKnownResource {
                 source,
             }
         })?;
-        let known = self.file_link.into_known(resource_id.clone())?;
+        let known = match self.effect {
+            PersistedKnownEffect::FileLink {
+                source_path,
+                target_path,
+                link_target,
+            } => PersistedFileLink {
+                source_path,
+                target_path,
+                link_target,
+            }
+            .into_known(resource_id.clone())?,
+            PersistedKnownEffect::FileCopy { .. } => {
+                return Err(StateDecodeError::CopyEffectNotYetExecutable { resource_id });
+            }
+        };
         let actual_hash = definition_hash_for_known(&known).map_err(|source| {
             StateDecodeError::DefinitionHashEncoding {
                 resource_id: resource_id.clone(),
@@ -462,6 +495,9 @@ pub(crate) enum StateDecodeError {
     UnsupportedSchemaVersion {
         actual: u32,
     },
+    CopyEffectNotYetExecutable {
+        resource_id: FullyQualifiedResourceId,
+    },
     InvalidResourceId {
         value: String,
         source: FullyQualifiedResourceIdError,
@@ -507,6 +543,10 @@ impl fmt::Display for StateDecodeError {
             Self::UnsupportedSchemaVersion { actual } => write!(
                 formatter,
                 "unsupported state schema_version {actual}; expected {STATE_SCHEMA_VERSION}"
+            ),
+            Self::CopyEffectNotYetExecutable { resource_id } => write!(
+                formatter,
+                "persisted file-copy effect for {resource_id} is not executable in this implementation slice"
             ),
             Self::InvalidResourceId { value, source } => {
                 write!(
@@ -579,6 +619,7 @@ impl std::error::Error for StateDecodeError {
             Self::InvalidDesiredHash(error) => Some(error),
             Self::InvalidOperation(error) => Some(error),
             Self::UnsupportedSchemaVersion { .. }
+            | Self::CopyEffectNotYetExecutable { .. }
             | Self::DefinitionHashMismatch { .. }
             | Self::NonNormalizedPath { .. }
             | Self::InvalidTargetCondition
@@ -617,7 +658,8 @@ mod tests {
         if (kind == "create_link") == (status == "succeeded") {
             resources["base/config"] = json!({
                 "definition_hash": definition_hash(&resolved).unwrap().as_str(),
-                "file_link": {
+                "effect": {
+                    "kind": "file_link",
                     "source_path": source,
                     "target_path": target,
                     "link_target": source,
@@ -625,7 +667,7 @@ mod tests {
             });
         }
         json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "resources": resources,
             "active_operation": {
                 "id": "op-fixture",
@@ -672,7 +714,7 @@ mod tests {
         for pointer in [
             "",
             "/resources/base~1config",
-            "/resources/base~1config/file_link",
+            "/resources/base~1config/effect",
             "/active_operation",
             "/active_operation/actions/a1",
             "/active_operation/actions/a1/precondition",
@@ -745,7 +787,7 @@ mod tests {
     #[test]
     fn windows_nonconforming_v1_known_and_active_operation_paths_are_rejected() {
         let mut known_fixture = document_fixture("create_link", "succeeded");
-        known_fixture["resources"]["base/config"]["file_link"]["target_path"] =
+        known_fixture["resources"]["base/config"]["effect"]["target_path"] =
             json!(r"\\?\C:\Users\Example\target");
         let known_document = serde_json::from_value::<StateDocument>(known_fixture).unwrap();
         assert!(matches!(
@@ -763,7 +805,7 @@ mod tests {
         ));
 
         let mut control_character_fixture = document_fixture("create_link", "succeeded");
-        control_character_fixture["resources"]["base/config"]["file_link"]["target_path"] =
+        control_character_fixture["resources"]["base/config"]["effect"]["target_path"] =
             json!("C:\\Users\\Example\\target\u{0001}");
         let control_character_document =
             serde_json::from_value::<StateDocument>(control_character_fixture).unwrap();

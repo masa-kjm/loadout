@@ -4,7 +4,7 @@ use std::{fs, io};
 
 use crate::declaration::environment_config::{EnvironmentConfig, EnvironmentConfigError};
 use crate::domain::actual::ActualFileLink;
-use crate::domain::desired::ResolvedDesired;
+use crate::domain::desired::{ResolvedDesired, ResolvedResource};
 use crate::domain::file_link::ResolvedFileLink;
 use crate::domain::ids::{FullyQualifiedResourceId, ProfileId};
 use crate::domain::known::KnownFileLink;
@@ -173,6 +173,10 @@ pub(crate) enum QueryError {
     State(StateRepositoryError),
     Inspection(TargetInspectionError),
     ConfigField(String),
+    UnsupportedResourceEffect {
+        resource_id: FullyQualifiedResourceId,
+        effect: &'static str,
+    },
 }
 
 fn load_environment(context: &ResolverContext) -> Result<EnvironmentConfig, QueryError> {
@@ -299,6 +303,7 @@ pub(crate) fn desired_resources(
     request: &DeclarationRequest,
 ) -> Result<DesiredResourcesReport, QueryError> {
     let desired = resolve_desired(request)?;
+    reject_unrenderable_effects(&desired)?;
     Ok(DesiredResourcesReport {
         root_profile: desired.root_profile().clone(),
         resources: desired.resources().to_vec(),
@@ -343,6 +348,14 @@ fn status_with_inspector(
             });
         }
     };
+    if let Err(error) = reject_unrenderable_effects(&desired) {
+        return Ok(StatusReport {
+            active_operation,
+            desired: StatusDesired::Unavailable(error),
+            has_unavailable_observation: false,
+            inspection_initialization_error: None,
+        });
+    }
     let (inspector, inspection_initialization_error) =
         match initialize_inspector(request.context.home_directory().as_ref()) {
             Ok(inspector) => (Some(inspector), None),
@@ -407,6 +420,20 @@ fn status_with_inspector(
         has_unavailable_observation,
         inspection_initialization_error,
     })
+}
+
+fn reject_unrenderable_effects(desired: &ResolvedDesired) -> Result<(), QueryError> {
+    if let Some(ResolvedResource::FileCopy(resource)) = desired
+        .variants()
+        .iter()
+        .find(|resource| matches!(resource, ResolvedResource::FileCopy(_)))
+    {
+        return Err(QueryError::UnsupportedResourceEffect {
+            resource_id: resource.resource_id().clone(),
+            effect: "file_copy",
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn validate(request: &ValidationRequest) -> Result<ValidationReport, QueryError> {
@@ -508,7 +535,7 @@ mod tests {
             .unwrap();
             fs::write(
                 root.join("portable/profiles/base.yaml"),
-                "schema_version: 1\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.item\n",
+                "schema_version: 2\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.item\n",
             )
             .unwrap();
             let root = crate::domain::paths::ResolvedPath::from_platform_canonicalized(
@@ -543,7 +570,8 @@ mod tests {
     fn persisted_known_file_link(resource: &ResolvedFileLink) -> serde_json::Value {
         serde_json::json!({
             "definition_hash": crate::domain::hashes::definition_hash(resource).unwrap().as_str(),
-            "file_link": {
+            "effect": {
+                "kind": "file_link",
                 "source_path": resource.source_path().as_ref(),
                 "target_path": resource.target_path().as_ref(),
                 "link_target": resource.link_target().as_path().as_ref(),
@@ -688,7 +716,7 @@ mod tests {
         fs::write(
             workspace.root.join("state/state.json"),
             serde_json::json!({
-                "schema_version": 1,
+                "schema_version":2,
                 "resources": {},
                 "active_operation": {
                     "id": "interrupted-operation",
@@ -737,7 +765,7 @@ mod tests {
         let workspace = Workspace::new();
         fs::write(
             workspace.root.join("portable/profiles/base.yaml"),
-            "schema_version: 1\nid: base\nresources:\n  changed:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.changed\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.item\n",
+            "schema_version: 2\nid: base\nresources:\n  changed:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.changed\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.item\n",
         )
         .unwrap();
         let desired_item = desired_resources(&DeclarationRequest {
@@ -785,7 +813,7 @@ mod tests {
         fs::write(
             workspace.root.join("state/state.json"),
             serde_json::json!({
-                "schema_version": 1,
+                "schema_version":2,
                 "resources": resources,
                 "active_operation": null,
             })
@@ -847,7 +875,7 @@ mod tests {
         fs::write(
             workspace.root.join("state/state.json"),
             serde_json::json!({
-                "schema_version": 1,
+                "schema_version":2,
                 "resources": {
                     "base/item": persisted_known_file_link(&desired),
                 },
@@ -951,7 +979,7 @@ mod tests {
         let workspace = Workspace::new();
         fs::write(
             workspace.root.join("portable/profiles/base.yaml"),
-            "schema_version: 1\nid: base\nresources:\n  another:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.another\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.blocked/item\n",
+            "schema_version: 2\nid: base\nresources:\n  another:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.another\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.blocked/item\n",
         )
         .unwrap();
         let blocked = workspace.root.join("home/.blocked");

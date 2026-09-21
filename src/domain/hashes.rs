@@ -6,12 +6,14 @@ use std::path::PathBuf;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::domain::desired::ResolvedDesired;
+use crate::domain::desired::{ResolvedDesired, ResolvedResource};
+use crate::domain::file_copy::ResolvedFileCopy;
 use crate::domain::file_link::ResolvedFileLink;
 
 const SHA256_PREFIX: &str = "sha256:";
 const RESOLVED_FILE_LINK_FORMAT: &str = "loadout.resolved-file-link.v1";
-const RESOLVED_DESIRED_FORMAT: &str = "loadout.resolved-desired.v1";
+const RESOLVED_FILE_COPY_FORMAT: &str = "loadout.resolved-file-copy.v1";
+const RESOLVED_DESIRED_FORMAT: &str = "loadout.resolved-desired.v2";
 
 /// A SHA-256 hash of one canonical resolved file-link definition.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -69,10 +71,18 @@ pub(crate) fn definition_hash(
     Ok(DefinitionHash(sha256(&canonical_json(&definition))))
 }
 
+/// Produces the definition hash for a resolved file-copy definition.
+pub(crate) fn file_copy_definition_hash(
+    resource: &ResolvedFileCopy,
+) -> Result<DefinitionHash, CanonicalHashError> {
+    let definition = CanonicalFileCopy::from_resolved(resource)?;
+    Ok(DefinitionHash(sha256(&canonical_json(&definition))))
+}
+
 /// Produces the desired-set hash from canonically ordered resolved resources.
 pub(crate) fn desired_hash(desired: &ResolvedDesired) -> Result<DesiredHash, CanonicalHashError> {
     let mut resources = desired
-        .resources()
+        .variants()
         .iter()
         .map(CanonicalDesiredResource::from_resolved)
         .collect::<Result<Vec<_>, _>>()?;
@@ -137,6 +147,30 @@ impl CanonicalFileLink {
 }
 
 #[derive(Serialize)]
+struct CanonicalFileCopy {
+    #[serde(rename = "type")]
+    resource_type: &'static str,
+    target_path: String,
+    operation: &'static str,
+    kind: &'static str,
+    source_path: String,
+    format: &'static str,
+}
+
+impl CanonicalFileCopy {
+    fn from_resolved(resource: &ResolvedFileCopy) -> Result<Self, CanonicalHashError> {
+        Ok(Self {
+            resource_type: "file",
+            target_path: resolved_path_utf8(resource.target_path())?,
+            operation: "copy",
+            kind: "file",
+            source_path: resolved_path_utf8(resource.source_path())?,
+            format: RESOLVED_FILE_COPY_FORMAT,
+        })
+    }
+}
+
+#[derive(Serialize)]
 struct CanonicalDesired {
     format: &'static str,
     resources: Vec<CanonicalDesiredResource>,
@@ -144,14 +178,29 @@ struct CanonicalDesired {
 
 #[derive(Serialize)]
 struct CanonicalDesiredResource {
-    definition: CanonicalFileLink,
+    definition: CanonicalResolvedDefinition,
     resource_id: String,
 }
 
+#[derive(Serialize)]
+#[serde(untagged)]
+enum CanonicalResolvedDefinition {
+    FileLink(CanonicalFileLink),
+    FileCopy(CanonicalFileCopy),
+}
+
 impl CanonicalDesiredResource {
-    fn from_resolved(resource: &ResolvedFileLink) -> Result<Self, CanonicalHashError> {
+    fn from_resolved(resource: &ResolvedResource) -> Result<Self, CanonicalHashError> {
+        let definition = match resource {
+            ResolvedResource::FileLink(resource) => {
+                CanonicalResolvedDefinition::FileLink(CanonicalFileLink::from_resolved(resource)?)
+            }
+            ResolvedResource::FileCopy(resource) => {
+                CanonicalResolvedDefinition::FileCopy(CanonicalFileCopy::from_resolved(resource)?)
+            }
+        };
         Ok(Self {
-            definition: CanonicalFileLink::from_resolved(resource)?,
+            definition,
             resource_id: resource.resource_id().as_str().to_owned(),
         })
     }
@@ -251,6 +300,41 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn file_copy_definition_hash_uses_its_effect_specific_canonical_value() {
+        let resource = ResolvedFileCopy::new(
+            FullyQualifiedResourceId::parse("base/copy-config").unwrap(),
+            ResolvedPath::new("/home/example/dotfiles/git/config").unwrap(),
+            ResolvedPath::new("/home/example/.copyconfig").unwrap(),
+            crate::domain::file_copy::ContentFingerprint::parse(format!(
+                "sha256:{}",
+                "a".repeat(64)
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            canonical_json(&CanonicalFileCopy::from_resolved(&resource).unwrap()),
+            br#"{"format":"loadout.resolved-file-copy.v1","kind":"file","operation":"copy","source_path":"/home/example/dotfiles/git/config","target_path":"/home/example/.copyconfig","type":"file"}"#
+        );
+        assert_eq!(
+            file_copy_definition_hash(&resource).unwrap().as_str(),
+            "sha256:519b2af3f86be4b6c4a1ea01ab17bc61a4943f310c950dd12522440c7ebcb1a7"
+        );
+
+        let desired = ResolvedDesired::new(
+            ProfileId::parse("workstation").unwrap(),
+            Vec::<ResolvedResource>::from([file_link("base/git-config").into(), resource.into()]),
+        )
+        .unwrap();
+        assert_eq!(
+            desired_hash(&desired).unwrap().as_str(),
+            "sha256:c659c640473e4d8bdc69db2253991ba4fa9889f6eb742df91ebefe596b2dc8a3"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_definition_hash_fixture_preserves_case_and_normalized_separators() {
@@ -292,7 +376,7 @@ mod tests {
 
         assert_eq!(
             desired_hash(&desired).unwrap().as_str(),
-            "sha256:2f2e1e550b61eb6fd9916996456d1f3c1321df8f6e3c568d4711c358ffa86e54"
+            "sha256:01b178b4059b64f1debd6f6ff4e092a403551eaca6b9d5b0d11720a162c0db7e"
         );
     }
 

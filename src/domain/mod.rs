@@ -16,6 +16,9 @@ pub(crate) mod diagnostic;
 pub(crate) mod file_link;
 
 #[allow(dead_code)]
+pub(crate) mod file_copy;
+
+#[allow(dead_code)]
 pub(crate) mod hashes;
 
 #[allow(dead_code)]

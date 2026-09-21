@@ -387,6 +387,14 @@ pub(super) fn planned(out: &mut impl Write, err: &mut impl Write, plan: &Plan) -
                 "blocked: {resource_id}: unsupported {}",
                 action_name(*action_kind)
             )?,
+            Diagnostic::UnsupportedResourceEffect {
+                resource_id,
+                target_path,
+                effect,
+            } => writeln!(
+                err,
+                "blocked: {resource_id}: {target_path}: {effect} planning is not implemented"
+            )?,
             Diagnostic::IdentityHandoffPrecondition {
                 old_resource_id,
                 new_resource_id,
@@ -412,6 +420,10 @@ pub(super) fn query_error(error: &QueryError) -> String {
         QueryError::State(error) => error.to_string(),
         QueryError::Inspection(error) => error.to_string(),
         QueryError::ConfigField(field) => format!("unsupported configuration field: {field}"),
+        QueryError::UnsupportedResourceEffect {
+            resource_id,
+            effect,
+        } => format!("resource {resource_id} uses unsupported {effect} read-only rendering"),
     }
 }
 

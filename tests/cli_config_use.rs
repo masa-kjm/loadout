@@ -47,7 +47,7 @@ impl Fixture {
         .unwrap();
         fs::write(
             root.join("portable/profiles/base.yaml"),
-            "schema_version: 1\nid: base\nresources: {}\n",
+            "schema_version: 2\nid: base\nresources: {}\n",
         )
         .unwrap();
         Self { root }

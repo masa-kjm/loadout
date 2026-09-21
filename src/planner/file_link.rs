@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::domain::actual::{ActualState, TargetObservation};
-use crate::domain::desired::ResolvedDesired;
+use crate::domain::desired::{ResolvedDesired, ResolvedResource};
 use crate::domain::diagnostic::Diagnostic;
 use crate::domain::file_link::ResolvedFileLink;
 use crate::domain::ids::FullyQualifiedResourceId;
@@ -21,14 +21,24 @@ pub(crate) fn plan(desired: &ResolvedDesired, known: &KnownState, actual: &Actua
     crate::test_support::assert_desired_dependencies_allowed();
     let mut actions = Vec::new();
     let mut diagnostics = Vec::new();
-    let blocked_targets = desired_target_collisions(desired, &mut diagnostics);
+    let mut blocked_targets = desired_target_collisions(desired, &mut diagnostics);
+    for resource in desired.variants() {
+        if let ResolvedResource::FileCopy(resource) = resource {
+            blocked_targets.insert(resource.target_path().clone());
+            diagnostics.push(Diagnostic::UnsupportedResourceEffect {
+                resource_id: resource.resource_id().clone(),
+                target_path: resource.target_path().clone(),
+                effect: "file_copy",
+            });
+        }
+    }
     let desired_ids = desired
-        .resources()
+        .variants()
         .iter()
         .map(|resource| resource.resource_id().clone())
         .collect::<BTreeSet<_>>();
     let desired_targets = desired
-        .resources()
+        .variants()
         .iter()
         .map(|resource| resource.target_path().clone())
         .collect::<BTreeSet<_>>();

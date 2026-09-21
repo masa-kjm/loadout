@@ -70,7 +70,7 @@ impl Fixture {
         self.write("portable/config.yaml", &format!("schema_version: 2\n{default}profile_discovery:\n  paths: [profiles]\nstores:\n  files:\n    type: local\n    properties:\n      path: ../store\n"));
     }
     fn profile(&self, id: &str, resource: &str, target: &str) {
-        self.write(&format!("portable/profiles/{id}.yaml"), &format!("schema_version: 1\nid: {id}\nresources:\n  {resource}:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: {target}\n"));
+        self.write(&format!("portable/profiles/{id}.yaml"), &format!("schema_version: 2\nid: {id}\nresources:\n  {resource}:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: {target}\n"));
     }
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_loadout"));
@@ -119,7 +119,7 @@ impl Fixture {
     fn state(&self, resources: Value, active: Value) {
         self.write(
             "state/loadout/state.json",
-            &json!({"schema_version":1,"resources":resources,"active_operation":active})
+            &json!({"schema_version":2,"resources":resources,"active_operation":active})
                 .to_string(),
         );
     }
@@ -128,7 +128,7 @@ impl Fixture {
         let target = self.path(&format!("home/{target}"));
         let definition = json!({"format":"loadout.resolved-file-link.v1","kind":"file","operation":"link","source_path":source,"target_path":target,"type":"file"});
         let digest = Sha256::digest(serde_json_canonicalizer::to_vec(&definition).unwrap());
-        json!({"definition_hash":format!("sha256:{digest:x}"),"file_link":{"source_path":source,"target_path":target,"link_target":source}})
+        json!({"definition_hash":format!("sha256:{digest:x}"),"effect":{"kind":"file_link","source_path":source,"target_path":target,"link_target":source}})
     }
 }
 impl Drop for Fixture {
@@ -233,7 +233,7 @@ fn defaults_all_roots_and_argument_rejections() {
     );
     f.write(
         "portable/profiles/work.yaml",
-        "schema_version: 1\nid: work\nincludes: [{id: missing}]\nresources: {}\n",
+        "schema_version: 2\nid: work\nincludes: [{id: missing}]\nresources: {}\n",
     );
     expect(
         f.run(&["validate", "--config", "../portable/config.yaml", "--all"]),
@@ -269,7 +269,7 @@ fn plan_conflict_and_runtime_state_error_have_distinct_exit_status() {
     );
     for state in [
         "invalid",
-        "{\"schema_version\":2,\"resources\":{},\"active_operation\":null}",
+        "{\"schema_version\":1,\"resources\":{},\"active_operation\":null}",
     ] {
         f.write("state/loadout/state.json", state);
         for command in ["plan", "diff"] {
@@ -433,7 +433,7 @@ fn status_returns_partial_report_after_an_unavailable_desired_target_observation
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 1\nid: base\nresources:\n  available:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.available\n  unavailable:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.blocked/target\n",
+        "schema_version: 2\nid: base\nresources:\n  available:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.available\n  unavailable:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.blocked/target\n",
     );
     let blocked = f.path("home/.blocked");
     fs::create_dir(&blocked).unwrap();
@@ -783,6 +783,84 @@ fn status_reports_active_operation_when_valid_state_precedes_an_invalid_declarat
         &[
             "desired_unavailable",
             "active_operation: interrupted-operation",
+            "a1",
+            "pending",
+        ],
+    );
+}
+
+#[test]
+fn copy_declarations_block_lifecycle_and_read_only_rendering_without_mutation() {
+    let f = Fixture::new();
+    f.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 2\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+    );
+
+    expect(
+        f.run(&["plan", "--config", "../portable/config.yaml"]),
+        2,
+        &[
+            "blocked",
+            "base/copied",
+            "file_copy planning is not implemented",
+        ],
+    );
+    let before_apply = f.snapshot();
+    let apply = f
+        .command()
+        .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+        .output()
+        .unwrap();
+    expect(
+        apply,
+        2,
+        &[
+            "blocked",
+            "base/copied",
+            "file_copy planning is not implemented",
+        ],
+    );
+    assert!(!f.path("home/.copy-target").exists());
+    assert!(!f.path("state/loadout/state.json").exists());
+    let mut expected_after_apply = before_apply;
+    expected_after_apply.insert(f.path("state/loadout"), b"directory".to_vec());
+    expected_after_apply.insert(f.path("state/loadout/state.lock"), Vec::new());
+    assert_eq!(
+        f.snapshot(),
+        expected_after_apply,
+        "copy rejection may create only the ordinary state lock boundary"
+    );
+    expect(
+        f.run(&["resource", "list", "--config", "../portable/config.yaml"]),
+        2,
+        &["unsupported file_copy read-only rendering"],
+    );
+
+    f.state(
+        json!({}),
+        json!({
+            "id":"copy-rendering-operation",
+            "desired_hash":format!("sha256:{}", "a".repeat(64)),
+            "actions": {
+                "a1": {
+                    "kind":"create_link",
+                    "resource_id":"base/pending",
+                    "target_path":f.path("home/pending"),
+                    "precondition":{"target":"missing"},
+                    "postcondition":{"target":"expected_link","link_target":f.path("store/source")},
+                    "status":"pending",
+                }
+            }
+        }),
+    );
+    expect(
+        f.run(&["status", "--config", "../portable/config.yaml"]),
+        2,
+        &[
+            "desired_unavailable",
+            "unsupported file_copy read-only rendering",
+            "active_operation: copy-rendering-operation",
             "a1",
             "pending",
         ],

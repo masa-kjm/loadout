@@ -6,9 +6,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use crate::declaration::environment_config::EnvironmentConfig;
-use crate::declaration::profile::ProfileDeclaration;
-use crate::domain::desired::{ResolvedDesired, ResolvedDesiredError};
+use crate::declaration::profile::{FileOperation, ProfileDeclaration};
+use crate::domain::desired::{ResolvedDesired, ResolvedDesiredError, ResolvedResource};
+use crate::domain::file_copy::{ContentFingerprint, ResolvedFileCopy};
 use crate::domain::file_link::{ResolvedFileLink, ResolvedFileLinkError};
 use crate::domain::ids::{
     FullyQualifiedResourceId, IdentifierError, ProfileId, ResourceId, StoreId,
@@ -225,11 +228,11 @@ pub(crate) fn resolve(
 ) -> Result<ResolvedDesired, ResolverError> {
     let (root_profile, resources) =
         resolve_resource_inputs(context, environment, selected_root_profile)?;
-    ResolvedDesired::new(
-        root_profile,
-        resources.into_iter().map(|resource| resource.resolved),
-    )
-    .map_err(ResolverError::InvalidDesired)
+    let resources = resources
+        .into_iter()
+        .map(resolve_resource_for_desired)
+        .collect::<Result<Vec<_>, _>>()?;
+    ResolvedDesired::new(root_profile, resources).map_err(ResolverError::InvalidDesired)
 }
 
 /// Resolves one selected root profile and retains the verified source facts required by a later non-dry-run apply.
@@ -256,8 +259,19 @@ pub(crate) fn resolve_for_apply(
             resource.resolved.target_path().clone(),
         )
         .map_err(ResolverError::InvalidResolvedFileLink)?;
-        verified_sources.insert(resolved.resource_id().clone(), verified_source);
-        resolved_resources.push(resolved);
+        verified_sources.insert(resolved.resource_id().clone(), verified_source.clone());
+        resolved_resources.push(match resource.operation {
+            FileOperation::Link => ResolvedResource::FileLink(resolved),
+            FileOperation::Copy => ResolvedResource::FileCopy(
+                ResolvedFileCopy::new(
+                    resolved.resource_id().clone(),
+                    resolved.source_path().clone(),
+                    resolved.target_path().clone(),
+                    content_fingerprint(verified_source.path())?,
+                )
+                .map_err(ResolverError::InvalidResolvedFileCopy)?,
+            ),
+        });
     }
     let desired = ResolvedDesired::new(root_profile, resolved_resources)
         .map_err(ResolverError::InvalidDesired)?;
@@ -269,8 +283,44 @@ pub(crate) fn resolve_for_apply(
 
 struct ResolvedResourceInput {
     resolved: ResolvedFileLink,
+    operation: FileOperation,
     store_root: PhysicalStoreRoot,
     source_path: SourceRelativePath,
+}
+
+fn resolve_resource_for_desired(
+    resource: ResolvedResourceInput,
+) -> Result<ResolvedResource, ResolverError> {
+    match resource.operation {
+        FileOperation::Link => Ok(ResolvedResource::FileLink(resource.resolved)),
+        FileOperation::Copy => {
+            let verified_source =
+                verify_regular_source(&resource.store_root, &resource.source_path).map_err(
+                    |source| ResolverError::SourceVerification {
+                        resource_id: resource.resolved.resource_id().clone(),
+                        source,
+                    },
+                )?;
+            Ok(ResolvedResource::FileCopy(
+                ResolvedFileCopy::new(
+                    resource.resolved.resource_id().clone(),
+                    verified_source.path().clone(),
+                    resource.resolved.target_path().clone(),
+                    content_fingerprint(verified_source.path())?,
+                )
+                .map_err(ResolverError::InvalidResolvedFileCopy)?,
+            ))
+        }
+    }
+}
+
+fn content_fingerprint(path: &ResolvedPath) -> Result<ContentFingerprint, ResolverError> {
+    let bytes = fs::read(path.as_path()).map_err(|source| ResolverError::ReadCopySource {
+        path: path.clone(),
+        source,
+    })?;
+    ContentFingerprint::parse(format!("sha256:{:x}", Sha256::digest(bytes)))
+        .map_err(ResolverError::InvalidContentFingerprint)
 }
 
 fn resolve_resource_inputs(
@@ -325,6 +375,7 @@ fn resolve_resource_inputs(
                 .map_err(ResolverError::InvalidResolvedFileLink)?;
             resources.push(ResolvedResourceInput {
                 resolved,
+                operation: properties.operation(),
                 store_root: store.root.clone(),
                 source_path: source_components,
             });
@@ -895,7 +946,17 @@ pub(crate) enum ResolverError {
         target_path: ResolvedPath,
         protected_by: &'static str,
     },
+    UnsupportedFileOperation {
+        resource_id: FullyQualifiedResourceId,
+        operation: &'static str,
+    },
     InvalidResolvedFileLink(ResolvedFileLinkError),
+    InvalidResolvedFileCopy(crate::domain::file_copy::ResolvedFileCopyError),
+    ReadCopySource {
+        path: ResolvedPath,
+        source: io::Error,
+    },
+    InvalidContentFingerprint(crate::domain::file_copy::ContentFingerprintError),
     InvalidDesired(ResolvedDesiredError),
 }
 
@@ -1019,7 +1080,19 @@ impl fmt::Display for ResolverError {
                 formatter,
                 "target {target_path} is protected {protected_by}"
             ),
+            Self::UnsupportedFileOperation {
+                resource_id,
+                operation,
+            } => write!(
+                formatter,
+                "resource {resource_id} uses {operation:?}, which is not executable in this implementation slice"
+            ),
             Self::InvalidResolvedFileLink(error) => error.fmt(formatter),
+            Self::InvalidResolvedFileCopy(error) => error.fmt(formatter),
+            Self::ReadCopySource { path, source } => {
+                write!(formatter, "cannot read copy source {path}: {source}")
+            }
+            Self::InvalidContentFingerprint(error) => error.fmt(formatter),
             Self::InvalidDesired(error) => error.fmt(formatter),
         }
     }
@@ -1039,6 +1112,9 @@ impl std::error::Error for ResolverError {
                 Some(source)
             }
             Self::InvalidResolvedFileLink(error) => Some(error),
+            Self::InvalidResolvedFileCopy(error) => Some(error),
+            Self::ReadCopySource { source, .. } => Some(source),
+            Self::InvalidContentFingerprint(error) => Some(error),
             Self::InvalidDesired(error) => Some(error),
             Self::EnvironmentConfigHasNoParent
             | Self::RuntimeConfigHasNoParent
@@ -1055,7 +1131,8 @@ impl std::error::Error for ResolverError {
             | Self::InvalidSourcePath { .. }
             | Self::InvalidTargetPath { .. }
             | Self::TargetOutsideHome { .. }
-            | Self::ProtectedTarget { .. } => None,
+            | Self::ProtectedTarget { .. }
+            | Self::UnsupportedFileOperation { .. } => None,
         }
     }
 }
@@ -1169,7 +1246,7 @@ mod tests {
                 .collect::<String>();
             format!("includes:\n{entries}")
         };
-        format!("schema_version: 1\nid: {id}\n{includes}resources:\n{resources}")
+        format!("schema_version: 2\nid: {id}\n{includes}resources:\n{resources}")
     }
 
     fn file_resource(resource_id: &str, source: &str, target: &str) -> String {

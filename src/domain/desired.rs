@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::domain::file_copy::ResolvedFileCopy;
 use crate::domain::file_link::ResolvedFileLink;
 use crate::domain::ids::{FullyQualifiedResourceId, ProfileId};
 use crate::domain::paths::ResolvedPath;
@@ -12,19 +13,55 @@ use crate::domain::paths::ResolvedPath;
 pub(crate) struct ResolvedDesired {
     root_profile: ProfileId,
     resources: Vec<ResolvedFileLink>,
+    variants: Vec<ResolvedResource>,
+}
+
+/// A closed resolved resource effect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ResolvedResource {
+    FileLink(ResolvedFileLink),
+    FileCopy(ResolvedFileCopy),
+}
+
+impl ResolvedResource {
+    pub(crate) fn resource_id(&self) -> &FullyQualifiedResourceId {
+        match self {
+            Self::FileLink(resource) => resource.resource_id(),
+            Self::FileCopy(resource) => resource.resource_id(),
+        }
+    }
+
+    pub(crate) fn target_path(&self) -> &ResolvedPath {
+        match self {
+            Self::FileLink(resource) => resource.target_path(),
+            Self::FileCopy(resource) => resource.target_path(),
+        }
+    }
+}
+
+impl From<ResolvedFileLink> for ResolvedResource {
+    fn from(resource: ResolvedFileLink) -> Self {
+        Self::FileLink(resource)
+    }
+}
+
+impl From<ResolvedFileCopy> for ResolvedResource {
+    fn from(resource: ResolvedFileCopy) -> Self {
+        Self::FileCopy(resource)
+    }
 }
 
 impl ResolvedDesired {
     /// Builds a deterministically ordered Desired set with unique IDs and targets.
     pub(crate) fn new(
         root_profile: ProfileId,
-        resources: impl IntoIterator<Item = ResolvedFileLink>,
+        resources: impl IntoIterator<Item = impl Into<ResolvedResource>>,
     ) -> Result<Self, ResolvedDesiredError> {
         let mut resource_ids = BTreeSet::new();
         let mut targets = BTreeMap::new();
-        let mut ordered_resources = Vec::new();
+        let mut ordered_variants = Vec::new();
 
-        for resource in resources {
+        for resource in resources.into_iter().map(Into::into) {
             let resource_id = resource.resource_id().clone();
             if !resource_ids.insert(resource_id.clone()) {
                 return Err(ResolvedDesiredError::DuplicateResourceId { resource_id });
@@ -41,14 +78,22 @@ impl ResolvedDesired {
                 });
             }
 
-            ordered_resources.push(resource);
+            ordered_variants.push(resource);
         }
 
-        ordered_resources.sort_by_key(|resource| resource.resource_id().clone());
+        ordered_variants.sort_by_key(|resource| resource.resource_id().clone());
+        let resources = ordered_variants
+            .iter()
+            .filter_map(|resource| match resource {
+                ResolvedResource::FileLink(resource) => Some(resource.clone()),
+                ResolvedResource::FileCopy(_) => None,
+            })
+            .collect();
 
         Ok(Self {
             root_profile,
-            resources: ordered_resources,
+            resources,
+            variants: ordered_variants,
         })
     }
 
@@ -60,6 +105,11 @@ impl ResolvedDesired {
     /// Resources sorted by fully qualified resource ID.
     pub(crate) fn resources(&self) -> &[ResolvedFileLink] {
         &self.resources
+    }
+
+    /// Every effect variant, sorted by fully qualified resource ID.
+    pub(crate) fn variants(&self) -> &[ResolvedResource] {
+        &self.variants
     }
 
     /// Finds one resource by its stable identity.
@@ -82,6 +132,7 @@ impl ResolvedDesired {
 
         Self {
             root_profile,
+            variants: resources.iter().cloned().map(Into::into).collect(),
             resources,
         }
     }

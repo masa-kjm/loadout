@@ -5,7 +5,7 @@
 This specification defines v0.3.0 durable state, operation records, exclusive locking, atomic commits, and recovery after interruption retained by v0.4.0.
 It applies only to the v0.3.0 file-link lifecycle retained by v0.4.0.
 
-Every normative v0.3.0 requirement in this document remains a v0.4.0 requirement under the [retained baseline](README.md#retained-v030-baseline), including state validation before v0.4.0 inspection relies on state facts.
+Every retained state and recovery requirement in this document remains a v0.5.0 requirement under the [v0.5.0 baseline](README.md#v050-baseline), including state validation before inspection relies on state facts.
 
 ## State Files
 
@@ -258,3 +258,92 @@ A later apply re-runs recovery and proceeds only if every formerly uncertain act
 
 Verified actions from before a failure remain in Known state.
 v0.3.0 does not roll them back.
+
+## v0.5.0 State Schema
+
+This section supersedes the v0.3.0 state schema, hash formats, and operation representation for v0.5.0.
+`state.json` has `schema_version: 2`; version `1` and every other version are rejected before target observation, recovery, planning, or state rewrite.
+v0.5.0 does not migrate, decode for conversion, or reinterpret a version-1 state file.
+
+Each `resources` member has `definition_hash` and exactly one tagged `effect` object.
+
+```json
+{
+  "schema_version": 2,
+  "resources": {
+    "base/git-config": {
+      "definition_hash": "sha256:...",
+      "effect": {
+        "kind": "file_copy",
+        "source_path": "/home/example/dotfiles/git/config",
+        "target_path": "/home/example/.gitconfig",
+        "content_fingerprint": "sha256:..."
+      }
+    }
+  },
+  "active_operation": null
+}
+```
+
+`effect.kind` is exactly `file_link` or `file_copy`.
+A `file_link` effect records `source_path`, `target_path`, and `link_target` as before.
+A `file_copy` effect records `source_path`, `target_path`, and the SHA-256 fingerprint of the exact copied bytes.
+Unknown fields, a mismatched effect, duplicate target paths, invalid fingerprints, or an invalid active operation are errors.
+
+The v0.5 desired hash uses `loadout.resolved-desired.v2` and sorts resource IDs lexicographically.
+Its resource definition is the effect-specific resolved definition from [File Links](file-link.md) or [File Copies](file-copy.md).
+The definition hash does not include copy source content; the copy Known record does.
+
+Every copy action records its effect kind, resolved source and target, planned source fingerprint, precondition, postcondition, and exact action-local temporary path and fingerprint until publication completes.
+The temporary is part of the post-condition: it must be missing before `succeeded` is committed.
+`replace_effect` records both old and final effects and requires the old effect's ownership predicate before any final-effect publication.
+
+An active v2 operation has this exact logical shape; unknown fields are errors.
+
+```json
+{
+  "id": "opaque-operation-id",
+  "desired_hash": "sha256:...",
+  "actions": {
+    "a1": {
+      "kind": "replace_effect",
+      "resource_id": "base/git-config",
+      "old_effect": { "kind": "file_link", "source_path": "/store/old", "target_path": "/home/example/.gitconfig", "link_target": "/store/old" },
+      "final_effect": { "kind": "file_copy", "source_path": "/store/new", "target_path": "/home/example/.gitconfig", "content_fingerprint": "sha256:..." },
+      "temporary": { "path": "/home/example/.loadout-tmp", "kind": "file_copy", "content_fingerprint": "sha256:..." },
+      "precondition": { "kind": "expected_file_link", "target_path": "/home/example/.gitconfig", "link_target": "/store/old" },
+      "postcondition": { "kind": "expected_file_copy", "target_path": "/home/example/.gitconfig", "content_fingerprint": "sha256:...", "temporary": "missing" },
+      "status": "pending"
+    }
+  }
+}
+```
+
+Every action contains `kind`, `resource_id`, typed `precondition`, typed `postcondition`, and `status`.
+The complete `old_effect` and `final_effect` objects provide the corresponding Known-state update values; predicates repeat the exact target ownership facts needed for recovery.
+`create_copy`, `replace_copy`, `relocate_copy`, `remove_copy`, and `replace_effect` use the `file_copy` predicate with its fingerprint.
+`create_link`, `replace_link`, `relocate_link`, `remove_link`, and `replace_effect` use the `file_link` predicate with its exact link target.
+Copy publication and every replacement/handoff has `temporary`; remove, forget, and state-only identity actions do not.
+Relocation additionally records distinct old and new typed effects.
+
+| Action kind | Typed precondition | Typed postcondition | Known update |
+| --- | --- | --- | --- |
+| `create_link` | target missing | expected final link | record final link |
+| `create_copy` | target missing | expected final copy and temporary missing | record final copy |
+| `replace_link` | expected old link | expected final link and temporary missing | replace link effect |
+| `replace_copy` | expected old copy | expected final copy and temporary missing | replace copy effect |
+| `replace_effect` | expected complete old effect | expected complete final effect and temporary missing | replace old effect with final effect |
+| `relocate_link` / `relocate_copy` | expected old effect and missing new target | expected final new effect and missing old target | replace recorded target/effect |
+| `remove_link` / `remove_copy` | expected old effect | target missing | remove effect |
+| `forget_missing` | target missing | target missing | remove stale effect |
+| `replace_ownership` | expected old effect | expected final effect | replace old identity with new identity |
+
+`replace_ownership` records `old_resource_id`, `new_resource_id`, and complete old/final effects.
+When its effects are byte-for-byte equal it has no temporary and its `running` transition precedes the final ownership verification; otherwise it uses the final effect's replacement temporary and the same recovery predicates as `replace_effect`.
+
+For a running `replace_effect`, recovery observes the recorded target and temporary only.
+If the complete final effect holds and the temporary is missing, it atomically commits the final Known effect and `succeeded`.
+If the complete old effect holds, it may remove only an exact recorded expected temporary after a fresh no-follow recheck, then marks `failed` and retains the old Known effect.
+If neither complete predicate can be proven, or cleanup is unsafe, unavailable, or unprovable, it retains `uncertain` and the old Known effect.
+For a failed create of either final effect, a matching final observation remains `uncertain` under the non-adoption rule.
+The general mutation classification and recovery tables apply to every other v0.5 action.

@@ -6,7 +6,7 @@ This specification defines the v0.3.0 lifecycle retained by v0.4.0 for validatin
 It owns planning decisions and the Desired/Known/Actual transition table.
 The File Links and State and Recovery specifications define the filesystem and durable-state mechanics used by those decisions.
 
-Every normative v0.3.0 requirement in this document remains a v0.4.0 requirement under the [retained baseline](README.md#retained-v030-baseline).
+Every retained lifecycle requirement in this document remains a v0.5.0 requirement under the [v0.5.0 baseline](README.md#v050-baseline).
 
 ## Inputs
 
@@ -168,3 +168,35 @@ Verified actions from earlier phases remain committed; v0.3.0 does not roll them
 `apply --dry-run` performs resolution, validation, observation, and planning only.
 It reports the same Planned Actions and blocking diagnostics as a non-dry-run apply at the point of observation.
 It MUST NOT acquire an exclusive state lock, create an operation record, write state, create directories, create temporary files, or mutate a target.
+
+## v0.5.0 Resource Effects
+
+This section supersedes the v0.3.0 action inventory and transition table for v0.5.0.
+The planner remains pure and receives source fingerprints as part of Resolved Desired copy values.
+
+The actions are `create_link`, `replace_link`, `relocate_link`, `remove_link`, `create_copy`, `replace_copy`, `relocate_copy`, `remove_copy`, `replace_ownership`, `replace_effect`, `forget_missing`, and `noop`.
+`replace_effect` is the managed same-target handoff between `link` and `copy`.
+It requires current Actual proof of the old Known effect and uses the final effect's publication contract; it never adopts an unmanaged entry.
+
+| Desired effect | Known effect | Actual | Required result |
+| --- | --- | --- | --- |
+| Copy at unchanged target | Link | Expected old link | `replace_effect` with `old_effect: file_link`, `final_effect: file_copy` |
+| Link at unchanged target | Copy | Expected old copy | `replace_effect` with `old_effect: file_copy`, `final_effect: file_link` |
+| Either final effect | Either old effect | Missing | Corresponding final-effect create; old Known remains until that action's normal state update rules apply |
+| Either final effect | Either old effect | Any unexpected or unsafe observation | Blocked conflict |
+
+For a handoff, the typed precondition is the complete old Known effect and the typed postcondition is the complete final effect plus absence of any recorded temporary.
+The state update removes the old identity's effect and records the final effect atomically with `succeeded`.
+`link -> copy` uses the handoff-specific primitive in [Link-to-Copy Effect Handoff](file-copy.md#link-to-copy-effect-handoff), whose old-target predicate is the expected link; `copy -> link` uses the handoff-specific primitive in [Copy-to-Link Effect Handoff](file-link.md#copy-to-link-effect-handoff), whose old-target predicate is the expected copy.
+Neither handoff is state-only and neither may delete the old target before the final effect is ready.
+
+For either effect, a desired resource without Known state creates only at a missing target and otherwise blocks.
+An unchanged known link is `noop` only when its expected link is Actual; an unchanged known copy is `noop` only when its target bytes equal the applied fingerprint and its current source fingerprint equals that applied fingerprint.
+An expected copy with a changed source fingerprint is `replace_copy`.
+An expected target whose definition changes at the same path uses the corresponding replacement or managed effect handoff.
+For either effect, a missing known target creates when desired or is forgotten when stale; every other unexpected observation blocks.
+Target relocation creates and verifies the new effect before removing the old expected effect as one contiguous action.
+
+Within a phase, actions sort lexicographically by fully qualified resource ID; a managed identity handoff sorts by `<old-resource-id>\u0000<new-resource-id>`.
+The phases are: (1) creates, (2) replacements, effect handoffs, identity handoffs, and relocations, then (3) removals and forgets.
+No later action begins after an earlier action fails, and verified earlier actions are not rolled back.

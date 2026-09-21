@@ -1,6 +1,6 @@
 ---
 name: propose-loadout-change
-description: Draft evidence-based Loadout v0.4 issue, commit, and pull-request text. Use when proposing an issue or its acceptance criteria, naming a commit or branch, or preparing a pull-request title and body.
+description: Draft evidence-based Loadout v0.5 issue, commit, and pull-request text. Use when proposing an issue or its acceptance criteria, naming a commit or branch, or preparing a pull-request title and body.
 ---
 
 # Propose Loadout Changes

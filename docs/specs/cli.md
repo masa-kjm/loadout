@@ -2,8 +2,8 @@
 
 ## Scope
 
-This specification defines the complete v0.4.0 command surface.
-Commands not listed here are not part of v0.4.0.
+This specification defines the complete v0.5.0 command surface.
+Commands not listed here are not part of v0.5.0.
 
 The CLI parses input, presents diagnostics and plans, obtains confirmation, and maps outcomes to exit status.
 It does not make ownership, planner, filesystem, or state decisions outside the lifecycle.
@@ -91,12 +91,16 @@ loadout diff
 `diff` reports drift between Known state and Actual state for every resource recorded in the platform state repository.
 It does not read `loadout.yaml`, an environment configuration, a profile, or a local store; it has no `--config` or positional profile option.
 
-For each Known file-link resource, `diff` performs the no-follow target and parent observation required by [File Links](file-link.md).
+For each Known `file_link` resource, `diff` performs the no-follow target and parent observation required by [File Links](file-link.md).
 It reports whether the target is the expected link, missing, another link, another entry kind, or unreachable through a safe parent path.
+For each Known `file_copy` resource, `diff` performs the effect-specific no-follow target and parent observation required by [File Copies](file-copy.md).
+It reports `expected_copy`, `missing`, `other_regular_file`, `other_entry`, `unsafe_path`, or `unavailable`; an `expected_copy` report means only that the recorded applied fingerprint matches the current target bytes.
 It also reports any active operation and each action with `pending`, `running`, or `uncertain` status.
 
 `diff` does not produce an executable Plan, plan a repair, reconcile an operation, acquire the exclusive state lock, write state, create a directory, or mutate a target.
 An absent state file represents an empty Known set and produces a successful empty report.
+An observable unsafe path or unexpected entry is a reportable result with status `0`.
+If an effect-specific observation cannot be established, `diff` reports that resource as `unavailable`, reports independently completed resources and active-operation facts, returns status `1`, and still performs no mutation.
 
 ### `loadout status`
 
@@ -201,4 +205,4 @@ It never reports success merely because some earlier actions were committed. A f
 
 ## Excluded Commands
 
-v0.4.0 does not provide configuration reset, generic YAML editing, resource import, partial apply, task execution, copy materialization, directory materialization, remote store management, forceful takeover, rollback, parallel execution, state repair, operation recovery on inspection, or machine-readable inspection output.
+v0.5.0 does not provide configuration reset, generic YAML editing, resource import, partial apply, task execution, directory materialization, remote store management, forceful takeover, rollback, parallel execution, state repair, migration, operation recovery on inspection, or machine-readable inspection output.

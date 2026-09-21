@@ -2,10 +2,8 @@
 
 ## Scope
 
-This specification defines profile files, identifiers, include composition, resource declarations, and static validation for the v0.3.0 core retained by v0.4.0.
-It defines only the file-link resource declaration; see [File Links](file-link.md) for its runtime behavior.
-
-Every normative v0.3.0 requirement in this document remains a v0.4.0 requirement under the [retained baseline](README.md#retained-v030-baseline).
+This specification defines v0.5.0 profile files, identifiers, include composition, resource declarations, and static validation.
+The `file` resource supports `link` and `copy`; see [File Links](file-link.md) and [File Copies](file-copy.md) for runtime behavior.
 
 ## Identifiers
 
@@ -28,7 +26,7 @@ It does not include a filename, discovery path, target path, or source path.
 One profile file defines one profile.
 
 ```yaml
-schema_version: 1
+schema_version: 2
 id: workstation
 includes:
   - id: base
@@ -50,8 +48,9 @@ Unknown fields are errors at every object level.
 
 `resources` is an object keyed by resource ID.
 The resource value MUST contain `type` and `properties`.
-The only valid v0.3.0 type is `file`.
-The `properties` object for that type is defined in [File Links](file-link.md).
+The only valid v0.5.0 type is `file`.
+Its `properties.operation` is exactly `link` or `copy` and its properties are defined by [File Links](file-link.md) and [File Copies](file-copy.md).
+v0.5.0 rejects every profile schema version other than `2` before it resolves a target or creates a plan.
 
 ## Includes
 

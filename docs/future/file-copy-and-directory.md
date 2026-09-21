@@ -3,7 +3,8 @@
 ## Status
 
 This is a non-binding design note.
-File copy and directory resources are not part of v0.2.0 and this document defines no additional resource schema.
+Regular-file copy is specified for v0.5.0 in [File Copies](../specs/file-copy.md).
+This note remains non-binding and concerns only later directory-resource work.
 
 ## Why They Are Separate
 
@@ -11,13 +12,13 @@ A file link exposes a source path directly and has a narrow ownership proof: the
 A copied file and a directory tree need content-based ownership and drift rules instead.
 They must not inherit file-link behavior by implication.
 
-File copy and directory materialization should be promoted independently.
+Directory materialization remains independent from the promoted regular-file copy.
 Directory behavior has a larger destructive surface and must not be added as a small variation of file copy.
 
-## Candidate File-Copy Rules
+## Promoted File-Copy Direction
 
-A copied file would need Known state containing the applied content fingerprint, resolved source, resolved target, and relevant metadata contract.
-Removal would be safe only when the current target content matches the applied fingerprint and its entry kind remains expected.
+The v0.5 specification owns file-copy Known state, content fingerprints, removal, replacement, and recovery.
+This note must not be used to reinterpret that contract.
 
 Candidate outcomes include:
 
@@ -57,7 +58,7 @@ Any copy or directory design must preserve the v0.2.0 boundaries:
 - Known state changes only after post-condition verification; and
 - recovery never deletes user-visible artifacts to clean up an uncertain operation.
 
-## Required Promotion Work
+## Remaining Directory Promotion Work
 
-Promotion requires separate specifications for file copy and every supported directory model.
-Each specification needs a state schema, a complete transition table, platform failure guarantees, and tests for content drift, target-kind changes, nested unsafe entries, partial-copy failure, replacement failure, and recovery after interruption.
+Promotion requires a separate specification for every supported directory model.
+Each needs a state schema, complete transition table, platform failure guarantees, and tests for nested unsafe entries, partial traversal failure, replacement failure, and recovery after interruption.

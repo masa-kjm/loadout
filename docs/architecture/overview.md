@@ -8,14 +8,14 @@ It converges a machine toward the desired resource set produced by one composed 
 Loadout owns profile composition, resource lifecycle planning, local state, conflict detection, and the safe mutation of supported resources.
 It does not reimplement package managers, runtime version resolution, secret management, or the side-effect guarantees of arbitrary commands.
 
-## v0.4.0 Core
+## v0.5.0 Core
 
-v0.4.0 retains the lifecycle architecture with one supported resource implementation: a single file from a local store materialized as a link at a target path.
-It adds read-only inspection of profiles, resources, and selected Desired/Known/Actual relations.
-The architecture is intentionally prepared for additional resource types, but task resources, copy operations, directory resources, remote stores, and parameters are not part of the v0.4.0 executable surface.
+v0.5.0 supports two closed effects for one regular file from a local store: a link or a content-owned copy at a target path.
+It retains read-only inspection of profiles, resources, and selected Desired/Known/Actual relations.
+Task resources, directory resources, remote stores, and parameters are not part of the v0.5.0 executable surface.
 
 The first implementation must prefer a narrow, complete file-link lifecycle over generic extension mechanisms.
-In particular, v0.4.0 does not expose an external resource-plugin API.
+In particular, v0.5.0 does not expose an external resource-plugin API.
 
 ## System Model
 
@@ -77,7 +77,7 @@ Known state is evidence of a past operation, not proof that the current filesyst
 ### Actual
 
 Actual state is the current observation of a resource target and its relevant parents.
-For a file-link resource, the observation must distinguish at least a missing target, the expected link, a link to another target, a regular file, and an unsafe parent path.
+For a file-link resource it distinguishes the expected link from other links and entries; for a file-copy resource it distinguishes a regular file whose bytes match the recorded ownership fingerprint from another regular file, other entries, and unsafe paths.
 Actual state is not persisted as an assertion of ownership.
 
 ### Plan
@@ -113,10 +113,10 @@ If a recheck fails, the executor aborts the action; it does not reinterpret the 
 
 ### Determinism
 
-Apply is sequential in v0.4.0.
+Apply is sequential in v0.5.0.
 Execution order must not depend on a YAML mapping iteration order or an implementation collection order.
 The lifecycle specification will define the stable phase order and the fully qualified resource-ID ordering within each phase.
-v0.4.0 does not expose resource IDs or declaration position as an ordering control.
+v0.5.0 does not expose resource IDs or declaration position as an ordering control.
 A future dependency model may constrain action order, but independent actions must retain a canonical deterministic tie-breaker.
 
 ## Responsibilities

@@ -2,7 +2,7 @@
 
 ## Scope
 
-This specification defines the v0.4.0 read-only inspection commands: `status`, `profile list`, `profile show`, `resource list`, and `resource show`.
+This specification defines the v0.5.0 read-only inspection commands: `status`, `profile list`, `profile show`, `resource list`, and `resource show`.
 It extends the v0.3.0 `diff` inspection contract without changing that command.
 
 Inspection reports facts from the declaration, Resolved Desired, Known, and Actual layers.
@@ -72,7 +72,9 @@ A displayed declaration does not establish that it can resolve or apply.
 Without `--known`, `resource list` and `resource show` resolve one selected root profile according to [Profiles](profiles.md).
 They report only that root's Resolved Desired resources.
 They MUST perform all declaration, include, store binding, path normalization, collision, and semantic validation required to produce Resolved Desired.
-They MUST NOT inspect a resource target, read state, report an active operation, or invoke source checks that are required only for a later filesystem mutation.
+They MUST NOT inspect a resource target, read state, or report an active operation.
+For a copy resource, they compute the source-content fingerprint required by its Resolved Desired representation; this source read does not authorize mutation or establish target ownership.
+They do not invoke any other source check that is required only for a later filesystem mutation.
 
 `resource list` reports resources in lexicographic fully qualified resource-ID order.
 `resource show` reports one exact fully qualified resource ID from the selected Resolved Desired set.
@@ -101,8 +103,8 @@ If state cannot be read and validated, `status` MUST fail without inspecting a t
 If state is valid but selected-declaration loading or resolution fails, `status` MUST report the active operation when one exists, report that Desired state is unavailable, return the applicable failure status, and MUST NOT inspect a target.
 
 When both Desired and Known state are available, `status` compares the union of their fully qualified resource IDs in lexicographic order.
-For every Known file-link resource it performs the no-follow target and parent observation required by [File Links](file-link.md), using that record's expected link target.
-For every Desired-only file-link resource it performs the same no-follow observation using the resolved desired link target.
+For every Known resource it performs the effect-specific no-follow target and parent observation required by [File Links](file-link.md) or [File Copies](file-copy.md), using that record's ownership evidence.
+For every Desired-only resource it performs the corresponding observation using the resolved desired effect.
 An observation is informational only and does not prove ownership for a Desired-only resource.
 
 For an ID that exists in both sets, `status` MUST distinguish equal and different definitions using the canonical `definition_hash` and the typed resolved fields that it represents.
@@ -141,4 +143,4 @@ If an observation cannot be established because of an I/O failure, the report id
 
 ## Non-Goals
 
-v0.4.0 inspection does not provide configuration editing, state repair, operation recovery, migration, import, target adoption, forceful takeover, a repair form of `diff`, a saved plan, or machine-readable output.
+v0.5.0 inspection does not provide configuration editing, state repair, operation recovery, migration, import, target adoption, forceful takeover, a repair form of `diff`, a saved plan, or machine-readable output.

@@ -1,14 +1,14 @@
 # Contributing to Loadout
 
 v0.3.0 and v0.4.0 are released.
-Keep the default branch internally consistent, reviewable, and aligned with the authoritative v0.4.0 documentation.
+Keep the default branch internally consistent, reviewable, and aligned with the authoritative v0.5.0 development documentation.
 
 v0.1 is retired and unsupported.
 The `v0.1.0` and `legacy/v0.1-final` tags are immutable historical archives, not compatibility targets or starting points for v0.4.0 work.
 
 ## Sources of Truth
 
-Before proposing or implementing a v0.4.0 behavior change, read the documents that own it:
+Before proposing or implementing a v0.5.0 behavior change, read the documents that own it:
 
 - [`docs/README.md`](docs/README.md) defines document authority and scope.
 - [`docs/architecture/`](docs/architecture/README.md) defines system responsibilities and architectural invariants.
@@ -16,7 +16,7 @@ Before proposing or implementing a v0.4.0 behavior change, read the documents th
 - [`docs/development/testing.md`](docs/development/testing.md) defines required test evidence.
 
 Architecture and specifications are authoritative.
-`docs/future/` is non-binding; it records constraints and promotion work for later capabilities but does not modify v0.4.0 behavior.
+`docs/future/` is non-binding; it records constraints and promotion work for later capabilities but does not modify v0.5.0 behavior.
 Draft material is exploratory and cannot override published documentation.
 
 ## Issues
@@ -45,7 +45,7 @@ Describe the observed failure or required behavior and its impact.
 ```
 
 For a filesystem mutation, state the target and source scope, ownership proof, preconditions, post-condition, dry-run behavior, failure aftermath, recovery behavior, and Unix/Windows expectations.
-Link the owning v0.4.0 specification and name intentional non-goals.
+Link the owning v0.5.0 specification and name intentional non-goals.
 
 ## Branches
 
@@ -109,7 +109,7 @@ Before requesting review:
 
 For documentation-only work, at minimum run `git diff --check` and verify affected relative links.
 
-Once the v0.4.0 Rust package exists, run the relevant commands before handoff when the environment permits:
+Once the v0.5.0 Rust package exists, run the relevant commands before handoff when the environment permits:
 
 ```sh
 cargo fmt --all -- --check

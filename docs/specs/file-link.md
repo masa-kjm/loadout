@@ -5,7 +5,7 @@
 This specification defines the only v0.3.0 resource implementation retained by v0.4.0: a regular file from a local store materialized as a file symbolic link below the current user's home directory.
 It defines declaration syntax, containment, ownership, observation, mutation preconditions, and platform requirements.
 
-Every normative v0.3.0 requirement in this document remains a v0.4.0 requirement under the [retained baseline](README.md#retained-v030-baseline), including the no-follow observations used by v0.4.0 inspection.
+Every retained link requirement in this document remains a v0.5.0 requirement under the [v0.5.0 baseline](README.md#v050-baseline), including the no-follow observations used by inspection.
 
 Copy operations, directory resources, hard links, junctions, and remote stores are outside v0.3.0.
 
@@ -149,6 +149,17 @@ It MUST NOT first delete the old link and then attempt an unrelated create.
 
 Replacement MUST use an atomic same-filesystem name replacement. If the platform cannot preserve the old link when the replacement operation itself fails, subject to the external-concurrency limit, preflight MUST block the action before new target mutation.
 
+### Copy-to-Link Effect Handoff
+
+`copy -> link` is a `replace_effect` action, not `replace_link`.
+Its precondition is a fresh no-follow `expected_copy` observation matching the complete recorded file-copy effect, not an `expected_link` observation.
+The executor creates a unique recorded temporary file symbolic link to the verified final source, then immediately rechecks the expected old copy, the temporary, parent safety, containment, and declared-path association before one atomic same-filesystem target-name replacement.
+Its postcondition is the expected final link and absence of the recorded temporary.
+
+The primitive MUST NOT delete the expected copy before the final link is ready and MUST NOT fall back to delete-then-create.
+If the platform cannot preserve the old expected copy when the replacement operation itself fails, subject to the external-concurrency limit, preflight MUST block `copy -> link` without a new operation record or target mutation.
+The action records its complete old copy and final link predicates, temporary path, and recovery facts as defined by [State and Recovery](state-and-recovery.md#v050-state-schema).
+
 ### Replace Ownership
 
 Replace Ownership is an internal handoff between two Loadout-managed resource identities at one target.
@@ -204,10 +215,11 @@ The following guarantees apply to a target whose parent path and final entry hav
 | --- | --- |
 | Create | Create only a file symbolic link at a target that is still `missing`. The implementation must not replace an entry that appeared after planning. |
 | Replace | Record a unique Loadout-owned temporary sibling path, construct a new file symbolic link there, then use one target-name replacement operation. The temporary path is action-local and is never a declared resource target. It MUST NOT implement replacement as deleting the managed link and later creating a new one. Success requires both the new expected target link and absence of the temporary entry. Immediately before replacement, recheck both the expected old target and the expected recorded temporary under their shared safe parent, together with applicable source, containment and path-association predicates. If the platform cannot preserve the old expected link when the replacement operation itself fails, subject to external concurrency, it does not support `replace_link` and preflight MUST block the action. |
+| Copy-to-Link Effect Handoff | Apply every Replace temporary, atomic publication, postcondition, and failure guarantee, but recheck an expected recorded copy rather than an expected link before replacement. It is required only for `replace_effect` whose old effect is `file_copy` and final effect is `file_link`. |
 | Source-changing Replace Ownership | Apply every Replace guarantee. It is required only when the old and new resolved link targets differ. |
 | Remove | Use a fresh no-follow expected-link recheck and name-based removal through the same retained parent and final component. Do not follow the link, remove its referent, or request parent-directory removal. An entry substituted after the recheck can be deleted; no atomic entry-identity binding is promised. |
 
-The state repository allocates a unique temporary sibling path while it persists the operation record for every `replace_link` action and every `replace_ownership` action whose resolved link targets differ, before any mutation.
+The state repository allocates a unique temporary sibling path while it persists the operation record for every `replace_link`, copy-to-link `replace_effect`, and source-changing `replace_ownership` action before any mutation.
 This allocation is an execution-local nonce, not a planner decision, resource identity, or ordering input.
 The executor may use only the recorded path and MUST recheck that it is missing under the same safe parent immediately before creating the temporary link.
 

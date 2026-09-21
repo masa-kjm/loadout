@@ -2,7 +2,7 @@
 
 ## Scope
 
-This document defines how an implementation demonstrates conformance with the v0.4.0 architecture and specifications.
+This document defines how an implementation demonstrates conformance with the v0.5.0 architecture and specifications.
 It does not add runtime behavior, change an error outcome, or replace a specification.
 
 Every behavior change must identify its owning specification and add evidence at the narrowest test layer that can prove the contract.
@@ -21,19 +21,23 @@ An observable CLI or filesystem contract also requires an integration or accepta
 
 ## Contract Matrix
 
-The following matrix is the minimum evidence required before v0.4.0 is considered complete.
+The following matrix is the minimum evidence required before v0.5.0 is considered complete.
 
 | Contract owner | Required evidence |
 | --- | --- |
 | [Configuration](../specs/configuration.md) | Runtime and CLI configuration selection; path-base resolution; store-type-specific property validation and unknown-field rejection; duplicate profile IDs; store roots remain unchanged. |
 | [Profiles](../specs/profiles.md) | Include order; cycle and missing-ID rejection; deduplication through multiple paths; fully qualified identity; target-collision rejection; deterministic ordering independent of input-map iteration. |
 | [File Links](../specs/file-link.md) | Create, no-op, replace, relocate, remove, forget-missing, and managed identity-handoff outcomes; observed unmanaged-target rejection and the external-concurrency limits; wrong-link and regular-file conflicts; parent-escape rejection; source and target containment; no parent removal. |
+| [File Copies](../specs/file-copy.md) | Create, no-op, replace, relocate, remove, forget-missing, link/copy handoff, source and target content drift, byte-fingerprint ownership, temporary publication, failed publication, and recovery without adoption. |
 | [Lifecycle](../specs/lifecycle.md) | Every Desired/Known/Actual table row; blocked Plans and preflight failures perform no new planned target mutation; preflight failure creates no new operation record; permitted prior-operation recovery cleanup and state commits are asserted separately; executor recheck rejects observable changes since planning; phase ordering; contiguous relocation; and stop-after-failure behavior. |
 | [State and Recovery](../specs/state-and-recovery.md) | Corrupt-state rejection; canonical-hash fixtures; exclusive-lock contention; atomic-commit failure; every operation-status transition; same-source identity-handoff recovery; recovery to succeeded, failed, skipped, and uncertain; no rollback of verified earlier actions. |
 | [CLI](../specs/cli.md) | Positional root-profile selection; `validate` default-profile and `--all` behavior; `diff` Known-to-Actual reporting and zero mutation; `plan` and `apply` default-profile behavior; confirmation after successful preflight and before an operation record; non-interactive `--yes` requirement; dry-run zero mutation; all documented exit-status classes. |
 | [Initialization](../specs/init.md) | A compiled-binary `init` creates the exact valid `.loadout` bundle; dry run changes no entry, state, store, or runtime configuration; every existing final entry kind is preserved; and staging write, validation, flush, publication, and external-collision failures never publish a partial bundle or replace an external entry. |
 | [Configuration Authoring](../specs/config-authoring.md) | Read-only config commands leave configuration, state, store, and targets unchanged; typed-path and value rejection; complete-document validation; confirmation; runtime-selection creation and replacement; portable-configuration presentation preservation or rejection; publication failure and external-substitution aftermath; and Unix/Windows behavior. |
 | [Inspection](../specs/inspection.md) | Every `status`, profile, and resource grammar and selection conflict; declaration/Desired/Known/Actual read-set boundaries; deterministic ordering; active-operation display for `status` and existing `diff` only; Desired-only, Known-only, definition-changed, expected, drifted, unsafe, and unavailable status rows; invalid declaration/state behavior; partial status report behavior; and snapshots proving no target, store, configuration, state, lock, operation, or directory mutation. |
+
+Version-boundary tests reject profile version 1, state version 1, and unknown future versions before target observation, state rewrite, or implicit conversion.
+Copy tests snapshot the target tree, state directory, store, and control files for every rejection and dry-run case and use only disposable locations.
 
 ## Pure Domain Tests
 

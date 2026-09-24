@@ -3,19 +3,22 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 use crate::domain::actual::{
-    ActualFileLink, ActualState, OtherEntryKind, ParentSafety, TargetObservation,
+    ActualFileCopy, ActualFileLink, ActualState, CopyTargetObservation, OtherEntryKind,
+    ParentSafety, TargetObservation,
 };
 use crate::domain::desired::ResolvedDesired;
+use crate::domain::file_copy::ContentFingerprint;
 use crate::domain::file_link::LinkTarget;
 use crate::domain::known::KnownState;
 use crate::domain::paths::{ResolvedPath, ResolvedPathError};
 use crate::filesystem::{
     NoFollowEntryKind, classify_nofollow_entry, normalize_observed_absolute_path,
 };
+use sha2::{Digest, Sha256};
 
 /// A read-only observer rooted at the current user's canonical home directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,17 +76,88 @@ impl FileLinkInspector {
                 .or_default()
                 .desired_link_target = Some(resource.link_target().clone());
         }
-        for resource in known.resources() {
+        for resource in known.file_links() {
             expectations
                 .entry(resource.target_path().clone())
                 .or_default()
                 .known_link_target = Some(resource.link_target().clone());
         }
 
-        let observations = expectations
-            .into_iter()
-            .map(|(target_path, expectations)| self.inspect_target(target_path, expectations))
-            .collect::<Result<Vec<_>, _>>()?;
+        // A Known copy owns a byte fingerprint and determines the observation representation during a link/copy handoff at the same target.
+        // Observing Desired links first would lose that ownership proof.
+        let known_copy_targets = known
+            .variants()
+            .filter_map(|resource| match resource {
+                crate::domain::known::KnownResource::FileCopy(resource) => Some(resource),
+                crate::domain::known::KnownResource::FileLink(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let mut observations = known_copy_targets
+            .iter()
+            .map(|resource| {
+                self.inspect_target_for_copy(
+                    resource.target_path(),
+                    Some(resource.content_fingerprint()),
+                )
+                .map(Into::into)
+            })
+            .collect::<Result<Vec<crate::domain::actual::ActualResource>, _>>()?;
+
+        observations.extend(
+            expectations
+                .into_iter()
+                .filter(|(target_path, _)| {
+                    !known_copy_targets
+                        .iter()
+                        .any(|resource| resource.target_path() == target_path)
+                })
+                .map(|(target_path, expectations)| {
+                    self.inspect_target(target_path, expectations)
+                        .map(Into::into)
+                })
+                .collect::<Result<Vec<crate::domain::actual::ActualResource>, _>>()?,
+        );
+        for resource in desired.variants() {
+            let crate::domain::desired::ResolvedResource::FileCopy(resource) = resource else {
+                continue;
+            };
+            if observations
+                .iter()
+                .any(|observation| observation.target_path() == resource.target_path())
+            {
+                continue;
+            }
+            observations.push(
+                self.inspect_target_for_copy(
+                    resource.target_path(),
+                    match known.get_variant(resource.resource_id()) {
+                        Some(crate::domain::known::KnownResource::FileCopy(known)) => {
+                            Some(known.content_fingerprint())
+                        }
+                        _ => None,
+                    },
+                )?
+                .into(),
+            );
+        }
+        for resource in known.variants() {
+            let crate::domain::known::KnownResource::FileCopy(resource) = resource else {
+                continue;
+            };
+            if observations
+                .iter()
+                .any(|observation| observation.target_path() == resource.target_path())
+            {
+                continue;
+            }
+            observations.push(
+                self.inspect_target_for_copy(
+                    resource.target_path(),
+                    Some(resource.content_fingerprint()),
+                )?
+                .into(),
+            );
+        }
         ActualState::new(observations).map_err(TargetInspectionError::InvalidActualState)
     }
 
@@ -100,6 +174,39 @@ impl FileLinkInspector {
                 known_link_target: Some(expected_link_target.clone()),
             },
         )
+    }
+
+    /// Rechecks one target as a regular file owned by an expected byte fingerprint.
+    pub(crate) fn inspect_target_for_expected_copy(
+        &self,
+        target_path: &ResolvedPath,
+        expected_fingerprint: &ContentFingerprint,
+    ) -> Result<ActualFileCopy, TargetInspectionError> {
+        self.inspect_target_for_copy(target_path, Some(expected_fingerprint))
+    }
+
+    fn inspect_target_for_copy(
+        &self,
+        target_path: &ResolvedPath,
+        expected_fingerprint: Option<&ContentFingerprint>,
+    ) -> Result<ActualFileCopy, TargetInspectionError> {
+        let Some(physical_target_path) = self.physical_target_path(target_path)? else {
+            return ActualFileCopy::new(
+                target_path.clone(),
+                CopyTargetObservation::UnsafePath {
+                    parent_safety: ParentSafety::OutsideHome,
+                },
+            )
+            .map_err(TargetInspectionError::InvalidActualFileCopy);
+        };
+        let parent_safety = self.inspect_parent_safety(target_path, &physical_target_path)?;
+        let observation = if !parent_safety.is_safe() {
+            CopyTargetObservation::UnsafePath { parent_safety }
+        } else {
+            self.inspect_final_copy(target_path, &physical_target_path, expected_fingerprint)?
+        };
+        ActualFileCopy::new(target_path.clone(), observation)
+            .map_err(TargetInspectionError::InvalidActualFileCopy)
     }
 
     /// Observes one declared Desired target without treating a matching link as owned.
@@ -311,6 +418,86 @@ impl FileLinkInspector {
             }),
         }
     }
+
+    fn inspect_final_copy(
+        &self,
+        target_path: &ResolvedPath,
+        physical_target_path: &ResolvedPath,
+        expected_fingerprint: Option<&ContentFingerprint>,
+    ) -> Result<CopyTargetObservation, TargetInspectionError> {
+        let metadata = match fs::symlink_metadata(physical_target_path.as_ref()) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                return Ok(CopyTargetObservation::Missing);
+            }
+            Err(source) => {
+                return Err(TargetInspectionError::TargetMetadata {
+                    target_path: target_path.clone(),
+                    source,
+                });
+            }
+        };
+        match classify_nofollow_entry(&metadata) {
+            NoFollowEntryKind::RegularFile => {
+                let mut file =
+                    open_copy_target_nofollow(physical_target_path.as_ref()).map_err(|source| {
+                        TargetInspectionError::TargetContent {
+                            target_path: target_path.clone(),
+                            source,
+                        }
+                    })?;
+                let mut hasher = Sha256::new();
+                let mut buffer = [0_u8; 8192];
+                loop {
+                    let read = file.read(&mut buffer).map_err(|source| {
+                        TargetInspectionError::TargetContent {
+                            target_path: target_path.clone(),
+                            source,
+                        }
+                    })?;
+                    if read == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..read]);
+                }
+                let fingerprint =
+                    ContentFingerprint::parse(format!("sha256:{:x}", hasher.finalize()))
+                        .expect("SHA-256 output is canonical");
+                Ok(if expected_fingerprint == Some(&fingerprint) {
+                    CopyTargetObservation::ExpectedCopy {
+                        content_fingerprint: fingerprint,
+                    }
+                } else {
+                    CopyTargetObservation::OtherRegularFile {
+                        content_fingerprint: fingerprint,
+                    }
+                })
+            }
+            NoFollowEntryKind::Directory => Ok(CopyTargetObservation::OtherEntry {
+                kind: OtherEntryKind::Directory,
+            }),
+            NoFollowEntryKind::ReparsePoint => Ok(CopyTargetObservation::OtherEntry {
+                kind: OtherEntryKind::ReparsePoint,
+            }),
+            NoFollowEntryKind::FileSymbolicLink | NoFollowEntryKind::Unsupported => {
+                Ok(CopyTargetObservation::OtherEntry {
+                    kind: OtherEntryKind::Unsupported,
+                })
+            }
+        }
+    }
+}
+
+fn open_copy_target_nofollow(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -378,6 +565,10 @@ pub(crate) enum TargetInspectionError {
         target_path: ResolvedPath,
         source: io::Error,
     },
+    TargetContent {
+        target_path: ResolvedPath,
+        source: io::Error,
+    },
     ReadLink {
         target_path: ResolvedPath,
         source: io::Error,
@@ -388,6 +579,7 @@ pub(crate) enum TargetInspectionError {
         source: ResolvedPathError,
     },
     InvalidActualFileLink(crate::domain::actual::ActualFileLinkError),
+    InvalidActualFileCopy(crate::domain::actual::ActualFileCopyError),
     InvalidActualState(crate::domain::actual::ActualStateError),
 }
 
@@ -432,6 +624,13 @@ impl fmt::Display for TargetInspectionError {
                 target_path,
                 source,
             } => write!(formatter, "cannot inspect target {target_path}: {source}"),
+            Self::TargetContent {
+                target_path,
+                source,
+            } => write!(
+                formatter,
+                "cannot fingerprint target {target_path}: {source}"
+            ),
             Self::ReadLink {
                 target_path,
                 source,
@@ -449,6 +648,7 @@ impl fmt::Display for TargetInspectionError {
                 link_target.display()
             ),
             Self::InvalidActualFileLink(error) => error.fmt(formatter),
+            Self::InvalidActualFileCopy(error) => error.fmt(formatter),
             Self::InvalidActualState(error) => error.fmt(formatter),
         }
     }
@@ -460,11 +660,13 @@ impl std::error::Error for TargetInspectionError {
             Self::HomeDirectoryIo { source, .. }
             | Self::ParentMetadata { source, .. }
             | Self::TargetMetadata { source, .. }
+            | Self::TargetContent { source, .. }
             | Self::ReadLink { source, .. } => Some(source),
             Self::InvalidDeclaredHome(error)
             | Self::InvalidCanonicalHome(error)
             | Self::InvalidObservedLinkTarget { source: error, .. } => Some(error),
             Self::InvalidActualFileLink(error) => Some(error),
+            Self::InvalidActualFileCopy(error) => Some(error),
             Self::InvalidActualState(error) => Some(error),
             Self::HomeDirectoryNotDirectory { .. }
             | Self::TargetHasNoParent { .. }
@@ -480,11 +682,12 @@ mod tests {
 
     use super::*;
     use crate::domain::desired::ResolvedDesired;
+    use crate::domain::file_copy::{ContentFingerprint, ResolvedFileCopy};
     use crate::domain::file_link::ResolvedFileLink;
     use crate::domain::ids::{FullyQualifiedResourceId, ProfileId};
     #[cfg(any(unix, windows))]
     use crate::domain::known::KnownFileLink;
-    use crate::domain::known::KnownState;
+    use crate::domain::known::{KnownFileCopy, KnownState};
 
     static NEXT_WORKSPACE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -577,6 +780,31 @@ mod tests {
         ResolvedDesired::new(ProfileId::parse("workstation").unwrap(), resources).unwrap()
     }
 
+    fn fingerprint(contents: &[u8]) -> ContentFingerprint {
+        let mut hasher = Sha256::new();
+        hasher.update(contents);
+        ContentFingerprint::parse(format!("sha256:{:x}", hasher.finalize())).unwrap()
+    }
+
+    fn copy_resource(
+        workspace: &TestWorkspace,
+        id: &str,
+        source_relative_path: &str,
+        target_relative_path: &str,
+        contents: &[u8],
+    ) -> ResolvedFileCopy {
+        let source = workspace.path("store").join(source_relative_path);
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, contents).unwrap();
+        ResolvedFileCopy::new(
+            FullyQualifiedResourceId::parse(id).unwrap(),
+            ResolvedPath::new(source).unwrap(),
+            ResolvedPath::new(workspace.path("home").join(target_relative_path)).unwrap(),
+            fingerprint(contents),
+        )
+        .unwrap()
+    }
+
     #[cfg(unix)]
     fn create_fifo(path: &Path) {
         use std::ffi::CString;
@@ -629,6 +857,121 @@ mod tests {
             !workspace.path("home/missing").exists(),
             "inspection must not create a missing target"
         );
+    }
+
+    #[test]
+    fn inspector_classifies_copy_targets_by_known_byte_fingerprint_without_adoption() {
+        let workspace = TestWorkspace::new();
+        let expected = copy_resource(
+            &workspace,
+            "workstation/expected-copy",
+            "expected-copy-source",
+            "expected-copy",
+            b"expected copy bytes\n",
+        );
+        let other = copy_resource(
+            &workspace,
+            "workstation/other-copy",
+            "other-copy-source",
+            "other-copy",
+            b"desired bytes\n",
+        );
+        let missing = copy_resource(
+            &workspace,
+            "workstation/missing-copy",
+            "missing-copy-source",
+            "missing-copy",
+            b"missing desired bytes\n",
+        );
+        fs::write(expected.target_path().as_ref(), b"expected copy bytes\n").unwrap();
+        fs::write(other.target_path().as_ref(), b"desired bytes\n").unwrap();
+        let known = KnownState::new([KnownFileCopy::from_resolved(&expected)]).unwrap();
+        let desired = ResolvedDesired::new(
+            ProfileId::parse("workstation").unwrap(),
+            [expected.clone(), other.clone(), missing.clone()],
+        )
+        .unwrap();
+
+        let actual = workspace.inspector().inspect(&desired, &known).unwrap();
+
+        assert!(matches!(
+            actual.get_variant(expected.target_path()),
+            Some(crate::domain::actual::ActualResource::FileCopy(
+                ActualFileCopy { .. }
+            ))
+        ));
+        assert_eq!(
+            actual
+                .get_variant(expected.target_path())
+                .and_then(|value| match value {
+                    crate::domain::actual::ActualResource::FileCopy(value) =>
+                        Some(value.observation()),
+                    _ => None,
+                }),
+            Some(&CopyTargetObservation::ExpectedCopy {
+                content_fingerprint: expected.source_content_fingerprint().clone(),
+            })
+        );
+        assert_eq!(
+            actual
+                .get_variant(other.target_path())
+                .and_then(|value| match value {
+                    crate::domain::actual::ActualResource::FileCopy(value) =>
+                        Some(value.observation()),
+                    _ => None,
+                }),
+            Some(&CopyTargetObservation::OtherRegularFile {
+                content_fingerprint: other.source_content_fingerprint().clone(),
+            }),
+            "matching desired bytes without Known state are unmanaged"
+        );
+        assert_eq!(
+            actual
+                .get_variant(missing.target_path())
+                .and_then(|value| match value {
+                    crate::domain::actual::ActualResource::FileCopy(value) =>
+                        Some(value.observation()),
+                    _ => None,
+                }),
+            Some(&CopyTargetObservation::Missing)
+        );
+    }
+
+    #[test]
+    fn known_copy_observation_wins_over_desired_link_during_effect_handoff() {
+        let workspace = TestWorkspace::new();
+        let copy = copy_resource(
+            &workspace,
+            "workstation/item",
+            "copy-source",
+            "item",
+            b"owned copy bytes\n",
+        );
+        fs::write(copy.target_path().as_ref(), b"owned copy bytes\n").unwrap();
+        workspace.write("store/link-source", "link source bytes\n");
+        let link = ResolvedFileLink::new(
+            copy.resource_id().clone(),
+            ResolvedPath::new(workspace.path("store/link-source")).unwrap(),
+            copy.target_path().clone(),
+        )
+        .unwrap();
+        let known = KnownState::new([KnownFileCopy::from_resolved(&copy)]).unwrap();
+        let desired =
+            ResolvedDesired::new(ProfileId::parse("workstation").unwrap(), [link.clone()]).unwrap();
+
+        let actual = workspace.inspector().inspect(&desired, &known).unwrap();
+        assert!(matches!(
+            actual.get_variant(link.target_path()),
+            Some(crate::domain::actual::ActualResource::FileCopy(actual))
+                if matches!(actual.observation(), CopyTargetObservation::ExpectedCopy { content_fingerprint }
+                    if content_fingerprint == copy.source_content_fingerprint())
+        ));
+
+        let plan = crate::planner::plan(&desired, &known, &actual);
+        assert!(matches!(
+            plan.resource_actions(),
+            [crate::domain::plan::PlannedResourceAction::ReplaceEffect(_)]
+        ));
     }
 
     #[cfg(unix)]

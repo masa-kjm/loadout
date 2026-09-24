@@ -7,7 +7,7 @@ use crate::domain::desired::{ResolvedDesired, ResolvedResource};
 use crate::domain::diagnostic::Diagnostic;
 use crate::domain::file_link::ResolvedFileLink;
 use crate::domain::ids::FullyQualifiedResourceId;
-use crate::domain::known::{KnownFileLink, KnownState};
+use crate::domain::known::{KnownFileLink, KnownResource, KnownState};
 use crate::domain::paths::ResolvedPath;
 use crate::domain::plan::{Plan, PlannedAction};
 use crate::planner::ordering::sort_actions;
@@ -24,6 +24,16 @@ pub(crate) fn plan(desired: &ResolvedDesired, known: &KnownState, actual: &Actua
     let mut blocked_targets = desired_target_collisions(desired, &mut diagnostics);
     for resource in desired.variants() {
         if let ResolvedResource::FileCopy(resource) = resource {
+            blocked_targets.insert(resource.target_path().clone());
+            diagnostics.push(Diagnostic::UnsupportedResourceEffect {
+                resource_id: resource.resource_id().clone(),
+                target_path: resource.target_path().clone(),
+                effect: "file_copy",
+            });
+        }
+    }
+    for resource in known.variants() {
+        if let KnownResource::FileCopy(resource) = resource {
             blocked_targets.insert(resource.target_path().clone());
             diagnostics.push(Diagnostic::UnsupportedResourceEffect {
                 resource_id: resource.resource_id().clone(),
@@ -65,7 +75,7 @@ pub(crate) fn plan(desired: &ResolvedDesired, known: &KnownState, actual: &Actua
         }
     }
 
-    for previous in known.resources() {
+    for previous in known.file_links() {
         if desired_ids.contains(previous.resource_id())
             || handed_off_known_ids.contains(previous.resource_id())
             || blocked_targets.contains(previous.target_path())
@@ -193,7 +203,7 @@ fn plan_new_identity(
     actions: &mut Vec<PlannedAction>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let stale_at_target = known.resources().find(|previous| {
+    let stale_at_target = known.file_links().find(|previous| {
         previous.target_path() == desired.target_path()
             && !desired_ids.contains(previous.resource_id())
     });
@@ -282,8 +292,10 @@ mod tests {
     use super::*;
     use crate::domain::actual::{ActualFileLink, OtherEntryKind, ParentSafety};
     use crate::domain::desired::ResolvedDesired;
+    use crate::domain::file_copy::ContentFingerprint;
     use crate::domain::file_link::LinkTarget;
     use crate::domain::ids::ProfileId;
+    use crate::domain::known::{KnownFileCopy, KnownResource};
     use crate::domain::plan::{ActionKind, ActionReason, KnownStateUpdate, TargetCondition};
 
     fn path(name: &str) -> ResolvedPath {
@@ -822,5 +834,31 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["base/git", "zeta/zsh"]
         );
+    }
+
+    #[test]
+    fn known_copy_blocks_the_link_only_planner_without_an_executable_action() {
+        let copy = KnownFileCopy::new(
+            FullyQualifiedResourceId::parse("base/copy").unwrap(),
+            path("store/copy"),
+            path("home/.copyconfig"),
+            ContentFingerprint::parse(format!("sha256:{}", "a".repeat(64))).unwrap(),
+        )
+        .unwrap();
+        let plan = plan(
+            &desired(vec![]),
+            &KnownState::new([KnownResource::from(copy)]).unwrap(),
+            &ActualState::default(),
+        );
+
+        assert_blocked(plan.clone());
+        assert!(plan.actions().is_empty());
+        assert!(matches!(
+            plan.diagnostics()[0],
+            Diagnostic::UnsupportedResourceEffect {
+                effect: "file_copy",
+                ..
+            }
+        ));
     }
 }

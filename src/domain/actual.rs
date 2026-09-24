@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use crate::domain::file_copy::ContentFingerprint;
 use crate::domain::file_link::LinkTarget;
 use crate::domain::paths::ResolvedPath;
 
@@ -117,20 +118,123 @@ impl fmt::Display for ActualFileLinkError {
 
 impl std::error::Error for ActualFileLinkError {}
 
+/// The no-follow planner classification for a file-copy target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CopyTargetObservation {
+    Missing,
+    ExpectedCopy {
+        content_fingerprint: ContentFingerprint,
+    },
+    OtherRegularFile {
+        content_fingerprint: ContentFingerprint,
+    },
+    OtherEntry {
+        kind: OtherEntryKind,
+    },
+    UnsafePath {
+        parent_safety: ParentSafety,
+    },
+}
+
+impl CopyTargetObservation {
+    pub(crate) fn parent_safety(&self) -> ParentSafety {
+        match self {
+            Self::UnsafePath { parent_safety } => *parent_safety,
+            Self::Missing
+            | Self::ExpectedCopy { .. }
+            | Self::OtherRegularFile { .. }
+            | Self::OtherEntry { .. } => ParentSafety::Safe,
+        }
+    }
+}
+
+/// An effect-specific no-follow observation supplied to copy planning.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ActualFileCopy {
+    target_path: ResolvedPath,
+    observation: CopyTargetObservation,
+}
+
+/// A closed effect-specific Actual observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ActualResource {
+    FileLink(ActualFileLink),
+    FileCopy(ActualFileCopy),
+}
+
+impl ActualResource {
+    pub(crate) fn target_path(&self) -> &ResolvedPath {
+        match self {
+            Self::FileLink(value) => value.target_path(),
+            Self::FileCopy(value) => value.target_path(),
+        }
+    }
+}
+
+impl From<ActualFileLink> for ActualResource {
+    fn from(value: ActualFileLink) -> Self {
+        Self::FileLink(value)
+    }
+}
+impl From<ActualFileCopy> for ActualResource {
+    fn from(value: ActualFileCopy) -> Self {
+        Self::FileCopy(value)
+    }
+}
+
+impl ActualFileCopy {
+    pub(crate) fn new(
+        target_path: ResolvedPath,
+        observation: CopyTargetObservation,
+    ) -> Result<Self, ActualFileCopyError> {
+        if matches!(
+            observation,
+            CopyTargetObservation::UnsafePath {
+                parent_safety: ParentSafety::Safe
+            }
+        ) {
+            return Err(ActualFileCopyError::UnsafePathMarkedSafe);
+        }
+        Ok(Self {
+            target_path,
+            observation,
+        })
+    }
+    pub(crate) fn target_path(&self) -> &ResolvedPath {
+        &self.target_path
+    }
+    pub(crate) fn observation(&self) -> &CopyTargetObservation {
+        &self.observation
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ActualFileCopyError {
+    UnsafePathMarkedSafe,
+}
+
+impl fmt::Display for ActualFileCopyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an unsafe copy target path must record an unsafe parent condition")
+    }
+}
+
+impl std::error::Error for ActualFileCopyError {}
+
 /// The complete no-follow observations supplied to one planner invocation.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ActualState {
-    targets: BTreeMap<ResolvedPath, ActualFileLink>,
+    targets: BTreeMap<ResolvedPath, ActualResource>,
 }
 
 impl ActualState {
     /// Builds a target-indexed Actual state without duplicate observations.
     pub(crate) fn new(
-        observations: impl IntoIterator<Item = ActualFileLink>,
+        observations: impl IntoIterator<Item = impl Into<ActualResource>>,
     ) -> Result<Self, ActualStateError> {
         let mut targets = BTreeMap::new();
 
-        for observation in observations {
+        for observation in observations.into_iter().map(Into::into) {
             let target_path = observation.target_path().clone();
             if targets.insert(target_path.clone(), observation).is_some() {
                 return Err(ActualStateError::DuplicateTargetObservation { target_path });
@@ -142,12 +246,19 @@ impl ActualState {
 
     /// Looks up the observation for one resolved target path.
     pub(crate) fn get(&self, target_path: &ResolvedPath) -> Option<&ActualFileLink> {
-        self.targets.get(target_path)
+        match self.targets.get(target_path) {
+            Some(ActualResource::FileLink(value)) => Some(value),
+            _ => None,
+        }
     }
 
     /// Iterates over observations in deterministic resolved-path order.
-    pub(crate) fn observations(&self) -> impl ExactSizeIterator<Item = &ActualFileLink> {
+    pub(crate) fn observations(&self) -> impl ExactSizeIterator<Item = &ActualResource> {
         self.targets.values()
+    }
+
+    pub(crate) fn get_variant(&self, target_path: &ResolvedPath) -> Option<&ActualResource> {
+        self.targets.get(target_path)
     }
 }
 
@@ -224,6 +335,33 @@ mod tests {
             .unwrap_err(),
             ActualFileLinkError::UnsafePathMarkedSafe
         );
+    }
+
+    #[test]
+    fn copy_observation_preserves_fingerprint_ownership_without_adoption() {
+        let fingerprint = ContentFingerprint::parse(format!("sha256:{}", "a".repeat(64))).unwrap();
+        let expected = ActualFileCopy::new(
+            path("home/.copyconfig"),
+            CopyTargetObservation::ExpectedCopy {
+                content_fingerprint: fingerprint.clone(),
+            },
+        )
+        .unwrap();
+        let unmanaged = ActualFileCopy::new(
+            path("home/.copyconfig"),
+            CopyTargetObservation::OtherRegularFile {
+                content_fingerprint: fingerprint,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            expected.observation(),
+            CopyTargetObservation::ExpectedCopy { .. }
+        ));
+        assert!(matches!(
+            unmanaged.observation(),
+            CopyTargetObservation::OtherRegularFile { .. }
+        ));
     }
 
     #[test]

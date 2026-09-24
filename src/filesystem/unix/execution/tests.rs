@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::{ExecutionBoundary as Boundary, on_execution_boundary};
+use sha2::{Digest, Sha256};
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,6 +53,127 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+fn fingerprint(contents: &[u8]) -> ContentFingerprint {
+    let mut hasher = Sha256::new();
+    hasher.update(contents);
+    ContentFingerprint::parse(format!("sha256:{:x}", hasher.finalize())).unwrap()
+}
+
+#[test]
+fn copy_temporary_is_flushed_verified_and_published_without_replacing_a_target() {
+    let f = Fixture::new();
+    let target = f.target();
+    let temporary_path = f.path("home/parent/.loadout-copy-a1");
+    let temporary = ExecutionTarget::open(&f.path("home"), &temporary_path).unwrap();
+    let expected = fingerprint(b"new contents");
+
+    temporary
+        .copy_source_to_temporary(&f.path("store"), &f.path("store/new"), &expected)
+        .unwrap();
+    target
+        .publish_copy_no_replace(&temporary_path, &expected)
+        .unwrap();
+
+    assert_eq!(
+        fs::read(f.path("home/parent/target").as_ref()).unwrap(),
+        b"new contents"
+    );
+    assert!(fs::symlink_metadata(temporary_path.as_ref()).is_err());
+    f.assert_sources();
+}
+
+#[test]
+fn copy_no_replace_preserves_an_entry_that_appears_after_the_final_recheck() {
+    let f = Fixture::new();
+    let target = f.target();
+    let temporary_path = f.path("home/parent/.loadout-copy-a1");
+    let temporary = ExecutionTarget::open(&f.path("home"), &temporary_path).unwrap();
+    let expected = fingerprint(b"new contents");
+    temporary
+        .copy_source_to_temporary(&f.path("store"), &f.path("store/new"), &expected)
+        .unwrap();
+    let final_path = f.path("home/parent/target");
+    let _hook = on_execution_boundary(Boundary::AfterFinalRecheck, move || {
+        fs::write(final_path.as_ref(), "unmanaged")
+    });
+
+    assert_eq!(
+        target
+            .publish_copy_no_replace(&temporary_path, &expected)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(
+        fs::read_to_string(f.path("home/parent/target").as_ref()).unwrap(),
+        "unmanaged"
+    );
+    assert_eq!(fs::read(temporary_path.as_ref()).unwrap(), b"new contents");
+    f.assert_sources();
+}
+
+#[test]
+fn copy_replace_and_removal_require_the_expected_owned_fingerprint() {
+    let f = Fixture::new();
+    let target = f.target();
+    let temporary_path = f.path("home/parent/.loadout-copy-a1");
+    let temporary = ExecutionTarget::open(&f.path("home"), &temporary_path).unwrap();
+    let old = fingerprint(b"old copy bytes");
+    let new = fingerprint(b"new contents");
+    fs::write(f.path("home/parent/target").as_ref(), b"old copy bytes").unwrap();
+    temporary
+        .copy_source_to_temporary(&f.path("store"), &f.path("store/new"), &new)
+        .unwrap();
+
+    target
+        .replace_copy_from_temporary(&temporary_path, &old, &new)
+        .unwrap();
+    assert_eq!(
+        target.observe_copy(Some(&new)).unwrap(),
+        CopyTargetObservation::ExpectedCopy {
+            content_fingerprint: new.clone(),
+        }
+    );
+    assert!(fs::symlink_metadata(temporary_path.as_ref()).is_err());
+    assert!(target.remove_expected_copy(&old).is_err());
+    assert_eq!(
+        fs::read(f.path("home/parent/target").as_ref()).unwrap(),
+        b"new contents"
+    );
+    target.remove_expected_copy(&new).unwrap();
+    assert_eq!(
+        target.observe_copy(Some(&new)).unwrap(),
+        CopyTargetObservation::Missing
+    );
+    f.assert_sources();
+}
+
+#[test]
+fn link_to_copy_handoff_requires_the_expected_link_and_verified_temporary() {
+    let f = Fixture::new();
+    let target = f.target();
+    let temporary_path = f.path("home/parent/.loadout-copy-a1");
+    let temporary = ExecutionTarget::open(&f.path("home"), &temporary_path).unwrap();
+    let expected = fingerprint(b"new contents");
+    f.link("home/parent/target", &f.old());
+    temporary
+        .copy_source_to_temporary(&f.path("store"), &f.path("store/new"), &expected)
+        .unwrap();
+
+    target
+        .replace_link_with_copy_temporary(&temporary_path, &f.old(), &expected)
+        .unwrap();
+
+    assert_eq!(
+        target.observe_copy(Some(&expected)).unwrap(),
+        CopyTargetObservation::ExpectedCopy {
+            content_fingerprint: expected,
+        }
+    );
+    assert!(fs::symlink_metadata(temporary_path.as_ref()).is_err());
+    f.assert_sources();
 }
 
 #[test]

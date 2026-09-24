@@ -14,7 +14,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use crate::domain::paths::ResolvedPath;
 use crate::domain::{
-    actual::{OtherEntryKind, TargetObservation},
+    actual::{CopyTargetObservation, OtherEntryKind, TargetObservation},
+    file_copy::ContentFingerprint,
     file_link::LinkTarget,
 };
 
@@ -111,6 +112,73 @@ impl ExecutionTarget {
         let observation = self.observe_name(expected)?;
         self.check_association()?;
         Ok(observation)
+    }
+
+    /// Copy publication is fail-closed until Windows-native no-replace and failure-aftermath evidence exists.
+    pub(crate) fn copy_source_to_temporary(
+        &self,
+        _: &ResolvedPath,
+        _: &ResolvedPath,
+        _: &ContentFingerprint,
+    ) -> io::Result<()> {
+        Err(copy_unsupported())
+    }
+
+    /// Copy publication is fail-closed until Windows-native no-replace and failure-aftermath evidence exists.
+    pub(crate) fn publish_copy_no_replace(
+        &self,
+        _: &ResolvedPath,
+        _: &ContentFingerprint,
+    ) -> io::Result<()> {
+        Err(copy_unsupported())
+    }
+
+    /// Copy replacement is fail-closed until Windows-native failure-aftermath evidence exists.
+    pub(crate) fn replace_copy_from_temporary(
+        &self,
+        _: &ResolvedPath,
+        _: &ContentFingerprint,
+        _: &ContentFingerprint,
+    ) -> io::Result<()> {
+        Err(copy_unsupported())
+    }
+
+    /// Copy removal is fail-closed until Windows-native ownership and aftermath evidence exists.
+    pub(crate) fn remove_expected_copy(&self, _: &ContentFingerprint) -> io::Result<()> {
+        Err(copy_unsupported())
+    }
+
+    /// Copy observation is unavailable until the native no-follow byte-reading boundary is proven.
+    pub(crate) fn observe_copy(
+        &self,
+        _: Option<&ContentFingerprint>,
+    ) -> io::Result<CopyTargetObservation> {
+        Err(copy_unsupported())
+    }
+
+    /// Link-to-copy replacement is fail-closed until Windows-native failure-aftermath evidence exists.
+    pub(crate) fn replace_link_with_copy_temporary(
+        &self,
+        _: &ResolvedPath,
+        _: &LinkTarget,
+        _: &ContentFingerprint,
+    ) -> io::Result<()> {
+        Err(copy_unsupported())
+    }
+
+    /// Copy-to-link replacement is fail-closed until Windows-native failure-aftermath evidence exists.
+    pub(crate) fn create_link_temporary(&self, _: &ResolvedPath, _: &LinkTarget) -> io::Result<()> {
+        Err(copy_unsupported())
+    }
+
+    /// Copy-to-link replacement is fail-closed until Windows-native failure-aftermath evidence exists.
+    pub(crate) fn replace_copy_with_link_temporary(
+        &self,
+        _: &ResolvedPath,
+        _: &ContentFingerprint,
+        _: &LinkTarget,
+    ) -> io::Result<()> {
+        Err(copy_unsupported())
     }
 
     /// Rechecks the declared-path association and exact file-link value, then retains the checked final entry for deletion.
@@ -442,6 +510,13 @@ fn directory_identity(file: &File) -> io::Result<(u32, u32, u32)> {
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+fn copy_unsupported() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Windows file-copy execution is unavailable pending native capability evidence",
+    )
 }
 
 #[cfg(test)]

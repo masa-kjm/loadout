@@ -17,11 +17,16 @@ impl ActionPhase {
     pub(crate) fn for_action(action: &PlannedAction) -> Self {
         match action.kind() {
             ActionKind::Noop => Self::Noop,
-            ActionKind::CreateLink => Self::Create,
-            ActionKind::ReplaceLink | ActionKind::ReplaceOwnership | ActionKind::RelocateLink => {
-                Self::ReplaceOrRelocate
+            ActionKind::CreateLink | ActionKind::CreateCopy => Self::Create,
+            ActionKind::ReplaceLink
+            | ActionKind::ReplaceOwnership
+            | ActionKind::RelocateLink
+            | ActionKind::ReplaceCopy
+            | ActionKind::ReplaceEffect
+            | ActionKind::RelocateCopy => Self::ReplaceOrRelocate,
+            ActionKind::RemoveLink | ActionKind::ForgetMissing | ActionKind::RemoveCopy => {
+                Self::RemoveOrForget
             }
-            ActionKind::RemoveLink | ActionKind::ForgetMissing => Self::RemoveOrForget,
         }
     }
 }

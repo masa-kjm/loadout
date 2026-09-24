@@ -23,6 +23,11 @@ pub(super) fn action_name(kind: ActionKind) -> &'static str {
         ActionKind::ReplaceOwnership => "replace_ownership",
         ActionKind::RemoveLink => "remove_link",
         ActionKind::ForgetMissing => "forget_missing",
+        ActionKind::CreateCopy => "create_copy",
+        ActionKind::ReplaceCopy => "replace_copy",
+        ActionKind::RelocateCopy => "relocate_copy",
+        ActionKind::RemoveCopy => "remove_copy",
+        ActionKind::ReplaceEffect => "replace_effect",
         ActionKind::Noop => "noop",
     }
 }
@@ -375,6 +380,14 @@ pub(super) fn planned(out: &mut impl Write, err: &mut impl Write, plan: &Plan) -
                 err,
                 "conflict: {resource_id}: {target_path}: {}",
                 observation(actual)
+            )?,
+            Diagnostic::UnexpectedCopyTarget {
+                resource_id,
+                target_path,
+                observation,
+            } => writeln!(
+                err,
+                "conflict: {resource_id}: {target_path}: {observation:?}"
             )?,
             Diagnostic::MissingActualObservation { target_path } => {
                 writeln!(err, "blocked: missing observation for {target_path}")?

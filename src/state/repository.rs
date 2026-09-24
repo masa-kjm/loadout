@@ -11,11 +11,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::domain::hashes::{CanonicalHashError, DesiredHash};
 use crate::domain::known::{KnownFileLink, KnownState, KnownStateError};
 use crate::domain::paths::ResolvedPath;
-use crate::domain::plan::{ActionKind, PlannedAction};
+use crate::domain::plan::{ActionKind, PlannedAction, PlannedResourceAction};
 pub(crate) use crate::state::codec::StateDecodeError;
 use crate::state::codec::StateDocument;
 use crate::state::operation::{
-    ActionId, ActionStatus, OperationId, OperationRecord, OperationRecordError,
+    ActionId, ActionStatus, OperationId, OperationRecord, OperationRecordError, RecordedAction,
     RecordedKnownStateUpdate,
 };
 
@@ -42,14 +42,14 @@ impl PersistedState {
     ) -> Result<Self, StateDecodeError> {
         if let Some(operation) = &active_operation {
             for (_, action) in operation.actions() {
-                if let Some(facts) = action.replacement_facts() {
+                if let Some(temporary_path) = action.temporary_path() {
                     if known
                         .resources()
-                        .any(|resource| resource.target_path() == facts.temporary_path())
+                        .any(|resource| resource.target_path() == temporary_path)
                     {
                         return Err(StateDecodeError::InvalidOperation(
                             OperationRecordError::DuplicateTargetPath {
-                                target_path: facts.temporary_path().clone(),
+                                target_path: temporary_path.clone(),
                             },
                         ));
                     }
@@ -328,6 +328,100 @@ impl LockedStateRepository {
         Ok(ids)
     }
 
+    /// Records copy materializations and cross-effect handoffs with repository-allocated exact temporary siblings.
+    ///
+    /// This intentionally accepts only mutation actions whose recovery facts are complete; noops and copy removal remain outside this entry point until their operation records are implemented.
+    pub(crate) fn begin_resource_actions(
+        &mut self,
+        desired_hash: DesiredHash,
+        actions: &[PlannedResourceAction],
+    ) -> Result<Vec<ActionId>, StateRepositoryError> {
+        if self.state.active_operation.is_some() {
+            return Err(StateRepositoryError::ActiveOperationPresent);
+        }
+        let mut reserved = self
+            .state
+            .known()
+            .resources()
+            .map(|resource| resource.target_path().clone())
+            .collect::<BTreeSet<_>>();
+        for action in actions {
+            for target in action.touched_targets() {
+                reserved.insert(target.clone());
+            }
+        }
+        let mut recorded = Vec::new();
+        let mut ids = Vec::new();
+        for (index, action) in actions.iter().enumerate() {
+            let id = ActionId::parse(format!("a{}", index + 1))
+                .map_err(StateRepositoryError::Operation)?;
+            let target = match action {
+                PlannedResourceAction::FileCopy(copy) => {
+                    copy.desired().map(|value| value.target_path())
+                }
+                PlannedResourceAction::ReplaceEffect(handoff) => {
+                    Some(handoff.final_effect().target_path())
+                }
+                PlannedResourceAction::FileLink(_) => None,
+            }
+            .ok_or(StateRepositoryError::Operation(
+                OperationRecordError::UnsupportedActionKind {
+                    kind: action.kind(),
+                },
+            ))?;
+            let temporary = self.allocate_temporary_sibling(target, &reserved)?;
+            let facts = match action {
+                PlannedResourceAction::FileCopy(copy) => {
+                    RecordedAction::copy(copy, temporary.clone())
+                }
+                PlannedResourceAction::ReplaceEffect(handoff) => {
+                    RecordedAction::replace_effect(handoff, temporary.clone())
+                }
+                PlannedResourceAction::FileLink(_) => {
+                    unreachable!("link actions use begin_actions")
+                }
+            }
+            .map_err(StateRepositoryError::Operation)?;
+            reserved.insert(temporary);
+            ids.push(id.clone());
+            recorded.push((id, facts));
+        }
+        let operation = OperationRecord::from_actions(new_operation_id(), desired_hash, recorded)
+            .map_err(StateRepositoryError::Operation)?;
+        let mut candidate = self.state.clone();
+        candidate.active_operation = Some(operation);
+        self.commit_candidate(candidate)?;
+        Ok(ids)
+    }
+
+    fn allocate_temporary_sibling(
+        &self,
+        target: &ResolvedPath,
+        reserved: &BTreeSet<ResolvedPath>,
+    ) -> Result<ResolvedPath, StateRepositoryError> {
+        let parent = target.as_ref().parent().ok_or({
+            StateRepositoryError::Operation(OperationRecordError::InvalidActionConditions {
+                kind: ActionKind::ReplaceEffect,
+            })
+        })?;
+        for _ in 0..MAX_TEMPORARY_NAME_ATTEMPTS {
+            let nonce = NEXT_REPLACEMENT_NONCE.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(".loadout-replace-{}-{nonce}", std::process::id()));
+            if !reserved.iter().any(|reserved| reserved.as_ref() == path) {
+                return ResolvedPath::new(path).map_err(|_| {
+                    StateRepositoryError::Operation(OperationRecordError::InvalidActionConditions {
+                        kind: ActionKind::ReplaceEffect,
+                    })
+                });
+            }
+        }
+        Err(StateRepositoryError::Operation(
+            OperationRecordError::InvalidActionConditions {
+                kind: ActionKind::ReplaceEffect,
+            },
+        ))
+    }
+
     fn allocate_replacement_temporary_path(
         &self,
         action: &PlannedAction,
@@ -433,6 +527,10 @@ impl LockedStateRepository {
             RecordedKnownStateUpdate::Upsert(known) => candidate
                 .known
                 .with_upserted(known)
+                .map_err(StateRepositoryError::KnownState)?,
+            RecordedKnownStateUpdate::UpsertCopy(known) => candidate
+                .known
+                .with_upserted_copy(known)
                 .map_err(StateRepositoryError::KnownState)?,
             RecordedKnownStateUpdate::RemoveExpected(known) => candidate
                 .known
@@ -684,6 +782,10 @@ fn validate_succeeded_actions(
             RecordedKnownStateUpdate::Upsert(expected) => {
                 known.get(expected.resource_id()) == Some(&expected)
             }
+            RecordedKnownStateUpdate::UpsertCopy(expected) => {
+                known.get_variant(expected.resource_id())
+                    == Some(&crate::domain::known::KnownResource::FileCopy(expected))
+            }
             RecordedKnownStateUpdate::RemoveExpected(expected) => {
                 known.get(expected.resource_id()).is_none()
             }
@@ -770,6 +872,16 @@ fn validate_unfinished_stale_action_known_state(
                 }),
                 None => false,
             },
+            ActionKind::ReplaceCopy | ActionKind::RelocateCopy => {
+                action.copy_facts().is_some_and(|facts| {
+                    facts.old_effect().is_some_and(|old_effect| {
+                        known.get_variant(old_effect.resource_id()) == Some(old_effect)
+                    })
+                })
+            }
+            ActionKind::ReplaceEffect => action.effect_handoff_facts().is_some_and(|facts| {
+                known.get_variant(facts.old_effect().resource_id()) == Some(facts.old_effect())
+            }),
             ActionKind::CreateLink => true,
             _ => true,
         };
@@ -1206,10 +1318,12 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+    use crate::domain::file_copy::{ContentFingerprint, ResolvedFileCopy};
     use crate::domain::file_link::ResolvedFileLink;
     use crate::domain::hashes::definition_hash;
     use crate::domain::ids::FullyQualifiedResourceId;
     use crate::domain::known::KnownFileLink;
+    use crate::domain::plan::{PlannedFileCopyAction, PlannedResourceAction};
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -1351,6 +1465,39 @@ mod tests {
             .action(action_id)
             .unwrap()
             .status()
+    }
+
+    #[test]
+    fn begin_resource_actions_persists_a_pending_copy_with_a_unique_sibling() {
+        let workspace = TestStateDirectory::new();
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let target = ResolvedPath::new(workspace.root.join("home/.config")).unwrap();
+        let fingerprint = ContentFingerprint::parse(format!("sha256:{}", "b".repeat(64))).unwrap();
+        let action = PlannedResourceAction::FileCopy(PlannedFileCopyAction::Create {
+            desired: ResolvedFileCopy::new(
+                FullyQualifiedResourceId::parse("base/config").unwrap(),
+                ResolvedPath::new(workspace.root.join("store/config")).unwrap(),
+                target.clone(),
+                fingerprint.clone(),
+            )
+            .unwrap(),
+        });
+
+        let ids = locked
+            .begin_resource_actions(desired_hash(), &[action])
+            .unwrap();
+        let state = repository.load().unwrap();
+        let recorded = state.active_operation().unwrap().action(&ids[0]).unwrap();
+        let facts = recorded.copy_facts().unwrap();
+        assert_eq!(recorded.status(), ActionStatus::Pending);
+        assert_eq!(facts.target_path(), &target);
+        assert_eq!(facts.content_fingerprint(), &fingerprint);
+        assert_ne!(facts.temporary_path(), &target);
+        assert_eq!(
+            facts.temporary_path().as_ref().parent(),
+            target.as_ref().parent()
+        );
     }
 
     #[test]

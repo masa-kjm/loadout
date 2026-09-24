@@ -166,7 +166,7 @@ pub(super) fn desired_resources(
 pub(super) fn desired_resource(
     out: &mut impl Write,
     root_profile: &crate::domain::ids::ProfileId,
-    resource: &crate::domain::file_link::ResolvedFileLink,
+    resource: &crate::domain::desired::ResolvedResource,
 ) -> io::Result<()> {
     writeln!(out, "Desired resource for {root_profile}:")?;
     render_resolved_resource(out, resource)
@@ -178,28 +178,16 @@ pub(super) fn known_resources(
 ) -> io::Result<()> {
     writeln!(out, "Known resources: {}", report.resources.len())?;
     for resource in &report.resources {
-        writeln!(
-            out,
-            "{}: file link: source {}: target {}",
-            resource.resource_id(),
-            resource.source_path(),
-            resource.target_path()
-        )?;
+        render_known_resource(out, resource)?;
     }
     Ok(())
 }
 
 pub(super) fn known_resource(
     out: &mut impl Write,
-    resource: &crate::domain::known::KnownFileLink,
+    resource: &crate::domain::known::KnownResource,
 ) -> io::Result<()> {
-    writeln!(
-        out,
-        "{}: file link: source {}: target {}",
-        resource.resource_id(),
-        resource.source_path(),
-        resource.target_path()
-    )
+    render_known_resource(out, resource)
 }
 
 pub(super) fn status(out: &mut impl Write, report: &StatusReport) -> io::Result<()> {
@@ -309,15 +297,47 @@ fn unavailable_status_category(
 
 fn render_resolved_resource(
     out: &mut impl Write,
-    resource: &crate::domain::file_link::ResolvedFileLink,
+    resource: &crate::domain::desired::ResolvedResource,
 ) -> io::Result<()> {
-    writeln!(
-        out,
-        "{}: file link: source {}: target {}: operation link",
-        resource.resource_id(),
-        resource.source_path(),
-        resource.target_path()
-    )
+    match resource {
+        crate::domain::desired::ResolvedResource::FileLink(resource) => writeln!(
+            out,
+            "{}: file link: source {}: target {}: operation link",
+            resource.resource_id(),
+            resource.source_path(),
+            resource.target_path()
+        ),
+        crate::domain::desired::ResolvedResource::FileCopy(resource) => writeln!(
+            out,
+            "{}: file copy: source {}: target {}: operation copy",
+            resource.resource_id(),
+            resource.source_path(),
+            resource.target_path()
+        ),
+    }
+}
+
+fn render_known_resource(
+    out: &mut impl Write,
+    resource: &crate::domain::known::KnownResource,
+) -> io::Result<()> {
+    match resource {
+        crate::domain::known::KnownResource::FileLink(resource) => writeln!(
+            out,
+            "{}: file link: source {}: target {}",
+            resource.resource_id(),
+            resource.source_path(),
+            resource.target_path()
+        ),
+        crate::domain::known::KnownResource::FileCopy(resource) => writeln!(
+            out,
+            "{}: file copy: source {}: target {}: content {}",
+            resource.resource_id(),
+            resource.source_path(),
+            resource.target_path(),
+            resource.content_fingerprint().as_str()
+        ),
+    }
 }
 
 pub(super) fn plan(

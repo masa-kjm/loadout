@@ -790,7 +790,7 @@ fn status_reports_active_operation_when_valid_state_precedes_an_invalid_declarat
 }
 
 #[test]
-fn copy_declarations_block_lifecycle_and_read_only_rendering_without_mutation() {
+fn copy_declarations_block_lifecycle_but_render_desired_resources_without_mutation() {
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
@@ -833,8 +833,12 @@ fn copy_declarations_block_lifecycle_and_read_only_rendering_without_mutation() 
     );
     expect(
         f.run(&["resource", "list", "--config", "../portable/config.yaml"]),
-        2,
-        &["unsupported file_copy read-only rendering"],
+        0,
+        &[
+            "Desired resources for base: 1",
+            "base/copied: file copy:",
+            "operation copy",
+        ],
     );
 
     f.state(

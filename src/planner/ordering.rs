@@ -1,8 +1,8 @@
-//! Deterministic v0.2 action ordering without filesystem or state access.
+//! Deterministic v0.5 action ordering without filesystem or state access.
 
-use crate::domain::plan::{ActionKind, PlannedAction};
+use crate::domain::plan::{ActionKind, PlannedAction, PlannedResourceAction};
 
-/// The fixed v0.2 execution phases.
+/// The fixed v0.5 execution phases.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum ActionPhase {
     /// Noop actions are reports only and have no executor phase.
@@ -15,7 +15,16 @@ pub(crate) enum ActionPhase {
 impl ActionPhase {
     /// Maps each planned action to its fixed execution phase.
     pub(crate) fn for_action(action: &PlannedAction) -> Self {
-        match action.kind() {
+        Self::for_kind(action.kind())
+    }
+
+    /// Maps every closed resource action to its fixed execution phase.
+    pub(crate) fn for_resource_action(action: &PlannedResourceAction) -> Self {
+        Self::for_kind(action.kind())
+    }
+
+    fn for_kind(kind: ActionKind) -> Self {
+        match kind {
             ActionKind::Noop => Self::Noop,
             ActionKind::CreateLink | ActionKind::CreateCopy => Self::Create,
             ActionKind::ReplaceLink
@@ -54,6 +63,19 @@ impl ActionSortKey {
         }
     }
 
+    /// Creates the one phase plus identity key used by the mixed resource-action queue.
+    pub(crate) fn for_resource_action(action: &PlannedResourceAction) -> Self {
+        let resource_identity = match action.replaced_resource_id() {
+            Some(old_resource_id) => format!("{old_resource_id}\0{}", action.resource_id()),
+            None => action.resource_id().as_str().to_owned(),
+        };
+
+        Self {
+            phase: ActionPhase::for_resource_action(action),
+            resource_identity,
+        }
+    }
+
     /// The fixed phase portion of the ordering key.
     pub(crate) fn phase(&self) -> ActionPhase {
         self.phase
@@ -69,13 +91,20 @@ pub(crate) fn sort_actions(actions: &mut [PlannedAction]) {
     actions.sort_by_key(ActionSortKey::for_action);
 }
 
+/// Sorts the aggregate resource-action queue exactly once after all planners contribute.
+pub(crate) fn sort_resource_actions(actions: &mut [PlannedResourceAction]) {
+    actions.sort_by_key(ActionSortKey::for_resource_action);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::file_copy::{ContentFingerprint, ResolvedFileCopy};
     use crate::domain::file_link::ResolvedFileLink;
     use crate::domain::ids::FullyQualifiedResourceId;
-    use crate::domain::known::KnownFileLink;
+    use crate::domain::known::{KnownFileLink, KnownResource};
     use crate::domain::paths::ResolvedPath;
+    use crate::domain::plan::{PlannedEffectHandoff, PlannedFileCopyAction};
 
     fn path(name: &str) -> ResolvedPath {
         ResolvedPath::new(
@@ -91,6 +120,16 @@ mod tests {
             FullyQualifiedResourceId::parse(id).unwrap(),
             path(source),
             path(target),
+        )
+        .unwrap()
+    }
+
+    fn copy(id: &str, source: &str, target: &str) -> ResolvedFileCopy {
+        ResolvedFileCopy::new(
+            FullyQualifiedResourceId::parse(id).unwrap(),
+            path(source),
+            path(target),
+            ContentFingerprint::parse(format!("sha256:{}", "a".repeat(64))).unwrap(),
         )
         .unwrap()
     }
@@ -151,5 +190,47 @@ mod tests {
         assert_eq!(keys[0].phase(), ActionPhase::ReplaceOrRelocate);
         assert_eq!(keys[0].resource_identity(), "old/alpha\0new/zeta");
         assert_eq!(keys[1].resource_identity(), "old/zeta\0new/alpha");
+    }
+
+    #[test]
+    fn mixed_resource_actions_share_one_phase_and_identity_ordering() {
+        let mut actions = vec![
+            PlannedAction::remove_link(KnownFileLink::from_resolved(&desired(
+                "alpha/remove",
+                "store/remove",
+                "home/.remove",
+            )))
+            .into(),
+            PlannedEffectHandoff::new(
+                KnownResource::from(KnownFileLink::from_resolved(&desired(
+                    "base/handoff",
+                    "store/old",
+                    "home/.handoff",
+                ))),
+                copy("base/handoff", "store/new", "home/.handoff").into(),
+            )
+            .unwrap()
+            .into(),
+            PlannedAction::create_link(desired("zeta/link", "store/link", "home/.link")).into(),
+            PlannedFileCopyAction::Create {
+                desired: copy("alpha/copy", "store/copy", "home/.copy"),
+            }
+            .into(),
+        ];
+
+        sort_resource_actions(&mut actions);
+
+        assert_eq!(
+            actions
+                .iter()
+                .map(|action| (action.kind(), action.resource_id().as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (ActionKind::CreateCopy, "alpha/copy"),
+                (ActionKind::CreateLink, "zeta/link"),
+                (ActionKind::ReplaceEffect, "base/handoff"),
+                (ActionKind::RemoveLink, "alpha/remove"),
+            ]
+        );
     }
 }

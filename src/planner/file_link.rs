@@ -9,14 +9,18 @@ use crate::domain::file_link::ResolvedFileLink;
 use crate::domain::ids::FullyQualifiedResourceId;
 use crate::domain::known::{KnownFileLink, KnownResource, KnownState};
 use crate::domain::paths::ResolvedPath;
-use crate::domain::plan::{Plan, PlannedAction};
-use crate::planner::ordering::sort_actions;
+use crate::domain::plan::PlannedAction;
+use crate::planner::PlanContribution;
 
-/// Produces a complete deterministic Plan from resolved Desired, Known, and Actual inputs.
+/// Produces the link actions and diagnostics that contribute to the aggregate Plan.
 ///
 /// This is intentionally a pure function. Every input is a typed domain value;
 /// it neither observes nor mutates the filesystem or durable state.
-pub(crate) fn plan(desired: &ResolvedDesired, known: &KnownState, actual: &ActualState) -> Plan {
+pub(super) fn contribute(
+    desired: &ResolvedDesired,
+    known: &KnownState,
+    actual: &ActualState,
+) -> PlanContribution {
     #[cfg(test)]
     crate::test_support::assert_desired_dependencies_allowed();
     let mut actions = Vec::new();
@@ -88,8 +92,21 @@ pub(crate) fn plan(desired: &ResolvedDesired, known: &KnownState, actual: &Actua
         plan_stale_identity(previous, actual, &mut actions, &mut diagnostics);
     }
 
-    sort_actions(&mut actions);
-    Plan::new(actions, diagnostics).expect("planner must not emit competing target actions")
+    PlanContribution::new(actions.into_iter().map(Into::into), diagnostics)
+}
+
+#[cfg(test)]
+fn plan(
+    desired: &ResolvedDesired,
+    known: &KnownState,
+    actual: &ActualState,
+) -> crate::domain::plan::Plan {
+    let contribution = contribute(desired, known, actual);
+    crate::domain::plan::Plan::new_with_resource_actions(
+        contribution.resource_actions,
+        contribution.diagnostics,
+    )
+    .expect("link planner must not emit competing target actions")
 }
 
 fn desired_target_collisions(
@@ -296,7 +313,7 @@ mod tests {
     use crate::domain::file_link::LinkTarget;
     use crate::domain::ids::ProfileId;
     use crate::domain::known::{KnownFileCopy, KnownResource};
-    use crate::domain::plan::{ActionKind, ActionReason, KnownStateUpdate, TargetCondition};
+    use crate::domain::plan::{ActionKind, ActionReason, KnownStateUpdate, Plan, TargetCondition};
 
     fn path(name: &str) -> ResolvedPath {
         ResolvedPath::new(
@@ -762,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_orders_complete_output_by_phase_then_resource_identity() {
+    fn aggregate_planner_orders_complete_output_by_phase_then_resource_identity() {
         let create = resource("zeta/create", "store/create", "home/.create");
         let old_replace = resource("base/replace", "store/replace-old", "home/.replace");
         let new_replace = resource("base/replace", "store/replace-new", "home/.replace");
@@ -772,7 +789,7 @@ mod tests {
             KnownFileLink::from_resolved(&stale),
         ])
         .unwrap();
-        let transition = plan(
+        let transition = crate::planner::plan(
             &desired(vec![new_replace.clone(), create.clone()]),
             &known,
             &actual(vec![

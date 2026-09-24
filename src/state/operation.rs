@@ -78,6 +78,7 @@ pub(crate) enum RecordedKnownStateUpdate {
     Upsert(KnownFileLink),
     UpsertCopy(crate::domain::known::KnownFileCopy),
     RemoveExpected(KnownFileLink),
+    RemoveExpectedCopy(crate::domain::known::KnownFileCopy),
     RemoveMissing {
         resource_id: FullyQualifiedResourceId,
     },
@@ -105,6 +106,19 @@ pub(crate) struct PersistedCopyActionFacts {
     pub(crate) temporary_path: ResolvedPath,
     pub(crate) old_effect: Option<KnownResource>,
     pub(crate) final_effect: KnownResource,
+    pub(crate) precondition: TargetCondition,
+    pub(crate) postcondition: TargetCondition,
+    pub(crate) status: ActionStatus,
+}
+
+/// Complete persisted facts required to reconstruct a copy removal or missing-target cleanup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PersistedCopyRemovalFacts {
+    pub(crate) kind: ActionKind,
+    pub(crate) resource_id: FullyQualifiedResourceId,
+    pub(crate) source_path: ResolvedPath,
+    pub(crate) target_path: ResolvedPath,
+    pub(crate) content_fingerprint: ContentFingerprint,
     pub(crate) precondition: TargetCondition,
     pub(crate) postcondition: TargetCondition,
     pub(crate) status: ActionStatus,
@@ -139,6 +153,18 @@ enum ActionFacts {
     ForgetMissing {
         resource_id: FullyQualifiedResourceId,
         target_path: ResolvedPath,
+    },
+    RemoveCopy {
+        resource_id: FullyQualifiedResourceId,
+        source_path: ResolvedPath,
+        target_path: ResolvedPath,
+        content_fingerprint: ContentFingerprint,
+    },
+    ForgetMissingCopy {
+        resource_id: FullyQualifiedResourceId,
+        source_path: ResolvedPath,
+        target_path: ResolvedPath,
+        content_fingerprint: ContentFingerprint,
     },
     ReplaceLink {
         resource_id: FullyQualifiedResourceId,
@@ -219,6 +245,88 @@ impl RecordedAction {
             postcondition.clone(),
             ActionStatus::Pending,
         )
+    }
+
+    /// Records a copy removal or missing-target state cleanup without a temporary sibling.
+    pub(crate) fn copy_removal(
+        action: &PlannedFileCopyAction,
+    ) -> Result<Self, OperationRecordError> {
+        let previous = action
+            .previous()
+            .ok_or(OperationRecordError::InvalidActionConditions {
+                kind: action.kind(),
+            })?;
+        match action.kind() {
+            ActionKind::RemoveCopy => Ok(Self {
+                facts: ActionFacts::RemoveCopy {
+                    resource_id: previous.resource_id().clone(),
+                    source_path: previous.source_path().clone(),
+                    target_path: previous.target_path().clone(),
+                    content_fingerprint: previous.content_fingerprint().clone(),
+                },
+                status: ActionStatus::Pending,
+            }),
+            ActionKind::ForgetMissing => Ok(Self {
+                facts: ActionFacts::ForgetMissingCopy {
+                    resource_id: previous.resource_id().clone(),
+                    source_path: previous.source_path().clone(),
+                    target_path: previous.target_path().clone(),
+                    content_fingerprint: previous.content_fingerprint().clone(),
+                },
+                status: ActionStatus::Pending,
+            }),
+            kind => Err(OperationRecordError::UnsupportedActionKind { kind }),
+        }
+    }
+
+    /// Reconstructs a copy removal or missing-target cleanup from complete ownership facts.
+    pub(crate) fn from_persisted_copy_removal(
+        facts: PersistedCopyRemovalFacts,
+    ) -> Result<Self, OperationRecordError> {
+        let PersistedCopyRemovalFacts {
+            kind,
+            resource_id,
+            source_path,
+            target_path,
+            content_fingerprint,
+            precondition,
+            postcondition,
+            status,
+        } = facts;
+        crate::domain::known::KnownFileCopy::new(
+            resource_id.clone(),
+            source_path.clone(),
+            target_path.clone(),
+            content_fingerprint.clone(),
+        )
+        .map_err(OperationRecordError::InvalidKnownFileCopy)?;
+        let expected_copy = TargetCondition::ExpectedCopy {
+            target_path: target_path.clone(),
+            content_fingerprint: content_fingerprint.clone(),
+        };
+        let missing = TargetCondition::Missing {
+            target_path: target_path.clone(),
+        };
+        let facts = match kind {
+            ActionKind::RemoveCopy if precondition == expected_copy && postcondition == missing => {
+                ActionFacts::RemoveCopy {
+                    resource_id,
+                    source_path,
+                    target_path,
+                    content_fingerprint,
+                }
+            }
+            ActionKind::ForgetMissing if precondition == missing && postcondition == missing => {
+                ActionFacts::ForgetMissingCopy {
+                    resource_id,
+                    source_path,
+                    target_path,
+                    content_fingerprint,
+                }
+            }
+            _ => return Err(OperationRecordError::InvalidActionConditions { kind }),
+        };
+        Ok(Self { facts, status })
     }
 
     /// Records a same-target replacement with its repository-allocated sibling.
@@ -749,6 +857,8 @@ impl RecordedAction {
             ActionFacts::CreateLink { .. } => ActionKind::CreateLink,
             ActionFacts::RemoveLink { .. } => ActionKind::RemoveLink,
             ActionFacts::ForgetMissing { .. } => ActionKind::ForgetMissing,
+            ActionFacts::RemoveCopy { .. } => ActionKind::RemoveCopy,
+            ActionFacts::ForgetMissingCopy { .. } => ActionKind::ForgetMissing,
             ActionFacts::ReplaceLink { .. } => ActionKind::ReplaceLink,
             ActionFacts::ReplaceOwnership { .. } => ActionKind::ReplaceOwnership,
             ActionFacts::RelocateLink { .. } => ActionKind::RelocateLink,
@@ -762,7 +872,9 @@ impl RecordedAction {
         match &self.facts {
             ActionFacts::CreateLink { resource_id, .. }
             | ActionFacts::RemoveLink { resource_id, .. }
-            | ActionFacts::ForgetMissing { resource_id, .. } => resource_id,
+            | ActionFacts::ForgetMissing { resource_id, .. }
+            | ActionFacts::RemoveCopy { resource_id, .. }
+            | ActionFacts::ForgetMissingCopy { resource_id, .. } => resource_id,
             ActionFacts::ReplaceLink { resource_id, .. } => resource_id,
             ActionFacts::ReplaceOwnership {
                 new_resource_id, ..
@@ -778,7 +890,9 @@ impl RecordedAction {
         match &self.facts {
             ActionFacts::CreateLink { target_path, .. }
             | ActionFacts::RemoveLink { target_path, .. }
-            | ActionFacts::ForgetMissing { target_path, .. } => target_path,
+            | ActionFacts::ForgetMissing { target_path, .. }
+            | ActionFacts::RemoveCopy { target_path, .. }
+            | ActionFacts::ForgetMissingCopy { target_path, .. } => target_path,
             ActionFacts::ReplaceLink { target_path, .. } => target_path,
             ActionFacts::ReplaceOwnership { target_path, .. } => target_path,
             ActionFacts::RelocateLink {
@@ -818,6 +932,17 @@ impl RecordedAction {
             },
             ActionFacts::CreateLink { target_path, .. }
             | ActionFacts::ForgetMissing { target_path, .. } => TargetCondition::Missing {
+                target_path: target_path.clone(),
+            },
+            ActionFacts::RemoveCopy {
+                target_path,
+                content_fingerprint,
+                ..
+            } => TargetCondition::ExpectedCopy {
+                target_path: target_path.clone(),
+                content_fingerprint: content_fingerprint.clone(),
+            },
+            ActionFacts::ForgetMissingCopy { target_path, .. } => TargetCondition::Missing {
                 target_path: target_path.clone(),
             },
             ActionFacts::RelocateLink {
@@ -862,6 +987,10 @@ impl RecordedAction {
             },
             ActionFacts::RemoveLink { target_path, .. }
             | ActionFacts::ForgetMissing { target_path, .. } => TargetCondition::Missing {
+                target_path: target_path.clone(),
+            },
+            ActionFacts::RemoveCopy { target_path, .. }
+            | ActionFacts::ForgetMissingCopy { target_path, .. } => TargetCondition::Missing {
                 target_path: target_path.clone(),
             },
             ActionFacts::RelocateLink {
@@ -912,6 +1041,24 @@ impl RecordedAction {
             .map(RecordedKnownStateUpdate::RemoveExpected)
             .map_err(OperationRecordError::InvalidKnownFileLink),
             ActionFacts::ForgetMissing { resource_id, .. } => {
+                Ok(RecordedKnownStateUpdate::RemoveMissing {
+                    resource_id: resource_id.clone(),
+                })
+            }
+            ActionFacts::RemoveCopy {
+                resource_id,
+                source_path,
+                target_path,
+                content_fingerprint,
+            } => crate::domain::known::KnownFileCopy::new(
+                resource_id.clone(),
+                source_path.clone(),
+                target_path.clone(),
+                content_fingerprint.clone(),
+            )
+            .map(RecordedKnownStateUpdate::RemoveExpectedCopy)
+            .map_err(OperationRecordError::InvalidKnownFileCopy),
+            ActionFacts::ForgetMissingCopy { resource_id, .. } => {
                 Ok(RecordedKnownStateUpdate::RemoveMissing {
                     resource_id: resource_id.clone(),
                 })
@@ -1048,6 +1195,29 @@ impl RecordedAction {
         }
     }
 
+    /// Copy-removal ownership facts retained without a temporary publication path.
+    pub(crate) fn copy_removal_facts(&self) -> Option<CopyRemovalFacts> {
+        match &self.facts {
+            ActionFacts::RemoveCopy {
+                source_path,
+                target_path,
+                content_fingerprint,
+                ..
+            }
+            | ActionFacts::ForgetMissingCopy {
+                source_path,
+                target_path,
+                content_fingerprint,
+                ..
+            } => Some(CopyRemovalFacts {
+                source_path: source_path.clone(),
+                target_path: target_path.clone(),
+                content_fingerprint: content_fingerprint.clone(),
+            }),
+            _ => None,
+        }
+    }
+
     pub(crate) fn effect_handoff_facts(&self) -> Option<EffectHandoffFacts> {
         match &self.facts {
             ActionFacts::ReplaceEffect {
@@ -1077,6 +1247,8 @@ impl RecordedAction {
             ActionFacts::CreateLink { .. }
             | ActionFacts::RemoveLink { .. }
             | ActionFacts::ForgetMissing { .. }
+            | ActionFacts::RemoveCopy { .. }
+            | ActionFacts::ForgetMissingCopy { .. }
             | ActionFacts::ReplaceOwnership {
                 temporary_path: None,
                 ..
@@ -1197,6 +1369,28 @@ pub(crate) struct CopyFacts {
     temporary_path: ResolvedPath,
     old_effect: Option<KnownResource>,
     final_effect: KnownResource,
+}
+
+/// Copy ownership facts for actions that do not publish a temporary sibling.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CopyRemovalFacts {
+    source_path: ResolvedPath,
+    target_path: ResolvedPath,
+    content_fingerprint: ContentFingerprint,
+}
+
+impl CopyRemovalFacts {
+    pub(crate) fn source_path(&self) -> &ResolvedPath {
+        &self.source_path
+    }
+
+    pub(crate) fn target_path(&self) -> &ResolvedPath {
+        &self.target_path
+    }
+
+    pub(crate) fn content_fingerprint(&self) -> &ContentFingerprint {
+        &self.content_fingerprint
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1516,6 +1710,7 @@ impl OperationRecord {
             RecordedKnownStateUpdate::Upsert(known) => Ok(known),
             RecordedKnownStateUpdate::UpsertCopy(_)
             | RecordedKnownStateUpdate::RemoveExpected(_)
+            | RecordedKnownStateUpdate::RemoveExpectedCopy(_)
             | RecordedKnownStateUpdate::RemoveMissing { .. }
             | RecordedKnownStateUpdate::ReplaceIdentity { .. } => {
                 Err(OperationRecordError::UnsupportedActionKind {

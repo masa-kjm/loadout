@@ -272,6 +272,20 @@ impl LockedStateRepository {
         desired_hash: DesiredHash,
         actions: &[PlannedAction],
     ) -> Result<Vec<ActionId>, StateRepositoryError> {
+        let actions = actions
+            .iter()
+            .cloned()
+            .map(PlannedResourceAction::from)
+            .collect::<Vec<_>>();
+        self.begin_resource_actions(desired_hash, &actions)
+    }
+
+    /// Records one complete mixed resource-action sequence before any executor work begins.
+    pub(crate) fn begin_resource_actions(
+        &mut self,
+        desired_hash: DesiredHash,
+        actions: &[PlannedResourceAction],
+    ) -> Result<Vec<ActionId>, StateRepositoryError> {
         if self.state.active_operation.is_some() {
             return Err(StateRepositoryError::ActiveOperationPresent);
         }
@@ -295,94 +309,55 @@ impl LockedStateRepository {
         for (index, action) in actions.iter().enumerate() {
             let id = ActionId::parse(format!("a{}", index + 1))
                 .map_err(StateRepositoryError::Operation)?;
-            let facts = match action.kind() {
-                ActionKind::ReplaceLink => crate::state::operation::RecordedAction::replace_link(
-                    action,
-                    self.allocate_replacement_temporary_path(action, &reserved)?,
-                ),
-                ActionKind::ReplaceOwnership => {
-                    let temporary = if action.preconditions() == action.postconditions() {
-                        None
-                    } else {
-                        Some(self.allocate_replacement_temporary_path(action, &reserved)?)
-                    };
-                    crate::state::operation::RecordedAction::replace_ownership(action, temporary)
-                }
-                ActionKind::RelocateLink => {
-                    crate::state::operation::RecordedAction::relocate_link(action)
-                }
-                _ => crate::state::operation::RecordedAction::from_action(action),
-            }
-            .map_err(StateRepositoryError::Operation)?;
-            if let Some(facts) = facts.replacement_facts() {
-                reserved.insert(facts.temporary_path().clone());
-            }
-            ids.push(id.clone());
-            recorded.push((id, facts));
-        }
-        let operation = OperationRecord::from_actions(new_operation_id(), desired_hash, recorded)
-            .map_err(StateRepositoryError::Operation)?;
-        let mut candidate = self.state.clone();
-        candidate.active_operation = Some(operation);
-        self.commit_candidate(candidate)?;
-        Ok(ids)
-    }
-
-    /// Records copy materializations and cross-effect handoffs with repository-allocated exact temporary siblings.
-    ///
-    /// This intentionally accepts only mutation actions whose recovery facts are complete; noops and copy removal remain outside this entry point until their operation records are implemented.
-    pub(crate) fn begin_resource_actions(
-        &mut self,
-        desired_hash: DesiredHash,
-        actions: &[PlannedResourceAction],
-    ) -> Result<Vec<ActionId>, StateRepositoryError> {
-        if self.state.active_operation.is_some() {
-            return Err(StateRepositoryError::ActiveOperationPresent);
-        }
-        let mut reserved = self
-            .state
-            .known()
-            .resources()
-            .map(|resource| resource.target_path().clone())
-            .collect::<BTreeSet<_>>();
-        for action in actions {
-            for target in action.touched_targets() {
-                reserved.insert(target.clone());
-            }
-        }
-        let mut recorded = Vec::new();
-        let mut ids = Vec::new();
-        for (index, action) in actions.iter().enumerate() {
-            let id = ActionId::parse(format!("a{}", index + 1))
-                .map_err(StateRepositoryError::Operation)?;
-            let target = match action {
-                PlannedResourceAction::FileCopy(copy) => {
-                    copy.desired().map(|value| value.target_path())
-                }
-                PlannedResourceAction::ReplaceEffect(handoff) => {
-                    Some(handoff.final_effect().target_path())
-                }
-                PlannedResourceAction::FileLink(_) => None,
-            }
-            .ok_or(StateRepositoryError::Operation(
-                OperationRecordError::UnsupportedActionKind {
-                    kind: action.kind(),
-                },
-            ))?;
-            let temporary = self.allocate_temporary_sibling(target, &reserved)?;
             let facts = match action {
-                PlannedResourceAction::FileCopy(copy) => {
-                    RecordedAction::copy(copy, temporary.clone())
-                }
+                PlannedResourceAction::FileLink(link) => match link.kind() {
+                    ActionKind::ReplaceLink => RecordedAction::replace_link(
+                        link,
+                        self.allocate_replacement_temporary_path(link, &reserved)?,
+                    ),
+                    ActionKind::ReplaceOwnership => {
+                        let temporary = if link.preconditions() == link.postconditions() {
+                            None
+                        } else {
+                            Some(self.allocate_replacement_temporary_path(link, &reserved)?)
+                        };
+                        RecordedAction::replace_ownership(link, temporary)
+                    }
+                    ActionKind::RelocateLink => RecordedAction::relocate_link(link),
+                    ActionKind::Noop => {
+                        Err(OperationRecordError::UnsupportedActionKind { kind: link.kind() })
+                    }
+                    _ => RecordedAction::from_action(link),
+                },
+                PlannedResourceAction::FileCopy(copy) => match copy.kind() {
+                    ActionKind::CreateCopy | ActionKind::ReplaceCopy | ActionKind::RelocateCopy => {
+                        let target = copy
+                            .desired()
+                            .expect("materialized copies have a desired target")
+                            .target_path();
+                        let temporary = self.allocate_temporary_sibling(target, &reserved)?;
+                        RecordedAction::copy(copy, temporary)
+                    }
+                    ActionKind::RemoveCopy | ActionKind::ForgetMissing => {
+                        RecordedAction::copy_removal(copy)
+                    }
+                    ActionKind::Noop => {
+                        Err(OperationRecordError::UnsupportedActionKind { kind: copy.kind() })
+                    }
+                    _ => Err(OperationRecordError::UnsupportedActionKind { kind: copy.kind() }),
+                },
                 PlannedResourceAction::ReplaceEffect(handoff) => {
-                    RecordedAction::replace_effect(handoff, temporary.clone())
-                }
-                PlannedResourceAction::FileLink(_) => {
-                    unreachable!("link actions use begin_actions")
+                    let temporary = self.allocate_temporary_sibling(
+                        handoff.final_effect().target_path(),
+                        &reserved,
+                    )?;
+                    RecordedAction::replace_effect(handoff, temporary)
                 }
             }
             .map_err(StateRepositoryError::Operation)?;
-            reserved.insert(temporary);
+            if let Some(temporary) = facts.temporary_path() {
+                reserved.insert(temporary.clone());
+            }
             ids.push(id.clone());
             recorded.push((id, facts));
         }
@@ -535,6 +510,10 @@ impl LockedStateRepository {
             RecordedKnownStateUpdate::RemoveExpected(known) => candidate
                 .known
                 .with_removed(&known)
+                .map_err(StateRepositoryError::KnownState)?,
+            RecordedKnownStateUpdate::RemoveExpectedCopy(known) => candidate
+                .known
+                .with_removed_copy(&known)
                 .map_err(StateRepositoryError::KnownState)?,
             RecordedKnownStateUpdate::RemoveMissing { resource_id } => candidate
                 .known
@@ -789,8 +768,15 @@ fn validate_succeeded_actions(
             RecordedKnownStateUpdate::RemoveExpected(expected) => {
                 known.get(expected.resource_id()).is_none()
             }
+            RecordedKnownStateUpdate::RemoveExpectedCopy(expected) => {
+                known.get_variant(expected.resource_id()).is_none()
+            }
             RecordedKnownStateUpdate::RemoveMissing { resource_id } => {
-                known.get(&resource_id).is_none()
+                if action.copy_removal_facts().is_some() {
+                    known.get_variant(&resource_id).is_none()
+                } else {
+                    known.get(&resource_id).is_none()
+                }
             }
             RecordedKnownStateUpdate::ReplaceIdentity {
                 old_resource,
@@ -830,9 +816,35 @@ fn validate_unfinished_stale_action_known_state(
                 }
                 _ => unreachable!("a validated remove action has an exact removal update"),
             },
-            ActionKind::ForgetMissing => known
-                .get(action.resource_id())
-                .is_some_and(|resource| resource.target_path() == action.target_path()),
+            ActionKind::RemoveCopy => match action
+                .known_state_update_after_success()
+                .map_err(StateDecodeError::InvalidOperation)?
+            {
+                RecordedKnownStateUpdate::RemoveExpectedCopy(expected) => {
+                    known.get_variant(expected.resource_id())
+                        == Some(&crate::domain::known::KnownResource::FileCopy(expected))
+                }
+                _ => unreachable!("a validated copy removal has an exact removal update"),
+            },
+            ActionKind::ForgetMissing => action.copy_removal_facts().map_or_else(
+                || {
+                    known
+                        .get(action.resource_id())
+                        .is_some_and(|resource| resource.target_path() == action.target_path())
+                },
+                |facts| {
+                    crate::domain::known::KnownFileCopy::new(
+                        action.resource_id().clone(),
+                        facts.source_path().clone(),
+                        facts.target_path().clone(),
+                        facts.content_fingerprint().clone(),
+                    )
+                    .is_ok_and(|expected| {
+                        known.get_variant(expected.resource_id())
+                            == Some(&crate::domain::known::KnownResource::FileCopy(expected))
+                    })
+                },
+            ),
             ActionKind::ReplaceLink => match action.replacement_facts() {
                 Some(facts) => KnownFileLink::new(
                     action.resource_id().clone(),
@@ -1322,8 +1334,8 @@ mod tests {
     use crate::domain::file_link::ResolvedFileLink;
     use crate::domain::hashes::definition_hash;
     use crate::domain::ids::FullyQualifiedResourceId;
-    use crate::domain::known::KnownFileLink;
-    use crate::domain::plan::{PlannedFileCopyAction, PlannedResourceAction};
+    use crate::domain::known::{KnownFileCopy, KnownFileLink, KnownState};
+    use crate::domain::plan::{PlannedFileCopyAction, PlannedResourceAction, TargetCondition};
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -1498,6 +1510,158 @@ mod tests {
             facts.temporary_path().as_ref().parent(),
             target.as_ref().parent()
         );
+    }
+
+    #[test]
+    fn begin_resource_actions_records_link_and_copy_in_one_pending_operation() {
+        let workspace = TestStateDirectory::new();
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let copy_target = ResolvedPath::new(workspace.root.join("home/.config")).unwrap();
+        let copy = PlannedFileCopyAction::Create {
+            desired: ResolvedFileCopy::new(
+                FullyQualifiedResourceId::parse("base/config").unwrap(),
+                ResolvedPath::new(workspace.root.join("store/config")).unwrap(),
+                copy_target.clone(),
+                ContentFingerprint::parse(format!("sha256:{}", "b".repeat(64))).unwrap(),
+            )
+            .unwrap(),
+        };
+        let link = PlannedAction::create_link(
+            ResolvedFileLink::new(
+                FullyQualifiedResourceId::parse("base/git").unwrap(),
+                ResolvedPath::new(workspace.root.join("store/gitconfig")).unwrap(),
+                ResolvedPath::new(workspace.root.join("home/.gitconfig")).unwrap(),
+            )
+            .unwrap(),
+        );
+
+        let ids = locked
+            .begin_resource_actions(
+                desired_hash(),
+                &[link.into(), PlannedResourceAction::FileCopy(copy)],
+            )
+            .unwrap();
+
+        let state = repository.load().unwrap();
+        let operation = state.active_operation().unwrap();
+        assert_eq!(
+            ids.iter().map(ActionId::as_str).collect::<Vec<_>>(),
+            ["a1", "a2"]
+        );
+        assert!(
+            operation
+                .action(&ids[0])
+                .unwrap()
+                .temporary_path()
+                .is_none()
+        );
+        let temporary = operation.action(&ids[1]).unwrap().temporary_path().unwrap();
+        assert_ne!(temporary, &copy_target);
+        assert_eq!(temporary.as_ref().parent(), copy_target.as_ref().parent());
+    }
+
+    #[test]
+    fn copy_removal_record_round_trips_and_requires_the_exact_known_copy() {
+        let workspace = TestStateDirectory::new();
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let desired = ResolvedFileCopy::new(
+            FullyQualifiedResourceId::parse("base/config").unwrap(),
+            ResolvedPath::new(workspace.root.join("store/config")).unwrap(),
+            ResolvedPath::new(workspace.root.join("home/.config")).unwrap(),
+            ContentFingerprint::parse(format!("sha256:{}", "b".repeat(64))).unwrap(),
+        )
+        .unwrap();
+        let create = PlannedResourceAction::FileCopy(PlannedFileCopyAction::Create {
+            desired: desired.clone(),
+        });
+        let create_id = locked
+            .begin_resource_actions(desired_hash(), &[create])
+            .unwrap()[0]
+            .clone();
+        locked.mark_running(&create_id).unwrap();
+        locked.commit_succeeded(&create_id).unwrap();
+        locked.close_finished_operation().unwrap();
+
+        let removal = PlannedResourceAction::FileCopy(PlannedFileCopyAction::Remove {
+            previous: crate::domain::known::KnownFileCopy::from_resolved(&desired),
+        });
+        let removal_id = locked
+            .begin_resource_actions(desired_hash(), &[removal])
+            .unwrap()[0]
+            .clone();
+
+        let state = repository.load().unwrap();
+        let action = state
+            .active_operation()
+            .unwrap()
+            .action(&removal_id)
+            .unwrap();
+        assert_eq!(action.kind(), ActionKind::RemoveCopy);
+        assert!(action.temporary_path().is_none());
+        assert!(action.copy_removal_facts().is_some());
+
+        locked
+            .mark_without_known(&removal_id, ActionStatus::Skipped)
+            .unwrap();
+        locked.close_finished_operation().unwrap();
+        let forget = PlannedResourceAction::FileCopy(PlannedFileCopyAction::ForgetMissing {
+            previous: crate::domain::known::KnownFileCopy::from_resolved(&desired),
+        });
+        let forget_id = locked
+            .begin_resource_actions(desired_hash(), &[forget])
+            .unwrap()[0]
+            .clone();
+        let state = repository.load().unwrap();
+        let action = state
+            .active_operation()
+            .unwrap()
+            .action(&forget_id)
+            .unwrap();
+        assert_eq!(action.kind(), ActionKind::ForgetMissing);
+        assert!(matches!(
+            action.precondition(),
+            TargetCondition::Missing { .. }
+        ));
+        assert!(action.temporary_path().is_none());
+    }
+
+    #[test]
+    fn succeeded_copy_removals_reject_a_retained_known_copy() {
+        let desired = ResolvedFileCopy::new(
+            FullyQualifiedResourceId::parse("base/config").unwrap(),
+            path("loadout-state-store", "config"),
+            path("loadout-state-home", ".config"),
+            ContentFingerprint::parse(format!("sha256:{}", "b".repeat(64))).unwrap(),
+        )
+        .unwrap();
+        let known = KnownFileCopy::from_resolved(&desired);
+
+        for action in [
+            PlannedFileCopyAction::Remove {
+                previous: known.clone(),
+            },
+            PlannedFileCopyAction::ForgetMissing {
+                previous: known.clone(),
+            },
+        ] {
+            let action_id = ActionId::parse("a1").unwrap();
+            let recorded = RecordedAction::copy_removal(&action).unwrap();
+            let mut operation = OperationRecord::from_actions(
+                OperationId::parse("operation").unwrap(),
+                desired_hash(),
+                [(action_id.clone(), recorded)],
+            )
+            .unwrap();
+            operation.mark_running(&action_id).unwrap();
+            operation.mark_succeeded(&action_id).unwrap();
+
+            assert!(matches!(
+                validate_succeeded_actions(&KnownState::new([known.clone()]).unwrap(), &operation),
+                Err(StateDecodeError::SucceededActionKnownMismatch { .. })
+            ));
+        }
     }
 
     #[test]

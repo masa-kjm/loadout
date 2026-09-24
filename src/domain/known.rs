@@ -308,6 +308,27 @@ impl KnownState {
         Self::new(resources.into_values())
     }
 
+    /// Returns a new Known state without one exact previously verified copy fact.
+    pub(crate) fn with_removed_copy(
+        &self,
+        expected: &KnownFileCopy,
+    ) -> Result<Self, KnownStateError> {
+        let Some(actual) = self.resources.get(expected.resource_id()) else {
+            return Err(KnownStateError::MissingResource {
+                resource_id: expected.resource_id().clone(),
+            });
+        };
+        if actual != &KnownResource::FileCopy(expected.clone()) {
+            return Err(KnownStateError::ResourceMismatch {
+                resource_id: expected.resource_id().clone(),
+            });
+        }
+
+        let mut resources = self.resources.clone();
+        resources.remove(expected.resource_id());
+        Self::new(resources.into_values())
+    }
+
     /// Returns a new Known state without a stale resource whose target was freshly proven missing. The caller's operation record supplies the resource identity; no filesystem entry is removed for this transition.
     pub(crate) fn with_missing_resource_removed(
         &self,

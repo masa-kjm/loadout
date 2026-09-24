@@ -21,7 +21,8 @@ use crate::domain::paths::{ResolvedPath, ResolvedPathError};
 use crate::domain::plan::{ActionKind, TargetCondition};
 use crate::state::operation::{
     ActionId, ActionStatus, OperationId, OperationRecord, OperationRecordError,
-    PersistedCopyActionFacts, PersistedEffectHandoffFacts, RecordedAction,
+    PersistedCopyActionFacts, PersistedCopyRemovalFacts, PersistedEffectHandoffFacts,
+    RecordedAction,
 };
 use crate::state::repository::{CommitError, PersistedState};
 
@@ -324,6 +325,7 @@ impl PersistedRecordedAction {
             ActionKind::CreateCopy => PersistedActionKind::CreateCopy,
             ActionKind::ReplaceCopy => PersistedActionKind::ReplaceCopy,
             ActionKind::RelocateCopy => PersistedActionKind::RelocateCopy,
+            ActionKind::RemoveCopy => PersistedActionKind::RemoveCopy,
             ActionKind::ReplaceEffect => PersistedActionKind::ReplaceEffect,
             kind => return Err(CommitError::UnsupportedOperationAction { kind }),
         };
@@ -360,10 +362,20 @@ impl PersistedRecordedAction {
             source_path: action
                 .copy_facts()
                 .map(|facts| encode_path(facts.source_path()))
+                .or_else(|| {
+                    action
+                        .copy_removal_facts()
+                        .map(|facts| encode_path(facts.source_path()))
+                })
                 .transpose()?,
             content_fingerprint: action
                 .copy_facts()
-                .map(|facts| facts.content_fingerprint().as_str().to_owned()),
+                .map(|facts| facts.content_fingerprint().as_str().to_owned())
+                .or_else(|| {
+                    action
+                        .copy_removal_facts()
+                        .map(|facts| facts.content_fingerprint().as_str().to_owned())
+                }),
             precondition: PersistedTargetCondition::from_condition(&action.precondition())?,
             postcondition: PersistedTargetCondition::from_condition(&action.postcondition())?,
             temporary_path: action
@@ -401,6 +413,7 @@ impl PersistedRecordedAction {
             PersistedActionKind::CreateCopy => ActionKind::CreateCopy,
             PersistedActionKind::ReplaceCopy => ActionKind::ReplaceCopy,
             PersistedActionKind::RelocateCopy => ActionKind::RelocateCopy,
+            PersistedActionKind::RemoveCopy => ActionKind::RemoveCopy,
             PersistedActionKind::ReplaceEffect => ActionKind::ReplaceEffect,
         };
         let target_path = decode_path(self.target_path)?;
@@ -479,6 +492,36 @@ impl PersistedRecordedAction {
             })
             .map_err(StateDecodeError::InvalidOperation);
         }
+        if matches!(kind, ActionKind::RemoveCopy | ActionKind::ForgetMissing)
+            && (self.source_path.is_some() || self.content_fingerprint.is_some())
+        {
+            if old_resource_id.is_some()
+                || old_target_path.is_some()
+                || self.temporary_path.is_some()
+                || self.old_effect.is_some()
+                || self.final_effect.is_some()
+            {
+                return Err(StateDecodeError::InvalidTargetCondition);
+            }
+            let source_path = self
+                .source_path
+                .ok_or(StateDecodeError::InvalidTargetCondition)?;
+            let content_fingerprint = self
+                .content_fingerprint
+                .ok_or(StateDecodeError::InvalidTargetCondition)?;
+            return RecordedAction::from_persisted_copy_removal(PersistedCopyRemovalFacts {
+                kind,
+                resource_id,
+                source_path: decode_path(source_path)?,
+                target_path,
+                content_fingerprint: ContentFingerprint::parse(content_fingerprint)
+                    .map_err(|_| StateDecodeError::InvalidTargetCondition)?,
+                precondition,
+                postcondition,
+                status,
+            })
+            .map_err(StateDecodeError::InvalidOperation);
+        }
         match (kind, old_resource_id, old_target_path, self.temporary_path) {
             (ActionKind::ReplaceLink, None, None, Some(temporary_path)) => {
                 RecordedAction::from_persisted_replace_link(
@@ -545,6 +588,7 @@ enum PersistedActionKind {
     CreateCopy,
     ReplaceCopy,
     RelocateCopy,
+    RemoveCopy,
     ReplaceEffect,
 }
 

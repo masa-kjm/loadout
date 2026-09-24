@@ -8,7 +8,9 @@ use crate::domain::hashes::{CanonicalHashError, desired_hash};
 use crate::domain::ids::FullyQualifiedResourceId;
 #[cfg(test)]
 use crate::domain::paths::ResolvedPath;
-use crate::domain::plan::{ActionKind, Plan, PlannedAction, TargetCondition};
+use crate::domain::plan::{
+    ActionKind, Plan, PlannedAction, PlannedResourceAction, TargetCondition,
+};
 use crate::executor::file_copy::FileCopyExecutor;
 use crate::executor::file_link::{
     CreateLinkExecutionError, FileLinkExecutor, ForgetMissingExecutionError,
@@ -157,7 +159,14 @@ fn apply_request_with_hooks(
             .collect::<Vec<_>>();
         if !actions.is_empty() {
             stage = ApplyStage::OperationCreation;
-            let ids = locked.begin_actions(hash, &actions).map_err(state_error)?;
+            let resource_actions = actions
+                .iter()
+                .cloned()
+                .map(PlannedResourceAction::from)
+                .collect::<Vec<_>>();
+            let ids = locked
+                .begin_resource_actions(hash, &resource_actions)
+                .map_err(state_error)?;
             stage = ApplyStage::Execution;
             execute_actions(
                 locked,

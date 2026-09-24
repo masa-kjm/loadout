@@ -3,12 +3,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::domain::file_copy::ContentFingerprint;
 use crate::domain::file_link::LinkTarget;
 use crate::domain::hashes::DesiredHash;
 use crate::domain::ids::FullyQualifiedResourceId;
+use crate::domain::known::KnownResource;
 use crate::domain::known::{KnownFileLink, KnownFileLinkError};
 use crate::domain::paths::ResolvedPath;
-use crate::domain::plan::{ActionKind, PlannedAction, TargetCondition};
+use crate::domain::plan::{
+    ActionKind, PlannedAction, PlannedEffectHandoff, PlannedFileCopyAction, TargetCondition,
+};
 
 /// An opaque operation identifier stored in `active_operation`.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -72,6 +76,7 @@ impl ActionStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RecordedKnownStateUpdate {
     Upsert(KnownFileLink),
+    UpsertCopy(crate::domain::known::KnownFileCopy),
     RemoveExpected(KnownFileLink),
     RemoveMissing {
         resource_id: FullyQualifiedResourceId,
@@ -87,6 +92,34 @@ pub(crate) enum RecordedKnownStateUpdate {
 pub(crate) struct RecordedAction {
     facts: ActionFacts,
     status: ActionStatus,
+}
+
+/// Complete persisted facts required to reconstruct one copy action.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PersistedCopyActionFacts {
+    pub(crate) kind: ActionKind,
+    pub(crate) resource_id: FullyQualifiedResourceId,
+    pub(crate) source_path: ResolvedPath,
+    pub(crate) target_path: ResolvedPath,
+    pub(crate) content_fingerprint: ContentFingerprint,
+    pub(crate) temporary_path: ResolvedPath,
+    pub(crate) old_effect: Option<KnownResource>,
+    pub(crate) final_effect: KnownResource,
+    pub(crate) precondition: TargetCondition,
+    pub(crate) postcondition: TargetCondition,
+    pub(crate) status: ActionStatus,
+}
+
+/// Complete persisted facts required to reconstruct one managed effect handoff.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PersistedEffectHandoffFacts {
+    pub(crate) resource_id: FullyQualifiedResourceId,
+    pub(crate) old_effect: KnownResource,
+    pub(crate) final_effect: KnownResource,
+    pub(crate) temporary_path: ResolvedPath,
+    pub(crate) precondition: TargetCondition,
+    pub(crate) postcondition: TargetCondition,
+    pub(crate) status: ActionStatus,
 }
 
 /// Only the facts required by an implemented action are representable.
@@ -128,6 +161,26 @@ enum ActionFacts {
         new_target_path: ResolvedPath,
         old_link_target: LinkTarget,
         new_link_target: LinkTarget,
+    },
+    Copy {
+        kind: ActionKind,
+        resource_id: FullyQualifiedResourceId,
+        source_path: ResolvedPath,
+        target_path: ResolvedPath,
+        content_fingerprint: ContentFingerprint,
+        temporary_path: ResolvedPath,
+        old_effect: Box<Option<KnownResource>>,
+        final_effect: Box<KnownResource>,
+        precondition: TargetCondition,
+        postcondition: TargetCondition,
+    },
+    ReplaceEffect {
+        resource_id: FullyQualifiedResourceId,
+        old_effect: Box<KnownResource>,
+        final_effect: Box<KnownResource>,
+        temporary_path: ResolvedPath,
+        precondition: TargetCondition,
+        postcondition: TargetCondition,
     },
 }
 
@@ -510,6 +563,186 @@ impl RecordedAction {
         Ok(Self { facts, status })
     }
 
+    /// Reconstructs a copy action from its complete typed content-ownership facts.
+    pub(crate) fn from_persisted_copy(
+        facts: PersistedCopyActionFacts,
+    ) -> Result<Self, OperationRecordError> {
+        let PersistedCopyActionFacts {
+            kind,
+            resource_id,
+            source_path,
+            target_path,
+            content_fingerprint,
+            temporary_path,
+            old_effect,
+            final_effect,
+            precondition,
+            postcondition,
+            status,
+        } = facts;
+        if !matches!(
+            kind,
+            ActionKind::CreateCopy | ActionKind::ReplaceCopy | ActionKind::RelocateCopy
+        ) {
+            return Err(OperationRecordError::UnsupportedActionKind { kind });
+        }
+        if postcondition.target_path() != &target_path {
+            return Err(OperationRecordError::InvalidActionConditions { kind });
+        }
+        if temporary_path == target_path
+            || temporary_path.as_ref().parent() != target_path.as_ref().parent()
+        {
+            return Err(OperationRecordError::InvalidActionConditions { kind });
+        }
+        let KnownResource::FileCopy(final_copy) = &final_effect else {
+            return Err(OperationRecordError::InvalidActionConditions { kind });
+        };
+        if final_copy.resource_id() != &resource_id
+            || final_copy.source_path() != &source_path
+            || final_copy.target_path() != &target_path
+            || final_copy.content_fingerprint() != &content_fingerprint
+        {
+            return Err(OperationRecordError::InvalidActionConditions { kind });
+        }
+        if !matches!(postcondition, TargetCondition::ExpectedCopy { content_fingerprint: ref post_fingerprint, .. } if post_fingerprint == &content_fingerprint)
+        {
+            return Err(OperationRecordError::InvalidActionConditions { kind });
+        }
+        match kind {
+            ActionKind::CreateCopy
+                if old_effect.is_none()
+                    && matches!(precondition, TargetCondition::Missing { .. }) => {}
+            ActionKind::ReplaceCopy | ActionKind::RelocateCopy => {
+                let Some(KnownResource::FileCopy(old_copy)) = old_effect.as_ref() else {
+                    return Err(OperationRecordError::InvalidActionConditions { kind });
+                };
+                if !matches!(precondition, TargetCondition::ExpectedCopy { ref target_path, ref content_fingerprint } if target_path == old_copy.target_path() && content_fingerprint == old_copy.content_fingerprint())
+                    || (kind == ActionKind::ReplaceCopy && old_copy.target_path() != &target_path)
+                    || (kind == ActionKind::RelocateCopy && old_copy.target_path() == &target_path)
+                {
+                    return Err(OperationRecordError::InvalidActionConditions { kind });
+                }
+            }
+            _ => return Err(OperationRecordError::InvalidActionConditions { kind }),
+        }
+        Ok(Self {
+            facts: ActionFacts::Copy {
+                kind,
+                resource_id,
+                source_path,
+                target_path,
+                content_fingerprint,
+                temporary_path,
+                old_effect: Box::new(old_effect),
+                final_effect: Box::new(final_effect),
+                precondition,
+                postcondition,
+            },
+            status,
+        })
+    }
+
+    /// Records a copy materialization selected by the pure planner using its repository-allocated temporary sibling.
+    pub(crate) fn copy(
+        action: &PlannedFileCopyAction,
+        temporary_path: ResolvedPath,
+    ) -> Result<Self, OperationRecordError> {
+        let kind = action.kind();
+        if !matches!(
+            kind,
+            ActionKind::CreateCopy | ActionKind::ReplaceCopy | ActionKind::RelocateCopy
+        ) {
+            return Err(OperationRecordError::UnsupportedActionKind { kind });
+        }
+        let desired = action
+            .desired()
+            .ok_or(OperationRecordError::InvalidActionConditions { kind })?;
+        let old_effect = action.previous().cloned().map(KnownResource::from);
+        let preconditions = action.preconditions();
+        let postconditions = action.postconditions();
+        let precondition = match kind {
+            ActionKind::RelocateCopy => preconditions.first().cloned(),
+            _ => preconditions.into_iter().next(),
+        }
+        .ok_or(OperationRecordError::InvalidActionConditions { kind })?;
+        let postcondition = match kind {
+            ActionKind::RelocateCopy => postconditions.get(1).cloned(),
+            _ => postconditions.into_iter().next(),
+        }
+        .ok_or(OperationRecordError::InvalidActionConditions { kind })?;
+        Self::from_persisted_copy(PersistedCopyActionFacts {
+            kind,
+            resource_id: action.resource_id().clone(),
+            source_path: desired.source_path().clone(),
+            target_path: desired.target_path().clone(),
+            content_fingerprint: desired.source_content_fingerprint().clone(),
+            temporary_path,
+            old_effect,
+            final_effect: KnownResource::from(crate::domain::known::KnownFileCopy::from_resolved(
+                desired,
+            )),
+            precondition,
+            postcondition,
+            status: ActionStatus::Pending,
+        })
+    }
+
+    /// Reconstructs a managed link/copy handoff from complete old and final effects.
+    pub(crate) fn from_persisted_replace_effect(
+        facts: PersistedEffectHandoffFacts,
+    ) -> Result<Self, OperationRecordError> {
+        if facts.old_effect.resource_id() != &facts.resource_id
+            || facts.final_effect.resource_id() != &facts.resource_id
+            || facts.old_effect.target_path() != facts.final_effect.target_path()
+            || facts.temporary_path == *facts.final_effect.target_path()
+            || facts.temporary_path.as_ref().parent()
+                != facts.final_effect.target_path().as_ref().parent()
+            || !condition_matches_effect(&facts.precondition, &facts.old_effect)
+            || !condition_matches_effect(&facts.postcondition, &facts.final_effect)
+        {
+            return Err(OperationRecordError::InvalidActionConditions {
+                kind: ActionKind::ReplaceEffect,
+            });
+        }
+        Ok(Self {
+            facts: ActionFacts::ReplaceEffect {
+                resource_id: facts.resource_id,
+                old_effect: Box::new(facts.old_effect),
+                final_effect: Box::new(facts.final_effect),
+                temporary_path: facts.temporary_path,
+                precondition: facts.precondition,
+                postcondition: facts.postcondition,
+            },
+            status: facts.status,
+        })
+    }
+
+    /// Records a managed cross-effect handoff using its repository-allocated temporary sibling.
+    pub(crate) fn replace_effect(
+        action: &PlannedEffectHandoff,
+        temporary_path: ResolvedPath,
+    ) -> Result<Self, OperationRecordError> {
+        let final_effect = match action.final_effect() {
+            crate::domain::desired::ResolvedResource::FileLink(resource) => {
+                KnownResource::from(crate::domain::known::KnownFileLink::from_resolved(resource))
+            }
+            crate::domain::desired::ResolvedResource::FileCopy(resource) => {
+                KnownResource::from(crate::domain::known::KnownFileCopy::from_resolved(resource))
+            }
+        };
+        let precondition = condition_for_known_effect(action.old_effect());
+        let postcondition = condition_for_known_effect(&final_effect);
+        Self::from_persisted_replace_effect(PersistedEffectHandoffFacts {
+            resource_id: action.resource_id().clone(),
+            old_effect: action.old_effect().clone(),
+            final_effect,
+            temporary_path,
+            precondition,
+            postcondition,
+            status: ActionStatus::Pending,
+        })
+    }
+
     /// The planned action kind represented by this persisted record.
     pub(crate) fn kind(&self) -> ActionKind {
         match &self.facts {
@@ -519,6 +752,8 @@ impl RecordedAction {
             ActionFacts::ReplaceLink { .. } => ActionKind::ReplaceLink,
             ActionFacts::ReplaceOwnership { .. } => ActionKind::ReplaceOwnership,
             ActionFacts::RelocateLink { .. } => ActionKind::RelocateLink,
+            ActionFacts::Copy { kind, .. } => *kind,
+            ActionFacts::ReplaceEffect { .. } => ActionKind::ReplaceEffect,
         }
     }
 
@@ -533,6 +768,8 @@ impl RecordedAction {
                 new_resource_id, ..
             } => new_resource_id,
             ActionFacts::RelocateLink { resource_id, .. } => resource_id,
+            ActionFacts::Copy { resource_id, .. } => resource_id,
+            ActionFacts::ReplaceEffect { resource_id, .. } => resource_id,
         }
     }
 
@@ -547,6 +784,8 @@ impl RecordedAction {
             ActionFacts::RelocateLink {
                 new_target_path, ..
             } => new_target_path,
+            ActionFacts::Copy { target_path, .. } => target_path,
+            ActionFacts::ReplaceEffect { final_effect, .. } => final_effect.target_path(),
         }
     }
 
@@ -589,6 +828,8 @@ impl RecordedAction {
                 target_path: old_target_path.clone(),
                 link_target: old_link_target.clone(),
             },
+            ActionFacts::Copy { precondition, .. } => precondition.clone(),
+            ActionFacts::ReplaceEffect { precondition, .. } => precondition.clone(),
         }
     }
 
@@ -631,6 +872,8 @@ impl RecordedAction {
                 target_path: new_target_path.clone(),
                 link_target: new_link_target.clone(),
             },
+            ActionFacts::Copy { postcondition, .. } => postcondition.clone(),
+            ActionFacts::ReplaceEffect { postcondition, .. } => postcondition.clone(),
         }
     }
 
@@ -726,6 +969,28 @@ impl RecordedAction {
             )
             .map(RecordedKnownStateUpdate::Upsert)
             .map_err(OperationRecordError::InvalidKnownFileLink),
+            ActionFacts::Copy {
+                resource_id,
+                source_path,
+                target_path,
+                content_fingerprint,
+                ..
+            } => crate::domain::known::KnownFileCopy::new(
+                resource_id.clone(),
+                source_path.clone(),
+                target_path.clone(),
+                content_fingerprint.clone(),
+            )
+            .map(RecordedKnownStateUpdate::UpsertCopy)
+            .map_err(OperationRecordError::InvalidKnownFileCopy),
+            ActionFacts::ReplaceEffect { final_effect, .. } => match final_effect.as_ref() {
+                KnownResource::FileLink(resource) => {
+                    Ok(RecordedKnownStateUpdate::Upsert(resource.clone()))
+                }
+                KnownResource::FileCopy(resource) => {
+                    Ok(RecordedKnownStateUpdate::UpsertCopy(resource.clone()))
+                }
+            },
         }
     }
 
@@ -757,6 +1022,66 @@ impl RecordedAction {
                 temporary_path: temporary_path.clone(),
             }),
             _ => None,
+        }
+    }
+
+    /// Copy-specific ownership facts retained for typed persistence and later recovery.
+    pub(crate) fn copy_facts(&self) -> Option<CopyFacts> {
+        match &self.facts {
+            ActionFacts::Copy {
+                source_path,
+                target_path,
+                content_fingerprint,
+                temporary_path,
+                old_effect,
+                final_effect,
+                ..
+            } => Some(CopyFacts {
+                source_path: source_path.clone(),
+                target_path: target_path.clone(),
+                content_fingerprint: content_fingerprint.clone(),
+                temporary_path: temporary_path.clone(),
+                old_effect: (**old_effect).clone(),
+                final_effect: (**final_effect).clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn effect_handoff_facts(&self) -> Option<EffectHandoffFacts> {
+        match &self.facts {
+            ActionFacts::ReplaceEffect {
+                old_effect,
+                final_effect,
+                temporary_path,
+                ..
+            } => Some(EffectHandoffFacts {
+                old_effect: (**old_effect).clone(),
+                final_effect: (**final_effect).clone(),
+                temporary_path: temporary_path.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Returns the exact action-local temporary retained for a replacement or copy materialization.
+    pub(crate) fn temporary_path(&self) -> Option<&ResolvedPath> {
+        match &self.facts {
+            ActionFacts::ReplaceLink { temporary_path, .. }
+            | ActionFacts::Copy { temporary_path, .. }
+            | ActionFacts::ReplaceEffect { temporary_path, .. } => Some(temporary_path),
+            ActionFacts::ReplaceOwnership {
+                temporary_path: Some(temporary_path),
+                ..
+            } => Some(temporary_path),
+            ActionFacts::CreateLink { .. }
+            | ActionFacts::RemoveLink { .. }
+            | ActionFacts::ForgetMissing { .. }
+            | ActionFacts::ReplaceOwnership {
+                temporary_path: None,
+                ..
+            }
+            | ActionFacts::RelocateLink { .. } => None,
         }
     }
 
@@ -795,6 +1120,19 @@ impl RecordedAction {
                 new_target_path,
                 ..
             } => vec![old_target_path, new_target_path],
+            ActionFacts::Copy {
+                target_path,
+                old_effect,
+                kind: ActionKind::RelocateCopy,
+                ..
+            } => match old_effect.as_ref() {
+                Some(KnownResource::FileCopy(old_copy)) => {
+                    vec![old_copy.target_path(), target_path]
+                }
+                _ => vec![target_path],
+            },
+            ActionFacts::Copy { target_path, .. } => vec![target_path],
+            ActionFacts::ReplaceEffect { final_effect, .. } => vec![final_effect.target_path()],
             _ => vec![self.target_path()],
         }
     }
@@ -850,14 +1188,103 @@ pub(crate) struct ReplacementFacts {
     temporary_path: ResolvedPath,
 }
 
+/// The final copy ownership facts selected by a typed copy action.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CopyFacts {
+    source_path: ResolvedPath,
+    target_path: ResolvedPath,
+    content_fingerprint: ContentFingerprint,
+    temporary_path: ResolvedPath,
+    old_effect: Option<KnownResource>,
+    final_effect: KnownResource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EffectHandoffFacts {
+    old_effect: KnownResource,
+    final_effect: KnownResource,
+    temporary_path: ResolvedPath,
+}
+
+impl EffectHandoffFacts {
+    pub(crate) fn old_effect(&self) -> &KnownResource {
+        &self.old_effect
+    }
+    pub(crate) fn final_effect(&self) -> &KnownResource {
+        &self.final_effect
+    }
+    pub(crate) fn temporary_path(&self) -> &ResolvedPath {
+        &self.temporary_path
+    }
+}
+
+impl CopyFacts {
+    pub(crate) fn source_path(&self) -> &ResolvedPath {
+        &self.source_path
+    }
+    pub(crate) fn target_path(&self) -> &ResolvedPath {
+        &self.target_path
+    }
+    pub(crate) fn content_fingerprint(&self) -> &ContentFingerprint {
+        &self.content_fingerprint
+    }
+    pub(crate) fn temporary_path(&self) -> &ResolvedPath {
+        &self.temporary_path
+    }
+    pub(crate) fn old_effect(&self) -> Option<&KnownResource> {
+        self.old_effect.as_ref()
+    }
+    pub(crate) fn final_effect(&self) -> &KnownResource {
+        &self.final_effect
+    }
+}
+
 fn precondition_link_target(
     condition: &TargetCondition,
 ) -> Result<&LinkTarget, OperationRecordError> {
     match condition {
         TargetCondition::ExpectedLink { link_target, .. } => Ok(link_target),
-        TargetCondition::Missing { .. } => Err(OperationRecordError::InvalidActionConditions {
-            kind: ActionKind::ReplaceLink,
-        }),
+        TargetCondition::Missing { .. } | TargetCondition::ExpectedCopy { .. } => {
+            Err(OperationRecordError::InvalidActionConditions {
+                kind: ActionKind::ReplaceLink,
+            })
+        }
+    }
+}
+
+fn condition_matches_effect(condition: &TargetCondition, effect: &KnownResource) -> bool {
+    match (condition, effect) {
+        (
+            TargetCondition::ExpectedLink {
+                target_path,
+                link_target,
+            },
+            KnownResource::FileLink(effect),
+        ) => target_path == effect.target_path() && link_target == effect.link_target(),
+        (
+            TargetCondition::ExpectedCopy {
+                target_path,
+                content_fingerprint,
+            },
+            KnownResource::FileCopy(effect),
+        ) => {
+            target_path == effect.target_path()
+                && content_fingerprint == effect.content_fingerprint()
+        }
+        _ => false,
+    }
+}
+
+fn condition_for_known_effect(effect: &KnownResource) -> TargetCondition {
+    match effect {
+        KnownResource::FileLink(resource) => TargetCondition::ExpectedLink {
+            target_path: resource.target_path().clone(),
+            link_target: resource.link_target().clone(),
+        },
+        KnownResource::FileCopy(resource) => TargetCondition::ExpectedCopy {
+            target_path: resource.target_path().clone(),
+            content_fingerprint: resource.content_fingerprint().clone(),
+        },
     }
 }
 
@@ -1087,7 +1514,8 @@ impl OperationRecord {
     ) -> Result<KnownFileLink, OperationRecordError> {
         match self.mark_succeeded(action_id)? {
             RecordedKnownStateUpdate::Upsert(known) => Ok(known),
-            RecordedKnownStateUpdate::RemoveExpected(_)
+            RecordedKnownStateUpdate::UpsertCopy(_)
+            | RecordedKnownStateUpdate::RemoveExpected(_)
             | RecordedKnownStateUpdate::RemoveMissing { .. }
             | RecordedKnownStateUpdate::ReplaceIdentity { .. } => {
                 Err(OperationRecordError::UnsupportedActionKind {
@@ -1146,6 +1574,7 @@ pub(crate) enum OperationRecordError {
         to: ActionStatus,
     },
     InvalidKnownFileLink(KnownFileLinkError),
+    InvalidKnownFileCopy(crate::domain::known::KnownFileCopyError),
 }
 
 impl fmt::Display for OperationRecordError {
@@ -1190,6 +1619,7 @@ impl fmt::Display for OperationRecordError {
                 )
             }
             Self::InvalidKnownFileLink(error) => error.fmt(formatter),
+            Self::InvalidKnownFileCopy(error) => error.fmt(formatter),
         }
     }
 }
@@ -1198,6 +1628,7 @@ impl std::error::Error for OperationRecordError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidKnownFileLink(error) => Some(error),
+            Self::InvalidKnownFileCopy(error) => Some(error),
             Self::EmptyOperationId
             | Self::ReplacementTemporaryRequired
             | Self::EmptyActionId
@@ -1215,6 +1646,8 @@ impl std::error::Error for OperationRecordError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::desired::ResolvedResource;
+    use crate::domain::file_copy::{ContentFingerprint, ResolvedFileCopy};
     use crate::domain::file_link::ResolvedFileLink;
     use crate::domain::ids::FullyQualifiedResourceId;
     use crate::domain::paths::ResolvedPath;
@@ -1241,6 +1674,241 @@ mod tests {
 
     fn desired_hash() -> DesiredHash {
         DesiredHash::parse(format!("sha256:{}", "a".repeat(64))).unwrap()
+    }
+
+    fn fingerprint() -> ContentFingerprint {
+        ContentFingerprint::parse(format!("sha256:{}", "b".repeat(64))).unwrap()
+    }
+
+    #[test]
+    fn replace_copy_requires_the_exact_old_copy_effect() {
+        let resource_id = FullyQualifiedResourceId::parse("base/git").unwrap();
+        let source = path("store/git/config");
+        let target = path("home/.gitconfig");
+        let old = crate::domain::known::KnownFileCopy::new(
+            resource_id.clone(),
+            path("store/git/old"),
+            target.clone(),
+            fingerprint(),
+        )
+        .unwrap();
+        let final_copy = crate::domain::known::KnownFileCopy::new(
+            resource_id.clone(),
+            source.clone(),
+            target.clone(),
+            fingerprint(),
+        )
+        .unwrap();
+        let facts = PersistedCopyActionFacts {
+            kind: ActionKind::ReplaceCopy,
+            resource_id,
+            source_path: source,
+            target_path: target.clone(),
+            content_fingerprint: fingerprint(),
+            temporary_path: path("home/.loadout-copy-a1"),
+            old_effect: Some(old.into()),
+            final_effect: final_copy.into(),
+            precondition: TargetCondition::ExpectedCopy {
+                target_path: target.clone(),
+                content_fingerprint: fingerprint(),
+            },
+            postcondition: TargetCondition::ExpectedCopy {
+                target_path: target,
+                content_fingerprint: fingerprint(),
+            },
+            status: ActionStatus::Pending,
+        };
+        assert!(RecordedAction::from_persisted_copy(facts.clone()).is_ok());
+
+        assert!(matches!(
+            RecordedAction::from_persisted_copy(PersistedCopyActionFacts {
+                old_effect: None,
+                ..facts
+            }),
+            Err(OperationRecordError::InvalidActionConditions {
+                kind: ActionKind::ReplaceCopy
+            })
+        ));
+    }
+
+    #[test]
+    fn relocate_copy_requires_distinct_old_and_new_owned_targets() {
+        let resource_id = FullyQualifiedResourceId::parse("base/git").unwrap();
+        let old_target = path("home/.gitconfig");
+        let new_target = path("home/.config/git/config");
+        let old = crate::domain::known::KnownFileCopy::new(
+            resource_id.clone(),
+            path("store/git/old"),
+            old_target.clone(),
+            fingerprint(),
+        )
+        .unwrap();
+        let final_copy = crate::domain::known::KnownFileCopy::new(
+            resource_id.clone(),
+            path("store/git/config"),
+            new_target.clone(),
+            fingerprint(),
+        )
+        .unwrap();
+        let facts = PersistedCopyActionFacts {
+            kind: ActionKind::RelocateCopy,
+            resource_id,
+            source_path: path("store/git/config"),
+            target_path: new_target.clone(),
+            content_fingerprint: fingerprint(),
+            temporary_path: path("home/.config/git/.loadout-copy-a1"),
+            old_effect: Some(old.clone().into()),
+            final_effect: final_copy.into(),
+            precondition: TargetCondition::ExpectedCopy {
+                target_path: old_target,
+                content_fingerprint: fingerprint(),
+            },
+            postcondition: TargetCondition::ExpectedCopy {
+                target_path: new_target,
+                content_fingerprint: fingerprint(),
+            },
+            status: ActionStatus::Pending,
+        };
+        let action = RecordedAction::from_persisted_copy(facts.clone()).unwrap();
+        assert_eq!(action.kind(), ActionKind::RelocateCopy);
+        assert_eq!(
+            action.copy_facts().unwrap().old_effect(),
+            Some(&KnownResource::from(old.clone()))
+        );
+
+        assert!(matches!(
+            RecordedAction::from_persisted_copy(PersistedCopyActionFacts {
+                target_path: old.target_path().clone(),
+                ..facts
+            }),
+            Err(OperationRecordError::InvalidActionConditions {
+                kind: ActionKind::RelocateCopy
+            })
+        ));
+    }
+
+    #[test]
+    fn replace_effect_accepts_a_copy_to_link_handoff_with_typed_effects() {
+        let resource_id = FullyQualifiedResourceId::parse("base/git").unwrap();
+        let target = path("home/.gitconfig");
+        let old = crate::domain::known::KnownFileCopy::new(
+            resource_id.clone(),
+            path("store/git/config"),
+            target.clone(),
+            fingerprint(),
+        )
+        .unwrap();
+        let final_link = KnownFileLink::new(
+            resource_id.clone(),
+            path("store/git/next"),
+            target.clone(),
+            LinkTarget::new(path("store/git/next")),
+        )
+        .unwrap();
+        let action = RecordedAction::from_persisted_replace_effect(PersistedEffectHandoffFacts {
+            resource_id,
+            old_effect: old.into(),
+            final_effect: final_link.into(),
+            temporary_path: path("home/.loadout-effect-a1"),
+            precondition: TargetCondition::ExpectedCopy {
+                target_path: target.clone(),
+                content_fingerprint: fingerprint(),
+            },
+            postcondition: TargetCondition::ExpectedLink {
+                target_path: target,
+                link_target: LinkTarget::new(path("store/git/next")),
+            },
+            status: ActionStatus::Pending,
+        })
+        .unwrap();
+        assert_eq!(action.kind(), ActionKind::ReplaceEffect);
+        assert!(matches!(
+            action.known_state_update_after_success(),
+            Ok(RecordedKnownStateUpdate::Upsert(_))
+        ));
+    }
+
+    #[test]
+    fn replace_effect_requires_a_temporary_sibling_of_its_target() {
+        let resource_id = FullyQualifiedResourceId::parse("base/git").unwrap();
+        let target = path("home/.gitconfig");
+        let old = crate::domain::known::KnownFileCopy::new(
+            resource_id.clone(),
+            path("store/git/config"),
+            target.clone(),
+            fingerprint(),
+        )
+        .unwrap();
+        let final_link = KnownFileLink::new(
+            resource_id.clone(),
+            path("store/git/next"),
+            target.clone(),
+            LinkTarget::new(path("store/git/next")),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            RecordedAction::from_persisted_replace_effect(PersistedEffectHandoffFacts {
+                resource_id,
+                old_effect: old.into(),
+                final_effect: final_link.into(),
+                temporary_path: path("home/other/.loadout-effect-a1"),
+                precondition: TargetCondition::ExpectedCopy {
+                    target_path: target.clone(),
+                    content_fingerprint: fingerprint(),
+                },
+                postcondition: TargetCondition::ExpectedLink {
+                    target_path: target,
+                    link_target: LinkTarget::new(path("store/git/next")),
+                },
+                status: ActionStatus::Pending,
+            }),
+            Err(OperationRecordError::InvalidActionConditions {
+                kind: ActionKind::ReplaceEffect
+            })
+        ));
+    }
+
+    #[test]
+    fn planner_copy_and_handoff_actions_become_pending_typed_records() {
+        let resource_id = FullyQualifiedResourceId::parse("base/git").unwrap();
+        let source = path("store/git/config");
+        let target = path("home/.gitconfig");
+        let copy = ResolvedFileCopy::new(
+            resource_id.clone(),
+            source.clone(),
+            target.clone(),
+            fingerprint(),
+        )
+        .unwrap();
+        let create = PlannedFileCopyAction::Create {
+            desired: copy.clone(),
+        };
+        let recorded_copy = RecordedAction::copy(&create, path("home/.loadout-copy-a1")).unwrap();
+        assert_eq!(recorded_copy.kind(), ActionKind::CreateCopy);
+        assert_eq!(recorded_copy.status(), ActionStatus::Pending);
+        assert_eq!(
+            recorded_copy.copy_facts().unwrap().final_effect(),
+            &KnownResource::from(crate::domain::known::KnownFileCopy::from_resolved(&copy))
+        );
+
+        let final_link = ResolvedFileLink::new(resource_id, source, target).unwrap();
+        let handoff = PlannedEffectHandoff::new(
+            KnownResource::from(crate::domain::known::KnownFileCopy::from_resolved(&copy)),
+            ResolvedResource::from(final_link.clone()),
+        )
+        .unwrap();
+        let recorded_handoff =
+            RecordedAction::replace_effect(&handoff, path("home/.loadout-effect-a1")).unwrap();
+        assert_eq!(recorded_handoff.kind(), ActionKind::ReplaceEffect);
+        assert_eq!(recorded_handoff.status(), ActionStatus::Pending);
+        assert_eq!(
+            recorded_handoff
+                .effect_handoff_facts()
+                .unwrap()
+                .final_effect(),
+            &KnownResource::from(KnownFileLink::from_resolved(&final_link))
+        );
     }
 
     #[test]

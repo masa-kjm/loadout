@@ -3,10 +3,12 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use crate::domain::desired::ResolvedResource;
 use crate::domain::diagnostic::Diagnostic;
+use crate::domain::file_copy::ResolvedFileCopy;
 use crate::domain::file_link::{LinkTarget, ResolvedFileLink};
 use crate::domain::ids::FullyQualifiedResourceId;
-use crate::domain::known::KnownFileLink;
+use crate::domain::known::{KnownFileCopy, KnownFileLink, KnownResource};
 use crate::domain::paths::ResolvedPath;
 
 /// The file-link action chosen by the planner.
@@ -18,7 +20,152 @@ pub(crate) enum ActionKind {
     ReplaceOwnership,
     RemoveLink,
     ForgetMissing,
+    CreateCopy,
+    ReplaceCopy,
+    RelocateCopy,
+    RemoveCopy,
+    ReplaceEffect,
     Noop,
+}
+
+/// The closed file-copy action vocabulary reserved for the copy planner and executor slice.
+///
+/// These values are intentionally separate from `PlannedAction` until M3 can provide every required precondition, temporary, recovery, and executor implementation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PlannedFileCopyAction {
+    Create {
+        desired: ResolvedFileCopy,
+    },
+    Replace {
+        desired: ResolvedFileCopy,
+        previous: crate::domain::known::KnownFileCopy,
+    },
+    Relocate {
+        desired: ResolvedFileCopy,
+        previous: crate::domain::known::KnownFileCopy,
+    },
+    Remove {
+        previous: crate::domain::known::KnownFileCopy,
+    },
+    ForgetMissing {
+        previous: crate::domain::known::KnownFileCopy,
+    },
+    Noop {
+        desired: ResolvedFileCopy,
+        previous: crate::domain::known::KnownFileCopy,
+    },
+}
+
+impl PlannedFileCopyAction {
+    /// Returns the closed action kind represented by this copy payload.
+    pub(crate) fn kind(&self) -> ActionKind {
+        match self {
+            Self::Create { .. } => ActionKind::CreateCopy,
+            Self::Replace { .. } => ActionKind::ReplaceCopy,
+            Self::Relocate { .. } => ActionKind::RelocateCopy,
+            Self::Remove { .. } => ActionKind::RemoveCopy,
+            Self::ForgetMissing { .. } => ActionKind::ForgetMissing,
+            Self::Noop { .. } => ActionKind::Noop,
+        }
+    }
+
+    /// Returns the stable resource identity that participates in deterministic ordering.
+    pub(crate) fn resource_id(&self) -> &FullyQualifiedResourceId {
+        match self {
+            Self::Create { desired }
+            | Self::Replace { desired, .. }
+            | Self::Relocate { desired, .. }
+            | Self::Noop { desired, .. } => desired.resource_id(),
+            Self::Remove { previous } | Self::ForgetMissing { previous } => previous.resource_id(),
+        }
+    }
+
+    /// Returns the desired copy definition for actions that materialize a final copy.
+    pub(crate) fn desired(&self) -> Option<&ResolvedFileCopy> {
+        match self {
+            Self::Create { desired }
+            | Self::Replace { desired, .. }
+            | Self::Relocate { desired, .. }
+            | Self::Noop { desired, .. } => Some(desired),
+            Self::Remove { .. } | Self::ForgetMissing { .. } => None,
+        }
+    }
+
+    /// Returns the prior owned copy fact for actions that require one.
+    pub(crate) fn previous(&self) -> Option<&KnownFileCopy> {
+        match self {
+            Self::Replace { previous, .. }
+            | Self::Relocate { previous, .. }
+            | Self::Remove { previous }
+            | Self::ForgetMissing { previous }
+            | Self::Noop { previous, .. } => Some(previous),
+            Self::Create { .. } => None,
+        }
+    }
+
+    /// Returns the exact no-follow predicates the executor must recheck before mutation.
+    pub(crate) fn preconditions(&self) -> Vec<TargetCondition> {
+        match self {
+            Self::Create { desired } => vec![missing(desired.target_path())],
+            Self::Replace { previous, .. } | Self::Remove { previous } => {
+                vec![expected_copy(previous)]
+            }
+            Self::Relocate { desired, previous } => {
+                vec![expected_copy(previous), missing(desired.target_path())]
+            }
+            Self::ForgetMissing { previous } => vec![missing(previous.target_path())],
+            Self::Noop { previous, .. } => vec![expected_copy(previous)],
+        }
+    }
+
+    /// Returns the exact predicates required before Known state can be changed.
+    pub(crate) fn postconditions(&self) -> Vec<TargetCondition> {
+        match self {
+            Self::Create { desired }
+            | Self::Replace { desired, .. }
+            | Self::Noop { desired, .. } => vec![expected_desired_copy(desired)],
+            Self::Relocate { desired, previous } => {
+                vec![
+                    missing(previous.target_path()),
+                    expected_desired_copy(desired),
+                ]
+            }
+            Self::Remove { previous } | Self::ForgetMissing { previous } => {
+                vec![missing(previous.target_path())]
+            }
+        }
+    }
+
+    /// Returns the typed state transition that becomes eligible after the postcondition.
+    pub(crate) fn known_state_update(&self) -> Option<KnownStateUpdate> {
+        match self {
+            Self::Create { desired }
+            | Self::Replace { desired, .. }
+            | Self::Relocate { desired, .. } => Some(KnownStateUpdate::UpsertCopy {
+                resource: KnownFileCopy::from_resolved(desired),
+            }),
+            Self::Remove { previous } | Self::ForgetMissing { previous } => {
+                Some(KnownStateUpdate::Remove {
+                    resource_id: previous.resource_id().clone(),
+                })
+            }
+            Self::Noop { .. } => None,
+        }
+    }
+
+    pub(crate) fn touched_targets(&self) -> Vec<&ResolvedPath> {
+        match self {
+            Self::Create { desired }
+            | Self::Replace { desired, .. }
+            | Self::Noop { desired, .. } => vec![desired.target_path()],
+            Self::Relocate { desired, previous } => {
+                vec![previous.target_path(), desired.target_path()]
+            }
+            Self::Remove { previous } | Self::ForgetMissing { previous } => {
+                vec![previous.target_path()]
+            }
+        }
+    }
 }
 
 /// The planner reason attached to a selected action.
@@ -43,13 +190,19 @@ pub(crate) enum TargetCondition {
         target_path: ResolvedPath,
         link_target: LinkTarget,
     },
+    ExpectedCopy {
+        target_path: ResolvedPath,
+        content_fingerprint: crate::domain::file_copy::ContentFingerprint,
+    },
 }
 
 impl TargetCondition {
     /// The target path governed by this condition.
     pub(crate) fn target_path(&self) -> &ResolvedPath {
         match self {
-            Self::Missing { target_path } | Self::ExpectedLink { target_path, .. } => target_path,
+            Self::Missing { target_path }
+            | Self::ExpectedLink { target_path, .. }
+            | Self::ExpectedCopy { target_path, .. } => target_path,
         }
     }
 }
@@ -59,6 +212,9 @@ impl TargetCondition {
 pub(crate) enum KnownStateUpdate {
     Upsert {
         resource: KnownFileLink,
+    },
+    UpsertCopy {
+        resource: KnownFileCopy,
     },
     Remove {
         resource_id: FullyQualifiedResourceId,
@@ -73,6 +229,97 @@ pub(crate) enum KnownStateUpdate {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PlannedAction {
     inner: PlannedActionInner,
+}
+
+/// A closed executor-plan member. The legacy link payload stays distinct while copy planning gains a typed path into the aggregate plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PlannedResourceAction {
+    FileLink(PlannedAction),
+    FileCopy(PlannedFileCopyAction),
+    ReplaceEffect(PlannedEffectHandoff),
+}
+
+/// A managed same-target handoff between the two closed file effects.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PlannedEffectHandoff {
+    old_effect: KnownResource,
+    final_effect: ResolvedResource,
+}
+
+impl PlannedEffectHandoff {
+    pub(crate) fn new(
+        old_effect: KnownResource,
+        final_effect: ResolvedResource,
+    ) -> Result<Self, PlannedActionError> {
+        if old_effect.target_path() != final_effect.target_path() {
+            return Err(PlannedActionError::TargetPathMismatch);
+        }
+        if old_effect.resource_id() != final_effect.resource_id() {
+            return Err(PlannedActionError::ResourceIdMismatch);
+        }
+        Ok(Self {
+            old_effect,
+            final_effect,
+        })
+    }
+    pub(crate) fn resource_id(&self) -> &FullyQualifiedResourceId {
+        self.final_effect.resource_id()
+    }
+    /// Returns the complete old owned effect required by the executor precondition.
+    pub(crate) fn old_effect(&self) -> &KnownResource {
+        &self.old_effect
+    }
+    /// Returns the exact final resolved effect required by the executor postcondition.
+    pub(crate) fn final_effect(&self) -> &ResolvedResource {
+        &self.final_effect
+    }
+    pub(crate) fn touched_targets(&self) -> Vec<&ResolvedPath> {
+        vec![self.final_effect.target_path()]
+    }
+}
+
+impl PlannedResourceAction {
+    pub(crate) fn kind(&self) -> ActionKind {
+        match self {
+            Self::FileLink(action) => action.kind(),
+            Self::FileCopy(action) => action.kind(),
+            Self::ReplaceEffect(_) => ActionKind::ReplaceEffect,
+        }
+    }
+
+    pub(crate) fn resource_id(&self) -> &FullyQualifiedResourceId {
+        match self {
+            Self::FileLink(action) => action.resource_id(),
+            Self::FileCopy(action) => action.resource_id(),
+            Self::ReplaceEffect(action) => action.resource_id(),
+        }
+    }
+
+    pub(crate) fn touched_targets(&self) -> Vec<&ResolvedPath> {
+        match self {
+            Self::FileLink(action) => action.touched_targets(),
+            Self::FileCopy(action) => action.touched_targets(),
+            Self::ReplaceEffect(action) => action.touched_targets(),
+        }
+    }
+}
+
+impl From<PlannedAction> for PlannedResourceAction {
+    fn from(action: PlannedAction) -> Self {
+        Self::FileLink(action)
+    }
+}
+
+impl From<PlannedFileCopyAction> for PlannedResourceAction {
+    fn from(action: PlannedFileCopyAction) -> Self {
+        Self::FileCopy(action)
+    }
+}
+
+impl From<PlannedEffectHandoff> for PlannedResourceAction {
+    fn from(action: PlannedEffectHandoff) -> Self {
+        Self::ReplaceEffect(action)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -333,6 +580,20 @@ fn expected_desired(desired: &ResolvedFileLink) -> TargetCondition {
     }
 }
 
+fn expected_copy(known: &KnownFileCopy) -> TargetCondition {
+    TargetCondition::ExpectedCopy {
+        target_path: known.target_path().clone(),
+        content_fingerprint: known.content_fingerprint().clone(),
+    }
+}
+
+fn expected_desired_copy(desired: &ResolvedFileCopy) -> TargetCondition {
+    TargetCondition::ExpectedCopy {
+        target_path: desired.target_path().clone(),
+        content_fingerprint: desired.source_content_fingerprint().clone(),
+    }
+}
+
 fn require_same_resource_id(
     desired: &ResolvedFileLink,
     previous: &KnownFileLink,
@@ -396,6 +657,7 @@ impl std::error::Error for PlannedActionError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Plan {
     actions: Vec<PlannedAction>,
+    resource_actions: Vec<PlannedResourceAction>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -406,9 +668,28 @@ impl Plan {
         diagnostics: impl IntoIterator<Item = Diagnostic>,
     ) -> Result<Self, PlanError> {
         let actions = actions.into_iter().collect::<Vec<_>>();
+        Self::from_resource_actions(
+            actions.iter().cloned().map(PlannedResourceAction::from),
+            diagnostics,
+        )
+    }
+
+    /// Builds a closed mixed-effect plan. Link-only orchestration continues to use [`Self::new`] until the executor owns every copy action.
+    pub(crate) fn new_with_resource_actions(
+        actions: impl IntoIterator<Item = PlannedResourceAction>,
+        diagnostics: impl IntoIterator<Item = Diagnostic>,
+    ) -> Result<Self, PlanError> {
+        Self::from_resource_actions(actions, diagnostics)
+    }
+
+    fn from_resource_actions(
+        actions: impl IntoIterator<Item = PlannedResourceAction>,
+        diagnostics: impl IntoIterator<Item = Diagnostic>,
+    ) -> Result<Self, PlanError> {
+        let resource_actions = actions.into_iter().collect::<Vec<_>>();
         let mut claimed_targets = BTreeMap::new();
 
-        for action in &actions {
+        for action in &resource_actions {
             for target_path in action.touched_targets() {
                 if let Some(first_resource_id) =
                     claimed_targets.insert(target_path.clone(), action.resource_id().clone())
@@ -422,8 +703,19 @@ impl Plan {
             }
         }
 
+        let actions = resource_actions
+            .iter()
+            .filter_map(|action| match action {
+                PlannedResourceAction::FileLink(action) => Some(action.clone()),
+                PlannedResourceAction::FileCopy(_) | PlannedResourceAction::ReplaceEffect(_) => {
+                    None
+                }
+            })
+            .collect();
+
         Ok(Self {
             actions,
+            resource_actions,
             diagnostics: diagnostics.into_iter().collect(),
         })
     }
@@ -433,6 +725,11 @@ impl Plan {
         &self.actions
     }
 
+    /// Returns every closed resource action, including copy actions not yet accepted by the link-only executor.
+    pub(crate) fn resource_actions(&self) -> &[PlannedResourceAction] {
+        &self.resource_actions
+    }
+
     /// Returns structured diagnostics without exposing mutable access.
     pub(crate) fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
@@ -440,9 +737,11 @@ impl Plan {
 
     /// Whether apply may execute this plan after preflight and confirmation.
     pub(crate) fn is_executable(&self) -> bool {
-        self.diagnostics
-            .iter()
-            .all(|diagnostic| !diagnostic.is_blocking())
+        self.actions.len() == self.resource_actions.len()
+            && self
+                .diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.is_blocking())
     }
 }
 
@@ -478,6 +777,7 @@ mod tests {
     use super::*;
     use crate::domain::actual::TargetObservation;
     use crate::domain::diagnostic::Diagnostic;
+    use crate::domain::file_copy::{ContentFingerprint, ResolvedFileCopy};
 
     fn path(name: &str) -> ResolvedPath {
         ResolvedPath::new(std::env::temp_dir().join("loadout-domain-plan").join(name)).unwrap()
@@ -494,6 +794,19 @@ mod tests {
 
     fn known(id: &str, source: &str, target: &str) -> KnownFileLink {
         KnownFileLink::from_resolved(&desired(id, source, target))
+    }
+
+    fn copy(id: &str, source: &str, target: &str) -> ResolvedFileCopy {
+        ResolvedFileCopy::new(
+            FullyQualifiedResourceId::parse(id).unwrap(),
+            path(source),
+            path(target),
+            ContentFingerprint::parse(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -524,6 +837,68 @@ mod tests {
                 resource: KnownFileLink::from_resolved(&desired),
             })
         );
+    }
+
+    #[test]
+    fn copy_actions_carry_exact_predicates_and_typed_known_updates() {
+        let previous =
+            KnownFileCopy::from_resolved(&copy("base/git", "store/git/config", "home/.gitconfig"));
+        let desired = ResolvedFileCopy::new(
+            previous.resource_id().clone(),
+            path("store/git/next-config"),
+            previous.target_path().clone(),
+            ContentFingerprint::parse(format!("sha256:{}", "b".repeat(64))).unwrap(),
+        )
+        .unwrap();
+        let replace = PlannedFileCopyAction::Replace {
+            desired: desired.clone(),
+            previous: previous.clone(),
+        };
+
+        assert_eq!(
+            replace.preconditions(),
+            [TargetCondition::ExpectedCopy {
+                target_path: previous.target_path().clone(),
+                content_fingerprint: previous.content_fingerprint().clone(),
+            }]
+        );
+        assert_eq!(
+            replace.postconditions(),
+            [TargetCondition::ExpectedCopy {
+                target_path: desired.target_path().clone(),
+                content_fingerprint: desired.source_content_fingerprint().clone(),
+            }]
+        );
+        assert_eq!(
+            replace.known_state_update(),
+            Some(KnownStateUpdate::UpsertCopy {
+                resource: KnownFileCopy::from_resolved(&desired),
+            })
+        );
+
+        let relocate = PlannedFileCopyAction::Relocate {
+            desired: ResolvedFileCopy::new(
+                desired.resource_id().clone(),
+                desired.source_path().clone(),
+                path("home/.config/git/config"),
+                desired.source_content_fingerprint().clone(),
+            )
+            .unwrap(),
+            previous: previous.clone(),
+        };
+        assert!(matches!(
+            relocate.preconditions().as_slice(),
+            [
+                TargetCondition::ExpectedCopy { .. },
+                TargetCondition::Missing { .. }
+            ]
+        ));
+        assert!(matches!(
+            PlannedFileCopyAction::Remove { previous }
+                .postconditions()
+                .as_slice(),
+            [TargetCondition::Missing { .. }]
+        ));
     }
 
     #[test]
@@ -581,5 +956,20 @@ mod tests {
         assert!(!blocked.is_executable());
         assert!(blocked.actions().is_empty());
         assert_eq!(blocked.diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn aggregate_plan_retains_a_typed_copy_action_without_exposing_it_as_a_link_action() {
+        let copy_action = PlannedFileCopyAction::Create {
+            desired: copy("base/git", "store/git/config", "home/.gitconfig"),
+        };
+        let plan = Plan::new_with_resource_actions([copy_action.into()], []).unwrap();
+
+        assert!(plan.actions().is_empty());
+        assert!(!plan.is_executable());
+        assert!(matches!(
+            plan.resource_actions(),
+            [PlannedResourceAction::FileCopy(action)] if action.kind() == ActionKind::CreateCopy
+        ));
     }
 }

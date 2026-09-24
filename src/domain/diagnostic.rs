@@ -1,6 +1,6 @@
 //! Structured blocking diagnostics emitted by the pure planner.
 
-use crate::domain::actual::TargetObservation;
+use crate::domain::actual::{CopyTargetObservation, TargetObservation};
 use crate::domain::ids::FullyQualifiedResourceId;
 use crate::domain::paths::ResolvedPath;
 use crate::domain::plan::ActionKind;
@@ -16,6 +16,11 @@ pub(crate) enum Diagnostic {
         resource_id: FullyQualifiedResourceId,
         target_path: ResolvedPath,
         observation: TargetObservation,
+    },
+    UnexpectedCopyTarget {
+        resource_id: FullyQualifiedResourceId,
+        target_path: ResolvedPath,
+        observation: CopyTargetObservation,
     },
     MissingActualObservation {
         target_path: ResolvedPath,

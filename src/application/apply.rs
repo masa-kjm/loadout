@@ -9,12 +9,13 @@ use crate::domain::ids::FullyQualifiedResourceId;
 #[cfg(test)]
 use crate::domain::paths::ResolvedPath;
 use crate::domain::plan::{ActionKind, Plan, PlannedAction, TargetCondition};
+use crate::executor::file_copy::FileCopyExecutor;
 use crate::executor::file_link::{
     CreateLinkExecutionError, FileLinkExecutor, ForgetMissingExecutionError,
     RelocateLinkExecutionError, RemoveLinkExecutionError, ReplaceLinkExecutionError,
 };
 use crate::inspection::file_link::{FileLinkInspector, TargetInspectionError};
-use crate::planner::file_link::plan;
+use crate::planner::plan;
 #[cfg(test)]
 use crate::resolver::ResolvedApplyInput;
 use crate::state::operation::{ActionId, ActionStatus, RecordedAction};
@@ -1329,12 +1330,18 @@ where
             ActionStatus::Running | ActionStatus::Uncertain => {
                 // Recovery may remove only its recorded replacement temporary, and only if its executor rechecks can prove that cleanup is safe.
                 // Any failure leaves the action uncertain rather than allowing the later predicate-only decision to conceal an unproven cleanup.
-                let cleanup_failed = action.replacement_facts().is_some()
-                    && !cleanup_executor().is_some_and(|executor| {
+                let cleanup_failed = if action.replacement_facts().is_some() {
+                    !cleanup_executor().is_some_and(|executor| {
                         executor
                             .cleanup_recorded_replacement_temporary(&action)
                             .is_ok()
-                    });
+                    })
+                } else if action.temporary_path().is_some() {
+                    !FileCopyExecutor::new(home_directory)
+                        .is_ok_and(|executor| executor.cleanup_recorded_temporary(&action).is_ok())
+                } else {
+                    false
+                };
                 // An unavailable or unsafe recorded-path observation cannot prove either recorded condition, so it remains uncertain.
                 let decision = (!cleanup_failed)
                     .then(|| {
@@ -1412,8 +1419,11 @@ fn recovery_decision(
     inspector: &FileLinkInspector,
     action: &RecordedAction,
 ) -> Result<RecoveryDecision, TargetInspectionError> {
-    if action.kind() == ActionKind::CreateLink {
-        // A matching link does not prove that this create created it.
+    if matches!(
+        action.kind(),
+        ActionKind::CreateLink | ActionKind::CreateCopy
+    ) {
+        // A matching effect does not prove that this create created it.
         if condition_holds(inspector, &action.precondition())? {
             return Ok(RecoveryDecision::Failed);
         }
@@ -1460,6 +1470,44 @@ fn recovery_decision(
         });
     }
 
+    if action.kind() == ActionKind::RelocateCopy {
+        let facts = action
+            .copy_facts()
+            .expect("validated copy relocation record has facts");
+        let Some(crate::domain::known::KnownResource::FileCopy(old_copy)) = facts.old_effect()
+        else {
+            return Ok(RecoveryDecision::Uncertain);
+        };
+        let old_missing = condition_holds(
+            inspector,
+            &TargetCondition::Missing {
+                target_path: old_copy.target_path().clone(),
+            },
+        )?;
+        let new_expected = condition_holds(inspector, &action.postcondition())?;
+        if old_missing && new_expected {
+            return Ok(RecoveryDecision::Succeeded);
+        }
+        let old_expected = condition_holds(
+            inspector,
+            &TargetCondition::ExpectedCopy {
+                target_path: old_copy.target_path().clone(),
+                content_fingerprint: old_copy.content_fingerprint().clone(),
+            },
+        )?;
+        let new_missing = condition_holds(
+            inspector,
+            &TargetCondition::Missing {
+                target_path: facts.target_path().clone(),
+            },
+        )?;
+        return Ok(if old_expected && new_missing {
+            RecoveryDecision::Failed
+        } else {
+            RecoveryDecision::Uncertain
+        });
+    }
+
     if let Some(facts) = action.replacement_facts() {
         let postcondition = condition_holds(inspector, &action.postcondition())?;
         let temporary_missing = condition_holds(
@@ -1493,19 +1541,35 @@ fn condition_holds(
     inspector: &FileLinkInspector,
     condition: &TargetCondition,
 ) -> Result<bool, TargetInspectionError> {
-    let expected = match condition {
-        TargetCondition::ExpectedLink { link_target, .. } => link_target.clone(),
-        TargetCondition::Missing { target_path } => LinkTarget::new(target_path.clone()),
-    };
-    let actual = inspector.inspect_target_for_expected_link(condition.target_path(), &expected)?;
-    Ok(match condition {
-        TargetCondition::ExpectedLink { .. } => {
-            matches!(actual.observation(), TargetObservation::ExpectedLink { .. })
+    match condition {
+        TargetCondition::ExpectedCopy {
+            target_path,
+            content_fingerprint,
+        } => Ok(matches!(
+            inspector
+                .inspect_target_for_expected_copy(target_path, content_fingerprint)?
+                .observation(),
+            crate::domain::actual::CopyTargetObservation::ExpectedCopy { .. }
+        )),
+        TargetCondition::ExpectedLink { .. } | TargetCondition::Missing { .. } => {
+            let expected = match condition {
+                TargetCondition::ExpectedLink { link_target, .. } => link_target.clone(),
+                TargetCondition::Missing { target_path } => LinkTarget::new(target_path.clone()),
+                TargetCondition::ExpectedCopy { .. } => unreachable!("copy handled above"),
+            };
+            let actual =
+                inspector.inspect_target_for_expected_link(condition.target_path(), &expected)?;
+            Ok(match condition {
+                TargetCondition::ExpectedLink { .. } => {
+                    matches!(actual.observation(), TargetObservation::ExpectedLink { .. })
+                }
+                TargetCondition::Missing { .. } => {
+                    matches!(actual.observation(), TargetObservation::Missing)
+                }
+                TargetCondition::ExpectedCopy { .. } => unreachable!("copy handled above"),
+            })
         }
-        TargetCondition::Missing { .. } => {
-            matches!(actual.observation(), TargetObservation::Missing)
-        }
-    })
+    }
 }
 
 #[cfg(test)]

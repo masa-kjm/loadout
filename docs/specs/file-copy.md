@@ -99,6 +99,22 @@ Replace performs the same temporary preparation and atomically replaces only an 
 Neither operation may delete the final target before the new temporary has been completely written and verified.
 If a platform cannot preserve the old expected target when publication fails, preflight MUST block replacement.
 
+### Publication Primitives and Capability Boundary
+
+Copy publication always addresses the recorded temporary and final name through the already rechecked target parent; it MUST NOT re-resolve an absolute target pathname for the publish operation.
+The following primitives are the only candidates that v0.5.0 may enable after the required native evidence.
+
+| Platform and action | Permitted primitive | Required capability outcome |
+| --- | --- | --- |
+| Linux/local ext4 create | `renameat2` with `RENAME_NOREPLACE`, using the retained target-parent descriptor for both names | The call must reject an already existing final name. An unavailable syscall or filesystem flag support is a preflight rejection. |
+| macOS/local APFS create | `renamex_np` with `RENAME_EXCL`, after confirming the volume supports exclusive renaming | Unsupported volume capability is a preflight rejection. |
+| Windows/local NTFS create | `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`, after the reparse-point and declared-path rechecks | Any API behavior that can replace an existing final name is unsupported and blocks preflight. |
+| Unix replacement or effect handoff | `renameat` through the retained target-parent descriptor | A failed call must leave an entry at the final name; otherwise the capability is unsupported and blocks preflight. |
+| Windows replacement or effect handoff | None in v0.5.0 until a primitive with the required failure aftermath is proven | Preflight blocks the action without a new operation record or target mutation. `ReplaceFileW` is not enabled because its documented failure cases can leave the replaced name absent or moved. |
+
+No delete-then-create sequence, cross-directory move, backup-name workflow, delayed operation, or fallback primitive is permitted.
+Native conformance must prove the selected primitive's success and documented failure aftermath before the corresponding capability is enabled.
+
 ### Link-to-Copy Effect Handoff
 
 `link -> copy` is a `replace_effect` action, not `replace_copy`.

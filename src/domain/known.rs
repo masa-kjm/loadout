@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use crate::domain::file_copy::{ContentFingerprint, ResolvedFileCopy};
 use crate::domain::file_link::{LinkTarget, ResolvedFileLink};
 use crate::domain::ids::FullyQualifiedResourceId;
 use crate::domain::paths::ResolvedPath;
@@ -91,10 +92,109 @@ impl fmt::Display for KnownFileLinkError {
 
 impl std::error::Error for KnownFileLinkError {}
 
+/// A previously verified file-copy post-condition recorded in Known state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KnownFileCopy {
+    resource_id: FullyQualifiedResourceId,
+    source_path: ResolvedPath,
+    target_path: ResolvedPath,
+    content_fingerprint: ContentFingerprint,
+}
+
+impl KnownFileCopy {
+    /// Validates a persisted Known file-copy record before it can be trusted.
+    pub(crate) fn new(
+        resource_id: FullyQualifiedResourceId,
+        source_path: ResolvedPath,
+        target_path: ResolvedPath,
+        content_fingerprint: ContentFingerprint,
+    ) -> Result<Self, KnownFileCopyError> {
+        if source_path == target_path {
+            return Err(KnownFileCopyError::SourceEqualsTarget);
+        }
+        Ok(Self {
+            resource_id,
+            source_path,
+            target_path,
+            content_fingerprint,
+        })
+    }
+
+    /// Creates the Known record that becomes eligible only after verification.
+    pub(crate) fn from_resolved(resource: &ResolvedFileCopy) -> Self {
+        Self {
+            resource_id: resource.resource_id().clone(),
+            source_path: resource.source_path().clone(),
+            target_path: resource.target_path().clone(),
+            content_fingerprint: resource.source_content_fingerprint().clone(),
+        }
+    }
+
+    pub(crate) fn resource_id(&self) -> &FullyQualifiedResourceId {
+        &self.resource_id
+    }
+    pub(crate) fn source_path(&self) -> &ResolvedPath {
+        &self.source_path
+    }
+    pub(crate) fn target_path(&self) -> &ResolvedPath {
+        &self.target_path
+    }
+    pub(crate) fn content_fingerprint(&self) -> &ContentFingerprint {
+        &self.content_fingerprint
+    }
+}
+
+/// The reason a persisted Known file-copy fact violates the state contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KnownFileCopyError {
+    SourceEqualsTarget,
+}
+
+impl fmt::Display for KnownFileCopyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a Known file-copy source and target must not be the same path")
+    }
+}
+
+impl std::error::Error for KnownFileCopyError {}
+
+/// A closed verified resource effect in Known state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum KnownResource {
+    FileLink(KnownFileLink),
+    FileCopy(KnownFileCopy),
+}
+
+impl KnownResource {
+    pub(crate) fn resource_id(&self) -> &FullyQualifiedResourceId {
+        match self {
+            Self::FileLink(resource) => resource.resource_id(),
+            Self::FileCopy(resource) => resource.resource_id(),
+        }
+    }
+    pub(crate) fn target_path(&self) -> &ResolvedPath {
+        match self {
+            Self::FileLink(resource) => resource.target_path(),
+            Self::FileCopy(resource) => resource.target_path(),
+        }
+    }
+}
+
+impl From<KnownFileLink> for KnownResource {
+    fn from(resource: KnownFileLink) -> Self {
+        Self::FileLink(resource)
+    }
+}
+impl From<KnownFileCopy> for KnownResource {
+    fn from(resource: KnownFileCopy) -> Self {
+        Self::FileCopy(resource)
+    }
+}
+
 /// All verified historical resource facts, keyed by stable resource identity.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct KnownState {
-    resources: BTreeMap<FullyQualifiedResourceId, KnownFileLink>,
+    resources: BTreeMap<FullyQualifiedResourceId, KnownResource>,
 }
 
 impl KnownState {
@@ -105,12 +205,12 @@ impl KnownState {
 
     /// Builds state while validating resource-ID and target uniqueness.
     pub(crate) fn new(
-        resources: impl IntoIterator<Item = KnownFileLink>,
+        resources: impl IntoIterator<Item = impl Into<KnownResource>>,
     ) -> Result<Self, KnownStateError> {
         let mut known = Self::empty();
         let mut targets = BTreeMap::new();
 
-        for resource in resources {
+        for resource in resources.into_iter().map(Into::into) {
             let resource_id = resource.resource_id().clone();
             let target_path = resource.target_path().clone();
 
@@ -135,12 +235,38 @@ impl KnownState {
 
     /// Looks up the verified historical fact for one resource identity.
     pub(crate) fn get(&self, resource_id: &FullyQualifiedResourceId) -> Option<&KnownFileLink> {
-        self.resources.get(resource_id)
+        match self.resources.get(resource_id) {
+            Some(KnownResource::FileLink(resource)) => Some(resource),
+            _ => None,
+        }
     }
 
     /// Iterates over Known resources by fully qualified resource ID.
-    pub(crate) fn resources(&self) -> impl ExactSizeIterator<Item = &KnownFileLink> {
+    pub(crate) fn resources(&self) -> impl ExactSizeIterator<Item = &KnownResource> {
         self.resources.values()
+    }
+
+    /// Iterates over file-link facts for the legacy link-only implementation slice.
+    pub(crate) fn file_links(&self) -> impl Iterator<Item = &KnownFileLink> {
+        self.resources
+            .values()
+            .filter_map(|resource| match resource {
+                KnownResource::FileLink(resource) => Some(resource),
+                KnownResource::FileCopy(_) => None,
+            })
+    }
+
+    /// Iterates over every closed resource effect by fully qualified resource ID.
+    pub(crate) fn variants(&self) -> impl ExactSizeIterator<Item = &KnownResource> {
+        self.resources()
+    }
+
+    /// Looks up any typed verified historical fact for one resource identity.
+    pub(crate) fn get_variant(
+        &self,
+        resource_id: &FullyQualifiedResourceId,
+    ) -> Option<&KnownResource> {
+        self.resources.get(resource_id)
     }
 
     /// Returns a new Known state with one verified resource fact inserted or updated.
@@ -148,7 +274,17 @@ impl KnownState {
     /// The state repository uses this only in the same atomic commit that records the corresponding action as succeeded.
     pub(crate) fn with_upserted(&self, resource: KnownFileLink) -> Result<Self, KnownStateError> {
         let mut resources = self.resources.clone();
-        resources.insert(resource.resource_id().clone(), resource);
+        resources.insert(resource.resource_id().clone(), resource.into());
+        Self::new(resources.into_values())
+    }
+
+    /// Returns a new Known state with one verified copy fact inserted or updated.
+    pub(crate) fn with_upserted_copy(
+        &self,
+        resource: KnownFileCopy,
+    ) -> Result<Self, KnownStateError> {
+        let mut resources = self.resources.clone();
+        resources.insert(resource.resource_id().clone(), resource.into());
         Self::new(resources.into_values())
     }
 
@@ -161,7 +297,7 @@ impl KnownState {
                 resource_id: expected.resource_id().clone(),
             });
         };
-        if actual != expected {
+        if actual != &KnownResource::FileLink(expected.clone()) {
             return Err(KnownStateError::ResourceMismatch {
                 resource_id: expected.resource_id().clone(),
             });
@@ -198,7 +334,7 @@ impl KnownState {
                 resource_id: expected_old.resource_id().clone(),
             });
         };
-        if actual != expected_old {
+        if actual != &KnownResource::FileLink(expected_old.clone()) {
             return Err(KnownStateError::ResourceMismatch {
                 resource_id: expected_old.resource_id().clone(),
             });
@@ -210,7 +346,7 @@ impl KnownState {
         }
         let mut resources = self.resources.clone();
         resources.remove(expected_old.resource_id());
-        resources.insert(new_resource.resource_id().clone(), new_resource);
+        resources.insert(new_resource.resource_id().clone(), new_resource.into());
         Self::new(resources.into_values())
     }
 }
@@ -343,6 +479,25 @@ mod tests {
         assert!(matches!(
             duplicate_target,
             KnownStateError::DuplicateTarget { .. }
+        ));
+    }
+
+    #[test]
+    fn known_state_keeps_copy_effects_typed_and_enforces_cross_effect_target_uniqueness() {
+        let link = known("base/link", "store/link", "home/.config");
+        let copy = KnownFileCopy::new(
+            FullyQualifiedResourceId::parse("base/copy").unwrap(),
+            path("store/copy"),
+            path("home/.copyconfig"),
+            ContentFingerprint::parse(format!("sha256:{}", "a".repeat(64))).unwrap(),
+        )
+        .unwrap();
+        let state =
+            KnownState::new([KnownResource::from(link), KnownResource::from(copy)]).unwrap();
+        assert_eq!(state.variants().len(), 2);
+        assert!(matches!(
+            state.get_variant(&FullyQualifiedResourceId::parse("base/copy").unwrap()),
+            Some(KnownResource::FileCopy(_))
         ));
     }
 

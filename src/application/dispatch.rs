@@ -51,6 +51,13 @@ pub(super) fn preflight(
         ActionKind::Noop => executor
             .preflight_noop(action, source(resolved, action)?)
             .map_err(ApplyError::ReplacePreflight),
+        kind @ (ActionKind::CreateCopy
+        | ActionKind::ReplaceCopy
+        | ActionKind::RelocateCopy
+        | ActionKind::RemoveCopy
+        | ActionKind::ReplaceEffect) => Err(ApplyError::StalePreflight(
+            StaleLinkExecutionError::UnsupportedAction { kind },
+        )),
     }
 }
 
@@ -85,5 +92,12 @@ pub(super) fn execute(
             ApplyError::StalePreflight(StaleLinkExecutionError::ForgetMissing(error))
         }),
         ActionKind::Noop => unreachable!("report-only action cannot be recorded for execution"),
+        kind @ (ActionKind::CreateCopy
+        | ActionKind::ReplaceCopy
+        | ActionKind::RelocateCopy
+        | ActionKind::RemoveCopy
+        | ActionKind::ReplaceEffect) => Err(ApplyError::StalePreflight(
+            StaleLinkExecutionError::UnsupportedAction { kind },
+        )),
     }
 }

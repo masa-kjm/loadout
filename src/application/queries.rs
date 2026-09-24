@@ -8,9 +8,10 @@ use crate::domain::desired::{ResolvedDesired, ResolvedResource};
 use crate::domain::file_link::ResolvedFileLink;
 use crate::domain::ids::{FullyQualifiedResourceId, ProfileId};
 use crate::domain::known::KnownFileLink;
+use crate::domain::known::{KnownResource, KnownState};
 use crate::domain::plan::Plan;
 use crate::inspection::file_link::{FileLinkInspector, TargetInspectionError};
-use crate::planner::file_link::plan;
+use crate::planner::plan;
 use crate::resolver::{self, ResolvedApplyInput, ResolverContext, ResolverError};
 use crate::state::operation::OperationRecord;
 use crate::state::repository::{StateRepository, StateRepositoryError};
@@ -315,8 +316,9 @@ pub(crate) fn known_resources(
     repository: &StateRepository,
 ) -> Result<KnownResourcesReport, QueryError> {
     let state = repository.load().map_err(QueryError::State)?;
+    reject_unrenderable_known(state.known())?;
     Ok(KnownResourcesReport {
-        resources: state.known().resources().cloned().collect(),
+        resources: state.known().file_links().cloned().collect(),
     })
 }
 
@@ -336,6 +338,7 @@ fn status_with_inspector(
     ) -> Result<FileLinkInspector, TargetInspectionError>,
 ) -> Result<StatusReport, QueryError> {
     let state = repository.load().map_err(QueryError::State)?;
+    reject_unrenderable_known(state.known())?;
     let active_operation = state.active_operation().cloned();
     let desired = match resolve_desired(request) {
         Ok(desired) => desired,
@@ -369,7 +372,7 @@ fn status_with_inspector(
         .collect::<std::collections::BTreeMap<_, _>>();
     let mut known_by_id = state
         .known()
-        .resources()
+        .file_links()
         .cloned()
         .map(|resource| (resource.resource_id().clone(), resource))
         .collect::<std::collections::BTreeMap<_, _>>();
@@ -436,6 +439,19 @@ fn reject_unrenderable_effects(desired: &ResolvedDesired) -> Result<(), QueryErr
     Ok(())
 }
 
+fn reject_unrenderable_known(known: &KnownState) -> Result<(), QueryError> {
+    if let Some(KnownResource::FileCopy(resource)) = known
+        .variants()
+        .find(|resource| matches!(resource, KnownResource::FileCopy(_)))
+    {
+        return Err(QueryError::UnsupportedResourceEffect {
+            resource_id: resource.resource_id().clone(),
+            effect: "file_copy",
+        });
+    }
+    Ok(())
+}
+
 pub(crate) fn validate(request: &ValidationRequest) -> Result<ValidationReport, QueryError> {
     let environment = load_environment(&request.context)?;
     let roots = match &request.selection {
@@ -468,10 +484,11 @@ pub(crate) fn diff(
     repository: &StateRepository,
 ) -> Result<DiffReport, QueryError> {
     let state = repository.load().map_err(QueryError::State)?;
+    reject_unrenderable_known(state.known())?;
     let mut resources = Vec::new();
-    if state.known().resources().len() != 0 {
+    if state.known().file_links().next().is_some() {
         let inspector = FileLinkInspector::new(home.as_ref()).map_err(QueryError::Inspection)?;
-        for resource in state.known().resources() {
+        for resource in state.known().file_links() {
             let actual = inspector
                 .inspect_target_for_expected_link(resource.target_path(), resource.link_target())
                 .map_err(QueryError::Inspection)?;

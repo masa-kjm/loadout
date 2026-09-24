@@ -7,8 +7,7 @@ use crate::domain::actual::ActualFileLink;
 use crate::domain::desired::{ResolvedDesired, ResolvedResource};
 use crate::domain::file_link::ResolvedFileLink;
 use crate::domain::ids::{FullyQualifiedResourceId, ProfileId};
-use crate::domain::known::KnownFileLink;
-use crate::domain::known::{KnownResource, KnownState};
+use crate::domain::known::{KnownFileLink, KnownResource, KnownState};
 use crate::domain::plan::Plan;
 use crate::inspection::file_link::{FileLinkInspector, TargetInspectionError};
 use crate::planner::plan;
@@ -65,13 +64,13 @@ pub(crate) struct ProfileShowReport {
 #[derive(Debug)]
 pub(crate) struct DesiredResourcesReport {
     pub(crate) root_profile: ProfileId,
-    pub(crate) resources: Vec<ResolvedFileLink>,
+    pub(crate) resources: Vec<ResolvedResource>,
 }
 
 /// Validated historical resource records without target observation.
 #[derive(Debug)]
 pub(crate) struct KnownResourcesReport {
-    pub(crate) resources: Vec<KnownFileLink>,
+    pub(crate) resources: Vec<KnownResource>,
 }
 
 /// A status report that keeps Desired/Known association separate from Actual observation.
@@ -304,10 +303,9 @@ pub(crate) fn desired_resources(
     request: &DeclarationRequest,
 ) -> Result<DesiredResourcesReport, QueryError> {
     let desired = resolve_desired(request)?;
-    reject_unrenderable_effects(&desired)?;
     Ok(DesiredResourcesReport {
         root_profile: desired.root_profile().clone(),
-        resources: desired.resources().to_vec(),
+        resources: desired.variants().to_vec(),
     })
 }
 
@@ -316,9 +314,8 @@ pub(crate) fn known_resources(
     repository: &StateRepository,
 ) -> Result<KnownResourcesReport, QueryError> {
     let state = repository.load().map_err(QueryError::State)?;
-    reject_unrenderable_known(state.known())?;
     Ok(KnownResourcesReport {
-        resources: state.known().file_links().cloned().collect(),
+        resources: state.known().variants().cloned().collect(),
     })
 }
 
@@ -646,8 +643,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.resources.len(), 1);
+        let ResolvedResource::FileLink(resource) = &report.resources[0] else {
+            panic!("fixture resolves a file link");
+        };
         assert_eq!(
-            report.resources[0].source_path().as_ref(),
+            resource.source_path().as_ref(),
             workspace.root.join("store/source")
         );
     }
@@ -794,6 +794,9 @@ mod tests {
         .into_iter()
         .find(|resource| resource.resource_id().as_str() == "base/item")
         .unwrap();
+        let ResolvedResource::FileLink(desired_item) = desired_item else {
+            panic!("fixture resolves a file link");
+        };
         let mut resources = serde_json::Map::new();
         resources.insert(
             "base/item".to_owned(),
@@ -889,6 +892,9 @@ mod tests {
         .resources
         .pop()
         .unwrap();
+        let ResolvedResource::FileLink(desired) = desired else {
+            panic!("fixture resolves a file link");
+        };
         fs::write(
             workspace.root.join("state/state.json"),
             serde_json::json!({

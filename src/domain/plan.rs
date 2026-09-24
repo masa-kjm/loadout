@@ -846,11 +846,9 @@ impl Plan {
 
     /// Whether apply may execute this plan after preflight and confirmation.
     pub(crate) fn is_executable(&self) -> bool {
-        self.actions.len() == self.resource_actions.len()
-            && self
-                .diagnostics
-                .iter()
-                .all(|diagnostic| !diagnostic.is_blocking())
+        self.diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.is_blocking())
     }
 }
 
@@ -1106,7 +1104,7 @@ mod tests {
         let plan = Plan::new_with_resource_actions([copy_action.into()], []).unwrap();
 
         assert!(plan.actions().is_empty());
-        assert!(!plan.is_executable());
+        assert!(plan.is_executable());
         assert!(matches!(
             plan.resource_actions(),
             [PlannedResourceAction::FileCopy(action)] if action.kind() == ActionKind::CreateCopy

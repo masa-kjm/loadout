@@ -790,7 +790,7 @@ fn status_reports_active_operation_when_valid_state_precedes_an_invalid_declarat
 }
 
 #[test]
-fn copy_declarations_block_lifecycle_but_render_desired_resources_without_mutation() {
+fn copy_declarations_apply_before_read_only_rendering_is_enabled() {
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
@@ -799,38 +799,19 @@ fn copy_declarations_block_lifecycle_but_render_desired_resources_without_mutati
 
     expect(
         f.run(&["plan", "--config", "../portable/config.yaml"]),
-        2,
-        &[
-            "blocked",
-            "base/copied",
-            "file_copy planning is not implemented",
-        ],
+        0,
+        &["executable plan"],
     );
-    let before_apply = f.snapshot();
-    let apply = f
-        .command()
-        .args(["apply", "--yes", "--config", "../portable/config.yaml"])
-        .output()
-        .unwrap();
     expect(
-        apply,
-        2,
-        &[
-            "blocked",
-            "base/copied",
-            "file_copy planning is not implemented",
-        ],
+        f.command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        0,
+        &["apply completed: 1 committed actions"],
     );
-    assert!(!f.path("home/.copy-target").exists());
-    assert!(!f.path("state/loadout/state.json").exists());
-    let mut expected_after_apply = before_apply;
-    expected_after_apply.insert(f.path("state/loadout"), b"directory".to_vec());
-    expected_after_apply.insert(f.path("state/loadout/state.lock"), Vec::new());
-    assert_eq!(
-        f.snapshot(),
-        expected_after_apply,
-        "copy rejection may create only the ordinary state lock boundary"
-    );
+    assert_eq!(fs::read(f.path("home/.copy-target")).unwrap(), b"content\n");
+    assert!(f.path("state/loadout/state.json").exists());
     expect(
         f.run(&["resource", "list", "--config", "../portable/config.yaml"]),
         0,

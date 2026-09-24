@@ -3,11 +3,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::domain::actual::{ActualState, TargetObservation};
-use crate::domain::desired::{ResolvedDesired, ResolvedResource};
+use crate::domain::desired::ResolvedDesired;
 use crate::domain::diagnostic::Diagnostic;
 use crate::domain::file_link::ResolvedFileLink;
 use crate::domain::ids::FullyQualifiedResourceId;
-use crate::domain::known::{KnownFileLink, KnownResource, KnownState};
+use crate::domain::known::{KnownFileLink, KnownState};
 use crate::domain::paths::ResolvedPath;
 use crate::domain::plan::PlannedAction;
 use crate::planner::PlanContribution;
@@ -25,27 +25,7 @@ pub(super) fn contribute(
     crate::test_support::assert_desired_dependencies_allowed();
     let mut actions = Vec::new();
     let mut diagnostics = Vec::new();
-    let mut blocked_targets = desired_target_collisions(desired, &mut diagnostics);
-    for resource in desired.variants() {
-        if let ResolvedResource::FileCopy(resource) = resource {
-            blocked_targets.insert(resource.target_path().clone());
-            diagnostics.push(Diagnostic::UnsupportedResourceEffect {
-                resource_id: resource.resource_id().clone(),
-                target_path: resource.target_path().clone(),
-                effect: "file_copy",
-            });
-        }
-    }
-    for resource in known.variants() {
-        if let KnownResource::FileCopy(resource) = resource {
-            blocked_targets.insert(resource.target_path().clone());
-            diagnostics.push(Diagnostic::UnsupportedResourceEffect {
-                resource_id: resource.resource_id().clone(),
-                target_path: resource.target_path().clone(),
-                effect: "file_copy",
-            });
-        }
-    }
+    let blocked_targets = desired_target_collisions(desired, &mut diagnostics);
     let desired_ids = desired
         .variants()
         .iter()
@@ -854,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn known_copy_blocks_the_link_only_planner_without_an_executable_action() {
+    fn link_contribution_ignores_known_copy_effects() {
         let copy = KnownFileCopy::new(
             FullyQualifiedResourceId::parse("base/copy").unwrap(),
             path("store/copy"),
@@ -868,14 +848,8 @@ mod tests {
             &ActualState::default(),
         );
 
-        assert_blocked(plan.clone());
+        assert!(plan.is_executable());
         assert!(plan.actions().is_empty());
-        assert!(matches!(
-            plan.diagnostics()[0],
-            Diagnostic::UnsupportedResourceEffect {
-                effect: "file_copy",
-                ..
-            }
-        ));
+        assert!(plan.diagnostics().is_empty());
     }
 }

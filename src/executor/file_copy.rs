@@ -1,11 +1,17 @@
 //! Immediate safety rechecks and execution for planned file-copy creation.
 
 use std::fmt;
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
 
-use crate::domain::actual::CopyTargetObservation;
-use crate::domain::plan::{ActionKind, PlannedEffectHandoff, PlannedFileCopyAction};
+use sha2::{Digest, Sha256};
+
+use crate::domain::actual::{CopyTargetObservation, TargetObservation};
+use crate::domain::desired::ResolvedResource;
+use crate::domain::file_copy::ContentFingerprint;
+use crate::domain::plan::{
+    ActionKind, PlannedEffectHandoff, PlannedFileCopyAction, PlannedResourceAction, TargetCondition,
+};
 use crate::filesystem::ExecutionTarget;
 use crate::inspection::file_link::{FileLinkInspector, TargetInspectionError};
 use crate::inspection::source::{SourceVerificationError, VerifiedSource};
@@ -23,6 +29,166 @@ impl FileCopyExecutor {
         Ok(Self {
             inspector: FileLinkInspector::new(home_directory)?,
         })
+    }
+
+    /// Performs the non-mutating source, target, and platform checks required before recording a copy action.
+    pub(crate) fn preflight(
+        &self,
+        action: &PlannedResourceAction,
+        source: Option<&VerifiedSource>,
+    ) -> Result<(), CopyPreflightError> {
+        let expected_source = match action {
+            PlannedResourceAction::FileCopy(action) => action.desired().map(|desired| {
+                (
+                    desired.source_path(),
+                    Some(desired.source_content_fingerprint()),
+                )
+            }),
+            PlannedResourceAction::ReplaceEffect(action) => match action.final_effect() {
+                ResolvedResource::FileCopy(desired) => Some((
+                    desired.source_path(),
+                    Some(desired.source_content_fingerprint()),
+                )),
+                ResolvedResource::FileLink(desired) => Some((desired.source_path(), None)),
+            },
+            PlannedResourceAction::FileLink(_) => return Err(CopyPreflightError::WrongAction),
+        };
+        if let Some((expected_path, expected_fingerprint)) = expected_source {
+            let source = source.ok_or(CopyPreflightError::MissingVerifiedSource)?;
+            let reverified = source
+                .reverify()
+                .map_err(CopyPreflightError::SourceRecheck)?;
+            if reverified.path() != expected_path {
+                return Err(CopyPreflightError::SourceDoesNotMatchAction);
+            }
+            if let Some(expected_fingerprint) = expected_fingerprint {
+                if fingerprint_regular_file(reverified.path())? != *expected_fingerprint {
+                    return Err(CopyPreflightError::SourceFingerprintChanged);
+                }
+            }
+        }
+        for condition in action.preconditions() {
+            self.preflight_condition(&condition)?;
+        }
+        self.ensure_platform_capability(action)
+    }
+
+    fn preflight_condition(&self, condition: &TargetCondition) -> Result<(), CopyPreflightError> {
+        match condition {
+            TargetCondition::Missing { target_path } => {
+                let observation = self
+                    .inspector
+                    .inspect_target_for_expected_copy(
+                        target_path,
+                        &ContentFingerprint::parse(format!("sha256:{}", "0".repeat(64)))
+                            .expect("fixed fingerprint is canonical"),
+                    )
+                    .map_err(CopyPreflightError::TargetInspection)?;
+                if matches!(observation.observation(), CopyTargetObservation::Missing) {
+                    Ok(())
+                } else {
+                    Err(CopyPreflightError::PreconditionNoLongerHolds)
+                }
+            }
+            TargetCondition::ExpectedCopy {
+                target_path,
+                content_fingerprint,
+            } => {
+                let observation = self
+                    .inspector
+                    .inspect_target_for_expected_copy(target_path, content_fingerprint)
+                    .map_err(CopyPreflightError::TargetInspection)?;
+                if matches!(
+                    observation.observation(),
+                    CopyTargetObservation::ExpectedCopy { .. }
+                ) {
+                    Ok(())
+                } else {
+                    Err(CopyPreflightError::PreconditionNoLongerHolds)
+                }
+            }
+            TargetCondition::ExpectedLink {
+                target_path,
+                link_target,
+            } => {
+                let observation = self
+                    .inspector
+                    .inspect_target_for_expected_link(target_path, link_target)
+                    .map_err(CopyPreflightError::TargetInspection)?;
+                if matches!(
+                    observation.observation(),
+                    TargetObservation::ExpectedLink { .. }
+                ) {
+                    Ok(())
+                } else {
+                    Err(CopyPreflightError::PreconditionNoLongerHolds)
+                }
+            }
+        }
+    }
+
+    fn ensure_platform_capability(
+        &self,
+        action: &PlannedResourceAction,
+    ) -> Result<(), CopyPreflightError> {
+        match action {
+            PlannedResourceAction::FileCopy(action)
+                if matches!(action.kind(), ActionKind::Noop | ActionKind::ForgetMissing) =>
+            {
+                Ok(())
+            }
+            PlannedResourceAction::FileCopy(_) => self.ensure_copy_mutation_capability(action),
+            PlannedResourceAction::ReplaceEffect(handoff) => match handoff.final_effect() {
+                ResolvedResource::FileCopy(_) => self.ensure_copy_mutation_capability(action),
+                ResolvedResource::FileLink(_) => self.ensure_link_mutation_capability(action),
+            },
+            PlannedResourceAction::FileLink(_) => Err(CopyPreflightError::WrongAction),
+        }
+    }
+
+    fn ensure_copy_mutation_capability(
+        &self,
+        action: &PlannedResourceAction,
+    ) -> Result<(), CopyPreflightError> {
+        self.ensure_mutation_capability(action)
+    }
+
+    fn ensure_link_mutation_capability(
+        &self,
+        action: &PlannedResourceAction,
+    ) -> Result<(), CopyPreflightError> {
+        self.ensure_mutation_capability(action)
+    }
+
+    fn ensure_mutation_capability(
+        &self,
+        action: &PlannedResourceAction,
+    ) -> Result<(), CopyPreflightError> {
+        #[cfg(target_os = "linux")]
+        {
+            const EXT_SUPER_MAGIC: i64 = 0xEF53;
+            let supported_filesystems = action.touched_targets().into_iter().all(|target| {
+                target.as_ref().parent().is_some_and(|parent| {
+                    rustix::fs::statfs(parent)
+                        .is_ok_and(|filesystem| filesystem.f_type == EXT_SUPER_MAGIC)
+                })
+            });
+            // An empty old name cannot name an entry, so a NotFound result proves that the
+            // kernel accepted renameat2 and RENAME_NOREPLACE without mutating a target.
+            let rename_no_replace_supported = rustix::fs::renameat_with(
+                rustix::fs::CWD,
+                "",
+                rustix::fs::CWD,
+                "",
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .is_err_and(|error| io::Error::from(error).kind() == io::ErrorKind::NotFound);
+            if supported_filesystems && rename_no_replace_supported {
+                return Ok(());
+            }
+        }
+        let _ = action;
+        Err(CopyPreflightError::UnsupportedPlatformCapability)
     }
 
     /// Materializes one planned and recorded copy only after every immediate recheck succeeds.
@@ -746,6 +912,75 @@ impl fmt::Display for CopyTemporaryCleanupError {
 
 impl std::error::Error for CopyTemporaryCleanupError {}
 
+fn fingerprint_regular_file(
+    path: &crate::domain::paths::ResolvedPath,
+) -> Result<ContentFingerprint, CopyPreflightError> {
+    let mut file =
+        std::fs::File::open(path.as_ref()).map_err(CopyPreflightError::SourceFingerprint)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(CopyPreflightError::SourceFingerprint)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    ContentFingerprint::parse(format!("sha256:{:x}", hasher.finalize()))
+        .map_err(|_| CopyPreflightError::SourceFingerprintFormat)
+}
+
+/// The reason a copy action cannot pass the pre-operation safety gate.
+#[derive(Debug)]
+pub(crate) enum CopyPreflightError {
+    WrongAction,
+    MissingVerifiedSource,
+    SourceRecheck(SourceVerificationError),
+    SourceDoesNotMatchAction,
+    SourceFingerprint(io::Error),
+    SourceFingerprintFormat,
+    SourceFingerprintChanged,
+    TargetInspection(TargetInspectionError),
+    PreconditionNoLongerHolds,
+    UnsupportedPlatformCapability,
+}
+
+impl fmt::Display for CopyPreflightError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongAction => {
+                formatter.write_str("file-copy preflight requires a copy or effect-handoff action")
+            }
+            Self::MissingVerifiedSource => {
+                formatter.write_str("copy action is missing its verified source")
+            }
+            Self::SourceRecheck(error) => error.fmt(formatter),
+            Self::SourceDoesNotMatchAction => {
+                formatter.write_str("rechecked source does not match the planned copy action")
+            }
+            Self::SourceFingerprint(error) => write!(
+                formatter,
+                "cannot fingerprint rechecked copy source: {error}"
+            ),
+            Self::SourceFingerprintFormat => {
+                formatter.write_str("rechecked copy source fingerprint is invalid")
+            }
+            Self::SourceFingerprintChanged => formatter
+                .write_str("rechecked copy source bytes differ from the planned fingerprint"),
+            Self::TargetInspection(error) => error.fmt(formatter),
+            Self::PreconditionNoLongerHolds => {
+                formatter.write_str("copy target precondition no longer holds")
+            }
+            Self::UnsupportedPlatformCapability => formatter
+                .write_str("file-copy publication capability is unsupported on this platform"),
+        }
+    }
+}
+
+impl std::error::Error for CopyPreflightError {}
+
 /// The reason a selected `create_copy` action could not be proven successful.
 #[derive(Debug)]
 pub(crate) enum CreateCopyExecutionError {
@@ -1157,13 +1392,60 @@ mod tests {
         })
         .unwrap();
 
-        FileCopyExecutor::new(&root.join("home"))
-            .unwrap()
+        let executor = FileCopyExecutor::new(&root.join("home")).unwrap();
+        executor
+            .preflight(
+                &PlannedResourceAction::FileCopy(action.clone()),
+                Some(&source),
+            )
+            .unwrap();
+        executor
             .execute_create(&action, &recorded, &source)
             .unwrap();
 
         assert_eq!(fs::read(&target).unwrap(), b"copy source bytes\n");
         assert!(fs::symlink_metadata(&temporary).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preflight_rejects_changed_copy_source_without_creating_the_target() {
+        let root = std::env::temp_dir().join(format!(
+            "loadout-copy-preflight-source-change-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("home")).unwrap();
+        fs::create_dir(root.join("store")).unwrap();
+        fs::write(root.join("store/config"), b"planned bytes\n").unwrap();
+        let source_root = resolve_store_root(&root.join("store")).unwrap();
+        let source =
+            verify_regular_source(&source_root, &SourceRelativePath::parse("config").unwrap())
+                .unwrap();
+        let target = ResolvedPath::new(root.join("home/.config")).unwrap();
+        let desired = ResolvedFileCopy::new(
+            FullyQualifiedResourceId::parse("base/config").unwrap(),
+            source.path().clone(),
+            target.clone(),
+            fingerprint(b"planned bytes\n"),
+        )
+        .unwrap();
+        fs::write(root.join("store/config"), b"changed bytes\n").unwrap();
+
+        let executor = FileCopyExecutor::new(&root.join("home")).unwrap();
+        let error = executor
+            .preflight(
+                &PlannedResourceAction::FileCopy(PlannedFileCopyAction::Create { desired }),
+                Some(&source),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CopyPreflightError::SourceFingerprintChanged
+        ));
+        assert!(fs::symlink_metadata(&target).is_err());
         let _ = fs::remove_dir_all(root);
     }
 

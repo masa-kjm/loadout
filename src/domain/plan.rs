@@ -225,6 +225,42 @@ pub(crate) enum KnownStateUpdate {
     },
 }
 
+/// The closed Known-state transition selected for any resource action.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ResourceKnownStateUpdate {
+    Upsert {
+        resource: KnownResource,
+    },
+    Remove {
+        resource_id: FullyQualifiedResourceId,
+    },
+    ReplaceIdentity {
+        old_resource_id: FullyQualifiedResourceId,
+        new_resource: KnownResource,
+    },
+}
+
+impl From<KnownStateUpdate> for ResourceKnownStateUpdate {
+    fn from(update: KnownStateUpdate) -> Self {
+        match update {
+            KnownStateUpdate::Upsert { resource } => Self::Upsert {
+                resource: resource.into(),
+            },
+            KnownStateUpdate::UpsertCopy { resource } => Self::Upsert {
+                resource: resource.into(),
+            },
+            KnownStateUpdate::Remove { resource_id } => Self::Remove { resource_id },
+            KnownStateUpdate::ReplaceIdentity {
+                old_resource_id,
+                new_resource,
+            } => Self::ReplaceIdentity {
+                old_resource_id,
+                new_resource: new_resource.into(),
+            },
+        }
+    }
+}
+
 /// One complete action; its payload is private so every crate caller must use a validated constructor.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PlannedAction {
@@ -276,6 +312,23 @@ impl PlannedEffectHandoff {
     pub(crate) fn touched_targets(&self) -> Vec<&ResolvedPath> {
         vec![self.final_effect.target_path()]
     }
+
+    /// Returns the exact old managed effect required before the handoff can start.
+    pub(crate) fn preconditions(&self) -> Vec<TargetCondition> {
+        vec![condition_for_known_effect(&self.old_effect)]
+    }
+
+    /// Returns the exact final effect that must be verified before Known state changes.
+    pub(crate) fn postconditions(&self) -> Vec<TargetCondition> {
+        vec![condition_for_resolved_effect(&self.final_effect)]
+    }
+
+    /// Returns the final effect that replaces the old Known fact after verification.
+    pub(crate) fn known_state_update(&self) -> ResourceKnownStateUpdate {
+        ResourceKnownStateUpdate::Upsert {
+            resource: known_from_resolved_effect(&self.final_effect),
+        }
+    }
 }
 
 impl PlannedResourceAction {
@@ -300,6 +353,41 @@ impl PlannedResourceAction {
             Self::FileLink(action) => action.touched_targets(),
             Self::FileCopy(action) => action.touched_targets(),
             Self::ReplaceEffect(action) => action.touched_targets(),
+        }
+    }
+
+    /// Returns the exact predicates the common coordinator must recheck before execution.
+    pub(crate) fn preconditions(&self) -> Vec<TargetCondition> {
+        match self {
+            Self::FileLink(action) => action.preconditions(),
+            Self::FileCopy(action) => action.preconditions(),
+            Self::ReplaceEffect(action) => action.preconditions(),
+        }
+    }
+
+    /// Returns the exact predicates required before the common coordinator commits Known state.
+    pub(crate) fn postconditions(&self) -> Vec<TargetCondition> {
+        match self {
+            Self::FileLink(action) => action.postconditions(),
+            Self::FileCopy(action) => action.postconditions(),
+            Self::ReplaceEffect(action) => action.postconditions(),
+        }
+    }
+
+    /// Returns the complete Known-state transition eligible after postcondition verification.
+    pub(crate) fn known_state_update(&self) -> Option<ResourceKnownStateUpdate> {
+        match self {
+            Self::FileLink(action) => action.known_state_update().map(Into::into),
+            Self::FileCopy(action) => action.known_state_update().map(Into::into),
+            Self::ReplaceEffect(action) => Some(action.known_state_update()),
+        }
+    }
+
+    /// Returns the stale identity replaced by a same-effect ownership handoff, if any.
+    pub(crate) fn replaced_resource_id(&self) -> Option<&FullyQualifiedResourceId> {
+        match self {
+            Self::FileLink(action) => action.replaced_resource_id(),
+            Self::FileCopy(_) | Self::ReplaceEffect(_) => None,
         }
     }
 }
@@ -591,6 +679,27 @@ fn expected_desired_copy(desired: &ResolvedFileCopy) -> TargetCondition {
     TargetCondition::ExpectedCopy {
         target_path: desired.target_path().clone(),
         content_fingerprint: desired.source_content_fingerprint().clone(),
+    }
+}
+
+fn condition_for_known_effect(effect: &KnownResource) -> TargetCondition {
+    match effect {
+        KnownResource::FileLink(resource) => expected(resource),
+        KnownResource::FileCopy(resource) => expected_copy(resource),
+    }
+}
+
+fn condition_for_resolved_effect(effect: &ResolvedResource) -> TargetCondition {
+    match effect {
+        ResolvedResource::FileLink(resource) => expected_desired(resource),
+        ResolvedResource::FileCopy(resource) => expected_desired_copy(resource),
+    }
+}
+
+fn known_from_resolved_effect(effect: &ResolvedResource) -> KnownResource {
+    match effect {
+        ResolvedResource::FileLink(resource) => KnownFileLink::from_resolved(resource).into(),
+        ResolvedResource::FileCopy(resource) => KnownFileCopy::from_resolved(resource).into(),
     }
 }
 
@@ -899,6 +1008,37 @@ mod tests {
                 .as_slice(),
             [TargetCondition::Missing { .. }]
         ));
+    }
+
+    #[test]
+    fn resource_action_exposes_handoff_predicates_and_final_known_effect() {
+        let old =
+            KnownFileCopy::from_resolved(&copy("base/git", "store/git/config", "home/.gitconfig"));
+        let final_link = desired("base/git", "store/git/next-config", "home/.gitconfig");
+        let action = PlannedResourceAction::from(
+            PlannedEffectHandoff::new(old.clone().into(), final_link.clone().into()).unwrap(),
+        );
+
+        assert_eq!(
+            action.preconditions(),
+            [TargetCondition::ExpectedCopy {
+                target_path: old.target_path().clone(),
+                content_fingerprint: old.content_fingerprint().clone(),
+            }]
+        );
+        assert_eq!(
+            action.postconditions(),
+            [TargetCondition::ExpectedLink {
+                target_path: final_link.target_path().clone(),
+                link_target: final_link.link_target().clone(),
+            }]
+        );
+        assert_eq!(
+            action.known_state_update(),
+            Some(ResourceKnownStateUpdate::Upsert {
+                resource: KnownFileLink::from_resolved(&final_link).into(),
+            })
+        );
     }
 
     #[test]

@@ -7,10 +7,15 @@ use crate::domain::desired::{ResolvedDesired, ResolvedResource};
 use crate::domain::diagnostic::Diagnostic;
 use crate::domain::file_copy::ResolvedFileCopy;
 use crate::domain::known::{KnownFileCopy, KnownResource, KnownState};
-use crate::domain::plan::{Plan, PlannedEffectHandoff, PlannedFileCopyAction};
+use crate::domain::plan::{PlannedEffectHandoff, PlannedFileCopyAction};
+use crate::planner::PlanContribution;
 
-/// Plans only copy effects from typed Desired, Known, and Actual inputs without filesystem access.
-pub(crate) fn plan(desired: &ResolvedDesired, known: &KnownState, actual: &ActualState) -> Plan {
+/// Produces the copy actions and diagnostics that contribute to the aggregate Plan.
+pub(super) fn contribute(
+    desired: &ResolvedDesired,
+    known: &KnownState,
+    actual: &ActualState,
+) -> PlanContribution {
     let mut actions = Vec::new();
     let mut diagnostics = Vec::new();
     for resource in desired.variants() {
@@ -174,8 +179,21 @@ pub(crate) fn plan(desired: &ResolvedDesired, known: &KnownState, actual: &Actua
             observation => conflict_known(previous, observation, &mut diagnostics),
         }
     }
-    Plan::new_with_resource_actions(actions, diagnostics)
-        .expect("copy planner emits no duplicate target actions")
+    PlanContribution::new(actions, diagnostics)
+}
+
+#[cfg(test)]
+fn plan(
+    desired: &ResolvedDesired,
+    known: &KnownState,
+    actual: &ActualState,
+) -> crate::domain::plan::Plan {
+    let contribution = contribute(desired, known, actual);
+    crate::domain::plan::Plan::new_with_resource_actions(
+        contribution.resource_actions,
+        contribution.diagnostics,
+    )
+    .expect("copy planner must not emit competing target actions")
 }
 
 fn copy_observation(

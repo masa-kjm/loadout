@@ -11,7 +11,7 @@ use crate::domain::paths::ResolvedPath;
 use crate::domain::plan::{
     ActionKind, Plan, PlannedAction, PlannedResourceAction, TargetCondition,
 };
-use crate::executor::file_copy::FileCopyExecutor;
+use crate::executor::file_copy::{CopyPreflightError, FileCopyExecutor};
 use crate::executor::file_link::{
     CreateLinkExecutionError, FileLinkExecutor, ForgetMissingExecutionError,
     RelocateLinkExecutionError, RemoveLinkExecutionError, ReplaceLinkExecutionError,
@@ -133,13 +133,16 @@ fn apply_request_with_hooks(
         stage = ApplyStage::Preflight;
         let executor = FileLinkExecutor::new(request.context.home_directory().as_ref())
             .map_err(|error| lifecycle(ApplyError::InitialInspection(error)))?;
-        for action in fresh_plan.actions() {
+        let copy_executor = FileCopyExecutor::new(request.context.home_directory().as_ref())
+            .map_err(|error| lifecycle(ApplyError::InitialInspection(error)))?;
+        for action in fresh_plan.resource_actions() {
             affected_action = Some(ApplyAction {
                 action_id: None,
                 resource_id: action.resource_id().clone(),
                 kind: action.kind(),
             });
-            super::dispatch::preflight(&executor, action, &resolved).map_err(lifecycle)?;
+            super::dispatch::preflight(&executor, &copy_executor, action, &resolved)
+                .map_err(lifecycle)?;
         }
         affected_action = None;
         locked
@@ -151,31 +154,28 @@ fn apply_request_with_hooks(
             return Ok(ApplyReport::Declined { plan: fresh_plan });
         }
         // Noop is a report, without an executor phase or a Known transition.
-        let actions = fresh_plan
-            .actions()
+        let resource_actions = fresh_plan
+            .resource_actions()
             .iter()
             .filter(|action| action.kind() != ActionKind::Noop)
             .cloned()
             .collect::<Vec<_>>();
-        if !actions.is_empty() {
+        if !resource_actions.is_empty() {
             stage = ApplyStage::OperationCreation;
-            let resource_actions = actions
-                .iter()
-                .cloned()
-                .map(PlannedResourceAction::from)
-                .collect::<Vec<_>>();
             let ids = locked
                 .begin_resource_actions(hash, &resource_actions)
                 .map_err(state_error)?;
             stage = ApplyStage::Execution;
-            execute_actions(
+            execute_resource_actions(
                 locked,
-                &actions,
+                &resource_actions,
                 &ids,
                 &mut committed,
                 &mut affected_action,
                 after_running,
-                |action, recorded| super::dispatch::execute(&executor, action, recorded, &resolved),
+                |action, recorded| {
+                    super::dispatch::execute(&executor, &copy_executor, action, recorded, &resolved)
+                },
             )
             .map_err(lifecycle)?;
             stage = ApplyStage::Closure;
@@ -216,14 +216,17 @@ pub(crate) fn dry_run(
     super::queries::plan_request(request)
 }
 
-fn execute_actions(
+fn execute_resource_actions(
     locked: &mut LockedStateRepository,
-    actions: &[PlannedAction],
+    actions: &[PlannedResourceAction],
     ids: &[crate::state::operation::ActionId],
     committed: &mut Vec<FullyQualifiedResourceId>,
     affected_action: &mut Option<ApplyAction>,
     mut after_running: impl FnMut(usize, &mut LockedStateRepository),
-    mut execute: impl FnMut(&PlannedAction, &RecordedAction) -> Result<(), ApplyError>,
+    mut execute: impl FnMut(
+        &PlannedResourceAction,
+        &RecordedAction,
+    ) -> Result<(), super::dispatch::ResourceExecutionError>,
 ) -> Result<(), ApplyError> {
     for (index, (action, id)) in actions.iter().zip(ids).enumerate() {
         *affected_action = Some(ApplyAction {
@@ -242,11 +245,7 @@ fn execute_actions(
         let execution = execute(action, &recorded);
         let classification = match &execution {
             Ok(()) => ExecutionClassification::Succeeded,
-            Err(ApplyError::Preflight(error)) => classify_execution_error(error),
-            Err(ApplyError::ReplacePreflight(error)) => classify_replace_execution_error(error),
-            Err(ApplyError::RelocatePreflight(error)) => classify_relocate_execution_error(error),
-            Err(ApplyError::StalePreflight(error)) => classify_stale_execution_error(error),
-            Err(_) => ExecutionClassification::Uncertain,
+            Err(error) => classify_resource_execution_error(error),
         };
         match classification {
             ExecutionClassification::Succeeded => {
@@ -280,7 +279,7 @@ fn execute_actions(
                         .close_finished_operation()
                         .map_err(ApplyError::State)?;
                 }
-                return execution;
+                return execution.map_err(ApplyError::ResourceExecution);
             }
         }
     }
@@ -903,6 +902,38 @@ fn classify_execution<E>(
     }
 }
 
+fn classify_resource_execution_error(
+    error: &super::dispatch::ResourceExecutionError,
+) -> ExecutionClassification {
+    match error {
+        super::dispatch::ResourceExecutionError::CreateLink(error) => {
+            classify_execution_error(error)
+        }
+        super::dispatch::ResourceExecutionError::ReplaceLink(error) => {
+            classify_replace_execution_error(error)
+        }
+        super::dispatch::ResourceExecutionError::RelocateLink(error) => {
+            classify_relocate_execution_error(error)
+        }
+        super::dispatch::ResourceExecutionError::StaleLink(error) => {
+            classify_stale_execution_error(error)
+        }
+        // Copy executors return an error after a mutation only when its aftermath cannot yet be
+        // proven from the recorded predicates. Keep the operation open for recovery rather than
+        // inferring a Known transition from an operating-system result.
+        super::dispatch::ResourceExecutionError::CreateCopy(_)
+        | super::dispatch::ResourceExecutionError::ReplaceCopy(_)
+        | super::dispatch::ResourceExecutionError::RelocateCopy(_)
+        | super::dispatch::ResourceExecutionError::RemoveCopy(_)
+        | super::dispatch::ResourceExecutionError::CopyStateOnly(_)
+        | super::dispatch::ResourceExecutionError::LinkToCopyHandoff(_)
+        | super::dispatch::ResourceExecutionError::CopyToLinkHandoff(_)
+        | super::dispatch::ResourceExecutionError::InvalidEffectHandoff => {
+            ExecutionClassification::Uncertain
+        }
+    }
+}
+
 fn classify_stale_execution_error(error: &StaleLinkExecutionError) -> ExecutionClassification {
     match error {
         StaleLinkExecutionError::Remove(error) => classify_remove_execution_error(error),
@@ -1186,6 +1217,8 @@ pub(crate) enum ApplyError {
         action_kinds: Vec<ActionKind>,
     },
     Preflight(CreateLinkExecutionError),
+    CopyPreflight(CopyPreflightError),
+    ResourceExecution(super::dispatch::ResourceExecutionError),
     SliceSixRequiresSingleReplaceAction {
         action_kinds: Vec<ActionKind>,
     },
@@ -1224,6 +1257,8 @@ impl fmt::Display for ApplyError {
                 "Slice 4 apply supports exactly one create_link action, not {action_kinds:?}"
             ),
             Self::Preflight(error) => error.fmt(formatter),
+            Self::CopyPreflight(error) => error.fmt(formatter),
+            Self::ResourceExecution(error) => error.fmt(formatter),
             Self::SliceSixRequiresSingleReplaceAction { action_kinds } => write!(
                 formatter,
                 "Slice 6 apply supports exactly one replace_link action, not {action_kinds:?}"
@@ -1255,6 +1290,8 @@ impl std::error::Error for ApplyError {
             Self::StatePreflight(error) => Some(error),
             Self::InitialInspection(error) => Some(error),
             Self::Preflight(error) => Some(error),
+            Self::CopyPreflight(error) => Some(error),
+            Self::ResourceExecution(error) => Some(error),
             Self::ReplacePreflight(error) => Some(error),
             Self::RelocatePreflight(error) => Some(error),
             Self::StalePreflight(error) => Some(error),
@@ -2557,21 +2594,24 @@ mod tests {
             .unwrap();
         let plan = plan(resolved.desired(), locked.state().known(), &actual);
         assert_eq!(
-            plan.actions()
+            plan.resource_actions()
                 .iter()
-                .map(PlannedAction::kind)
+                .map(PlannedResourceAction::kind)
                 .collect::<Vec<_>>(),
             [ActionKind::RelocateLink, ActionKind::ForgetMissing]
         );
         let ids = locked
-            .begin_actions(desired_hash(resolved.desired()).unwrap(), plan.actions())
+            .begin_resource_actions(
+                desired_hash(resolved.desired()).unwrap(),
+                plan.resource_actions(),
+            )
             .unwrap();
         let mut committed = Vec::new();
         // Controlled executor substitute proves coordinator sequencing; it makes
         // no claim about a supported expected-entry deletion platform primitive.
-        execute_actions(
+        execute_resource_actions(
             &mut locked,
-            plan.actions(),
+            plan.resource_actions(),
             &ids,
             &mut committed,
             &mut None,
@@ -2625,7 +2665,10 @@ mod tests {
                         );
                         FileLinkExecutor::new(workspace.path("home").as_path())
                             .unwrap()
-                            .execute_forget_missing(action)
+                            .execute_forget_missing(match action {
+                                PlannedResourceAction::FileLink(action) => action,
+                                _ => panic!("unexpected non-link action"),
+                            })
                             .unwrap();
                     }
                     _ => panic!("unexpected action"),

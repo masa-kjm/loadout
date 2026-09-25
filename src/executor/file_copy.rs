@@ -817,7 +817,7 @@ impl FileCopyExecutor {
         }
     }
 
-    /// Removes only an exact recorded handoff or copy temporary after proving its final effect.
+    /// Removes only an exact recorded temporary after recovery has proven the old effect.
     #[allow(dead_code)] // M3-C wires this cleanup into operation recovery.
     pub(crate) fn cleanup_recorded_temporary(
         &self,
@@ -861,6 +861,18 @@ impl FileCopyExecutor {
                 context
                     .remove_expected_copy(copy.content_fingerprint())
                     .map_err(CopyTemporaryCleanupError::Filesystem)?;
+                if !matches!(
+                    self.inspector
+                        .inspect_target_for_expected_copy(
+                            temporary_path,
+                            copy.content_fingerprint()
+                        )
+                        .map_err(CopyTemporaryCleanupError::Inspection)?
+                        .observation(),
+                    CopyTargetObservation::Missing
+                ) {
+                    return Err(CopyTemporaryCleanupError::CleanupNotProven);
+                }
             }
             crate::domain::known::KnownResource::FileLink(link) => {
                 let observation = self
@@ -883,6 +895,15 @@ impl FileCopyExecutor {
                     .prepare_remove(link.link_target())
                     .and_then(|checked| checked.attempt())
                     .map_err(CopyTemporaryCleanupError::Filesystem)?;
+                if !matches!(
+                    self.inspector
+                        .inspect_target_for_expected_link(temporary_path, link.link_target())
+                        .map_err(CopyTemporaryCleanupError::Inspection)?
+                        .observation(),
+                    crate::domain::actual::TargetObservation::Missing
+                ) {
+                    return Err(CopyTemporaryCleanupError::CleanupNotProven);
+                }
             }
         }
         Ok(())
@@ -894,6 +915,7 @@ pub(crate) enum CopyTemporaryCleanupError {
     NoTemporary,
     Inspection(TargetInspectionError),
     Filesystem(io::Error),
+    CleanupNotProven,
     UnexpectedTemporary,
 }
 
@@ -903,6 +925,9 @@ impl fmt::Display for CopyTemporaryCleanupError {
             Self::NoTemporary => formatter.write_str("action has no recorded temporary"),
             Self::Inspection(error) => error.fmt(formatter),
             Self::Filesystem(error) => write!(formatter, "temporary cleanup failed: {error}"),
+            Self::CleanupNotProven => {
+                formatter.write_str("recorded temporary cleanup postcondition was not met")
+            }
             Self::UnexpectedTemporary => {
                 formatter.write_str("recorded temporary is not the expected owned effect")
             }

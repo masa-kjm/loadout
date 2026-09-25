@@ -69,6 +69,18 @@ impl PlannedFileCopyAction {
         }
     }
 
+    /// Returns the transition-table reason attached to this copy action.
+    pub(crate) fn reason(&self) -> ActionReason {
+        match self {
+            Self::Create { .. } => ActionReason::TargetMissing,
+            Self::Replace { .. } => ActionReason::SourceChanged,
+            Self::Relocate { .. } => ActionReason::TargetChanged,
+            Self::Remove { .. } => ActionReason::StaleResource,
+            Self::ForgetMissing { .. } => ActionReason::StaleResourceTargetMissing,
+            Self::Noop { .. } => ActionReason::AlreadySatisfied,
+        }
+    }
+
     /// Returns the stable resource identity that participates in deterministic ordering.
     pub(crate) fn resource_id(&self) -> &FullyQualifiedResourceId {
         match self {
@@ -301,6 +313,10 @@ impl PlannedEffectHandoff {
     pub(crate) fn resource_id(&self) -> &FullyQualifiedResourceId {
         self.final_effect.resource_id()
     }
+    /// Returns the transition-table reason attached to this effect handoff.
+    pub(crate) fn reason(&self) -> ActionReason {
+        ActionReason::ManagedIdentityHandoff
+    }
     /// Returns the complete old owned effect required by the executor precondition.
     pub(crate) fn old_effect(&self) -> &KnownResource {
         &self.old_effect
@@ -345,6 +361,15 @@ impl PlannedResourceAction {
             Self::FileLink(action) => action.resource_id(),
             Self::FileCopy(action) => action.resource_id(),
             Self::ReplaceEffect(action) => action.resource_id(),
+        }
+    }
+
+    /// Returns the transition-table reason attached to this selected action.
+    pub(crate) fn reason(&self) -> ActionReason {
+        match self {
+            Self::FileLink(action) => action.reason(),
+            Self::FileCopy(action) => action.reason(),
+            Self::ReplaceEffect(action) => action.reason(),
         }
     }
 

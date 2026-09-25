@@ -359,7 +359,7 @@ pub(super) fn plan(
 }
 
 pub(super) fn planned(out: &mut impl Write, err: &mut impl Write, plan: &Plan) -> io::Result<u8> {
-    for action in plan.actions() {
+    for action in plan.resource_actions() {
         let paths = action
             .preconditions()
             .iter()

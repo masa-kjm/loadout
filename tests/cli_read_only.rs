@@ -73,12 +73,15 @@ impl Fixture {
         self.write(&format!("portable/profiles/{id}.yaml"), &format!("schema_version: 2\nid: {id}\nresources:\n  {resource}:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: {target}\n"));
     }
     fn command(&self) -> Command {
+        self.command_with_home(&self.path("home"))
+    }
+    fn command_with_home(&self, home: &Path) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_loadout"));
         command.current_dir(self.path("cwd"));
         // Keep platform process-launch essentials while overriding every application location.
         command
-            .env("HOME", self.path("home"))
-            .env("USERPROFILE", self.path("home"))
+            .env("HOME", home)
+            .env("USERPROFILE", home)
             .env("XDG_CONFIG_HOME", self.path("config"))
             .env("XDG_STATE_HOME", self.path("state"))
             .env("APPDATA", self.path("config"))
@@ -131,6 +134,31 @@ impl Fixture {
         json!({"definition_hash":format!("sha256:{digest:x}"),"effect":{"kind":"file_link","source_path":source,"target_path":target,"link_target":source}})
     }
 }
+#[cfg(target_os = "linux")]
+struct DisposableDirectory {
+    path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl DisposableDirectory {
+    fn new(parent: &Path, label: &str) -> Self {
+        let path = parent.join(format!(
+            "loadout-cli-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        Self { path }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for DisposableDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
@@ -787,6 +815,219 @@ fn status_reports_active_operation_when_valid_state_precedes_an_invalid_declarat
             "pending",
         ],
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn copy_capability_preflight_rejection_creates_no_operation_or_target() {
+    let f = Fixture::new();
+    f.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 2\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+    );
+    let home = DisposableDirectory::new(Path::new("/dev/shm"), "copy-preflight");
+    assert!(fs::symlink_metadata(home.path.join(".copy-target")).is_err());
+    assert!(!f.path("state/loadout/state.json").exists());
+    let output = f
+        .command_with_home(&home.path)
+        .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+        .output()
+        .unwrap();
+
+    expect(
+        output,
+        2,
+        &[
+            "apply failed during Preflight",
+            "file-copy publication capability is unsupported",
+        ],
+    );
+    assert!(fs::symlink_metadata(home.path.join(".copy-target")).is_err());
+    assert!(!f.path("state/loadout/state.json").exists());
+}
+
+#[test]
+fn copy_recovery_closes_a_retained_create_before_presenting_a_fresh_plan() {
+    let f = Fixture::new();
+    f.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 2\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+    );
+    let fingerprint = format!("sha256:{:x}", Sha256::digest(b"content\n"));
+    f.state(
+        json!({}),
+        json!({
+            "id": "recover-copy-create",
+            "desired_hash": format!("sha256:{}", "a".repeat(64)),
+            "actions": {"a1": {
+                "kind": "create_copy",
+                "resource_id": "base/copied",
+                "target_path": f.path("home/.copy-target"),
+                "source_path": f.path("store/source"),
+                "content_fingerprint": fingerprint,
+                "temporary_path": f.path("home/.loadout-copy-a1"),
+                "final_effect": {
+                    "kind": "file_copy",
+                    "source_path": f.path("store/source"),
+                    "target_path": f.path("home/.copy-target"),
+                    "content_fingerprint": fingerprint
+                },
+                "precondition": {"target": "missing"},
+                "postcondition": {"target": "expected_copy", "content_fingerprint": fingerprint},
+                "status": "running"
+            }}
+        }),
+    );
+    let before_target = fs::symlink_metadata(f.path("home/.copy-target")).is_err();
+    let before_temporary = fs::symlink_metadata(f.path("home/.loadout-copy-a1")).is_err();
+
+    expect(
+        f.command()
+            .args(["apply", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        2,
+        &["create_copy", "confirmation unavailable"],
+    );
+    assert!(before_target && before_temporary);
+    assert!(fs::symlink_metadata(f.path("home/.copy-target")).is_err());
+    assert!(fs::symlink_metadata(f.path("home/.loadout-copy-a1")).is_err());
+    let recovered =
+        serde_json::from_slice::<Value>(&fs::read(f.path("state/loadout/state.json")).unwrap())
+            .unwrap();
+    assert!(recovered["active_operation"].is_null());
+    assert_eq!(recovered["resources"], json!({}));
+
+    expect(
+        f.command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        0,
+        &["create_copy", "apply completed: 1 committed actions"],
+    );
+    assert_eq!(fs::read(f.path("home/.copy-target")).unwrap(), b"content\n");
+    let applied =
+        serde_json::from_slice::<Value>(&fs::read(f.path("state/loadout/state.json")).unwrap())
+            .unwrap();
+    assert!(applied["active_operation"].is_null());
+    assert_eq!(
+        applied["resources"]["base/copied"]["effect"]["kind"],
+        "file_copy"
+    );
+}
+
+#[test]
+fn copy_lifecycle_commands_render_typed_actions_and_preserve_rejection_boundaries() {
+    let f = Fixture::new();
+    f.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 2\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+    );
+
+    expect(
+        f.run(&["validate", "--config", "../portable/config.yaml"]),
+        0,
+        &["valid profile: base"],
+    );
+    expect(
+        f.run(&["plan", "--config", "../portable/config.yaml"]),
+        0,
+        &["executable", "create_copy", "base/copied", "target missing"],
+    );
+    expect(
+        f.run(&[
+            "apply",
+            "--dry-run",
+            "--yes",
+            "--config",
+            "../portable/config.yaml",
+        ]),
+        0,
+        &["executable", "create_copy", "base/copied", "target missing"],
+    );
+    expect(
+        f.command()
+            .args(["apply", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        2,
+        &["create_copy", "confirmation unavailable"],
+    );
+    assert!(fs::symlink_metadata(f.path("home/.copy-target")).is_err());
+    assert!(!f.path("state/loadout/state.json").exists());
+
+    expect(
+        f.command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        0,
+        &[
+            "create_copy",
+            "base/copied",
+            "apply completed: 1 committed actions",
+        ],
+    );
+    assert_eq!(fs::read(f.path("home/.copy-target")).unwrap(), b"content\n");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(f.path("state/loadout/state.json")).unwrap())
+            .unwrap()["resources"]["base/copied"]["effect"]["kind"],
+        "file_copy"
+    );
+    assert!(
+        serde_json::from_slice::<Value>(&fs::read(f.path("state/loadout/state.json")).unwrap())
+            .unwrap()["active_operation"]
+            .is_null()
+    );
+
+    let conflict = Fixture::new();
+    conflict.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 2\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/target\n",
+    );
+    conflict.write("home/target", "unmanaged");
+    expect(
+        conflict.run(&["plan", "--config", "../portable/config.yaml"]),
+        2,
+        &["blocked", "conflict", "base/copied", "OtherRegularFile"],
+    );
+}
+
+#[test]
+fn copy_schema_rejection_precedes_target_observation_or_lifecycle_mutation() {
+    let f = Fixture::new();
+    f.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 1\nid: base\nresources: {}\n",
+    );
+    fs::remove_file(f.path("store/source")).unwrap();
+    expect(
+        f.command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        2,
+        &["schema_version"],
+    );
+    assert!(fs::symlink_metadata(f.path("home/target")).is_err());
+    assert!(!f.path("state/loadout/state.json").exists());
+
+    let state_fixture = Fixture::new();
+    state_fixture.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 2\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+    );
+    state_fixture.write(
+        "state/loadout/state.json",
+        "{\"schema_version\":1,\"resources\":{},\"active_operation\":null}",
+    );
+    expect(
+        state_fixture.run(&["plan", "--config", "../portable/config.yaml"]),
+        1,
+        &["state"],
+    );
+    assert!(fs::symlink_metadata(state_fixture.path("home/.copy-target")).is_err());
 }
 
 #[test]

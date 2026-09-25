@@ -338,6 +338,21 @@ impl PersistedRecordedAction {
             old_target_path: action
                 .relocation_facts()
                 .map(|facts| encode_path(facts.old_target_path()))
+                .or_else(|| {
+                    action
+                        .copy_facts()
+                        .and_then(|facts| {
+                            (action.kind() == ActionKind::RelocateCopy).then(|| {
+                                facts.old_effect().and_then(|effect| match effect {
+                                    KnownResource::FileCopy(copy) => {
+                                        Some(encode_path(copy.target_path()))
+                                    }
+                                    KnownResource::FileLink(_) => None,
+                                })
+                            })
+                        })
+                        .flatten()
+                })
                 .transpose()?,
             old_effect: action
                 .copy_facts()
@@ -462,7 +477,9 @@ impl PersistedRecordedAction {
             let content_fingerprint = self
                 .content_fingerprint
                 .ok_or(StateDecodeError::InvalidTargetCondition)?;
-            if old_resource_id.is_some() || old_target_path.is_some() {
+            if old_resource_id.is_some()
+                || (old_target_path.is_some() && kind != ActionKind::RelocateCopy)
+            {
                 return Err(StateDecodeError::InvalidTargetCondition);
             }
             let temporary_path = self
@@ -957,6 +974,108 @@ mod tests {
                 },
             },
         })
+    }
+
+    #[test]
+    fn active_relocate_copy_round_trips_its_old_and_new_target_predicates() {
+        let root = std::env::temp_dir().join("loadout-codec-relocate-copy-operation");
+        let resource_id = FullyQualifiedResourceId::parse("base/config").unwrap();
+        let old_target = ResolvedPath::new(root.join("home/.config")).unwrap();
+        let new_target = ResolvedPath::new(root.join("home/.config/config")).unwrap();
+        let old_source = ResolvedPath::new(root.join("store/old-config")).unwrap();
+        let new_source = ResolvedPath::new(root.join("store/new-config")).unwrap();
+        let old_fingerprint =
+            ContentFingerprint::parse(format!("sha256:{}", "b".repeat(64))).unwrap();
+        let new_fingerprint =
+            ContentFingerprint::parse(format!("sha256:{}", "c".repeat(64))).unwrap();
+        let old_copy = KnownFileCopy::new(
+            resource_id.clone(),
+            old_source.clone(),
+            old_target.clone(),
+            old_fingerprint.clone(),
+        )
+        .unwrap();
+        let definition_hash = definition_hash_for_copy_known(&old_copy).unwrap();
+        let document = json!({
+            "schema_version": 2,
+            "resources": {"base/config": {
+                "definition_hash": definition_hash.as_str(),
+                "effect": {
+                    "kind": "file_copy",
+                    "source_path": old_source.as_ref(),
+                    "target_path": old_target.as_ref(),
+                    "content_fingerprint": old_fingerprint.as_str(),
+                },
+            }},
+            "active_operation": {
+                "id": "op-relocate-copy",
+                "desired_hash": format!("sha256:{}", "a".repeat(64)),
+                "actions": {"a1": {
+                    "kind": "relocate_copy",
+                    "resource_id": "base/config",
+                    "old_target_path": old_target.as_ref(),
+                    "target_path": new_target.as_ref(),
+                    "source_path": new_source.as_ref(),
+                    "content_fingerprint": new_fingerprint.as_str(),
+                    "temporary_path": root.join("home/.config/.loadout-copy-a1"),
+                    "old_effect": {
+                        "kind": "file_copy",
+                        "source_path": old_source.as_ref(),
+                        "target_path": old_target.as_ref(),
+                        "content_fingerprint": old_fingerprint.as_str(),
+                    },
+                    "final_effect": {
+                        "kind": "file_copy",
+                        "source_path": new_source.as_ref(),
+                        "target_path": new_target.as_ref(),
+                        "content_fingerprint": new_fingerprint.as_str(),
+                    },
+                    "precondition": {
+                        "target": "expected_copy",
+                        "content_fingerprint": old_fingerprint.as_str(),
+                    },
+                    "postcondition": {
+                        "target": "expected_copy",
+                        "content_fingerprint": new_fingerprint.as_str(),
+                    },
+                    "status": "running",
+                }},
+            },
+        });
+
+        let state = serde_json::from_value::<StateDocument>(document)
+            .unwrap()
+            .into_state()
+            .unwrap();
+        let encoded = serde_json::to_value(StateDocument::from_state(&state).unwrap()).unwrap();
+        assert_eq!(
+            encoded["active_operation"]["actions"]["a1"]["old_target_path"],
+            json!(old_target.as_ref())
+        );
+        let round_tripped = serde_json::from_value::<StateDocument>(encoded)
+            .unwrap()
+            .into_state()
+            .unwrap();
+        let action = round_tripped
+            .active_operation()
+            .unwrap()
+            .action(&ActionId::parse("a1").unwrap())
+            .unwrap();
+        assert_eq!(action.kind(), ActionKind::RelocateCopy);
+        assert_eq!(
+            action.precondition(),
+            TargetCondition::ExpectedCopy {
+                target_path: old_target,
+                content_fingerprint: old_fingerprint,
+            }
+        );
+        assert_eq!(
+            action.postcondition(),
+            TargetCondition::ExpectedCopy {
+                target_path: new_target,
+                content_fingerprint: new_fingerprint,
+            }
+        );
     }
 
     #[test]

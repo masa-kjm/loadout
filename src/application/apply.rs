@@ -168,6 +168,7 @@ fn apply_request_with_hooks(
             stage = ApplyStage::Execution;
             execute_resource_actions(
                 locked,
+                request.context.home_directory().as_ref(),
                 &resource_actions,
                 &ids,
                 &mut committed,
@@ -216,8 +217,10 @@ pub(crate) fn dry_run(
     super::queries::plan_request(request)
 }
 
+#[allow(clippy::too_many_arguments)] // The shared coordinator owns the complete recorded-action lifecycle boundary.
 fn execute_resource_actions(
     locked: &mut LockedStateRepository,
+    home_directory: &std::path::Path,
     actions: &[PlannedResourceAction],
     ids: &[crate::state::operation::ActionId],
     committed: &mut Vec<FullyQualifiedResourceId>,
@@ -245,7 +248,7 @@ fn execute_resource_actions(
         let execution = execute(action, &recorded);
         let classification = match &execution {
             Ok(()) => ExecutionClassification::Succeeded,
-            Err(error) => classify_resource_execution_error(error),
+            Err(error) => classify_resource_execution_error(home_directory, &recorded, error),
         };
         match classification {
             ExecutionClassification::Succeeded => {
@@ -903,6 +906,8 @@ fn classify_execution<E>(
 }
 
 fn classify_resource_execution_error(
+    home_directory: &std::path::Path,
+    recorded: &RecordedAction,
     error: &super::dispatch::ResourceExecutionError,
 ) -> ExecutionClassification {
     match error {
@@ -918,17 +923,19 @@ fn classify_resource_execution_error(
         super::dispatch::ResourceExecutionError::StaleLink(error) => {
             classify_stale_execution_error(error)
         }
-        // Copy executors return an error after a mutation only when its aftermath cannot yet be
-        // proven from the recorded predicates. Keep the operation open for recovery rather than
-        // inferring a Known transition from an operating-system result.
         super::dispatch::ResourceExecutionError::CreateCopy(_)
         | super::dispatch::ResourceExecutionError::ReplaceCopy(_)
         | super::dispatch::ResourceExecutionError::RelocateCopy(_)
         | super::dispatch::ResourceExecutionError::RemoveCopy(_)
         | super::dispatch::ResourceExecutionError::CopyStateOnly(_)
         | super::dispatch::ResourceExecutionError::LinkToCopyHandoff(_)
-        | super::dispatch::ResourceExecutionError::CopyToLinkHandoff(_)
-        | super::dispatch::ResourceExecutionError::InvalidEffectHandoff => {
+        | super::dispatch::ResourceExecutionError::CopyToLinkHandoff(_) => {
+            FileLinkInspector::new(home_directory)
+                .and_then(|inspector| recovery_decision(&inspector, recorded))
+                .map(recovery_decision_as_execution_classification)
+                .unwrap_or(ExecutionClassification::Uncertain)
+        }
+        super::dispatch::ResourceExecutionError::InvalidEffectHandoff => {
             ExecutionClassification::Uncertain
         }
     }
@@ -941,6 +948,16 @@ fn classify_stale_execution_error(error: &StaleLinkExecutionError) -> ExecutionC
             classify_forget_missing_execution_error(error)
         }
         StaleLinkExecutionError::UnsupportedAction { .. } => ExecutionClassification::Uncertain,
+    }
+}
+
+fn recovery_decision_as_execution_classification(
+    decision: RecoveryDecision,
+) -> ExecutionClassification {
+    match decision {
+        RecoveryDecision::Succeeded => ExecutionClassification::Succeeded,
+        RecoveryDecision::Failed => ExecutionClassification::Failed,
+        RecoveryDecision::Uncertain => ExecutionClassification::Uncertain,
     }
 }
 
@@ -1374,29 +1391,37 @@ where
                 .mark_without_known(&action_id, ActionStatus::Skipped)
                 .map_err(ApplyError::State)?,
             ActionStatus::Running | ActionStatus::Uncertain => {
-                // Recovery may remove only its recorded replacement temporary, and only if its executor rechecks can prove that cleanup is safe.
-                // Any failure leaves the action uncertain rather than allowing the later predicate-only decision to conceal an unproven cleanup.
-                let cleanup_failed = if action.replacement_facts().is_some() {
-                    !cleanup_executor().is_some_and(|executor| {
-                        executor
-                            .cleanup_recorded_replacement_temporary(&action)
-                            .is_ok()
+                let mut decision = inspector
+                    .as_ref()
+                    .and_then(|inspector| recovery_decision(inspector, &action).ok())
+                    .unwrap_or(RecoveryDecision::Uncertain);
+                if decision == RecoveryDecision::Uncertain
+                    && action.temporary_path().is_some()
+                    && inspector.as_ref().is_some_and(|inspector| {
+                        condition_holds(inspector, &action.precondition()).unwrap_or(false)
                     })
-                } else if action.temporary_path().is_some() {
-                    !FileCopyExecutor::new(home_directory)
-                        .is_ok_and(|executor| executor.cleanup_recorded_temporary(&action).is_ok())
-                } else {
-                    false
-                };
-                // An unavailable or unsafe recorded-path observation cannot prove either recorded condition, so it remains uncertain.
-                let decision = (!cleanup_failed)
-                    .then(|| {
+                {
+                    // Cleanup is permitted only when the old recorded effect still holds; a final or unprovable effect must retain its temporary and remain uncertain.
+                    let cleaned = if action.replacement_facts().is_some() {
+                        cleanup_executor().is_some_and(|executor| {
+                            executor
+                                .cleanup_recorded_replacement_temporary(&action)
+                                .is_ok()
+                        })
+                    } else {
+                        FileCopyExecutor::new(home_directory).is_ok_and(|executor| {
+                            executor.cleanup_recorded_temporary(&action).is_ok()
+                        })
+                    };
+                    decision = if cleaned {
                         inspector
                             .as_ref()
                             .and_then(|inspector| recovery_decision(inspector, &action).ok())
-                    })
-                    .flatten()
-                    .unwrap_or(RecoveryDecision::Uncertain);
+                            .unwrap_or(RecoveryDecision::Uncertain)
+                    } else {
+                        RecoveryDecision::Uncertain
+                    };
+                }
                 match decision {
                     RecoveryDecision::Succeeded => locked
                         .commit_succeeded(&action_id)
@@ -1465,12 +1490,24 @@ fn recovery_decision(
     inspector: &FileLinkInspector,
     action: &RecordedAction,
 ) -> Result<RecoveryDecision, TargetInspectionError> {
+    let temporary_missing = action
+        .temporary_path()
+        .map(|temporary_path| {
+            condition_holds(
+                inspector,
+                &TargetCondition::Missing {
+                    target_path: temporary_path.clone(),
+                },
+            )
+        })
+        .transpose()?
+        .unwrap_or(true);
     if matches!(
         action.kind(),
         ActionKind::CreateLink | ActionKind::CreateCopy
     ) {
         // A matching effect does not prove that this create created it.
-        if condition_holds(inspector, &action.precondition())? {
+        if condition_holds(inspector, &action.precondition())? && temporary_missing {
             return Ok(RecoveryDecision::Failed);
         }
         return Ok(RecoveryDecision::Uncertain);
@@ -1493,7 +1530,7 @@ fn recovery_decision(
                 link_target: facts.new_link_target().clone(),
             },
         )?;
-        if old_missing && new_expected {
+        if old_missing && new_expected && temporary_missing {
             return Ok(RecoveryDecision::Succeeded);
         }
         let old_expected = condition_holds(
@@ -1509,7 +1546,7 @@ fn recovery_decision(
                 target_path: facts.new_target_path().clone(),
             },
         )?;
-        return Ok(if old_expected && new_missing {
+        return Ok(if old_expected && new_missing && temporary_missing {
             RecoveryDecision::Failed
         } else {
             RecoveryDecision::Uncertain
@@ -1531,7 +1568,7 @@ fn recovery_decision(
             },
         )?;
         let new_expected = condition_holds(inspector, &action.postcondition())?;
-        if old_missing && new_expected {
+        if old_missing && new_expected && temporary_missing {
             return Ok(RecoveryDecision::Succeeded);
         }
         let old_expected = condition_holds(
@@ -1547,21 +1584,15 @@ fn recovery_decision(
                 target_path: facts.target_path().clone(),
             },
         )?;
-        return Ok(if old_expected && new_missing {
+        return Ok(if old_expected && new_missing && temporary_missing {
             RecoveryDecision::Failed
         } else {
             RecoveryDecision::Uncertain
         });
     }
 
-    if let Some(facts) = action.replacement_facts() {
+    if action.replacement_facts().is_some() {
         let postcondition = condition_holds(inspector, &action.postcondition())?;
-        let temporary_missing = condition_holds(
-            inspector,
-            &TargetCondition::Missing {
-                target_path: facts.temporary_path().clone(),
-            },
-        )?;
         if postcondition && temporary_missing {
             return Ok(RecoveryDecision::Succeeded);
         }
@@ -1574,10 +1605,10 @@ fn recovery_decision(
     }
 
     // Same-source ownership handoff has identical predicates: a matching link proves its state-only postcondition rather than a failed mutation.
-    if condition_holds(inspector, &action.postcondition())? {
+    if condition_holds(inspector, &action.postcondition())? && temporary_missing {
         return Ok(RecoveryDecision::Succeeded);
     }
-    if condition_holds(inspector, &action.precondition())? {
+    if condition_holds(inspector, &action.precondition())? && temporary_missing {
         return Ok(RecoveryDecision::Failed);
     }
     Ok(RecoveryDecision::Uncertain)
@@ -1632,16 +1663,20 @@ mod tests {
 
     use super::*;
     use crate::declaration::environment_config::EnvironmentConfig;
-    use crate::domain::desired::ResolvedDesired;
+    use crate::domain::desired::{ResolvedDesired, ResolvedResource};
+    use crate::domain::file_copy::{ContentFingerprint, ResolvedFileCopy};
     use crate::domain::file_link::ResolvedFileLink;
     use crate::domain::hashes::desired_hash;
     use crate::domain::ids::ProfileId;
+    use crate::domain::known::{KnownFileCopy, KnownResource};
     use crate::domain::paths::SourceRelativePath;
+    use crate::domain::plan::{PlannedEffectHandoff, PlannedFileCopyAction};
     use crate::inspection::source::{VerifiedSource, resolve_store_root, verify_regular_source};
     use crate::resolver::{ResolverContext, resolve_for_apply};
     use crate::state::operation::ActionStatus;
     #[cfg(unix)]
     use crate::state::repository::{CommitError, CommitStage};
+    use sha2::{Digest, Sha256};
 
     static NEXT_WORKSPACE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -1859,6 +1894,120 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    fn copy_fingerprint(contents: &[u8]) -> ContentFingerprint {
+        let mut hasher = Sha256::new();
+        hasher.update(contents);
+        ContentFingerprint::parse(format!("sha256:{:x}", hasher.finalize())).unwrap()
+    }
+
+    fn copy_desired(
+        workspace: &TestWorkspace,
+        resource_id: FullyQualifiedResourceId,
+        source_relative: &str,
+        target: ResolvedPath,
+        contents: &[u8],
+    ) -> ResolvedFileCopy {
+        workspace.write(source_relative, std::str::from_utf8(contents).unwrap());
+        let store = resolve_store_root(&workspace.path("store")).unwrap();
+        let source = verify_regular_source(
+            &store,
+            &SourceRelativePath::parse(source_relative.strip_prefix("store/").unwrap()).unwrap(),
+        )
+        .unwrap();
+        ResolvedFileCopy::new(
+            resource_id,
+            source.path().clone(),
+            target,
+            copy_fingerprint(contents),
+        )
+        .unwrap()
+    }
+
+    fn copy_desired_set(desired: ResolvedFileCopy) -> ResolvedDesired {
+        ResolvedDesired::new(ProfileId::parse("workstation").unwrap(), [desired]).unwrap()
+    }
+
+    fn begin_running_copy_action(
+        locked: &mut LockedStateRepository,
+        desired: &ResolvedDesired,
+        action: PlannedFileCopyAction,
+    ) -> ActionId {
+        let action = PlannedResourceAction::FileCopy(action);
+        let action_id = locked
+            .begin_resource_actions(desired_hash(desired).unwrap(), &[action])
+            .unwrap()[0]
+            .clone();
+        locked.mark_running(&action_id).unwrap();
+        action_id
+    }
+
+    fn commit_known_copy(workspace: &TestWorkspace, desired: ResolvedFileCopy) -> KnownFileCopy {
+        let desired_set = copy_desired_set(desired.clone());
+        let mut locked = workspace.repository().acquire_exclusive().unwrap();
+        let action_id = begin_running_copy_action(
+            &mut locked,
+            &desired_set,
+            PlannedFileCopyAction::Create {
+                desired: desired.clone(),
+            },
+        );
+        fs::write(
+            desired.target_path(),
+            fs::read(desired.source_path()).unwrap(),
+        )
+        .unwrap();
+        locked.commit_succeeded(&action_id).unwrap();
+        locked.close_finished_operation().unwrap();
+        KnownFileCopy::from_resolved(&desired)
+    }
+
+    #[cfg(unix)]
+    fn commit_known_link(workspace: &TestWorkspace) -> KnownResource {
+        workspace.write("store/git/config", "old link\n");
+        workspace
+            .coordinator()
+            .apply_create_link(&workspace.input(), |_| true)
+            .unwrap();
+        workspace
+            .repository()
+            .load()
+            .unwrap()
+            .known()
+            .get_variant(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
+            .unwrap()
+            .clone()
+    }
+
+    fn begin_running_effect_handoff(
+        locked: &mut LockedStateRepository,
+        old_effect: KnownResource,
+        final_effect: ResolvedResource,
+    ) -> ResolvedPath {
+        let desired = ResolvedDesired::new(
+            ProfileId::parse("workstation").unwrap(),
+            [final_effect.clone()],
+        )
+        .unwrap();
+        let action = PlannedResourceAction::ReplaceEffect(
+            PlannedEffectHandoff::new(old_effect, final_effect).unwrap(),
+        );
+        let action_id = locked
+            .begin_resource_actions(desired_hash(&desired).unwrap(), &[action])
+            .unwrap()[0]
+            .clone();
+        let temporary = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .action(&action_id)
+            .unwrap()
+            .temporary_path()
+            .unwrap()
+            .clone();
+        locked.mark_running(&action_id).unwrap();
+        temporary
     }
 
     #[cfg(windows)]
@@ -2611,6 +2760,7 @@ mod tests {
         // no claim about a supported expected-entry deletion platform primitive.
         execute_resource_actions(
             &mut locked,
+            workspace.path("home").as_path(),
             plan.resource_actions(),
             &ids,
             &mut committed,
@@ -5868,5 +6018,544 @@ mod tests {
             .unwrap();
         assert_eq!(action.status(), ActionStatus::Running);
         assert_eq!(persisted.known().resources().len(), 0);
+    }
+
+    #[test]
+    fn recovery_keeps_matching_final_copy_create_uncertain_without_known_update() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "copy source\n");
+        let source = workspace.verified_source();
+        let resource_id = FullyQualifiedResourceId::parse("base/git-config").unwrap();
+        let target = ResolvedPath::new(workspace.path("home/.gitconfig")).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(b"copy source\n");
+        let fingerprint =
+            ContentFingerprint::parse(format!("sha256:{:x}", hasher.finalize())).unwrap();
+        let desired = ResolvedFileCopy::new(
+            resource_id.clone(),
+            source.path().clone(),
+            target.clone(),
+            fingerprint,
+        )
+        .unwrap();
+        let desired_set =
+            ResolvedDesired::new(ProfileId::parse("workstation").unwrap(), [desired.clone()])
+                .unwrap();
+        let action = PlannedResourceAction::FileCopy(PlannedFileCopyAction::Create { desired });
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let action_id = locked
+            .begin_resource_actions(desired_hash(&desired_set).unwrap(), &[action])
+            .unwrap()[0]
+            .clone();
+        locked.mark_running(&action_id).unwrap();
+        fs::write(&target, b"copy source\n").unwrap();
+        locked
+            .mark_without_known(&action_id, ActionStatus::Uncertain)
+            .unwrap();
+
+        assert!(reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap());
+        let (_, recorded) = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap();
+        assert_eq!(recorded.status(), ActionStatus::Uncertain);
+        assert!(locked.state().known().get_variant(&resource_id).is_none());
+        assert!(fs::symlink_metadata(target).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_cleans_an_exact_copy_temporary_then_fails_and_keeps_old_known() {
+        let workspace = TestWorkspace::new();
+        let resource_id = FullyQualifiedResourceId::parse("base/git-config").unwrap();
+        let target = ResolvedPath::new(workspace.path("home/.gitconfig")).unwrap();
+        let old = copy_desired(
+            &workspace,
+            resource_id.clone(),
+            "store/git/old",
+            target.clone(),
+            b"old\n",
+        );
+        let previous = commit_known_copy(&workspace, old);
+        let desired = copy_desired(
+            &workspace,
+            resource_id.clone(),
+            "store/git/new",
+            target,
+            b"new\n",
+        );
+        let desired_set = copy_desired_set(desired.clone());
+        let mut locked = workspace.repository().acquire_exclusive().unwrap();
+        begin_running_copy_action(
+            &mut locked,
+            &desired_set,
+            PlannedFileCopyAction::Replace {
+                desired: desired.clone(),
+                previous: previous.clone(),
+            },
+        );
+        let temporary = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap()
+            .1
+            .temporary_path()
+            .unwrap()
+            .clone();
+        fs::write(&temporary, b"new\n").unwrap();
+
+        assert!(
+            !reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap()
+        );
+        assert!(fs::symlink_metadata(temporary).is_err());
+        assert_eq!(
+            locked.state().known().get_variant(&resource_id),
+            Some(&KnownResource::FileCopy(previous))
+        );
+        assert!(locked.state().active_operation().is_none());
+    }
+
+    #[test]
+    fn recovery_keeps_copy_with_retained_or_unexpected_temporary_uncertain() {
+        let workspace = TestWorkspace::new();
+        let resource_id = FullyQualifiedResourceId::parse("base/git-config").unwrap();
+        let target = ResolvedPath::new(workspace.path("home/.gitconfig")).unwrap();
+        let old = copy_desired(
+            &workspace,
+            resource_id.clone(),
+            "store/git/old",
+            target.clone(),
+            b"old\n",
+        );
+        let previous = commit_known_copy(&workspace, old);
+        let desired = copy_desired(
+            &workspace,
+            resource_id.clone(),
+            "store/git/new",
+            target,
+            b"new\n",
+        );
+        let desired_set = copy_desired_set(desired.clone());
+        let mut locked = workspace.repository().acquire_exclusive().unwrap();
+        begin_running_copy_action(
+            &mut locked,
+            &desired_set,
+            PlannedFileCopyAction::Replace {
+                desired,
+                previous: previous.clone(),
+            },
+        );
+        let temporary = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap()
+            .1
+            .temporary_path()
+            .unwrap()
+            .clone();
+        fs::write(&temporary, b"unmanaged temporary\n").unwrap();
+
+        assert!(reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap());
+        let (_, recorded) = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap();
+        assert_eq!(recorded.status(), ActionStatus::Uncertain);
+        assert_eq!(fs::read(&temporary).unwrap(), b"unmanaged temporary\n");
+        assert_eq!(
+            locked.state().known().get_variant(&resource_id),
+            Some(&KnownResource::FileCopy(previous))
+        );
+
+        let retained = TestWorkspace::new();
+        let target = ResolvedPath::new(retained.path("home/.gitconfig")).unwrap();
+        let old = copy_desired(
+            &retained,
+            resource_id.clone(),
+            "store/git/old",
+            target.clone(),
+            b"old\n",
+        );
+        let previous = commit_known_copy(&retained, old);
+        let desired = copy_desired(
+            &retained,
+            resource_id.clone(),
+            "store/git/new",
+            target,
+            b"new\n",
+        );
+        let desired_set = copy_desired_set(desired.clone());
+        let mut locked = retained.repository().acquire_exclusive().unwrap();
+        begin_running_copy_action(
+            &mut locked,
+            &desired_set,
+            PlannedFileCopyAction::Replace {
+                desired: desired.clone(),
+                previous: previous.clone(),
+            },
+        );
+        let temporary = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap()
+            .1
+            .temporary_path()
+            .unwrap()
+            .clone();
+        fs::write(desired.target_path(), b"new\n").unwrap();
+        fs::write(&temporary, b"new\n").unwrap();
+
+        assert!(reconcile_active_operation(&mut locked, retained.path("home").as_path()).unwrap());
+        let (_, recorded) = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap();
+        assert_eq!(recorded.status(), ActionStatus::Uncertain);
+        assert_eq!(fs::read(&temporary).unwrap(), b"new\n");
+        assert_eq!(
+            locked.state().known().get_variant(&resource_id),
+            Some(&KnownResource::FileCopy(previous))
+        );
+    }
+
+    #[test]
+    fn recovery_keeps_a_partial_copy_relocation_uncertain_with_old_known() {
+        let workspace = TestWorkspace::new();
+        let resource_id = FullyQualifiedResourceId::parse("base/git-config").unwrap();
+        let old_target = ResolvedPath::new(workspace.path("home/.gitconfig")).unwrap();
+        let old = copy_desired(
+            &workspace,
+            resource_id.clone(),
+            "store/git/old",
+            old_target,
+            b"old\n",
+        );
+        let previous = commit_known_copy(&workspace, old);
+        fs::create_dir(workspace.path("home/.config")).unwrap();
+        let desired = copy_desired(
+            &workspace,
+            resource_id.clone(),
+            "store/git/new",
+            ResolvedPath::new(workspace.path("home/.config/gitconfig")).unwrap(),
+            b"new\n",
+        );
+        let desired_set = copy_desired_set(desired.clone());
+        let mut locked = workspace.repository().acquire_exclusive().unwrap();
+        begin_running_copy_action(
+            &mut locked,
+            &desired_set,
+            PlannedFileCopyAction::Relocate {
+                desired: desired.clone(),
+                previous: previous.clone(),
+            },
+        );
+        fs::write(desired.target_path(), b"new\n").unwrap();
+
+        assert!(reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap());
+        let (_, recorded) = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap();
+        assert_eq!(recorded.status(), ActionStatus::Uncertain);
+        assert_eq!(
+            locked.state().known().get_variant(&resource_id),
+            Some(&KnownResource::FileCopy(previous))
+        );
+    }
+
+    #[test]
+    fn recovery_removes_copy_known_only_for_the_recorded_missing_postcondition() {
+        let successful = TestWorkspace::new();
+        let resource_id = FullyQualifiedResourceId::parse("base/git-config").unwrap();
+        let target = ResolvedPath::new(successful.path("home/.gitconfig")).unwrap();
+        let old = copy_desired(
+            &successful,
+            resource_id.clone(),
+            "store/git/old",
+            target.clone(),
+            b"old\n",
+        );
+        let previous = commit_known_copy(&successful, old.clone());
+        let desired_set = copy_desired_set(old);
+        let mut locked = successful.repository().acquire_exclusive().unwrap();
+        begin_running_copy_action(
+            &mut locked,
+            &desired_set,
+            PlannedFileCopyAction::Remove { previous },
+        );
+        fs::remove_file(target).unwrap();
+        assert!(
+            !reconcile_active_operation(&mut locked, successful.path("home").as_path()).unwrap()
+        );
+        assert!(locked.state().known().get_variant(&resource_id).is_none());
+
+        let retained = TestWorkspace::new();
+        let target = ResolvedPath::new(retained.path("home/.gitconfig")).unwrap();
+        let old = copy_desired(
+            &retained,
+            resource_id.clone(),
+            "store/git/old",
+            target,
+            b"old\n",
+        );
+        let previous = commit_known_copy(&retained, old.clone());
+        let desired_set = copy_desired_set(old);
+        let mut locked = retained.repository().acquire_exclusive().unwrap();
+        begin_running_copy_action(
+            &mut locked,
+            &desired_set,
+            PlannedFileCopyAction::Remove {
+                previous: previous.clone(),
+            },
+        );
+        assert!(!reconcile_active_operation(&mut locked, retained.path("home").as_path()).unwrap());
+        assert_eq!(
+            locked.state().known().get_variant(&resource_id),
+            Some(&KnownResource::FileCopy(previous))
+        );
+        assert!(locked.state().active_operation().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_classifies_link_to_copy_handoff_aftermath_from_recorded_effects() {
+        let succeeded = TestWorkspace::new();
+        let resource_id = FullyQualifiedResourceId::parse("base/git-config").unwrap();
+        let old = commit_known_link(&succeeded);
+        let target = ResolvedPath::new(succeeded.path("home/.gitconfig")).unwrap();
+        let final_copy = copy_desired(
+            &succeeded,
+            resource_id.clone(),
+            "store/git/final-copy",
+            target.clone(),
+            b"final copy\n",
+        );
+        let mut locked = succeeded.repository().acquire_exclusive().unwrap();
+        begin_running_effect_handoff(
+            &mut locked,
+            old.clone(),
+            ResolvedResource::FileCopy(final_copy.clone()),
+        );
+        fs::remove_file(&target).unwrap();
+        fs::write(&target, b"final copy\n").unwrap();
+        let action_id = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap()
+            .0
+            .clone();
+        locked.fail_next_commit_at(CommitStage::CreateTemporary);
+        assert!(matches!(
+            locked.commit_succeeded(&action_id),
+            Err(StateRepositoryError::Commit(CommitError::Injected {
+                stage: CommitStage::CreateTemporary
+            }))
+        ));
+        assert!(
+            !reconcile_active_operation(&mut locked, succeeded.path("home").as_path()).unwrap()
+        );
+        assert_eq!(
+            locked.state().known().get_variant(&resource_id),
+            Some(&KnownResource::FileCopy(KnownFileCopy::from_resolved(
+                &final_copy
+            )))
+        );
+
+        let failed = TestWorkspace::new();
+        let old = commit_known_link(&failed);
+        let target = ResolvedPath::new(failed.path("home/.gitconfig")).unwrap();
+        let final_copy = copy_desired(
+            &failed,
+            resource_id.clone(),
+            "store/git/final-copy",
+            target,
+            b"final copy\n",
+        );
+        let mut locked = failed.repository().acquire_exclusive().unwrap();
+        let temporary = begin_running_effect_handoff(
+            &mut locked,
+            old.clone(),
+            ResolvedResource::FileCopy(final_copy),
+        );
+        fs::write(&temporary, b"final copy\n").unwrap();
+        assert!(!reconcile_active_operation(&mut locked, failed.path("home").as_path()).unwrap());
+        assert!(fs::symlink_metadata(temporary).is_err());
+        assert_eq!(locked.state().known().get_variant(&resource_id), Some(&old));
+
+        let uncertain = TestWorkspace::new();
+        let old = commit_known_link(&uncertain);
+        let target = ResolvedPath::new(uncertain.path("home/.gitconfig")).unwrap();
+        let final_copy = copy_desired(
+            &uncertain,
+            resource_id.clone(),
+            "store/git/final-copy",
+            target,
+            b"final copy\n",
+        );
+        let mut locked = uncertain.repository().acquire_exclusive().unwrap();
+        let temporary = begin_running_effect_handoff(
+            &mut locked,
+            old.clone(),
+            ResolvedResource::FileCopy(final_copy),
+        );
+        fs::write(&temporary, b"substituted temporary\n").unwrap();
+        assert!(reconcile_active_operation(&mut locked, uncertain.path("home").as_path()).unwrap());
+        let (_, action) = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap();
+        assert_eq!(action.status(), ActionStatus::Uncertain);
+        assert_eq!(fs::read(temporary).unwrap(), b"substituted temporary\n");
+        assert_eq!(locked.state().known().get_variant(&resource_id), Some(&old));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_classifies_copy_to_link_handoff_aftermath_from_recorded_effects() {
+        use std::os::unix::fs::symlink;
+
+        let succeeded = TestWorkspace::new();
+        let resource_id = FullyQualifiedResourceId::parse("base/git-config").unwrap();
+        let target = ResolvedPath::new(succeeded.path("home/.gitconfig")).unwrap();
+        let old_copy = copy_desired(
+            &succeeded,
+            resource_id.clone(),
+            "store/git/old-copy",
+            target.clone(),
+            b"old copy\n",
+        );
+        let old = KnownResource::FileCopy(commit_known_copy(&succeeded, old_copy));
+        succeeded.write("store/git/final-link", "final link\n");
+        let final_link = ResolvedFileLink::new(
+            resource_id.clone(),
+            ResolvedPath::new(succeeded.path("store/git/final-link")).unwrap(),
+            target.clone(),
+        )
+        .unwrap();
+        let mut locked = succeeded.repository().acquire_exclusive().unwrap();
+        begin_running_effect_handoff(
+            &mut locked,
+            old.clone(),
+            ResolvedResource::FileLink(final_link.clone()),
+        );
+        fs::remove_file(&target).unwrap();
+        symlink(final_link.source_path(), &target).unwrap();
+        let action_id = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap()
+            .0
+            .clone();
+        locked.fail_next_commit_at(CommitStage::CreateTemporary);
+        assert!(matches!(
+            locked.commit_succeeded(&action_id),
+            Err(StateRepositoryError::Commit(CommitError::Injected {
+                stage: CommitStage::CreateTemporary
+            }))
+        ));
+        assert!(
+            !reconcile_active_operation(&mut locked, succeeded.path("home").as_path()).unwrap()
+        );
+        assert_eq!(
+            locked.state().known().get_variant(&resource_id),
+            Some(&KnownResource::FileLink(
+                crate::domain::known::KnownFileLink::from_resolved(&final_link)
+            ))
+        );
+
+        let failed = TestWorkspace::new();
+        let target = ResolvedPath::new(failed.path("home/.gitconfig")).unwrap();
+        let old_copy = copy_desired(
+            &failed,
+            resource_id.clone(),
+            "store/git/old-copy",
+            target.clone(),
+            b"old copy\n",
+        );
+        let old = KnownResource::FileCopy(commit_known_copy(&failed, old_copy));
+        failed.write("store/git/final-link", "final link\n");
+        let final_link = ResolvedFileLink::new(
+            resource_id.clone(),
+            ResolvedPath::new(failed.path("store/git/final-link")).unwrap(),
+            target,
+        )
+        .unwrap();
+        let mut locked = failed.repository().acquire_exclusive().unwrap();
+        let temporary = begin_running_effect_handoff(
+            &mut locked,
+            old.clone(),
+            ResolvedResource::FileLink(final_link.clone()),
+        );
+        symlink(final_link.source_path(), &temporary).unwrap();
+        assert!(!reconcile_active_operation(&mut locked, failed.path("home").as_path()).unwrap());
+        assert!(fs::symlink_metadata(temporary).is_err());
+        assert_eq!(locked.state().known().get_variant(&resource_id), Some(&old));
+
+        let uncertain = TestWorkspace::new();
+        let target = ResolvedPath::new(uncertain.path("home/.gitconfig")).unwrap();
+        let old_copy = copy_desired(
+            &uncertain,
+            resource_id.clone(),
+            "store/git/old-copy",
+            target.clone(),
+            b"old copy\n",
+        );
+        let old = KnownResource::FileCopy(commit_known_copy(&uncertain, old_copy));
+        uncertain.write("store/git/final-link", "final link\n");
+        let final_link = ResolvedFileLink::new(
+            resource_id.clone(),
+            ResolvedPath::new(uncertain.path("store/git/final-link")).unwrap(),
+            target,
+        )
+        .unwrap();
+        let mut locked = uncertain.repository().acquire_exclusive().unwrap();
+        let temporary = begin_running_effect_handoff(
+            &mut locked,
+            old.clone(),
+            ResolvedResource::FileLink(final_link),
+        );
+        fs::write(&temporary, b"substituted temporary\n").unwrap();
+        assert!(reconcile_active_operation(&mut locked, uncertain.path("home").as_path()).unwrap());
+        let (_, action) = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap();
+        assert_eq!(action.status(), ActionStatus::Uncertain);
+        assert_eq!(fs::read(temporary).unwrap(), b"substituted temporary\n");
+        assert_eq!(locked.state().known().get_variant(&resource_id), Some(&old));
     }
 }

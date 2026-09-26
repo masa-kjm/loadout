@@ -493,9 +493,7 @@ fn query_exit_code(error: &QueryError) -> u8 {
             1
         }
         QueryError::Resolution(error) => resolver_exit_code(error),
-        QueryError::Configuration(_)
-        | QueryError::ConfigField(_)
-        | QueryError::UnsupportedResourceEffect { .. } => 2,
+        QueryError::Configuration(_) | QueryError::ConfigField(_) => 2,
     }
 }
 

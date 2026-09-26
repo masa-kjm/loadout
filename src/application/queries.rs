@@ -3,11 +3,10 @@
 use std::{fs, io};
 
 use crate::declaration::environment_config::{EnvironmentConfig, EnvironmentConfigError};
-use crate::domain::actual::ActualFileLink;
+use crate::domain::actual::ActualResource;
 use crate::domain::desired::{ResolvedDesired, ResolvedResource};
-use crate::domain::file_link::ResolvedFileLink;
 use crate::domain::ids::{FullyQualifiedResourceId, ProfileId};
-use crate::domain::known::{KnownFileLink, KnownResource, KnownState};
+use crate::domain::known::KnownResource;
 use crate::domain::plan::Plan;
 use crate::inspection::file_link::{FileLinkInspector, TargetInspectionError};
 use crate::planner::plan;
@@ -38,7 +37,7 @@ pub(crate) struct ValidationReport {
 
 #[derive(Debug)]
 pub(crate) struct DiffReport {
-    pub(crate) resources: Vec<(FullyQualifiedResourceId, ActualFileLink)>,
+    pub(crate) resources: Vec<(FullyQualifiedResourceId, ActualResource)>,
     pub(crate) active_operation: Option<OperationRecord>,
 }
 
@@ -96,15 +95,15 @@ pub(crate) enum StatusDesired {
 #[derive(Debug)]
 pub(crate) struct StatusResource {
     pub(crate) resource_id: FullyQualifiedResourceId,
-    pub(crate) desired: Option<ResolvedFileLink>,
-    pub(crate) known: Option<KnownFileLink>,
+    pub(crate) desired: Option<ResolvedResource>,
+    pub(crate) known: Option<KnownResource>,
     pub(crate) actual: StatusActual,
 }
 
 /// One Actual observation or the error that prevented its establishment.
 #[derive(Debug)]
 pub(crate) enum StatusActual {
-    Available(ActualFileLink),
+    Available(ActualResource),
     Unavailable(StatusUnavailable),
 }
 
@@ -130,10 +129,16 @@ impl StatusResource {
         match (&self.desired, &self.known) {
             (Some(_), None) => StatusRelationship::DesiredOnly,
             (None, Some(_)) => StatusRelationship::KnownOnly,
-            (Some(desired), Some(known))
+            (Some(ResolvedResource::FileLink(desired)), Some(KnownResource::FileLink(known)))
                 if desired.source_path() == known.source_path()
                     && desired.target_path() == known.target_path()
                     && desired.link_target() == known.link_target() =>
+            {
+                StatusRelationship::DefinitionsMatch
+            }
+            (Some(ResolvedResource::FileCopy(desired)), Some(KnownResource::FileCopy(known)))
+                if desired.source_path() == known.source_path()
+                    && desired.target_path() == known.target_path() =>
             {
                 StatusRelationship::DefinitionsMatch
             }
@@ -173,10 +178,6 @@ pub(crate) enum QueryError {
     State(StateRepositoryError),
     Inspection(TargetInspectionError),
     ConfigField(String),
-    UnsupportedResourceEffect {
-        resource_id: FullyQualifiedResourceId,
-        effect: &'static str,
-    },
 }
 
 fn load_environment(context: &ResolverContext) -> Result<EnvironmentConfig, QueryError> {
@@ -335,7 +336,6 @@ fn status_with_inspector(
     ) -> Result<FileLinkInspector, TargetInspectionError>,
 ) -> Result<StatusReport, QueryError> {
     let state = repository.load().map_err(QueryError::State)?;
-    reject_unrenderable_known(state.known())?;
     let active_operation = state.active_operation().cloned();
     let desired = match resolve_desired(request) {
         Ok(desired) => desired,
@@ -348,28 +348,20 @@ fn status_with_inspector(
             });
         }
     };
-    if let Err(error) = reject_unrenderable_effects(&desired) {
-        return Ok(StatusReport {
-            active_operation,
-            desired: StatusDesired::Unavailable(error),
-            has_unavailable_observation: false,
-            inspection_initialization_error: None,
-        });
-    }
     let (inspector, inspection_initialization_error) =
         match initialize_inspector(request.context.home_directory().as_ref()) {
             Ok(inspector) => (Some(inspector), None),
             Err(error) => (None, Some(error)),
         };
     let mut desired_by_id = desired
-        .resources()
+        .variants()
         .iter()
         .cloned()
         .map(|resource| (resource.resource_id().clone(), resource))
         .collect::<std::collections::BTreeMap<_, _>>();
     let mut known_by_id = state
         .known()
-        .file_links()
+        .variants()
         .cloned()
         .map(|resource| (resource.resource_id().clone(), resource))
         .collect::<std::collections::BTreeMap<_, _>>();
@@ -381,17 +373,26 @@ fn status_with_inspector(
     let mut resources = Vec::new();
     let mut has_unavailable_observation = false;
     for resource_id in resource_ids {
-        let desired = desired_by_id.remove(&resource_id);
-        let known = known_by_id.remove(&resource_id);
-        let (target_path, link_target) = match (&known, &desired) {
-            (Some(known), _) => (known.target_path(), known.link_target()),
-            (None, Some(desired)) => (desired.target_path(), desired.link_target()),
-            (None, None) => unreachable!("the union key has one source"),
-        };
+        let desired_resource = desired_by_id.remove(&resource_id);
+        let known_resource = known_by_id.remove(&resource_id);
         let actual = if let Some(inspector) = &inspector {
-            let observation = match known.is_some() {
-                true => inspector.inspect_target_for_expected_link(target_path, link_target),
-                false => inspector.inspect_target_for_desired_link(target_path, link_target),
+            let observation = match (&known_resource, &desired_resource) {
+                (Some(KnownResource::FileLink(known)), _) => inspector
+                    .inspect_target_for_expected_link(known.target_path(), known.link_target())
+                    .map(ActualResource::from),
+                (Some(KnownResource::FileCopy(known)), _) => inspector
+                    .inspect_target_for_expected_copy(
+                        known.target_path(),
+                        known.content_fingerprint(),
+                    )
+                    .map(ActualResource::from),
+                (None, Some(ResolvedResource::FileLink(desired))) => inspector
+                    .inspect_target_for_desired_link(desired.target_path(), desired.link_target())
+                    .map(ActualResource::from),
+                (None, Some(ResolvedResource::FileCopy(desired))) => inspector
+                    .inspect_target_for_desired_copy(desired.target_path())
+                    .map(ActualResource::from),
+                (None, None) => unreachable!("the union key has one source"),
             };
             match observation {
                 Ok(actual) => StatusActual::Available(actual),
@@ -406,8 +407,8 @@ fn status_with_inspector(
         };
         resources.push(StatusResource {
             resource_id,
-            desired,
-            known,
+            desired: desired_resource,
+            known: known_resource,
             actual,
         });
     }
@@ -420,33 +421,6 @@ fn status_with_inspector(
         has_unavailable_observation,
         inspection_initialization_error,
     })
-}
-
-fn reject_unrenderable_effects(desired: &ResolvedDesired) -> Result<(), QueryError> {
-    if let Some(ResolvedResource::FileCopy(resource)) = desired
-        .variants()
-        .iter()
-        .find(|resource| matches!(resource, ResolvedResource::FileCopy(_)))
-    {
-        return Err(QueryError::UnsupportedResourceEffect {
-            resource_id: resource.resource_id().clone(),
-            effect: "file_copy",
-        });
-    }
-    Ok(())
-}
-
-fn reject_unrenderable_known(known: &KnownState) -> Result<(), QueryError> {
-    if let Some(KnownResource::FileCopy(resource)) = known
-        .variants()
-        .find(|resource| matches!(resource, KnownResource::FileCopy(_)))
-    {
-        return Err(QueryError::UnsupportedResourceEffect {
-            resource_id: resource.resource_id().clone(),
-            effect: "file_copy",
-        });
-    }
-    Ok(())
 }
 
 pub(crate) fn validate(request: &ValidationRequest) -> Result<ValidationReport, QueryError> {
@@ -481,14 +455,25 @@ pub(crate) fn diff(
     repository: &StateRepository,
 ) -> Result<DiffReport, QueryError> {
     let state = repository.load().map_err(QueryError::State)?;
-    reject_unrenderable_known(state.known())?;
     let mut resources = Vec::new();
-    if state.known().file_links().next().is_some() {
+    if state.known().variants().next().is_some() {
         let inspector = FileLinkInspector::new(home.as_ref()).map_err(QueryError::Inspection)?;
-        for resource in state.known().file_links() {
-            let actual = inspector
-                .inspect_target_for_expected_link(resource.target_path(), resource.link_target())
-                .map_err(QueryError::Inspection)?;
+        for resource in state.known().variants() {
+            let actual = match resource {
+                KnownResource::FileLink(resource) => inspector
+                    .inspect_target_for_expected_link(
+                        resource.target_path(),
+                        resource.link_target(),
+                    )
+                    .map(ActualResource::from),
+                KnownResource::FileCopy(resource) => inspector
+                    .inspect_target_for_expected_copy(
+                        resource.target_path(),
+                        resource.content_fingerprint(),
+                    )
+                    .map(ActualResource::from),
+            }
+            .map_err(QueryError::Inspection)?;
             resources.push((resource.resource_id().clone(), actual));
         }
     }
@@ -518,6 +503,7 @@ pub(crate) fn plan_request(request: &DeclarationRequest) -> Result<PlanReport, Q
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::file_link::ResolvedFileLink;
     use crate::test_support::{
         forbid_desired_dependencies, forbid_mutation, forbid_target_inspection,
     };
@@ -719,10 +705,8 @@ mod tests {
         assert_eq!(resources[0].relationship(), StatusRelationship::DesiredOnly);
         assert!(matches!(
             resources[0].actual,
-            StatusActual::Available(ref actual)
-                if matches!(actual.observation(),
-            crate::domain::actual::TargetObservation::Missing
-                )
+            StatusActual::Available(crate::domain::actual::ActualResource::FileLink(ref actual))
+                if matches!(actual.observation(), crate::domain::actual::TargetObservation::Missing)
         ));
         assert!(!workspace.root.join("state/state.lock").exists());
     }
@@ -875,7 +859,7 @@ mod tests {
         assert!(resources.iter().all(|resource| {
             matches!(
                 resource.actual,
-                StatusActual::Available(ref actual)
+                StatusActual::Available(crate::domain::actual::ActualResource::FileLink(ref actual))
                     if matches!(actual.observation(), crate::domain::actual::TargetObservation::Missing)
             )
         }));
@@ -986,11 +970,8 @@ mod tests {
         };
         assert!(matches!(
             resources[0].actual,
-            StatusActual::Available(ref actual)
-                if matches!(
-                    actual.observation(),
-                    crate::domain::actual::TargetObservation::MatchingUnmanagedLink { .. }
-                )
+            StatusActual::Available(crate::domain::actual::ActualResource::FileLink(ref actual))
+                if matches!(actual.observation(), crate::domain::actual::TargetObservation::MatchingUnmanagedLink { .. })
         ));
     }
 
@@ -1024,7 +1005,7 @@ mod tests {
         assert!(report.has_unavailable_observation);
         assert!(matches!(
             resources[0].actual,
-            StatusActual::Available(ref actual)
+            StatusActual::Available(crate::domain::actual::ActualResource::FileLink(ref actual))
                 if matches!(actual.observation(), crate::domain::actual::TargetObservation::Missing)
         ));
         assert!(matches!(

@@ -185,6 +185,14 @@ impl FileLinkInspector {
         self.inspect_target_for_copy(target_path, Some(expected_fingerprint))
     }
 
+    /// Observes one desired copy target without treating matching content as owned.
+    pub(crate) fn inspect_target_for_desired_copy(
+        &self,
+        target_path: &ResolvedPath,
+    ) -> Result<ActualFileCopy, TargetInspectionError> {
+        self.inspect_target_for_copy(target_path, None)
+    }
+
     fn inspect_target_for_copy(
         &self,
         target_path: &ResolvedPath,

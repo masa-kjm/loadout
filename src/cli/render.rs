@@ -5,7 +5,7 @@ use crate::application::queries::{
     ValidationReport,
 };
 use crate::domain::{
-    actual::TargetObservation,
+    actual::{ActualResource, CopyTargetObservation, TargetObservation},
     diagnostic::Diagnostic,
     plan::{ActionKind, ActionReason, Plan},
 };
@@ -44,7 +44,7 @@ fn reason(reason: ActionReason) -> &'static str {
     }
 }
 
-fn observation(observation: &TargetObservation) -> String {
+fn link_observation(observation: &TargetObservation) -> String {
     match observation {
         TargetObservation::Missing => "missing".into(),
         TargetObservation::ExpectedLink { link_target } => {
@@ -60,6 +60,48 @@ fn observation(observation: &TargetObservation) -> String {
         TargetObservation::UnsafePath { parent_safety } => {
             format!("unsafe_path ({parent_safety:?})")
         }
+    }
+}
+
+fn observation(actual: &ActualResource) -> String {
+    match actual {
+        ActualResource::FileLink(actual) => link_observation(actual.observation()),
+        ActualResource::FileCopy(actual) => match actual.observation() {
+            CopyTargetObservation::Missing => "missing".into(),
+            CopyTargetObservation::ExpectedCopy {
+                content_fingerprint,
+            } => {
+                format!("expected_copy ({})", content_fingerprint.as_str())
+            }
+            CopyTargetObservation::OtherRegularFile {
+                content_fingerprint,
+            } => {
+                format!("other_regular_file ({})", content_fingerprint.as_str())
+            }
+            CopyTargetObservation::OtherEntry { kind } => format!("other_entry ({kind:?})"),
+            CopyTargetObservation::UnsafePath { parent_safety } => {
+                format!("unsafe_path ({parent_safety:?})")
+            }
+        },
+    }
+}
+
+fn expected_category(actual: &ActualResource) -> Option<&'static str> {
+    match actual {
+        ActualResource::FileLink(actual)
+            if matches!(actual.observation(), TargetObservation::ExpectedLink { .. }) =>
+        {
+            Some("expected_link")
+        }
+        ActualResource::FileCopy(actual)
+            if matches!(
+                actual.observation(),
+                CopyTargetObservation::ExpectedCopy { .. }
+            ) =>
+        {
+            Some("expected_copy")
+        }
+        ActualResource::FileLink(_) | ActualResource::FileCopy(_) => None,
     }
 }
 
@@ -95,7 +137,7 @@ pub(super) fn diff(out: &mut impl Write, report: &DiffReport) -> io::Result<u8> 
             out,
             "{id}: {}: {}",
             actual.target_path(),
-            observation(actual.observation())
+            observation(actual)
         )?;
     }
     if let Some(operation) = &report.active_operation {
@@ -216,27 +258,20 @@ pub(super) fn status(out: &mut impl Write, report: &StatusReport) -> io::Result<
                                 ("desired-to-actual", "desired_target_observation")
                             }
                             StatusRelationship::DefinitionsMatch
-                                if matches!(
-                                    actual.observation(),
-                                    TargetObservation::ExpectedLink { .. }
-                                ) =>
+                                if expected_category(actual).is_some() =>
                             {
                                 ("known-to-actual", "recorded_and_expected")
                             }
-                            _ if matches!(
-                                actual.observation(),
-                                TargetObservation::ExpectedLink { .. }
-                            ) =>
-                            {
-                                ("known-to-actual", "expected_link")
-                            }
-                            _ => ("known-to-actual", "drifted"),
+                            _ => match expected_category(actual) {
+                                Some(category) => ("known-to-actual", category),
+                                None => ("known-to-actual", "drifted"),
+                            },
                         };
                         writeln!(
                             out,
                             "  {comparison}: {category}: {}: {}",
                             actual.target_path(),
-                            observation(actual.observation())
+                            observation(actual)
                         )?;
                     }
                     StatusActual::Unavailable(StatusUnavailable::InspectorInitialization) => {
@@ -399,7 +434,7 @@ pub(super) fn planned(out: &mut impl Write, err: &mut impl Write, plan: &Plan) -
             } => writeln!(
                 err,
                 "conflict: {resource_id}: {target_path}: {}",
-                observation(actual)
+                link_observation(actual)
             )?,
             Diagnostic::UnexpectedCopyTarget {
                 resource_id,
@@ -436,7 +471,7 @@ pub(super) fn planned(out: &mut impl Write, err: &mut impl Write, plan: &Plan) -
             } => writeln!(
                 err,
                 "conflict: {old_resource_id} -> {new_resource_id}: {target_path}: {}",
-                observation(actual)
+                link_observation(actual)
             )?,
         }
     }
@@ -453,10 +488,6 @@ pub(super) fn query_error(error: &QueryError) -> String {
         QueryError::State(error) => error.to_string(),
         QueryError::Inspection(error) => error.to_string(),
         QueryError::ConfigField(field) => format!("unsupported configuration field: {field}"),
-        QueryError::UnsupportedResourceEffect {
-            resource_id,
-            effect,
-        } => format!("resource {resource_id} uses unsupported {effect} read-only rendering"),
     }
 }
 
@@ -522,7 +553,7 @@ mod tests {
                 root_profile: crate::domain::ids::ProfileId::parse("base").unwrap(),
                 resources: vec![StatusResource {
                     resource_id: resource.resource_id().clone(),
-                    desired: Some(resource),
+                    desired: Some(resource.into()),
                     known: None,
                     actual: StatusActual::Unavailable(StatusUnavailable::InspectorInitialization),
                 }],
@@ -569,9 +600,9 @@ mod tests {
                 root_profile: crate::domain::ids::ProfileId::parse("base").unwrap(),
                 resources: vec![StatusResource {
                     resource_id,
-                    desired: Some(desired),
-                    known: Some(known),
-                    actual: StatusActual::Available(actual),
+                    desired: Some(desired.into()),
+                    known: Some(known.into()),
+                    actual: StatusActual::Available(actual.into()),
                 }],
             },
             has_unavailable_observation: false,

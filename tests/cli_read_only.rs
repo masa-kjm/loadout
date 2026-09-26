@@ -133,6 +133,15 @@ impl Fixture {
         let digest = Sha256::digest(serde_json_canonicalizer::to_vec(&definition).unwrap());
         json!({"definition_hash":format!("sha256:{digest:x}"),"effect":{"kind":"file_link","source_path":source,"target_path":target,"link_target":source}})
     }
+    fn known_copy(&self, target: &str, contents: &[u8]) -> Value {
+        let source = self.path("store/source");
+        let target = self.path(&format!("home/{target}"));
+        let definition = json!({"format":"loadout.resolved-file-copy.v1","kind":"file","operation":"copy","source_path":source,"target_path":target,"type":"file"});
+        let definition_digest =
+            Sha256::digest(serde_json_canonicalizer::to_vec(&definition).unwrap());
+        let content_digest = Sha256::digest(contents);
+        json!({"definition_hash":format!("sha256:{definition_digest:x}"),"effect":{"kind":"file_copy","source_path":source,"target_path":target,"content_fingerprint":format!("sha256:{content_digest:x}")}})
+    }
 }
 #[cfg(target_os = "linux")]
 struct DisposableDirectory {
@@ -817,6 +826,77 @@ fn status_reports_active_operation_when_valid_state_precedes_an_invalid_declarat
     );
 }
 
+#[test]
+fn copy_inspection_reports_typed_known_and_desired_only_facts_without_side_effects() {
+    let f = Fixture::new();
+    f.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 2\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+    );
+    f.write("home/.copy-target", "content\n");
+    f.state(
+        json!({"base/copied": f.known_copy(".copy-target", b"content\n")}),
+        Value::Null,
+    );
+
+    expect(
+        f.run(&["diff"]),
+        0,
+        &["Known resources: 1", "base/copied", "expected_copy"],
+    );
+    expect(
+        f.run(&["status", "--config", "../portable/config.yaml"]),
+        0,
+        &[
+            "definitions_match",
+            "recorded_and_expected",
+            "expected_copy",
+        ],
+    );
+
+    f.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 2\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+    );
+    expect(
+        f.run(&["status", "--config", "../portable/config.yaml"]),
+        0,
+        &[
+            "definition_changed",
+            "known-to-actual: expected_copy",
+            "expected_copy",
+        ],
+    );
+
+    let desired_only = Fixture::new();
+    desired_only.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 2\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+    );
+    desired_only.write("home/.copy-target", "content\n");
+    expect(
+        desired_only.run(&["status", "--config", "../portable/config.yaml"]),
+        0,
+        &[
+            "desired_only",
+            "desired_target_observation",
+            "other_regular_file",
+        ],
+    );
+
+    f.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 2\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+    );
+    f.write("home/.copy-target", "drifted\n");
+    expect(f.run(&["diff"]), 0, &["base/copied", "other_regular_file"]);
+    expect(
+        f.run(&["status", "--config", "../portable/config.yaml"]),
+        0,
+        &["definitions_match", "drifted", "other_regular_file"],
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn copy_capability_preflight_rejection_creates_no_operation_or_target() {
@@ -1031,7 +1111,7 @@ fn copy_schema_rejection_precedes_target_observation_or_lifecycle_mutation() {
 }
 
 #[test]
-fn copy_declarations_apply_before_read_only_rendering_is_enabled() {
+fn copy_declarations_render_in_read_only_queries() {
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
@@ -1082,10 +1162,11 @@ fn copy_declarations_apply_before_read_only_rendering_is_enabled() {
     );
     expect(
         f.run(&["status", "--config", "../portable/config.yaml"]),
-        2,
+        0,
         &[
-            "desired_unavailable",
-            "unsupported file_copy read-only rendering",
+            "desired_only",
+            "desired_target_observation",
+            "other_regular_file",
             "active_operation: copy-rendering-operation",
             "a1",
             "pending",

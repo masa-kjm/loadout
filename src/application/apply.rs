@@ -2949,7 +2949,12 @@ mod tests {
         let observations = report
             .resources
             .iter()
-            .map(|(id, actual)| (id.as_str(), actual.observation()))
+            .filter_map(|(id, actual)| match actual {
+                crate::domain::actual::ActualResource::FileLink(actual) => {
+                    Some((id.as_str(), actual.observation()))
+                }
+                crate::domain::actual::ActualResource::FileCopy(_) => None,
+            })
             .collect::<BTreeMap<_, _>>();
         assert!(matches!(
             observations["base/expected"],

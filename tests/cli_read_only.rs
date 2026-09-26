@@ -926,6 +926,31 @@ fn copy_capability_preflight_rejection_creates_no_operation_or_target() {
     assert!(!f.path("state/loadout/state.json").exists());
 }
 
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn copy_capability_preflight_rejection_creates_no_operation_or_target() {
+    let f = Fixture::new();
+    f.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 2\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+    );
+
+    expect(
+        f.command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        2,
+        &[
+            "apply failed during Preflight",
+            "file-copy publication capability is unsupported",
+        ],
+    );
+    assert!(fs::symlink_metadata(f.path("home/.copy-target")).is_err());
+    assert!(!f.path("state/loadout/state.json").exists());
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn copy_recovery_closes_a_retained_create_before_presenting_a_fresh_plan() {
     let f = Fixture::new();
@@ -997,6 +1022,7 @@ fn copy_recovery_closes_a_retained_create_before_presenting_a_fresh_plan() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn copy_lifecycle_commands_render_typed_actions_and_preserve_rejection_boundaries() {
     let f = Fixture::new();
@@ -1110,6 +1136,7 @@ fn copy_schema_rejection_precedes_target_observation_or_lifecycle_mutation() {
     assert!(fs::symlink_metadata(state_fixture.path("home/.copy-target")).is_err());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn copy_declarations_render_in_read_only_queries() {
     let f = Fixture::new();

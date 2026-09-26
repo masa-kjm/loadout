@@ -1343,20 +1343,25 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::symlink;
 
     use sha2::{Digest, Sha256};
 
     use super::*;
+    #[cfg(target_os = "linux")]
     use crate::domain::desired::ResolvedResource;
     use crate::domain::file_copy::{ContentFingerprint, ResolvedFileCopy};
+    #[cfg(target_os = "linux")]
     use crate::domain::file_link::ResolvedFileLink;
     use crate::domain::ids::FullyQualifiedResourceId;
+    #[cfg(target_os = "linux")]
     use crate::domain::known::{KnownFileCopy, KnownFileLink, KnownResource};
     use crate::domain::paths::{ResolvedPath, SourceRelativePath};
+    #[cfg(target_os = "linux")]
     use crate::domain::plan::{PlannedEffectHandoff, TargetCondition};
     use crate::inspection::source::{resolve_store_root, verify_regular_source};
+    #[cfg(target_os = "linux")]
     use crate::state::operation::{
         ActionStatus, PersistedCopyActionFacts, PersistedEffectHandoffFacts,
     };
@@ -1369,6 +1374,7 @@ mod tests {
         ContentFingerprint::parse(format!("sha256:{:x}", hasher.finalize())).unwrap()
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn create_uses_only_the_recorded_temporary_and_verifies_its_postcondition() {
         let root = std::env::temp_dir().join(format!(
@@ -1474,6 +1480,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn replace_requires_the_recorded_old_copy_and_verifies_the_new_copy() {
         let root = std::env::temp_dir().join(format!(
@@ -1541,6 +1548,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn remove_requires_the_exact_owned_fingerprint() {
         let root = std::env::temp_dir().join(format!(
@@ -1572,6 +1580,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn relocate_publishes_the_new_copy_before_removing_the_old_copy() {
         let root = std::env::temp_dir().join(format!(
@@ -1642,7 +1651,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn link_to_copy_handoff_replaces_only_the_expected_managed_link() {
         let root = std::env::temp_dir().join(format!(
@@ -1713,7 +1722,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn copy_to_link_handoff_replaces_only_the_expected_managed_copy() {
         let root = std::env::temp_dir().join(format!(

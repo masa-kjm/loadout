@@ -2,10 +2,9 @@
 
 ## Scope
 
-This specification defines v0.3.0 durable state, operation records, exclusive locking, atomic commits, and recovery after interruption retained by v0.4.0.
-It applies only to the v0.3.0 file-link lifecycle retained by v0.4.0.
+This specification defines v0.5.0 durable state, operation records, exclusive locking, atomic commits, and recovery after interruption for both file-link and file-copy resource effects.
 
-Every retained state and recovery requirement in this document remains a v0.5.0 requirement under the [v0.5.0 baseline](README.md#v050-baseline), including state validation before inspection relies on state facts.
+The v0.5.0 State Schema section supersedes the retained v0.3.0 state schema, hash formats, and operation representation. Retained state and recovery requirements continue to apply unless that section states otherwise, including the requirement that inspection validates state before relying on its facts.
 
 ## State Files
 
@@ -17,7 +16,7 @@ state.lock
 ```
 
 `state.json` is UTF-8 JSON.
-If it does not exist, Loadout starts with an empty v0.3.0 state.
+If it does not exist, Loadout starts with an empty v0.5.0 Known state.
 The state directory and lock file may be created by a non-dry-run apply.
 
 If `state.json` is unreadable, invalid JSON, has an unsupported schema version, or violates an invariant, Loadout MUST abort before it inspects a managed target or creates a mutation.

@@ -120,8 +120,8 @@ At minimum, it reports these categories:
 | `desired_only` | a Desired identity with no Known identity |
 | `known_only` | a Known identity with no selected Desired identity |
 | `definition_changed` | the same identity exists in both sets but their definitions differ |
-| `recorded_and_expected` | equal Desired and Known definitions plus the expected Known-to-Actual link observation |
-| `drifted` | a Known resource with missing, different-link, other-entry, unsafe-parent, or unavailable Actual observation |
+| `recorded_and_expected` | equal Desired and Known definitions plus the expected effect-specific Known-to-Actual observation |
+| `drifted` | a Known resource with missing, different link or regular-file content, other entry, unsafe path, or unavailable Actual observation |
 | `desired_target_observation` | Actual observation of a Desired-only resource, explicitly labeled as non-ownership evidence |
 | `active_operation` | a persisted operation and unfinished action statuses |
 | `desired_unavailable` | valid state but an unavailable or invalid selected declaration before target observation |

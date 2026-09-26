@@ -106,7 +106,7 @@ Apply performs preflight after creating a fresh plan and before recording an act
 Preflight MUST verify all planned actions without mutation:
 
 - the plan is executable;
-- every current source still exists and satisfies the File Links source contract;
+- every current source still satisfies its effect-specific source contract and, for a copy, still has the planned content fingerprint;
 - every target and target parent satisfies the planned precondition;
 - no target collision exists;
 - the platform supports each planned mutation;

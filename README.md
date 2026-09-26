@@ -5,18 +5,19 @@ Loadout is a local environment manager built around explicit desired state, owne
 ## Status
 
 v0.3.0 and v0.4.0 are released.
-The v0.4.0 release implements `init`, `config`, `validate`, `diff`, `plan`, `apply`, `status`, `profile`, and `resource` as described in the [CLI specification](docs/specs/cli.md).
-Platform conformance for v0.4.0 requires recorded native evidence for the complete lifecycle and inspection observations on Linux/local ext4, macOS/local APFS, and Windows/local NTFS. Other combinations are not claimed supported merely because a capability is enabled.
+v0.5.0 is the current development contract. It defines `init`, `config`, `validate`, `diff`, `plan`, `apply`, `status`, `profile`, and `resource` as described in the [CLI specification](docs/specs/cli.md).
+Platform conformance for v0.5.0 requires recorded native evidence for the complete lifecycle and inspection observations on Linux/local ext4, macOS/local APFS, and Windows/local NTFS. Other combinations are not claimed supported merely because a capability is enabled.
 Release archives can be installed with the Unix and Windows installer scripts in `scripts/`.
 The published package's Rust library target is not yet a supported public API.
 
 v0.1 is retired and unsupported.
 The published `loadout` v0.1.0 crate is preserved by the `v0.1.0` archive tag, and the final legacy source snapshot is preserved by `legacy/v0.1-final`.
 v0.4.0 retains the v0.3.0 safe core and does not provide compatibility with v0.1 or v0.2 configuration, state, commands, resources, or behavior.
+v0.5.0 deliberately provides no migration or compatibility reader for v0.4 profile or state schemas.
 
-## v0.4.0 Direction
+## v0.5.0 Direction
 
-v0.4.0 retains one complete, safe resource lifecycle: materializing a regular file from a local store as a file symbolic link below the current user's home directory.
+v0.5.0 materializes a regular file from a local store below the current user's home directory as either a file symbolic link or a content-owned regular-file copy.
 It provides profile composition, validation, planning, drift inspection, conflict detection, state locking, verified application, crash recovery, and read-only inspection of declarations, Desired resources, Known state, and Actual observations.
 
 The core planning contract is:
@@ -27,7 +28,7 @@ Resolved Desired + Known + Actual -> Plan
 
 Loadout checks recorded ownership and filesystem safety immediately before mutations, but does not exclude concurrent external changes. An entry substituted after the last check can be deleted or replaced, and successful postcondition verification may not reveal the race. See the [file-link concurrency contract](docs/specs/file-link.md#external-filesystem-concurrency) for the scope and limits of these guarantees.
 
-The intended completion baseline is Linux/local ext4, macOS/local APFS and Windows/local NTFS for the complete file-link lifecycle. See [supported scope](docs/specs/file-link.md#intended-supported-scope) for exclusions and evidence gates; intended support is distinct from the current capability status above.
+The intended completion baseline is Linux/local ext4, macOS/local APFS and Windows/local NTFS for the complete file-link and file-copy lifecycles. See [File Links](docs/specs/file-link.md#intended-supported-scope) and [File Copies](docs/specs/file-copy.md#platform-requirements) for exclusions and evidence gates; intended support is distinct from the current capability status above.
 
 ## Installation
 
@@ -45,7 +46,7 @@ Both installers accept an exact release tag through `--version vX.Y.Z` or `-Vers
 
 ## Basic Usage
 
-Loadout v0.4.0 retains the same environment configuration and profile-file model. The local store can live anywhere; it does not need to be inside the directory containing the configuration. For example:
+Loadout v0.5.0 retains the environment configuration and profile-file model. The local store can live anywhere; it does not need to be inside the directory containing the configuration. For example:
 
 ```text
 loadout-config/
@@ -77,7 +78,7 @@ stores:
 `profiles/workstation.yaml`:
 
 ```yaml
-schema_version: 1
+schema_version: 2
 id: workstation
 resources:
   git-config:
@@ -88,7 +89,7 @@ resources:
         store: dotfiles
         path: gitconfig
       target: ~/.gitconfig
-      operation: link
+      operation: copy
 ```
 
 The source file must already exist, and the target's parent directories must already exist. Paths such as `./profiles` are relative to `config.yaml`, while `~/src/dotfiles` is resolved from the user's home directory. From `loadout-config/`, validate and preview the changes:
@@ -110,7 +111,7 @@ Use `--yes` when running `apply` non-interactively. `--dry-run` performs the app
 loadout diff
 ```
 
-The v0.4.0 development branch also provides read-only inspection commands. They report facts and never plan or repair a resource:
+v0.5.0 also provides read-only inspection commands. They report facts and never plan or repair a resource:
 
 ```sh
 loadout status --config ./config.yaml
@@ -132,12 +133,12 @@ loadout validate --config ./.loadout/config.yaml
 
 ## Documentation
 
-The authoritative v0.4 documentation is in [`docs/`](docs/README.md).
+The authoritative v0.5.0 documentation is in [`docs/`](docs/README.md).
 
 - [Architecture](docs/architecture/README.md) defines system responsibilities and boundaries.
-- [Specifications](docs/specs/README.md) define the v0.4.0 observable contracts.
+- [Specifications](docs/specs/README.md) define the v0.5.0 observable contracts.
 - [Testing Strategy](docs/development/testing.md) defines the required evidence for those contracts.
-- [Future Considerations](docs/future/README.md) records non-binding work outside v0.4.0.
+- [Future Considerations](docs/future/README.md) records non-binding work outside v0.5.0.
 
-`docs/architecture/` and `docs/specs/` are authoritative for v0.4.0.
-Future and draft material may inform a later design, but it cannot change a published v0.4.0 contract.
+`docs/architecture/` and `docs/specs/` are authoritative for v0.5.0.
+Future and draft material may inform a later design, but it cannot change the published v0.5.0 contract.

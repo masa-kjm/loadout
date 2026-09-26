@@ -99,7 +99,7 @@ At minimum, it rejects:
 - an include cycle or missing included profile;
 - a missing store or invalid store root;
 - an invalid resource-local source path;
-- an unsupported file-link property;
+- an unsupported file-resource property;
 - a target collision in the resolved desired set; and
 - a default profile that does not exist.
 

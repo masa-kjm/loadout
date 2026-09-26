@@ -3,7 +3,7 @@
 ## Scope
 
 This specification defines the machine-local runtime configuration, the portable environment configuration, local stores, and path syntax for the v0.3.0 core retained by v0.4.0.
-It does not define profile files or resource behavior; see [Profiles](profiles.md) and [File Links](file-link.md).
+It does not define profile files or resource behavior; see [Profiles](profiles.md), [File Links](file-link.md), and [File Copies](file-copy.md).
 
 Every retained configuration requirement in this document remains a v0.5.0 requirement under the [v0.5.0 baseline](README.md#v050-baseline).
 
@@ -110,7 +110,7 @@ The store path may be absolute, home-relative, or relative to the environment co
 It may contain `..` because it is a configuration-level root path.
 
 The resolved store root is used only to read source assets.
-Loadout MUST NOT modify its contents while resolving, planning, applying, or recovering a v0.3.0 resource.
+Loadout MUST NOT modify its contents while resolving, planning, applying, or recovering a resource.
 
 The [Configuration Authoring](config-authoring.md) specification defines the separate v0.3.0 commands that inspect or deliberately edit configuration.
 Those commands do not change the schema or make store contents writable.

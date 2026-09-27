@@ -138,22 +138,14 @@ impl FileCopyExecutor {
                 Ok(())
             }
             PlannedResourceAction::FileCopy(_) => self.ensure_copy_mutation_capability(action),
-            PlannedResourceAction::ReplaceEffect(handoff) => match handoff.final_effect() {
-                ResolvedResource::FileCopy(_) => self.ensure_copy_mutation_capability(action),
-                ResolvedResource::FileLink(_) => self.ensure_link_mutation_capability(action),
-            },
+            PlannedResourceAction::ReplaceEffect(_) => {
+                Err(CopyPreflightError::UnsupportedPlatformCapability)
+            }
             PlannedResourceAction::FileLink(_) => Err(CopyPreflightError::WrongAction),
         }
     }
 
     fn ensure_copy_mutation_capability(
-        &self,
-        action: &PlannedResourceAction,
-    ) -> Result<(), CopyPreflightError> {
-        self.ensure_mutation_capability(action)
-    }
-
-    fn ensure_link_mutation_capability(
         &self,
         action: &PlannedResourceAction,
     ) -> Result<(), CopyPreflightError> {

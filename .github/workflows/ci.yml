@@ -55,6 +55,10 @@ jobs:
       - name: cargo test (non-macOS)
         id: non_macos_test
         if: matrix.os != 'macos-latest'
+        env:
+          TMPDIR: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
         run: cargo test --locked
 
       - name: cargo test (macOS APFS fixture)
@@ -64,6 +68,22 @@ jobs:
         run: |
           set -o pipefail
           TMPDIR="$RUNNER_TEMP" cargo test --locked 2>&1 | tee macos-platform-test.log
+
+      - name: Native file-copy primitive probe
+        id: native_copy_probe
+        env:
+          LOADOUT_NATIVE_FIXTURE_ROOT: ${{ runner.temp }}
+        run: cargo test --locked --test native_copy_platform
+
+      - name: Record file-copy capability matrix
+        id: copy_capability_matrix
+        if: always()
+        env:
+          LOADOUT_NATIVE_FIXTURE_ROOT: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+        run: python .github/scripts/run-copy-capability-matrix.py
 
       - name: Record Linux platform evidence
         if: always() && matrix.os == 'ubuntu-latest'
@@ -81,6 +101,10 @@ jobs:
             cargo -V
             echo "command=cargo test --locked"
             echo "test_step_outcome=${{ steps.non_macos_test.outcome }}"
+            echo "native_copy_probe_command=cargo test --locked --test native_copy_platform"
+            echo "native_copy_probe_outcome=${{ steps.native_copy_probe.outcome }}"
+            echo "copy_capability_matrix_command=python .github/scripts/run-copy-capability-matrix.py"
+            echo "copy_capability_matrix_outcome=${{ steps.copy_capability_matrix.outcome }}"
           } | tee linux-platform-evidence.txt
 
       - name: Record macOS platform evidence
@@ -100,6 +124,10 @@ jobs:
             cargo -V
             echo "command=TMPDIR=${RUNNER_TEMP} cargo test --locked"
             echo "test_step_outcome=${{ steps.macos_test.outcome }}"
+            echo "native_copy_probe_command=cargo test --locked --test native_copy_platform"
+            echo "native_copy_probe_outcome=${{ steps.native_copy_probe.outcome }}"
+            echo "copy_capability_matrix_command=python .github/scripts/run-copy-capability-matrix.py"
+            echo "copy_capability_matrix_outcome=${{ steps.copy_capability_matrix.outcome }}"
           } | tee macos-platform-evidence.txt
 
       - name: Record Windows platform evidence
@@ -121,6 +149,10 @@ jobs:
             (cargo -V)
             'command=cargo test --locked'
             'test_step_outcome=${{ steps.non_macos_test.outcome }}'
+            'native_copy_probe_command=cargo test --locked --test native_copy_platform'
+            'native_copy_probe_outcome=${{ steps.native_copy_probe.outcome }}'
+            'copy_capability_matrix_command=python .github/scripts/run-copy-capability-matrix.py'
+            'copy_capability_matrix_outcome=${{ steps.copy_capability_matrix.outcome }}'
           ) | Set-Content -Encoding utf8 windows-platform-evidence.txt
 
       - name: Upload platform evidence
@@ -131,5 +163,8 @@ jobs:
           path: |
             *-platform-evidence.txt
             macos-platform-test.log
+            docs/development/copy-platform-decision-record.md
+            copy-capability-matrix.json
+            copy-capability-*.log
           if-no-files-found: error
           retention-days: 30

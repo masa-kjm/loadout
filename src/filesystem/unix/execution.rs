@@ -5,6 +5,10 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
+#[cfg(target_os = "macos")]
+use std::mem::MaybeUninit;
+#[cfg(target_os = "macos")]
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path};
 
@@ -84,6 +88,76 @@ impl ExecutionTarget {
 
     fn parent(&self) -> &OwnedFd {
         self.directories.last().expect("root retained")
+    }
+
+    /// Proves that this retained parent is on local APFS and exposes Darwin's exclusive-rename capability.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn ensure_copy_publication_capability(&self) -> io::Result<()> {
+        self.check_association()?;
+        let mut filesystem = MaybeUninit::<libc::statfs>::zeroed();
+        if unsafe { libc::fstatfs(self.parent().as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let filesystem = unsafe { filesystem.assume_init() };
+        if filesystem.f_flags & libc::MNT_LOCAL as u32 == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "copy publication requires a local target parent",
+            ));
+        }
+
+        let filesystem_name = unsafe {
+            std::ffi::CStr::from_ptr(filesystem.f_fstypename.as_ptr())
+                .to_bytes()
+                .to_ascii_lowercase()
+        };
+        if filesystem_name != b"apfs" {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "copy publication requires a local APFS target parent",
+            ));
+        }
+
+        #[repr(C)]
+        struct CapabilityResponse {
+            length: u32,
+            capabilities: libc::vol_capabilities_attr_t,
+        }
+
+        let mut attributes = libc::attrlist {
+            bitmapcount: libc::ATTR_BIT_MAP_COUNT as u16,
+            reserved: 0,
+            commonattr: 0,
+            volattr: libc::ATTR_VOL_CAPABILITIES,
+            dirattr: 0,
+            fileattr: 0,
+            forkattr: 0,
+        };
+        let mut response = MaybeUninit::<CapabilityResponse>::zeroed();
+        if unsafe {
+            libc::fgetattrlist(
+                self.parent().as_raw_fd(),
+                std::ptr::addr_of_mut!(attributes).cast(),
+                response.as_mut_ptr().cast(),
+                std::mem::size_of::<CapabilityResponse>(),
+                0,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let response = unsafe { response.assume_init() };
+        let interfaces = libc::VOL_CAPABILITIES_INTERFACES;
+        let exclusive_rename = libc::VOL_CAP_INT_RENAME_EXCL;
+        if response.capabilities.valid[interfaces] & exclusive_rename == 0
+            || response.capabilities.capabilities[interfaces] & exclusive_rename == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "APFS target parent does not support exclusive rename",
+            ));
+        }
+        self.check_association()
     }
 
     /// Re-walk the declared canonical path without following links below root, comparing every retained directory object. This does not lock names.
@@ -319,7 +393,21 @@ impl ExecutionTarget {
             .map_err(io::Error::from);
             after_attempt(result)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            use rustix::fs::{RenameFlags, renameat_with};
+
+            let result = renameat_with(
+                self.parent(),
+                &temporary_name,
+                self.parent(),
+                &self.name,
+                RenameFlags::NOREPLACE,
+            )
+            .map_err(io::Error::from);
+            after_attempt(result)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = temporary_name;
             Err(io::Error::new(

@@ -952,6 +952,66 @@ fn copy_capability_preflight_rejection_creates_no_operation_or_target() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn copy_handoffs_fail_preflight_without_mutating_target_or_state() {
+    let link_to_copy = Fixture::new();
+    let target = link_to_copy.path("home/.handoff");
+    std::os::unix::fs::symlink(link_to_copy.path("store/source"), &target).unwrap();
+    link_to_copy.state(
+        json!({"base/item": link_to_copy.known(".handoff")}),
+        Value::Null,
+    );
+    link_to_copy.write("portable/profiles/base.yaml", "schema_version: 2\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.handoff\n");
+    let before_target = fs::read_link(&target).unwrap();
+    let before_state = fs::read(link_to_copy.path("state/loadout/state.json")).unwrap();
+    expect(
+        link_to_copy
+            .command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        2,
+        &[
+            "apply failed during Preflight",
+            "file-copy publication capability is unsupported",
+        ],
+    );
+    assert_eq!(fs::read_link(&target).unwrap(), before_target);
+    assert_eq!(
+        fs::read(link_to_copy.path("state/loadout/state.json")).unwrap(),
+        before_state
+    );
+
+    let copy_to_link = Fixture::new();
+    let target = copy_to_link.path("home/.handoff");
+    fs::write(&target, b"content\n").unwrap();
+    copy_to_link.state(
+        json!({"base/item": copy_to_link.known_copy(".handoff", b"content\n")}),
+        Value::Null,
+    );
+    copy_to_link.profile("base", "item", "~/.handoff");
+    let before_target = fs::read(&target).unwrap();
+    let before_state = fs::read(copy_to_link.path("state/loadout/state.json")).unwrap();
+    expect(
+        copy_to_link
+            .command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        2,
+        &[
+            "apply failed during Preflight",
+            "file-copy publication capability is unsupported",
+        ],
+    );
+    assert_eq!(fs::read(&target).unwrap(), before_target);
+    assert_eq!(
+        fs::read(copy_to_link.path("state/loadout/state.json")).unwrap(),
+        before_state
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn copy_recovery_closes_a_retained_create_before_presenting_a_fresh_plan() {
     let f = Fixture::new();
     f.write(
@@ -1086,6 +1146,38 @@ fn copy_lifecycle_commands_render_typed_actions_and_preserve_rejection_boundarie
             .unwrap()["active_operation"]
             .is_null()
     );
+
+    f.write("store/source", "replaced content\n");
+    expect(
+        f.command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        0,
+        &["replace_copy"],
+    );
+    f.write("portable/profiles/base.yaml", "schema_version: 2\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-moved\n");
+    expect(
+        f.command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        0,
+        &["relocate_copy"],
+    );
+    f.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 2\nid: base\nresources: {}\n",
+    );
+    expect(
+        f.command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        0,
+        &["remove_copy"],
+    );
+    assert!(fs::symlink_metadata(f.path("home/.copy-moved")).is_err());
 
     let conflict = Fixture::new();
     conflict.write(

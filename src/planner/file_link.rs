@@ -39,6 +39,12 @@ pub(super) fn contribute(
     let mut handed_off_known_ids = BTreeSet::new();
 
     for resource in desired.resources() {
+        if matches!(
+            known.get_variant(resource.resource_id()),
+            Some(crate::domain::known::KnownResource::FileCopy(_))
+        ) {
+            continue;
+        }
         if blocked_targets.contains(resource.target_path()) {
             continue;
         }

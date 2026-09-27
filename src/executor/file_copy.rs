@@ -179,6 +179,25 @@ impl FileCopyExecutor {
                 return Ok(());
             }
         }
+        #[cfg(target_os = "macos")]
+        {
+            // Every action is checked independently. In particular, a successful create probe
+            // never enables replacement, removal, relocation, or either effect handoff.
+            for target in action.touched_targets() {
+                let physical_target = self
+                    .inspector
+                    .physical_target_path_for_execution(target)
+                    .map_err(CopyPreflightError::TargetInspection)?;
+                ExecutionTarget::open_with_declared_root(
+                    self.inspector.canonical_home(),
+                    self.inspector.declared_home(),
+                    &physical_target,
+                )
+                .and_then(|context| context.ensure_copy_publication_capability())
+                .map_err(CopyPreflightError::PlatformCapability)?;
+            }
+            return Ok(());
+        }
         let _ = action;
         Err(CopyPreflightError::UnsupportedPlatformCapability)
     }
@@ -1335,25 +1354,25 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::os::unix::fs::symlink;
 
     use sha2::{Digest, Sha256};
 
     use super::*;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::domain::desired::ResolvedResource;
     use crate::domain::file_copy::{ContentFingerprint, ResolvedFileCopy};
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::domain::file_link::ResolvedFileLink;
     use crate::domain::ids::FullyQualifiedResourceId;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::domain::known::{KnownFileCopy, KnownFileLink, KnownResource};
     use crate::domain::paths::{ResolvedPath, SourceRelativePath};
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::domain::plan::{PlannedEffectHandoff, TargetCondition};
     use crate::inspection::source::{resolve_store_root, verify_regular_source};
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::state::operation::{
         ActionStatus, PersistedCopyActionFacts, PersistedEffectHandoffFacts,
     };
@@ -1366,7 +1385,7 @@ mod tests {
         ContentFingerprint::parse(format!("sha256:{:x}", hasher.finalize())).unwrap()
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn create_uses_only_the_recorded_temporary_and_verifies_its_postcondition() {
         let root = std::env::temp_dir().join(format!(
@@ -1472,7 +1491,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn replace_requires_the_recorded_old_copy_and_verifies_the_new_copy() {
         let root = std::env::temp_dir().join(format!(
@@ -1540,7 +1559,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn remove_requires_the_exact_owned_fingerprint() {
         let root = std::env::temp_dir().join(format!(
@@ -1572,7 +1591,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn relocate_publishes_the_new_copy_before_removing_the_old_copy() {
         let root = std::env::temp_dir().join(format!(
@@ -1643,7 +1662,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn link_to_copy_handoff_replaces_only_the_expected_managed_link() {
         let root = std::env::temp_dir().join(format!(
@@ -1714,7 +1733,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn copy_to_link_handoff_replaces_only_the_expected_managed_copy() {
         let root = std::env::temp_dir().join(format!(

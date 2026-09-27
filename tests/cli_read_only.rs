@@ -950,7 +950,7 @@ fn copy_capability_preflight_rejection_creates_no_operation_or_target() {
     assert!(!f.path("state/loadout/state.json").exists());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn copy_handoffs_fail_preflight_without_mutating_target_or_state() {
     let link_to_copy = Fixture::new();
@@ -1010,7 +1010,7 @@ fn copy_handoffs_fail_preflight_without_mutating_target_or_state() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn copy_recovery_closes_a_retained_create_before_presenting_a_fresh_plan() {
     let f = Fixture::new();
@@ -1082,7 +1082,7 @@ fn copy_recovery_closes_a_retained_create_before_presenting_a_fresh_plan() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn copy_lifecycle_commands_render_typed_actions_and_preserve_rejection_boundaries() {
     let f = Fixture::new();

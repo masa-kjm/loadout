@@ -35,7 +35,7 @@ def run(action, phase, test_filter, capability):
     failed = failed or result.returncode != 0
 
 
-if platform_name == "linux":
+if platform_name in ("linux", "darwin"):
     for action, test_filter in [
         ("create_copy", "create_uses_only_the_recorded_temporary_and_verifies_its_postcondition"),
         ("replace_copy", "replace_requires_the_recorded_old_copy_and_verifies_the_new_copy"),

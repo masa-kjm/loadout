@@ -210,7 +210,7 @@ For a create attempt that returns an error, the execution-time exception below t
 | The recorded precondition still holds exactly | Mark the action `failed`; leave Known state unchanged. |
 | Neither condition holds exactly, or observation is unsafe or unavailable | Mark the action `uncertain`; leave Known state unchanged. |
 
-During execution, a failed `create_link` attempt followed by `expected_link` MUST remain `uncertain`, with Known unchanged. The observed link can have been created externally after the final recheck, so its matching value does not establish successful creation by this attempt. This includes an already-existing-entry error and errors whose physical effects cannot be distinguished from external creation. A failed create whose recorded missing precondition still holds remains `failed`; unsafe or unavailable observations remain `uncertain`. This exception does not alter removal or replacement result classification.
+During execution, a failed `create_link` or `create_copy` attempt followed by its expected final effect MUST remain `uncertain`, with Known unchanged. The observed effect can have been created externally after the final recheck, so its matching value does not establish successful creation by this attempt. This includes an already-existing-entry error and errors whose physical effects cannot be distinguished from external creation. A failed create whose recorded missing precondition still holds remains `failed`; unsafe or unavailable observations remain `uncertain`. This exception does not alter removal or replacement result classification.
 
 The [external filesystem concurrency contract](file-link.md#external-filesystem-concurrency) applies to execution and recovery observations and cleanup. The state lock does not exclude unrelated filesystem mutation. After a removal race, `missing` at the recorded target can be indistinguishable from ordinary success: when every required recorded postcondition and path association holds, the result is `succeeded`, Known is removed, and apply can ultimately exit 0. This does not prove which entry was deleted and does not require a race diagnostic based on information unavailable to production observations.
 
@@ -224,6 +224,8 @@ A `replace_link` action, and a `replace_ownership` action whose resolved link ta
 When its old-target precondition still holds and the recorded temporary path is the exact temporary link, the executor or recovery may remove that temporary entry only after a fresh no-follow safety recheck.
 It may mark the replacement `failed` only after that temporary path is `missing`.
 An observed unexpected or unsafe temporary entry MUST NOT be removed. An unremovable temporary or unprovable cleanup aftermath makes the replacement `uncertain`. Cleanup is limited to the exact recorded path, with no sibling scanning, and shares the recheck-to-syscall limitation. A failed recheck after temporary creation does not imply that no mutation occurred; existing effects are classified using the recorded predicates.
+
+For `replace_copy`, the complete new-copy postcondition authorizes `succeeded`; the complete old-copy precondition authorizes `failed` only after authorized cleanup leaves its exact recorded temporary missing. A final target that is missing, a different regular file, another entry, unsafe, or unavailable is `uncertain`. This weaker copy-only replacement rule does not apply to file-link replacement or `copy -> link` handoff, which retain their required old-effect preservation guarantee.
 
 ## Failure and Recovery
 
@@ -240,7 +242,7 @@ For each unfinished action, recovery applies the same evidence rules:
 | `running`; recorded precondition still holds exactly | Mark `failed`; leave the prior Known state unchanged. |
 | `running`; neither condition holds exactly, or inspection is unsafe | Mark `uncertain`; retain Known state unchanged. |
 
-An unfinished `create_link` is an exception to the recorded-postcondition row. Whether its status is `running` or `uncertain`, an observed `expected_link` remains `uncertain` and Known remains unchanged. That observation cannot prove that Loadout created the link: it is indistinguishable from external creation after the final recheck, including when the create syscall returned success before the process stopped. If the recorded create target is `missing`, recovery marks the action `failed`; every other observation remains `uncertain`. This deliberately sacrifices automatic recovery of a successful create whose Known commit was interrupted in order to preserve the rule that Loadout does not adopt an unmanaged matching link.
+An unfinished `create_link` or `create_copy` is an exception to the recorded-postcondition row. Whether its status is `running` or `uncertain`, an observed expected final effect remains `uncertain` and Known remains unchanged. That observation cannot prove that Loadout created the effect: it is indistinguishable from external creation after the final recheck, including when the create syscall returned success before the process stopped. If the recorded create target is `missing`, recovery marks the action `failed`; every other observation remains `uncertain`. This deliberately sacrifices automatic recovery of a successful create whose Known commit was interrupted in order to preserve the rule that Loadout does not adopt an unmanaged matching effect.
 
 For `relocate_link`, both required final observations must hold to prove success.
 A partial relocation, such as both old and new links existing, is `uncertain`.
@@ -251,9 +253,11 @@ Any other observation follows the normal recorded-precondition and post-conditio
 
 After every action has a final status of `succeeded`, `failed`, or `skipped`, the repository removes `active_operation` in a final atomic commit.
 If any action is `uncertain`, the repository retains the operation record and apply returns a blocking diagnostic without creating a new plan.
+An active operation containing `uncertain` is a global barrier: it prevents every fresh plan and every new planned target mutation, including work for resources not named by the uncertain action.
+Read-only inspection may report the active operation but MUST NOT reconcile it or use it to permit a partial apply.
 
 An operator may correct the filesystem manually.
-A later apply re-runs recovery and proceeds only if every formerly uncertain action can then be proven successful or failed by its recorded conditions. For `create_link`, only the recorded missing precondition can close an uncertain action; a matching link remains open.
+A later apply re-runs recovery and proceeds only if every formerly uncertain action can then be proven successful or failed by its recorded conditions. For `create_link` and `create_copy`, only the recorded missing precondition can close an uncertain action; a matching final effect remains open.
 
 Verified actions from before a failure remain in Known state.
 v0.3.0 does not roll them back.
@@ -293,8 +297,10 @@ The v0.5 desired hash uses `loadout.resolved-desired.v2` and sorts resource IDs 
 Its resource definition is the effect-specific resolved definition from [File Links](file-link.md) or [File Copies](file-copy.md).
 The definition hash does not include copy source content; the copy Known record does.
 
-Every copy action records its effect kind, resolved source and target, planned source fingerprint, precondition, postcondition, and exact action-local temporary path and fingerprint until publication completes.
-The temporary is part of the post-condition: it must be missing before `succeeded` is committed.
+Every copy action records its effect kind, resolved source and target, planned source fingerprint, precondition, and postcondition.
+A staged copy publication, every `replace_copy`, and every copy effect handoff also records its exact action-local temporary path and fingerprint until publication completes.
+For an action with a temporary, that temporary is part of the post-condition and must be missing before `succeeded` is committed.
+A direct `create-no-replace` action has no temporary and records the final missing precondition and exact final-copy postcondition needed to classify an incomplete or otherwise unproved final entry as `uncertain`.
 `replace_effect` records both old and final effects and requires the old effect's ownership predicate before any final-effect publication.
 
 An active v2 operation has this exact logical shape; unknown fields are errors.
@@ -322,13 +328,13 @@ Every action contains `kind`, `resource_id`, typed `precondition`, typed `postco
 The complete `old_effect` and `final_effect` objects provide the corresponding Known-state update values; predicates repeat the exact target ownership facts needed for recovery.
 `create_copy`, `replace_copy`, `relocate_copy`, `remove_copy`, and `replace_effect` use the `file_copy` predicate with its fingerprint.
 `create_link`, `replace_link`, `relocate_link`, `remove_link`, and `replace_effect` use the `file_link` predicate with its exact link target.
-Copy publication and every replacement/handoff has `temporary`; remove, forget, and state-only identity actions do not.
+Staged copy publication and every replacement/handoff has `temporary`; a direct `create-no-replace`, remove, forget, and state-only identity action does not.
 Relocation additionally records distinct old and new typed effects.
 
 | Action kind | Typed precondition | Typed postcondition | Known update |
 | --- | --- | --- | --- |
 | `create_link` | target missing | expected final link | record final link |
-| `create_copy` | target missing | expected final copy and temporary missing | record final copy |
+| `create_copy` | target missing | expected final copy, and temporary missing when staged | record final copy |
 | `replace_link` | expected old link | expected final link and temporary missing | replace link effect |
 | `replace_copy` | expected old copy | expected final copy and temporary missing | replace copy effect |
 | `replace_effect` | expected complete old effect | expected complete final effect and temporary missing | replace old effect with final effect |

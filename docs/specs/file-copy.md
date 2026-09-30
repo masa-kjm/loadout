@@ -93,27 +93,32 @@ The general lifecycle rules define managed identity handoff and `link`/`copy` ef
 Before each mutation step, the executor rechecks source regular-file safety, source fingerprint, target containment, parent safety, declared-path association, target kind, and action-specific ownership.
 It records `running` before the first mutation.
 
-Create writes the verified source bytes to a unique action-local temporary regular file in the target parent, flushes it, hashes it, and verifies that its fingerprint equals the planned source fingerprint.
-It then publishes the temporary only if the target is still missing.
-Replace performs the same temporary preparation and atomically replaces only an expected owned target.
-Neither operation may delete the final target before the new temporary has been completely written and verified.
-If a platform cannot preserve the old expected target when publication fails, preflight MUST block replacement.
+`create_copy`, including the new-target step of `relocate_copy`, uses `create-no-replace`: it creates the final regular-file copy only when the final target is still missing and MUST NOT overwrite an entry that appeared after planning.
+An implementation may use either an exclusive direct final-file create or a temporary followed by atomic no-replace publication, provided that it satisfies every required recheck, byte, flush, and post-mutation observation.
+A direct create may leave an incomplete final target after a failed write, flush, close, or verification.
+That entry is not Desired merely because its pathname is the final target: unless the recorded postcondition proves the exact planned bytes, it is `uncertain` and Loadout MUST NOT delete, overwrite, adopt, or retry it automatically.
+
+`replace_copy` prepares, flushes, hashes, and verifies a unique action-local temporary regular file before one replacement attempt against a freshly proved expected owned old copy.
+It MUST NOT delete the final target before the new temporary has been completely written and verified, and it MUST NOT use delete-then-create, a backup-and-restore workflow, a delayed operation, or a fallback primitive.
+Unlike file-link replacement and `copy -> link` handoff, `replace_copy` does not require a failed replacement attempt to leave the old copy at its pathname.
+Its failure aftermath is classified only from the recorded old-copy precondition and new-copy postcondition.
 
 ### Publication Primitives and Capability Boundary
 
-Copy publication always addresses the recorded temporary and final name through the already rechecked target parent; it MUST NOT re-resolve an absolute target pathname for the publish operation.
-The following primitives are the only candidates that v0.5.0 may enable after the required native evidence.
+Every copy mutation addresses the final name, and any action-local temporary name, through the already rechecked target parent; it MUST NOT re-resolve an absolute target pathname for a mutation.
+`create-no-replace` does not fix an implementation technique: an exclusive direct final-file create, temporary plus atomic no-replace publication, or a platform-specific implementation with equivalent native evidence is permitted.
+The following platform entries describe required properties rather than an exclusive implementation list.
 
 | Platform and action | Permitted primitive | Required capability outcome |
 | --- | --- | --- |
-| Linux/local ext4 create | `renameat2` with `RENAME_NOREPLACE`, using the retained target-parent descriptor for both names | The call must reject an already existing final name. An unavailable syscall or filesystem flag support is a preflight rejection. |
-| macOS/local APFS create | `renamex_np` with `RENAME_EXCL`, after confirming the volume supports exclusive renaming | Unsupported volume capability is a preflight rejection. |
-| Windows/local NTFS create | `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`, after the reparse-point and declared-path rechecks | Any API behavior that can replace an existing final name is unsupported and blocks preflight. |
-| Unix replacement or effect handoff | `renameat` through the retained target-parent descriptor | A failed call must leave an entry at the final name; otherwise the capability is unsupported and blocks preflight. |
-| Windows replacement or effect handoff | None in v0.5.0 until a primitive with the required failure aftermath is proven | Preflight blocks the action without a new operation record or target mutation. `ReplaceFileW` is not enabled because its documented failure cases can leave the replaced name absent or moved. |
+| Linux/local ext4 create | A retained-parent `create-no-replace` implementation | It must reject an already existing final name without changing it. Unsupported required syscall or filesystem behavior is a preflight rejection. |
+| macOS/local APFS create | A retained-parent `create-no-replace` implementation after the required volume capability check | It must reject an already existing final name without changing it. Unsupported volume capability is a preflight rejection. |
+| Windows/local NTFS create | A no-replace implementation after the reparse-point and declared-path rechecks | It must reject an already existing final name without changing it. Any behavior that can replace an existing final name is unsupported and blocks preflight. |
+| Copy replacement | One replacement attempt through the retained target parent after temporary staging | It must permit exact post-mutation classification as new expected copy, old expected copy, or `uncertain`; it need not preserve the old copy at its pathname on failure. |
+| Link replacement and `copy -> link` handoff | The primitives defined by [File Links](file-link.md) | They retain their stronger old-effect preservation requirement. |
 
 No delete-then-create sequence, cross-directory move, backup-name workflow, delayed operation, or fallback primitive is permitted.
-Native conformance must prove the selected primitive's success and documented failure aftermath before the corresponding capability is enabled.
+Native conformance must prove each selected platform/action implementation's success, existing-target collision preservation where `create-no-replace` is used, error aftermath, post-mutation classification, and applicable recovery before that capability is enabled.
 
 ### Link-to-Copy Effect Handoff
 
@@ -127,12 +132,14 @@ The primitive MUST NOT delete the expected link before the final copy is ready a
 If the platform cannot preserve the old expected link when the replacement operation itself fails, subject to the external-concurrency limit, preflight MUST block `link -> copy` without a new operation record or target mutation.
 The action records its complete old link and final copy predicates, temporary fingerprint, path, and recovery facts as defined by [State and Recovery](state-and-recovery.md#v050-state-schema).
 
-The recorded temporary path and expected temporary fingerprint are part of every create or replacement action until publication is verified.
-Immediately before publication, the executor rechecks both the exact temporary and final target.
-It verifies the final target's bytes and that the temporary is missing before it commits the Known update and `succeeded` status atomically.
+For staged publication, the recorded temporary path and expected temporary fingerprint are part of the action until publication is verified.
+Immediately before staged publication, the executor rechecks both the exact temporary and final target.
+For direct create, it rechecks the final target immediately before creation and after every attempted mutation boundary required to establish the postcondition.
+It verifies the final target's bytes and, for a staged action, that the temporary is missing before it commits the Known update and `succeeded` status atomically.
 
-After an attempted mutation, the recorded post-condition authorizes `succeeded`; the recorded precondition authorizes `failed`; any other, unsafe, or unavailable observation is `uncertain`.
+After an attempted `create-no-replace`, the recorded post-condition authorizes `succeeded`; the recorded missing precondition authorizes `failed`; any other, unsafe, or unavailable observation is `uncertain`.
 For a failed create followed by matching final content, the result is `uncertain`, not adoption.
+After an attempted `replace_copy`, the exact recorded new-copy postcondition authorizes `succeeded`; the exact recorded old-copy precondition authorizes `failed` after any authorized exact-temporary cleanup; a missing, different, unsafe, or unavailable final observation is `uncertain`.
 Recovery may remove only the exact recorded temporary after a fresh no-follow proof that it is the expected temporary regular file.
 It never scans sibling paths, deletes an unexpected temporary, retries an uncertain action, or rolls back a verified earlier action.
 

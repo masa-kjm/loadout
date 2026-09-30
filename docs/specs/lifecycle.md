@@ -134,6 +134,8 @@ A non-dry-run apply MUST perform this sequence:
 
 Apply MUST NOT resume a prior plan by its stored action sequence.
 After recovery, it always plans from current Resolved Desired, Known, and Actual state.
+If recovery retains any `uncertain` action, it MUST stop before resolution, observation for a fresh plan, preflight, confirmation, a new operation record, or any new planned target mutation.
+This is a global barrier, not resource-scoped continuation or partial apply.
 
 Confirmation is requested only after successful preflight.
 If confirmation is declined or unavailable, apply creates no new operation record and performs no new target mutation; this does not undo permitted earlier recovery effects.
@@ -185,10 +187,11 @@ It requires current Actual proof of the old Known effect and uses the final effe
 | Either final effect | Either old effect | Missing | Corresponding final-effect create; old Known remains until that action's normal state update rules apply |
 | Either final effect | Either old effect | Any unexpected or unsafe observation | Blocked conflict |
 
-For a handoff, the typed precondition is the complete old Known effect and the typed postcondition is the complete final effect plus absence of any recorded temporary.
+For a handoff, the typed precondition is the complete old Known effect and the typed postcondition is the complete final effect plus absence of its recorded temporary.
 The state update removes the old identity's effect and records the final effect atomically with `succeeded`.
 `link -> copy` uses the handoff-specific primitive in [Link-to-Copy Effect Handoff](file-copy.md#link-to-copy-effect-handoff), whose old-target predicate is the expected link; `copy -> link` uses the handoff-specific primitive in [Copy-to-Link Effect Handoff](file-link.md#copy-to-link-effect-handoff), whose old-target predicate is the expected copy.
 Neither handoff is state-only and neither may delete the old target before the final effect is ready.
+The weaker `replace_copy` aftermath does not weaken either handoff: `link -> copy` retains the file-link old-effect preservation guarantee, and `copy -> link` retains the File Links replacement guarantee.
 
 For either effect, a desired resource without Known state creates only at a missing target and otherwise blocks.
 An unchanged known link is `noop` only when its expected link is Actual; an unchanged known copy is `noop` only when its target bytes equal the applied fingerprint and its current source fingerprint equals that applied fingerprint.
@@ -196,6 +199,8 @@ An expected copy with a changed source fingerprint is `replace_copy`.
 An expected target whose definition changes at the same path uses the corresponding replacement or managed effect handoff.
 For either effect, a missing known target creates when desired or is forgotten when stale; every other unexpected observation blocks.
 Target relocation creates and verifies the new effect before removing the old expected effect as one contiguous action.
+For `relocate_copy`, the new target uses `create-no-replace`; after it is verified, removal still requires a fresh owned-old-copy proof.
+If either target cannot be proven by the action's recorded precondition or postcondition, the relocation is `uncertain` and is not rolled back.
 
 Within a phase, actions sort lexicographically by fully qualified resource ID; a managed identity handoff sorts by `<old-resource-id>\u0000<new-resource-id>`.
 The phases are: (1) creates, (2) replacements, effect handoffs, identity handoffs, and relocations, then (3) removals and forgets.

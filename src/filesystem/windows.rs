@@ -139,7 +139,8 @@ fn open_relative_no_follow_with_disposition(
 
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, NtCreateFile,
+        FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT,
+        FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
     };
     use windows_sys::Win32::Foundation::{HANDLE, RtlNtStatusToDosError, UNICODE_STRING};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -173,6 +174,7 @@ fn open_relative_no_follow_with_disposition(
         SecurityQualityOfService: ptr::null(),
     };
     let options = FILE_OPEN_REPARSE_POINT
+        | FILE_SYNCHRONOUS_IO_NONALERT
         | if expect_directory {
             FILE_DIRECTORY_FILE
         } else {
@@ -331,7 +333,7 @@ fn rename_relative_from_handle(
     replace_if_exists: bool,
 ) -> io::Result<()> {
     use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_RENAME_INFORMATION, FileRenameInformationEx, NtSetInformationFile,
+        FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
     };
     use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
@@ -369,7 +371,7 @@ fn rename_relative_from_handle(
             &mut status,
             buffer.as_ptr().cast(),
             buffer.len() as u32,
-            FileRenameInformationEx,
+            FileRenameInformation,
         )
     };
     if result < 0 {

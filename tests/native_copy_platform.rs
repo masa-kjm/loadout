@@ -63,7 +63,7 @@ fn retained_parent_no_replace_rejects_an_existing_final_name() {
     );
 }
 
-// This partial primitive spike covers only success and collision aftermath.
+// This partial primitive spike covers selected native primitive outcomes only.
 // It must not be used to select a candidate or enable Windows copy execution before the remaining Phase 2 matrix is proven natively.
 #[cfg(windows)]
 mod retained_parent_copy_candidates {
@@ -77,7 +77,8 @@ mod retained_parent_copy_candidates {
             fs::OpenOptionsExt,
             io::{AsRawHandle, FromRawHandle},
         },
-        path::Path,
+        path::{Path, PathBuf},
+        process::Command,
         ptr,
     };
 
@@ -91,16 +92,110 @@ mod retained_parent_copy_candidates {
             },
         },
         Win32::{
-            Foundation::{ERROR_ALREADY_EXISTS, HANDLE, RtlNtStatusToDosError, UNICODE_STRING},
+            Foundation::{
+                ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_LOCK_VIOLATION, HANDLE,
+                RtlNtStatusToDosError, UNICODE_STRING,
+            },
             Storage::FileSystem::{
                 DELETE, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
                 FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
             },
-            System::IO::IO_STATUS_BLOCK,
+            System::IO::{IO_STATUS_BLOCK, OVERLAPPED},
         },
     };
 
     use super::Fixture;
+
+    struct DenyAddFileAcl {
+        path: PathBuf,
+        principal: String,
+        installed: bool,
+    }
+
+    impl DenyAddFileAcl {
+        fn install(path: &Path) -> Self {
+            let principal_output = Command::new("whoami.exe")
+                .output()
+                .expect("resolve the current Windows principal");
+            assert!(principal_output.status.success());
+            let principal = String::from_utf8(principal_output.stdout)
+                .expect("current Windows principal is UTF-8")
+                .trim()
+                .to_owned();
+            assert!(!principal.is_empty());
+
+            let status = Command::new("icacls.exe")
+                .arg(path)
+                .arg("/deny")
+                .arg(format!("{principal}:(WD)"))
+                .arg("/c")
+                .status()
+                .expect("install disposable fixture ACL");
+            assert!(status.success());
+
+            Self {
+                path: path.to_owned(),
+                principal,
+                installed: true,
+            }
+        }
+
+        fn remove(&mut self) {
+            if !self.installed {
+                return;
+            }
+            let status = Command::new("icacls.exe")
+                .arg(&self.path)
+                .arg("/remove:d")
+                .arg(&self.principal)
+                .arg("/c")
+                .status()
+                .expect("restore disposable fixture ACL");
+            self.installed = false;
+            assert!(status.success());
+        }
+    }
+
+    impl Drop for DenyAddFileAcl {
+        fn drop(&mut self) {
+            if self.installed {
+                let _ = Command::new("icacls.exe")
+                    .arg(&self.path)
+                    .arg("/remove:d")
+                    .arg(&self.principal)
+                    .arg("/c")
+                    .status();
+            }
+        }
+    }
+
+    fn lock_byte(path: &Path, offset: u32) -> File {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(path)
+            .expect("open disposable fixture file for byte-range lock");
+        let mut overlapped = OVERLAPPED::default();
+        // This initializes the synchronous byte-range lock offset.
+        overlapped.Anonymous.Anonymous.Offset = offset;
+        // SAFETY: the lock is synchronous and the file remains open until the caller releases it.
+        assert_ne!(
+            unsafe {
+                LockFileEx(
+                    file.as_raw_handle() as HANDLE,
+                    LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                    0,
+                    1,
+                    0,
+                    &mut overlapped,
+                )
+            },
+            0
+        );
+        file
+    }
 
     fn retained_parent(path: &Path) -> File {
         OpenOptions::new()
@@ -228,6 +323,237 @@ mod retained_parent_copy_candidates {
         assert_eq!(
             fs::read(fixture.path().join("partial")).unwrap(),
             b"incomplete candidate bytes"
+        );
+    }
+
+    #[test]
+    fn direct_and_staged_create_preserve_partial_artifacts_after_locked_write_failure() {
+        let fixture = Fixture::new();
+        let parent = retained_parent(fixture.path());
+
+        let direct_prefix = b"direct prefix";
+        let mut direct = create_relative_no_replace(&parent, "direct-final").unwrap();
+        direct.write_all(direct_prefix).unwrap();
+        direct.sync_all().unwrap();
+        let direct_lock = lock_byte(
+            &fixture.path().join("direct-final"),
+            direct_prefix.len() as u32,
+        );
+        let direct_error = direct.write_all(b" remainder").unwrap_err();
+        assert_eq!(
+            direct_error.raw_os_error(),
+            Some(ERROR_LOCK_VIOLATION as i32)
+        );
+        drop(direct_lock);
+        assert_eq!(
+            fs::read(fixture.path().join("direct-final")).unwrap(),
+            direct_prefix
+        );
+        drop(direct);
+
+        let staged_prefix = b"staged prefix";
+        let mut temporary = create_relative_no_replace(&parent, "temporary").unwrap();
+        temporary.write_all(staged_prefix).unwrap();
+        temporary.sync_all().unwrap();
+        let temporary_lock = lock_byte(
+            &fixture.path().join("temporary"),
+            staged_prefix.len() as u32,
+        );
+        let staged_error = temporary.write_all(b" remainder").unwrap_err();
+        assert_eq!(
+            staged_error.raw_os_error(),
+            Some(ERROR_LOCK_VIOLATION as i32)
+        );
+        drop(temporary_lock);
+        assert_eq!(
+            fs::read(fixture.path().join("temporary")).unwrap(),
+            staged_prefix
+        );
+        assert!(!fixture.path().join("target").exists());
+        drop(temporary);
+    }
+
+    #[test]
+    fn candidates_observe_locked_read_failure_during_verification() {
+        let fixture = Fixture::new();
+        let parent = retained_parent(fixture.path());
+
+        let mut direct = create_relative_no_replace(&parent, "direct-final").unwrap();
+        direct.write_all(b"planned direct bytes").unwrap();
+        direct.sync_all().unwrap();
+        let direct_lock = lock_byte(&fixture.path().join("direct-final"), 0);
+        let direct_read = fs::read(fixture.path().join("direct-final")).unwrap_err();
+        assert_eq!(
+            direct_read.raw_os_error(),
+            Some(ERROR_LOCK_VIOLATION as i32)
+        );
+        drop(direct_lock);
+        assert_eq!(
+            fs::read(fixture.path().join("direct-final")).unwrap(),
+            b"planned direct bytes"
+        );
+        drop(direct);
+
+        let mut temporary = create_relative_no_replace(&parent, "temporary").unwrap();
+        temporary.write_all(b"planned staged bytes").unwrap();
+        temporary.sync_all().unwrap();
+        let temporary_lock = lock_byte(&fixture.path().join("temporary"), 0);
+        let temporary_read = fs::read(fixture.path().join("temporary")).unwrap_err();
+        assert_eq!(
+            temporary_read.raw_os_error(),
+            Some(ERROR_LOCK_VIOLATION as i32)
+        );
+        assert!(!fixture.path().join("target").exists());
+        drop(temporary_lock);
+        assert_eq!(
+            fs::read(fixture.path().join("temporary")).unwrap(),
+            b"planned staged bytes"
+        );
+        drop(temporary);
+    }
+
+    #[test]
+    fn candidates_observe_missing_names_after_another_operation_removes_them() {
+        let fixture = Fixture::new();
+        let parent = retained_parent(fixture.path());
+
+        let mut direct = create_relative_no_replace(&parent, "direct-final").unwrap();
+        direct.write_all(b"planned direct bytes").unwrap();
+        direct.sync_all().unwrap();
+        fs::remove_file(fixture.path().join("direct-final")).unwrap();
+        let direct_observation = fs::read(fixture.path().join("direct-final")).unwrap_err();
+        assert_eq!(direct_observation.kind(), io::ErrorKind::NotFound);
+        drop(direct);
+
+        let mut temporary = create_relative_no_replace(&parent, "temporary").unwrap();
+        temporary.write_all(b"planned staged bytes").unwrap();
+        temporary.sync_all().unwrap();
+        fs::remove_file(fixture.path().join("temporary")).unwrap();
+        let publication = rename_relative_no_replace(&temporary, &parent, "target").unwrap_err();
+        assert!(publication.raw_os_error().is_some());
+        assert!(!fixture.path().join("temporary").exists());
+        assert!(!fixture.path().join("target").exists());
+        drop(temporary);
+    }
+
+    #[test]
+    fn candidates_observe_byte_changes_through_another_handle_before_verification_or_publication() {
+        let fixture = Fixture::new();
+        let parent = retained_parent(fixture.path());
+
+        let mut direct = create_relative_no_replace(&parent, "direct-final").unwrap();
+        direct.write_all(b"planned direct bytes").unwrap();
+        direct.sync_all().unwrap();
+        let mut external_direct = OpenOptions::new()
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(fixture.path().join("direct-final"))
+            .unwrap();
+        external_direct.set_len(0).unwrap();
+        external_direct.write_all(b"external direct bytes").unwrap();
+        external_direct.sync_all().unwrap();
+        drop(external_direct);
+        assert_ne!(
+            fs::read(fixture.path().join("direct-final")).unwrap(),
+            b"planned direct bytes"
+        );
+        assert_eq!(
+            fs::read(fixture.path().join("direct-final")).unwrap(),
+            b"external direct bytes"
+        );
+        drop(direct);
+
+        let mut temporary = create_relative_no_replace(&parent, "temporary").unwrap();
+        temporary.write_all(b"planned staged bytes").unwrap();
+        temporary.sync_all().unwrap();
+        let mut external_temporary = OpenOptions::new()
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(fixture.path().join("temporary"))
+            .unwrap();
+        external_temporary.set_len(0).unwrap();
+        external_temporary
+            .write_all(b"external staged bytes")
+            .unwrap();
+        external_temporary.sync_all().unwrap();
+        drop(external_temporary);
+        assert_ne!(
+            fs::read(fixture.path().join("temporary")).unwrap(),
+            b"planned staged bytes"
+        );
+        assert_eq!(
+            fs::read(fixture.path().join("temporary")).unwrap(),
+            b"external staged bytes"
+        );
+        assert!(!fixture.path().join("target").exists());
+        drop(temporary);
+    }
+
+    #[test]
+    fn candidates_preserve_missing_names_when_parent_acl_denies_add_file() {
+        let fixture = Fixture::new();
+        let parent = retained_parent(fixture.path());
+        let mut acl = DenyAddFileAcl::install(fixture.path());
+
+        let direct = create_relative_no_replace(&parent, "direct-final").unwrap_err();
+        assert_eq!(direct.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+        assert!(!fixture.path().join("direct-final").exists());
+
+        let staged = create_relative_no_replace(&parent, "temporary").unwrap_err();
+        assert_eq!(staged.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+        assert!(!fixture.path().join("temporary").exists());
+
+        acl.remove();
+    }
+
+    #[test]
+    fn temporary_publication_preserves_temporary_when_parent_acl_denies_add_file() {
+        let fixture = Fixture::new();
+        let parent = retained_parent(fixture.path());
+        let mut temporary = create_relative_no_replace(&parent, "temporary").unwrap();
+        temporary.write_all(b"staged candidate bytes").unwrap();
+        temporary.sync_all().unwrap();
+        let mut acl = DenyAddFileAcl::install(fixture.path());
+
+        let publication = rename_relative_no_replace(&temporary, &parent, "target").unwrap_err();
+        assert_eq!(publication.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+        assert_eq!(
+            fs::read(fixture.path().join("temporary")).unwrap(),
+            b"staged candidate bytes"
+        );
+        assert!(!fixture.path().join("target").exists());
+
+        acl.remove();
+        drop(temporary);
+    }
+
+    #[test]
+    fn candidates_reject_a_file_reparse_target_without_changing_it() {
+        use std::os::windows::fs::symlink_file;
+
+        let fixture = Fixture::new();
+        let target = fixture.path().join("target");
+        let referent = fixture.path().join("referent");
+        fs::write(&referent, b"referent bytes").unwrap();
+        symlink_file(&referent, &target)
+            .expect("native fixture requires file symbolic-link support");
+        let parent = retained_parent(fixture.path());
+
+        let direct = create_relative_no_replace(&parent, "target").unwrap_err();
+        assert!(direct.raw_os_error().is_some());
+        assert_eq!(fs::read_link(&target).unwrap(), referent);
+        assert_eq!(fs::read(&referent).unwrap(), b"referent bytes");
+
+        let mut temporary = create_relative_no_replace(&parent, "temporary").unwrap();
+        temporary.write_all(b"staged candidate bytes").unwrap();
+        temporary.sync_all().unwrap();
+        let staged = rename_relative_no_replace(&temporary, &parent, "target").unwrap_err();
+        assert!(staged.raw_os_error().is_some());
+        assert_eq!(fs::read_link(&target).unwrap(), referent);
+        assert_eq!(fs::read(&referent).unwrap(), b"referent bytes");
+        assert_eq!(
+            fs::read(fixture.path().join("temporary")).unwrap(),
+            b"staged candidate bytes"
         );
     }
 

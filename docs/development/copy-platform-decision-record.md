@@ -33,7 +33,7 @@ A new narrow binding or direct FFI declaration needs an API review, maintenance 
 | macOS/APFS create | Retained-parent `create-no-replace` plus verified APFS capability | staged retained-parent rustix renameat_with RENAME_EXCL; retained-FD libc APFS and VOL_CAP_INT_RENAME_EXCL query | Enabled only after the per-parent APFS/capability check | macOS CI records success, collision, post-effect, recovery, and compiled-binary results. |
 | macOS/APFS replace, relocate, and remove | Retained-parent replacement/removal with action-specific aftermath | retained-parent rustix renameat/unlinkat after APFS/exclusive-rename capability query | Enabled only after each action's independent preflight check | macOS CI records copy-replacement classification, removal aftermath, executor, compiled-binary, and recovery evidence. |
 | macOS/APFS link/copy handoff | Preserved old expected target and complete effect aftermath | No enabled primitive in this step | Fail-closed | Dedicated compiled-binary success/failure-aftermath/recovery evidence remains required. |
-| Windows/NTFS create | `create-no-replace`, retained-parent/declared-path association, and exact classification | Direct exclusive `NtCreateFile(FILE_CREATE)` and temporary publication through handle-relative `NtSetInformationFile(FileRenameInformation)` | Partial native spike evidence; executor remains fail-closed | Add reparse, sharing/ACL, write/flush/close/verify failure, post-error observation, state/recovery, executor, and CLI evidence before selecting or enabling either implementation. |
+| Windows/NTFS create | `create-no-replace`, retained-parent/declared-path association, and exact classification | Direct exclusive `NtCreateFile(FILE_CREATE)` and temporary publication through handle-relative `NtSetInformationFile(FileRenameInformation)` | Partial native spike evidence; executor remains fail-closed | Add sharing denial, flush and close failure, post-error classification, state/recovery, executor, and CLI evidence before selecting or enabling either implementation. |
 | Windows/NTFS `replace_copy` | Fresh old-copy ownership proof, staged replacement, and exact new/old/uncertain classification | No selected primitive; `ReplaceFileW` remains excluded | Unresolved and fail-closed | A separately reviewed native spike proving success, old-copy definite failure, uncertain missing/different/unsafe/unavailable aftermath, recovery, and no delete-then-create or backup/restore fallback. |
 | Windows/NTFS relocate and source-changing handoff | Their independently required old-effect guarantees | No selected primitive | Unresolved and fail-closed | Do not infer enablement from Windows create or `replace_copy`; prove each action's required aftermath separately. |
 | Windows/NTFS remove and same-source handoff | Rechecked no-follow removal or state-only identity transition | No selection in this record | Unresolved and fail-closed where current capability gating requires it | Retained-parent/no-follow, sharing and ACL denial, executor/CLI, and recovery evidence. |
@@ -44,11 +44,33 @@ On 2026-09-30, the Windows-native probe ran on Windows 11 build 26200.0 with Pow
 The command was `cargo.exe test --test native_copy_platform -- --nocapture` from the WSL UNC worktree, with `CARGO_TARGET_DIR` set to a unique child of `%TEMP%` and fixtures below `%TEMP%`.
 This partial spike does not complete Step 2 and selects neither candidate. It does not authorize direct-create recovery or diagnostic behavior, executor integration, or Windows copy capability enablement.
 
-- Retained-parent direct exclusive `NtCreateFile(FILE_CREATE)` created and flushed exact bytes, rejected an existing final name without changing its bytes, and left a deliberately incomplete final-path artifact intact after close.
+### Candidate matrix
+
+| Required native condition | Direct exclusive create | Temporary no-replace publication |
+| --- | --- | --- |
+| Success and exact bytes | Confirmed | Confirmed; temporary missing after publication |
+| Existing-final collision preservation | Confirmed | Confirmed; final and temporary preserved |
+| Final file-reparse rejection | Confirmed | Confirmed; link and referent preserved |
+| Parent AddFile ACL denial | Confirmed; final remains missing | Confirmed; temporary remains missing |
+| Publication ACL denial after staging | Not applicable | Confirmed; `ERROR_ACCESS_DENIED`, temporary preserved, final missing |
+| Non-empty partial write failure | Confirmed; final retains the flushed prefix | Confirmed; temporary retains the flushed prefix and final is missing |
+| Verification failure | Confirmed for locked read and byte mismatch | Confirmed for locked read and byte mismatch before publication |
+| Post-mutation missing-name observation | Confirmed; final observation is `NotFound` | Confirmed; publication errors and both names are missing |
+| Sharing denial | Unverified | Unverified |
+| Flush failure | Unverified | Unverified |
+| Close failure | Unverified | Unverified |
+
+- Retained-parent direct exclusive `NtCreateFile(FILE_CREATE)` created and flushed exact bytes and rejected an existing final name without changing its bytes. A separate successful write followed by an ordinary close left its bytes at the final pathname; it is only an artifact observation, not an injected write, flush, close, or verification failure.
 - Retained-parent temporary publication used `NtSetInformationFile` with `FileRenameInformation`, a zero `ReplaceIfExists` field, and `DELETE` access on the temporary handle. It published to a missing final name and rejected an existing final name with `ERROR_ALREADY_EXISTS` while preserving both the existing final bytes and the temporary bytes.
+- Both candidates rejected a file reparse point at the final declared path without changing the link or its referent.
+- A disposable parent-directory DACL that denies the current principal `WD` caused both candidates’ initial create to return `ERROR_ACCESS_DENIED`; neither the direct final nor the staged temporary name appeared. The same denial after temporary staging caused handle-relative publication to return `ERROR_ACCESS_DENIED`, preserving the temporary bytes and leaving the final name missing. The fixture removed that explicit deny ACE before cleanup.
+- After each candidate flushed a non-empty prefix, an exclusive byte-range lock on the next byte caused `WriteFile` through the candidate handle to return `ERROR_LOCK_VIOLATION`. After lock release, the direct final and staged temporary retained only their flushed prefix bytes, and the staged final name was still missing.
+- An exclusive byte-range lock also caused direct-final and staged-temporary verification reads to return `ERROR_LOCK_VIOLATION`. After lock release, each artifact retained its planned bytes and the staged final name remained missing.
+- A separate writer handle changed an already flushed direct final and a staged temporary before their byte verification. The observed bytes differed from the planned bytes; the staged final name remained missing.
+- A separate filesystem operation removed a written direct final and a written staged temporary while the candidate handles remained open. The direct final path observation returned `NotFound`; handle-relative staged publication returned an error, and both staged names remained missing.
 - The earlier `FileRenameInformationEx` candidate and a temporary handle without `DELETE` access are not selected; they produced `ERROR_INVALID_PARAMETER` and `ERROR_ACCESS_DENIED` respectively during the same spike.
 
-This is primitive-only evidence. Reparse-point rejection, sharing denial, ACL denial, actual write/flush/close/verification failure, post-error classification, recovery, executor, and compiled-binary evidence remain unverified. The Windows copy executor therefore remains fail-closed.
+This is primitive-only evidence. Sharing denial, flush and close failure, post-error classification, recovery, executor, and compiled-binary evidence remain unverified. The Windows copy executor therefore remains fail-closed.
 
 The macOS and Windows entries are release work, not permitted permanent exclusions from the intended baseline.
 The macOS gate is queried through the retained parent descriptor, never an absolute-path capability lookup. When APFS or exclusive-rename proof is unavailable, preflight rejects before operation creation, target mutation, or Known-state update. Windows and every action still marked fail-closed retain that rejection behavior.

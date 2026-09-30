@@ -202,6 +202,8 @@ For `config`, output identifies the inspected or changed configuration file and 
 
 An `apply` that has already completed one or more verified actions and then fails exits with `1`.
 It never reports success merely because some earlier actions were committed. A failed recheck after a mutation step is an execution failure, with recorded effects classified as specified by State and Recovery. Conversely, exit `0` after verified removal does not prove the identity of the deleted entry when external substitution was indistinguishable from the required postconditions.
+When recovery retains an active operation containing `uncertain`, `apply` reports the global recovery barrier and exits `2` before it creates a fresh plan or starts any new target mutation.
+`diff` and `status` may report that active operation read-only; they do not clear the barrier or enable resource-scoped continuation.
 
 ## Excluded Commands
 

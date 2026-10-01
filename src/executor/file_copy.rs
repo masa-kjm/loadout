@@ -154,51 +154,9 @@ impl FileCopyExecutor {
 
     fn ensure_mutation_capability(
         &self,
-        action: &PlannedResourceAction,
+        _action: &PlannedResourceAction,
     ) -> Result<(), CopyPreflightError> {
-        #[cfg(target_os = "linux")]
-        {
-            const EXT_SUPER_MAGIC: i64 = 0xEF53;
-            let supported_filesystems = action.touched_targets().into_iter().all(|target| {
-                target.as_ref().parent().is_some_and(|parent| {
-                    rustix::fs::statfs(parent)
-                        .is_ok_and(|filesystem| filesystem.f_type == EXT_SUPER_MAGIC)
-                })
-            });
-            // An empty old name cannot name an entry, so a NotFound result proves that the
-            // kernel accepted renameat2 and RENAME_NOREPLACE without mutating a target.
-            let rename_no_replace_supported = rustix::fs::renameat_with(
-                rustix::fs::CWD,
-                "",
-                rustix::fs::CWD,
-                "",
-                rustix::fs::RenameFlags::NOREPLACE,
-            )
-            .is_err_and(|error| io::Error::from(error).kind() == io::ErrorKind::NotFound);
-            if supported_filesystems && rename_no_replace_supported {
-                return Ok(());
-            }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            // Every action is checked independently. In particular, a successful create probe
-            // never enables replacement, removal, relocation, or either effect handoff.
-            for target in action.touched_targets() {
-                let physical_target = self
-                    .inspector
-                    .physical_target_path_for_execution(target)
-                    .map_err(CopyPreflightError::TargetInspection)?;
-                ExecutionTarget::open_with_declared_root(
-                    self.inspector.canonical_home(),
-                    self.inspector.declared_home(),
-                    &physical_target,
-                )
-                .and_then(|context| context.ensure_copy_publication_capability())
-                .map_err(CopyPreflightError::PlatformCapability)?;
-            }
-            return Ok(());
-        }
-        let _ = action;
+        // Phase 3 retains the candidate-shaped executor and retained-parent primitives for deterministic contract checks, but no copy mutation capability is enabled until its Phase 7 evidence batch is complete.
         Err(CopyPreflightError::UnsupportedPlatformCapability)
     }
 
@@ -1387,7 +1345,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn create_uses_only_the_recorded_temporary_and_verifies_its_postcondition() {
+    fn create_primitive_uses_only_the_recorded_temporary_and_verifies_its_postcondition() {
         let root = std::env::temp_dir().join(format!(
             "loadout-copy-executor-{}-{}",
             std::process::id(),
@@ -1435,12 +1393,18 @@ mod tests {
         .unwrap();
 
         let executor = FileCopyExecutor::new(&root.join("home")).unwrap();
-        executor
+        let error = executor
             .preflight(
                 &PlannedResourceAction::FileCopy(action.clone()),
                 Some(&source),
             )
-            .unwrap();
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CopyPreflightError::UnsupportedPlatformCapability
+        ));
+        assert!(fs::symlink_metadata(&target).is_err());
+        assert!(fs::symlink_metadata(&temporary).is_err());
         executor
             .execute_create(&action, &recorded, &source)
             .unwrap();

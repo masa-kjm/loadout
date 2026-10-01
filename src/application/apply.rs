@@ -1591,6 +1591,28 @@ fn recovery_decision(
         });
     }
 
+    if action.kind() == ActionKind::ReplaceCopy {
+        let facts = action
+            .copy_facts()
+            .expect("validated copy replacement record has facts");
+        if !matches!(
+            facts.old_effect(),
+            Some(crate::domain::known::KnownResource::FileCopy(_))
+        ) {
+            return Ok(RecoveryDecision::Uncertain);
+        }
+        let postcondition = condition_holds(inspector, &action.postcondition())?;
+        if postcondition && temporary_missing {
+            return Ok(RecoveryDecision::Succeeded);
+        }
+        let precondition = condition_holds(inspector, &action.precondition())?;
+        return Ok(if precondition && temporary_missing {
+            RecoveryDecision::Failed
+        } else {
+            RecoveryDecision::Uncertain
+        });
+    }
+
     if action.replacement_facts().is_some() {
         let postcondition = condition_holds(inspector, &action.postcondition())?;
         if postcondition && temporary_missing {
@@ -1674,7 +1696,6 @@ mod tests {
     use crate::inspection::source::{VerifiedSource, resolve_store_root, verify_regular_source};
     use crate::resolver::{ResolverContext, resolve_for_apply};
     use crate::state::operation::ActionStatus;
-    #[cfg(unix)]
     use crate::state::repository::{CommitError, CommitStage};
     use sha2::{Digest, Sha256};
 
@@ -6122,6 +6143,211 @@ mod tests {
             Some(&KnownResource::FileCopy(previous))
         );
         assert!(locked.state().active_operation().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_recovery_keeps_an_exact_copy_temporary_uncertain_when_cleanup_is_unproven() {
+        let workspace = TestWorkspace::new();
+        let resource_id = FullyQualifiedResourceId::parse("base/git-config").unwrap();
+        let target = ResolvedPath::new(workspace.path("home/.gitconfig")).unwrap();
+        let old = copy_desired(
+            &workspace,
+            resource_id.clone(),
+            "store/git/old",
+            target.clone(),
+            b"old\n",
+        );
+        let previous = commit_known_copy(&workspace, old);
+        let desired = copy_desired(
+            &workspace,
+            resource_id.clone(),
+            "store/git/new",
+            target,
+            b"new\n",
+        );
+        let desired_set = copy_desired_set(desired.clone());
+        let mut locked = workspace.repository().acquire_exclusive().unwrap();
+        begin_running_copy_action(
+            &mut locked,
+            &desired_set,
+            PlannedFileCopyAction::Replace {
+                desired,
+                previous: previous.clone(),
+            },
+        );
+        let temporary = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap()
+            .1
+            .temporary_path()
+            .unwrap()
+            .clone();
+        fs::write(&temporary, b"new\n").unwrap();
+
+        assert!(reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap());
+        assert_eq!(fs::read(&temporary).unwrap(), b"new\n");
+        assert_eq!(
+            locked.state().known().get_variant(&resource_id),
+            Some(&KnownResource::FileCopy(previous))
+        );
+        let (_, action) = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap();
+        assert_eq!(action.status(), ActionStatus::Uncertain);
+    }
+
+    #[test]
+    fn recovery_commits_or_fails_copy_replacement_from_recorded_conditions() {
+        let successful = TestWorkspace::new();
+        let resource_id = FullyQualifiedResourceId::parse("base/git-config").unwrap();
+        let target = ResolvedPath::new(successful.path("home/.gitconfig")).unwrap();
+        let old = copy_desired(
+            &successful,
+            resource_id.clone(),
+            "store/git/old",
+            target.clone(),
+            b"old\n",
+        );
+        let previous = commit_known_copy(&successful, old);
+        let desired = copy_desired(
+            &successful,
+            resource_id.clone(),
+            "store/git/new",
+            target,
+            b"new\n",
+        );
+        let desired_set = copy_desired_set(desired.clone());
+        let mut locked = successful.repository().acquire_exclusive().unwrap();
+        begin_running_copy_action(
+            &mut locked,
+            &desired_set,
+            PlannedFileCopyAction::Replace {
+                desired: desired.clone(),
+                previous,
+            },
+        );
+        fs::write(desired.target_path(), b"new\n").unwrap();
+
+        assert!(
+            !reconcile_active_operation(&mut locked, successful.path("home").as_path()).unwrap()
+        );
+        assert!(locked.state().active_operation().is_none());
+        assert_eq!(
+            locked.state().known().get_variant(&resource_id),
+            Some(&KnownResource::FileCopy(KnownFileCopy::from_resolved(
+                &desired
+            )))
+        );
+
+        let failed = TestWorkspace::new();
+        let target = ResolvedPath::new(failed.path("home/.gitconfig")).unwrap();
+        let old = copy_desired(
+            &failed,
+            resource_id.clone(),
+            "store/git/old",
+            target.clone(),
+            b"old\n",
+        );
+        let previous = commit_known_copy(&failed, old);
+        let desired = copy_desired(
+            &failed,
+            resource_id.clone(),
+            "store/git/new",
+            target,
+            b"new\n",
+        );
+        let desired_set = copy_desired_set(desired.clone());
+        let mut locked = failed.repository().acquire_exclusive().unwrap();
+        begin_running_copy_action(
+            &mut locked,
+            &desired_set,
+            PlannedFileCopyAction::Replace {
+                desired,
+                previous: previous.clone(),
+            },
+        );
+
+        assert!(!reconcile_active_operation(&mut locked, failed.path("home").as_path()).unwrap());
+        assert!(locked.state().active_operation().is_none());
+        assert_eq!(
+            locked.state().known().get_variant(&resource_id),
+            Some(&KnownResource::FileCopy(previous))
+        );
+    }
+
+    #[test]
+    fn recovery_preserves_copy_replacement_until_a_failed_known_commit_can_be_retried() {
+        let workspace = TestWorkspace::new();
+        let resource_id = FullyQualifiedResourceId::parse("base/git-config").unwrap();
+        let target = ResolvedPath::new(workspace.path("home/.gitconfig")).unwrap();
+        let old = copy_desired(
+            &workspace,
+            resource_id.clone(),
+            "store/git/old",
+            target.clone(),
+            b"old\n",
+        );
+        let previous = commit_known_copy(&workspace, old);
+        let desired = copy_desired(
+            &workspace,
+            resource_id.clone(),
+            "store/git/new",
+            target,
+            b"new\n",
+        );
+        let desired_set = copy_desired_set(desired.clone());
+        let mut locked = workspace.repository().acquire_exclusive().unwrap();
+        begin_running_copy_action(
+            &mut locked,
+            &desired_set,
+            PlannedFileCopyAction::Replace {
+                desired: desired.clone(),
+                previous: previous.clone(),
+            },
+        );
+        fs::write(desired.target_path(), b"new\n").unwrap();
+        locked.fail_next_commit_at(CommitStage::CreateTemporary);
+
+        assert!(matches!(
+            reconcile_active_operation(&mut locked, workspace.path("home").as_path()),
+            Err(ApplyError::State(StateRepositoryError::Commit(
+                CommitError::Injected {
+                    stage: CommitStage::CreateTemporary
+                }
+            )))
+        ));
+        let (_, action) = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .actions()
+            .next()
+            .unwrap();
+        assert_eq!(action.status(), ActionStatus::Running);
+        assert_eq!(
+            locked.state().known().get_variant(&resource_id),
+            Some(&KnownResource::FileCopy(previous))
+        );
+
+        assert!(
+            !reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap()
+        );
+        assert!(locked.state().active_operation().is_none());
+        assert_eq!(
+            locked.state().known().get_variant(&resource_id),
+            Some(&KnownResource::FileCopy(KnownFileCopy::from_resolved(
+                &desired
+            )))
+        );
     }
 
     #[test]

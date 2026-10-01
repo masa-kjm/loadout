@@ -1120,6 +1120,67 @@ fn copy_recovery_keeps_matching_create_uncertain_and_blocks_a_fresh_plan() {
     );
 }
 
+#[test]
+fn copy_replacement_recovery_keeps_a_different_final_uncertain_and_blocks_a_fresh_plan() {
+    let f = Fixture::new();
+    f.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 2\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+    );
+    let old_fingerprint = format!("sha256:{:x}", Sha256::digest(b"old\n"));
+    let new_fingerprint = format!("sha256:{:x}", Sha256::digest(b"content\n"));
+    let old_known = f.known_copy(".copy-target", b"old\n");
+    let old_effect = old_known["effect"].clone();
+    let final_effect = json!({
+        "kind": "file_copy",
+        "source_path": f.path("store/source"),
+        "target_path": f.path("home/.copy-target"),
+        "content_fingerprint": new_fingerprint
+    });
+    f.state(
+        json!({"base/copied": old_known}),
+        json!({
+            "id": "uncertain-copy-replace",
+            "desired_hash": format!("sha256:{}", "a".repeat(64)),
+            "actions": {"a1": {
+                "kind": "replace_copy",
+                "resource_id": "base/copied",
+                "target_path": f.path("home/.copy-target"),
+                "source_path": f.path("store/source"),
+                "content_fingerprint": new_fingerprint,
+                "temporary_path": f.path("home/.loadout-copy-a1"),
+                "old_effect": old_effect,
+                "final_effect": final_effect,
+                "precondition": {"target": "expected_copy", "content_fingerprint": old_fingerprint},
+                "postcondition": {"target": "expected_copy", "content_fingerprint": new_fingerprint},
+                "status": "running"
+            }}
+        }),
+    );
+    fs::write(f.path("home/.copy-target"), b"different\n").unwrap();
+
+    expect(
+        f.command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        2,
+        &["apply failed during Recovery", "must be recovered"],
+    );
+    assert_eq!(
+        fs::read(f.path("home/.copy-target")).unwrap(),
+        b"different\n"
+    );
+    let state =
+        serde_json::from_slice::<Value>(&fs::read(f.path("state/loadout/state.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["resources"]["base/copied"], old_known);
+    assert_eq!(
+        state["active_operation"]["actions"]["a1"]["status"],
+        "uncertain"
+    );
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn copy_lifecycle_commands_render_typed_actions_and_fail_closed_before_mutation() {

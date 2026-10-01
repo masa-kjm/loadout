@@ -1067,6 +1067,59 @@ fn copy_recovery_closes_a_retained_create_before_presenting_a_fresh_plan() {
     assert_eq!(recovered["resources"], json!({}));
 }
 
+#[test]
+fn copy_recovery_keeps_matching_create_uncertain_and_blocks_a_fresh_plan() {
+    let f = Fixture::new();
+    f.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 2\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+    );
+    let fingerprint = format!("sha256:{:x}", Sha256::digest(b"content\n"));
+    f.state(
+        json!({}),
+        json!({
+            "id": "uncertain-copy-create",
+            "desired_hash": format!("sha256:{}", "a".repeat(64)),
+            "actions": {"a1": {
+                "kind": "create_copy",
+                "resource_id": "base/copied",
+                "target_path": f.path("home/.copy-target"),
+                "source_path": f.path("store/source"),
+                "content_fingerprint": fingerprint,
+                "temporary_path": f.path("home/.loadout-copy-a1"),
+                "final_effect": {
+                    "kind": "file_copy",
+                    "source_path": f.path("store/source"),
+                    "target_path": f.path("home/.copy-target"),
+                    "content_fingerprint": fingerprint
+                },
+                "precondition": {"target": "missing"},
+                "postcondition": {"target": "expected_copy", "content_fingerprint": fingerprint},
+                "status": "running"
+            }}
+        }),
+    );
+    fs::write(f.path("home/.copy-target"), b"content\n").unwrap();
+
+    expect(
+        f.command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        2,
+        &["apply failed during Recovery", "must be recovered"],
+    );
+    assert_eq!(fs::read(f.path("home/.copy-target")).unwrap(), b"content\n");
+    let state =
+        serde_json::from_slice::<Value>(&fs::read(f.path("state/loadout/state.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["resources"], json!({}));
+    assert_eq!(
+        state["active_operation"]["actions"]["a1"]["status"],
+        "uncertain"
+    );
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn copy_lifecycle_commands_render_typed_actions_and_fail_closed_before_mutation() {

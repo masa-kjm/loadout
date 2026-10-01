@@ -6055,9 +6055,6 @@ mod tests {
             .clone();
         locked.mark_running(&action_id).unwrap();
         fs::write(&target, b"copy source\n").unwrap();
-        locked
-            .mark_without_known(&action_id, ActionStatus::Uncertain)
-            .unwrap();
 
         assert!(reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap());
         let (_, recorded) = locked

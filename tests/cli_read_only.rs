@@ -950,6 +950,110 @@ fn copy_capability_preflight_rejection_creates_no_operation_or_target() {
     assert!(!f.path("state/loadout/state.json").exists());
 }
 
+#[test]
+fn copy_replace_relocate_and_remove_fail_preflight_without_mutating_target_or_state() {
+    let replace = Fixture::new();
+    replace.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 2\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+    );
+    replace.write("store/source", "new\n");
+    replace.write("home/.copy-target", "old\n");
+    replace.state(
+        json!({"base/item": replace.known_copy(".copy-target", b"old\n")}),
+        Value::Null,
+    );
+    let before_target = fs::read(replace.path("home/.copy-target")).unwrap();
+    let before_state = fs::read(replace.path("state/loadout/state.json")).unwrap();
+    expect(
+        replace
+            .command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        2,
+        &[
+            "apply failed during Preflight",
+            "file-copy publication capability is unsupported",
+        ],
+    );
+    assert_eq!(
+        fs::read(replace.path("home/.copy-target")).unwrap(),
+        before_target
+    );
+    assert_eq!(
+        fs::read(replace.path("state/loadout/state.json")).unwrap(),
+        before_state
+    );
+
+    let relocate = Fixture::new();
+    relocate.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 2\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.new-target\n",
+    );
+    relocate.write("home/.old-target", "content\n");
+    relocate.state(
+        json!({"base/item": relocate.known_copy(".old-target", b"content\n")}),
+        Value::Null,
+    );
+    let before_target = fs::read(relocate.path("home/.old-target")).unwrap();
+    let before_state = fs::read(relocate.path("state/loadout/state.json")).unwrap();
+    expect(
+        relocate
+            .command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        2,
+        &[
+            "apply failed during Preflight",
+            "file-copy publication capability is unsupported",
+        ],
+    );
+    assert_eq!(
+        fs::read(relocate.path("home/.old-target")).unwrap(),
+        before_target
+    );
+    assert!(fs::symlink_metadata(relocate.path("home/.new-target")).is_err());
+    assert_eq!(
+        fs::read(relocate.path("state/loadout/state.json")).unwrap(),
+        before_state
+    );
+
+    let remove = Fixture::new();
+    remove.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 2\nid: base\nresources: {}\n",
+    );
+    remove.write("home/.copy-target", "content\n");
+    remove.state(
+        json!({"base/item": remove.known_copy(".copy-target", b"content\n")}),
+        Value::Null,
+    );
+    let before_target = fs::read(remove.path("home/.copy-target")).unwrap();
+    let before_state = fs::read(remove.path("state/loadout/state.json")).unwrap();
+    expect(
+        remove
+            .command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        2,
+        &[
+            "apply failed during Preflight",
+            "file-copy publication capability is unsupported",
+        ],
+    );
+    assert_eq!(
+        fs::read(remove.path("home/.copy-target")).unwrap(),
+        before_target
+    );
+    assert_eq!(
+        fs::read(remove.path("state/loadout/state.json")).unwrap(),
+        before_state
+    );
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn copy_handoffs_fail_preflight_without_mutating_target_or_state() {

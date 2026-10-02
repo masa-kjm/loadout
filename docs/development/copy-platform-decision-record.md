@@ -74,3 +74,45 @@ This is primitive-only evidence. Sharing denial, flush and close failure, post-e
 
 The macOS and Windows entries are release work, not permitted permanent exclusions from the intended baseline.
 The macOS gate is queried through the retained parent descriptor, never an absolute-path capability lookup. When APFS or exclusive-rename proof is unavailable, preflight rejects before operation creation, target mutation, or Known-state update. Windows and every action still marked fail-closed retain that rejection behavior.
+
+## Phase 7 local evidence batch (2026-10-01; no capability enabled)
+
+All records in this batch retain the runtime `fail_closed` decision.
+The action-level matrix records candidate executor and recovery checks separately from compiled-binary rejection; a passing candidate check is not a publication capability selection.
+
+### Linux/ext4 local batch
+
+The batch ran on Linux 5.15.167.4-microsoft-standard-WSL2 with an ext4 disposable fixture at `/tmp/loadout-phase7-linux-evidence.FC3IRG`, Rust 1.95.0, and Cargo 1.95.0.
+The command was `LOADOUT_NATIVE_FIXTURE_ROOT=/tmp/loadout-phase7-linux-evidence.FC3IRG TMPDIR=/tmp/loadout-phase7-linux-evidence.FC3IRG TEMP=/tmp/loadout-phase7-linux-evidence.FC3IRG TMP=/tmp/loadout-phase7-linux-evidence.FC3IRG python3 .github/scripts/run-copy-capability-matrix.py`.
+The generated `copy-capability-matrix.json` contained 24 passing records for `create_copy`, `replace_copy`, `remove_copy`, `relocate_copy`, `link_to_copy_handoff`, and `copy_to_link_handoff`; every record matched exactly one passing test and named capability `fail_closed`.
+The matrix covered retained-parent candidate executor postconditions, action-specific recovery/post-effect classification, and compiled-binary fail-closed rejection without a new operation record or target mutation.
+It did not run compiled-binary publication success, native sharing/ACL denial, complete post-error aftermath, or manual-correction recovery for an enabled action.
+No Linux action is selected or enabled from this batch.
+
+### Windows/NTFS local batch
+
+The batch ran on Windows version 2009 with PowerShell 5.1.26100.9549, NTFS disposable fixtures below `%TEMP%`, Rust 1.95.0, and Cargo 1.95.0 from the WSL UNC worktree.
+The Windows-native direct invocation used PowerShell `-NoProfile` with this complete context:
+
+```powershell
+Set-Location '\\wsl.localhost\Ubuntu-24.04\home\masal\ghq\github.com\masa-kjm\loadout'
+$toolchain = 'C:\Users\ilafm\AppData\Local\mise\installs\rust\1.95.0'
+$env:PATH = "$toolchain;$env:PATH"
+$env:TEMP = 'C:\Users\ilafm\AppData\Local\Temp'
+$env:TMP = 'C:\Users\ilafm\AppData\Local\Temp'
+$env:CARGO_TARGET_DIR = 'C:\Users\ilafm\AppData\Local\Temp\loadout-phase7-windows-direct-20261001'
+$env:LOADOUT_NATIVE_FIXTURE_ROOT = 'C:\Users\ilafm\AppData\Local\Temp\loadout-phase7-windows-direct-fixtures-20261001'
+& "$toolchain\cargo.exe" test --test native_copy_platform
+```
+
+The native command passed 10 primitive-probe tests, including direct and staged collision preservation, file-reparse rejection, parent ACL denial, partial-write aftermath, verification observation, and temporary-publication aftermath.
+The compiled-binary commands `cargo.exe test --test cli_read_only copy_capability_preflight_rejection_creates_no_operation_or_target` and `cargo.exe test --test cli_read_only copy_replace_relocate_and_remove_fail_preflight_without_mutating_target_or_state` passed, proving fail-closed rejection for create, replace, relocate, and remove without a new operation record or target mutation.
+The state commands `cargo.exe test recovery_preserves_copy_replacement_until_a_failed_known_commit_can_be_retried` and `cargo.exe test recovery_commits_or_fails_copy_relocation_from_recorded_conditions` passed.
+The local Windows environment exposes only the Microsoft Store `python.exe` launcher and no Python runtime, so `.github/scripts/run-copy-capability-matrix.py` was unrun on Windows; no Windows matrix artifact was claimed.
+Windows sharing denial, flush and close failure, selected executor integration, compiled-binary publication success, and file-symbolic-link handoff policy evidence remain unrun.
+No Windows action is selected or enabled from this batch.
+
+### macOS/APFS
+
+No macOS/APFS runner was available for this batch.
+Every macOS action remains fail-closed pending its retained-parent APFS capability check and the required native, executor/state-recovery, and compiled-binary evidence.

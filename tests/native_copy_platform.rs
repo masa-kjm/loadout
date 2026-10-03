@@ -63,6 +63,26 @@ fn retained_parent_no_replace_rejects_an_existing_final_name() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn retained_parent_no_replace_publishes_exact_bytes_to_a_missing_final_name() {
+    use std::fs::{self, File};
+
+    use rustix::fs::{RenameFlags, renameat_with};
+
+    let fixture = Fixture::new();
+    let parent = File::open(fixture.path()).unwrap();
+    fs::write(fixture.path().join("source"), b"exact source bytes").unwrap();
+
+    renameat_with(&parent, "source", &parent, "target", RenameFlags::NOREPLACE).unwrap();
+
+    assert!(fs::symlink_metadata(fixture.path().join("source")).is_err());
+    assert_eq!(
+        fs::read(fixture.path().join("target")).unwrap(),
+        b"exact source bytes"
+    );
+}
+
 // This partial primitive spike covers selected native primitive outcomes only.
 // It must not be used to select a candidate or enable Windows copy execution before the remaining Phase 2 matrix is proven natively.
 #[cfg(windows)]

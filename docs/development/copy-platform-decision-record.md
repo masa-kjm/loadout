@@ -30,7 +30,7 @@ A new narrow binding or direct FFI declaration needs an API review, maintenance 
 | Linux/ext4 copy relocate and remove | Verified new `create-no-replace`, then rechecked owned-old removal and exact aftermath | Candidate-shaped `rustix` retained-parent rename/remove operations | Fail-closed pending their action-specific Phase 7A batches | Native safety, denial, aftermath, recovery, and compiled-binary evidence must select and enable each action independently. |
 | Linux/ext4 link replacement | Preserved old expected effect on failed publication | `rustix` retained-parent rename operations | Selected and enabled | Keep native executor, CLI, post-effect, and recovery coverage current. |
 | Linux/ext4 link/copy handoff | Preserved old expected target and complete effect aftermath | `rustix` retained-parent rename operations | Fail-closed pending their action-specific Phase 7A batches | Native safety, denial, aftermath, recovery, and compiled-binary evidence must select and enable either handoff capability. |
-| macOS/APFS create | Retained-parent `create-no-replace` plus verified APFS capability | Candidate-shaped staged retained-parent rustix renameat_with RENAME_EXCL; retained-FD libc APFS and VOL_CAP_INT_RENAME_EXCL query | Fail-closed pending the Phase 7 evidence batch | Native filesystem, executor/state-recovery, compiled-binary CLI, and recovery evidence must select and enable this action. |
+| macOS/APFS create | Retained-parent `create-no-replace` plus verified APFS capability | Candidate-shaped staged retained-parent rustix renameat_with RENAME_EXCL; retained-FD libc APFS and VOL_CAP_INT_RENAME_EXCL query | Phase 7B candidate evidence reviewed; final gate follow-up pending | The final-record CI must show native collision preservation, executor and recovery checks, compiled CLI success, and capability rejection for this exact revision before selection and enablement. |
 | macOS/APFS replace, relocate, and remove | Retained-parent replacement/removal with action-specific aftermath | Candidate-shaped retained-parent rustix renameat/unlinkat after APFS/exclusive-rename capability query | Fail-closed pending the Phase 7 evidence batch | Native filesystem, executor/state-recovery, compiled-binary CLI, and recovery evidence must select and enable each action independently. |
 | macOS/APFS link/copy handoff | Preserved old expected target and complete effect aftermath | No enabled primitive in this step | Fail-closed | Dedicated compiled-binary success/failure-aftermath/recovery evidence remains required. |
 | Windows/NTFS create | `create-no-replace`, retained-parent/declared-path association, and exact classification | Direct exclusive `NtCreateFile(FILE_CREATE)` and temporary publication through handle-relative `NtSetInformationFile(FileRenameInformation)` | Partial native spike evidence; executor remains fail-closed | Add sharing denial, flush and close failure, post-error classification, state/recovery, executor, and CLI evidence before selecting or enabling either implementation. |
@@ -116,6 +116,17 @@ No Windows action is selected or enabled from this batch.
 
 No macOS/APFS runner was available for this batch.
 Every macOS action remains fail-closed pending its retained-parent APFS capability check and the required native, executor/state-recovery, and compiled-binary evidence.
+
+## Phase 7B macOS/APFS candidate evidence (2026-10-03; final gate follow-up pending)
+
+CI run [#75](https://github.com/masa-kjm/loadout/actions/runs/37130136937) passed for candidate commit `037b6646639b689b524100a2731b91ce3dd9657b`.
+The `macos-latest` runner was macOS 26.6.2 build 25G83 on APFS at `/Users/runner/work/_temp`, with Rust and Cargo 1.95.0 on `aarch64-apple-darwin`.
+Its `cargo test --locked`, `cargo test --locked --test native_copy_platform`, and compiled-binary `copy_lifecycle_commands_render_typed_actions_and_apply_on_apfs` checks all passed.
+The compiled CLI test proved retained-parent APFS capability query, `VOL_CAP_INT_RENAME_EXCL` availability, exact copy creation, Known-state commit, and no active operation after success.
+The same artifact retains fail-closed preflight rejection evidence for `replace_copy`, `remove_copy`, `relocate_copy`, and both effect handoffs.
+
+The reviewed artifact predates this decision-record and matrix follow-up, so it is candidate evidence rather than final enablement evidence.
+The next CI run must execute the expanded macOS action matrix on this follow-up revision and preserve its APFS evidence artifact before this record changes to `Selected and enabled`.
 
 ## Phase 7A local Linux candidate batch (2026-10-02; not release-enabled)
 

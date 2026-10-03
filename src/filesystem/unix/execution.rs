@@ -125,7 +125,7 @@ impl ExecutionTarget {
         }
 
         let mut attributes = libc::attrlist {
-            bitmapcount: libc::ATTR_BIT_MAP_COUNT as u16,
+            bitmapcount: libc::ATTR_BIT_MAP_COUNT,
             reserved: 0,
             commonattr: 0,
             volattr: libc::ATTR_VOL_CAPABILITIES,

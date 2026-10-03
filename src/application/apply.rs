@@ -88,6 +88,7 @@ pub(crate) fn apply_request(
     apply_request_with_hooks(request, confirm, |_, _| {})
 }
 
+#[allow(clippy::result_large_err)] // The closure error is immediately converted into the public boxed ApplyFailure.
 fn apply_request_with_hooks(
     request: &super::queries::DeclarationRequest,
     confirm: impl FnOnce(&Plan) -> bool,

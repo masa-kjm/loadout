@@ -378,6 +378,8 @@ impl ExecutionTarget {
                 "recorded temporary does not have the expected content",
             ));
         }
+        #[cfg(target_os = "macos")]
+        self.ensure_copy_publication_capability()?;
         before_attempt()?;
         #[cfg(target_os = "linux")]
         {

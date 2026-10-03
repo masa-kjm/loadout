@@ -103,7 +103,7 @@ if platform_name == "linux":
             ["--test", "cli_read_only"],
         )
 elif platform_name == "darwin":
-    run("create_copy", "preflight_rejection", "copy_capability_preflight_rejection_creates_no_operation_or_target", "fail_closed", ["--test", "cli_read_only"])
+    run("create_copy", "compiled_cli_success", "copy_lifecycle_commands_render_typed_actions_and_apply_on_apfs", "candidate", ["--test", "cli_read_only"])
     for action in ["replace_copy", "remove_copy", "relocate_copy"]:
         run(
             action,

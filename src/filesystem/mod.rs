@@ -132,6 +132,19 @@ pub(crate) fn ensure_file_symbolic_link_removal_supported(
     platform::ensure_file_symbolic_link_removal_supported(target_parent)
 }
 
+/// Proves the platform capability required to publish a copy at `target_path`.
+///
+/// On macOS this deliberately opens the already resolved target through its retained parent context: an absolute-path volume lookup could validate a different object after an ancestor substitution.
+#[cfg(target_os = "macos")]
+pub(crate) fn ensure_file_copy_publication_supported(
+    canonical_home: &ResolvedPath,
+    declared_home: &ResolvedPath,
+    target_path: &ResolvedPath,
+) -> io::Result<()> {
+    ExecutionTarget::open_with_declared_root(canonical_home, declared_home, target_path)?
+        .ensure_copy_publication_capability()
+}
+
 pub(crate) fn normalize_observed_absolute_path(
     path: &Path,
 ) -> Result<ResolvedPath, ResolvedPathError> {

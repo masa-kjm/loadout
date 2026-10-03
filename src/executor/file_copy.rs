@@ -138,9 +138,7 @@ impl FileCopyExecutor {
                 Ok(())
             }
             PlannedResourceAction::FileCopy(_) => self.ensure_copy_mutation_capability(action),
-            PlannedResourceAction::ReplaceEffect(_) => {
-                Err(CopyPreflightError::UnsupportedPlatformCapability)
-            }
+            PlannedResourceAction::ReplaceEffect(_) => self.ensure_copy_mutation_capability(action),
             PlannedResourceAction::FileLink(_) => Err(CopyPreflightError::WrongAction),
         }
     }
@@ -154,10 +152,26 @@ impl FileCopyExecutor {
 
     fn ensure_mutation_capability(
         &self,
-        _action: &PlannedResourceAction,
+        action: &PlannedResourceAction,
     ) -> Result<(), CopyPreflightError> {
-        // Phase 3 retains the candidate-shaped executor and retained-parent primitives for deterministic contract checks, but no copy mutation capability is enabled until its Phase 7 evidence batch is complete.
-        Err(CopyPreflightError::UnsupportedPlatformCapability)
+        #[cfg(target_os = "linux")]
+        {
+            if matches!(
+                action,
+                PlannedResourceAction::FileCopy(action) if action.kind() == ActionKind::CreateCopy
+            ) {
+                // The Linux Phase 7A candidate batch currently proves only retained-parent create-no-replace publication.
+                Ok(())
+            } else {
+                Err(CopyPreflightError::UnsupportedPlatformCapability)
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = action;
+            // Other platforms remain fail-closed until their independent native evidence batches select a primitive.
+            Err(CopyPreflightError::UnsupportedPlatformCapability)
+        }
     }
 
     /// Materializes one planned and recorded copy only after every immediate recheck succeeds.
@@ -1393,12 +1407,21 @@ mod tests {
         .unwrap();
 
         let executor = FileCopyExecutor::new(&root.join("home")).unwrap();
+        #[cfg(target_os = "linux")]
+        executor
+            .preflight(
+                &PlannedResourceAction::FileCopy(action.clone()),
+                Some(&source),
+            )
+            .unwrap();
+        #[cfg(not(target_os = "linux"))]
         let error = executor
             .preflight(
                 &PlannedResourceAction::FileCopy(action.clone()),
                 Some(&source),
             )
             .unwrap_err();
+        #[cfg(not(target_os = "linux"))]
         assert!(matches!(
             error,
             CopyPreflightError::UnsupportedPlatformCapability

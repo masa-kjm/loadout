@@ -25,11 +25,11 @@ A new narrow binding or direct FFI declaration needs an API review, maintenance 
 
 | Platform/action | Required property | Candidate and binding | Decision | Evidence still required before enablement |
 | --- | --- | --- | --- | --- |
-| Linux/ext4 create | Retained-parent `create-no-replace` | Candidate-shaped `rustix::fs::renameat_with` with `RenameFlags::NOREPLACE` for staged publication | Fail-closed pending the Phase 7 evidence batch | Native filesystem, executor/state-recovery, compiled-binary CLI, and recovery evidence must select and enable this action. |
-| Linux/ext4 `replace_copy` | Fresh old-copy ownership proof, staged replacement, and exact new/old/uncertain classification | Candidate-shaped `rustix` retained-parent rename operations | Fail-closed pending the Phase 7 evidence batch | Native filesystem, executor/state-recovery, compiled-binary CLI, and recovery evidence must select and enable this action. |
-| Linux/ext4 copy relocate and remove | Verified new `create-no-replace`, then rechecked owned-old removal and exact aftermath | Candidate-shaped `rustix` retained-parent rename/remove operations | Fail-closed pending the Phase 7 evidence batch | Native filesystem, executor/state-recovery, compiled-binary CLI, and recovery evidence must select and enable each action independently. |
+| Linux/ext4 create | Retained-parent `create-no-replace` | Candidate-shaped `rustix::fs::renameat_with` with `RenameFlags::NOREPLACE` for staged publication | Phase 7A candidate execution only; not selected or release-enabled | Native CI artifact for the exact candidate commit, final gate rerun, and review must select and enable this action. |
+| Linux/ext4 `replace_copy` | Fresh old-copy ownership proof, staged replacement, and exact new/old/uncertain classification | Candidate-shaped `rustix` retained-parent rename operations | Fail-closed pending its action-specific Phase 7A batch | Native safety, denial, aftermath, recovery, and compiled-binary evidence must select and enable this action. |
+| Linux/ext4 copy relocate and remove | Verified new `create-no-replace`, then rechecked owned-old removal and exact aftermath | Candidate-shaped `rustix` retained-parent rename/remove operations | Fail-closed pending their action-specific Phase 7A batches | Native safety, denial, aftermath, recovery, and compiled-binary evidence must select and enable each action independently. |
 | Linux/ext4 link replacement | Preserved old expected effect on failed publication | `rustix` retained-parent rename operations | Selected and enabled | Keep native executor, CLI, post-effect, and recovery coverage current. |
-| Linux/ext4 link/copy handoff | Preserved old expected target and complete effect aftermath | `rustix` retained-parent rename operations | Evidence incomplete; not release-enabled | Add compiled-binary native handoff evidence before publishing either handoff capability as enabled. |
+| Linux/ext4 link/copy handoff | Preserved old expected target and complete effect aftermath | `rustix` retained-parent rename operations | Fail-closed pending their action-specific Phase 7A batches | Native safety, denial, aftermath, recovery, and compiled-binary evidence must select and enable either handoff capability. |
 | macOS/APFS create | Retained-parent `create-no-replace` plus verified APFS capability | Candidate-shaped staged retained-parent rustix renameat_with RENAME_EXCL; retained-FD libc APFS and VOL_CAP_INT_RENAME_EXCL query | Fail-closed pending the Phase 7 evidence batch | Native filesystem, executor/state-recovery, compiled-binary CLI, and recovery evidence must select and enable this action. |
 | macOS/APFS replace, relocate, and remove | Retained-parent replacement/removal with action-specific aftermath | Candidate-shaped retained-parent rustix renameat/unlinkat after APFS/exclusive-rename capability query | Fail-closed pending the Phase 7 evidence batch | Native filesystem, executor/state-recovery, compiled-binary CLI, and recovery evidence must select and enable each action independently. |
 | macOS/APFS link/copy handoff | Preserved old expected target and complete effect aftermath | No enabled primitive in this step | Fail-closed | Dedicated compiled-binary success/failure-aftermath/recovery evidence remains required. |
@@ -116,3 +116,19 @@ No Windows action is selected or enabled from this batch.
 
 No macOS/APFS runner was available for this batch.
 Every macOS action remains fail-closed pending its retained-parent APFS capability check and the required native, executor/state-recovery, and compiled-binary evidence.
+
+## Phase 7A local Linux candidate batch (2026-10-02; not release-enabled)
+
+This batch executes the Linux candidate paths in an unmerged Phase 7A worktree.
+It does not select or enable a release capability, and the candidate must remain out of the release branch until an Ubuntu CI artifact for its exact commit is reviewed.
+
+The batch ran on Linux 5.15.167.4-microsoft-standard-WSL2 with an ext4 disposable fixture at `/tmp/loadout-phase7a-linux-evidence.2VSU4p`, Rust 1.95.0, and Cargo 1.95.0.
+The command was `LOADOUT_NATIVE_FIXTURE_ROOT=/tmp/loadout-phase7a-linux-evidence.2VSU4p TMPDIR=/tmp/loadout-phase7a-linux-evidence.2VSU4p TEMP=/tmp/loadout-phase7a-linux-evidence.2VSU4p TMP=/tmp/loadout-phase7a-linux-evidence.2VSU4p python3 .github/scripts/run-copy-capability-matrix.py`.
+The generated matrix contained nine passing records, each with exactly one matched and one passing test.
+Four `candidate` records cover retained-parent `create_copy` executor postconditions, compiled-binary success with an exact Known-state commit, and recorded-condition recovery/post-effect classification.
+Five `fail_closed` records cover preflight rejection without target mutation or a new operation record for `replace_copy`, `relocate_copy`, `remove_copy`, and both handoffs.
+The focused native probe passed two Linux tests for temporary no-replace success with exact bytes and collision preservation.
+
+The local candidate batch does not replace the required Ubuntu CI artifact, final gate rerun, or review for the exact candidate commit.
+It also does not prove the native denial and post-error conditions needed for `create_copy` release enablement, or any native safety, denial, or aftermath conditions for the still fail-closed Linux actions, nor any macOS or Windows capability.
+No Linux action is selected or enabled from this batch.

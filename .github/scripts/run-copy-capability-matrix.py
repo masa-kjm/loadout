@@ -63,38 +63,63 @@ def record_unrun(action, phase, reason):
     )
 
 
-if platform_name in ("linux", "darwin"):
-    for action, test_filter in [
-        ("create_copy", "create_primitive_uses_only_the_recorded_temporary_and_verifies_its_postcondition"),
-        ("replace_copy", "replace_requires_the_recorded_old_copy_and_verifies_the_new_copy"),
-        ("remove_copy", "remove_requires_the_exact_owned_fingerprint"),
-        ("relocate_copy", "relocate_publishes_the_new_copy_before_removing_the_old_copy"),
-    ]:
-        capability = "fail_closed"
-        run(action, "executor_postcondition", test_filter, capability, ["--lib"])
-    for action, test_filter in [
-        ("link_to_copy_handoff", "link_to_copy_handoff_replaces_only_the_expected_managed_link"),
-        ("copy_to_link_handoff", "copy_to_link_handoff_replaces_only_the_expected_managed_copy"),
-    ]:
-        run(action, "executor_postcondition", test_filter, "fail_closed", ["--lib"])
-        run(action, "preflight_rejection", "copy_handoffs_fail_preflight_without_mutating_target_or_state", "fail_closed", ["--test", "cli_read_only"])
-    for action, test_filter in [
-        ("create_copy", "copy_lifecycle_commands_render_typed_actions_and_fail_closed_before_mutation"),
-        ("replace_copy", "copy_replace_relocate_and_remove_fail_preflight_without_mutating_target_or_state"),
-        ("remove_copy", "copy_replace_relocate_and_remove_fail_preflight_without_mutating_target_or_state"),
-        ("relocate_copy", "copy_replace_relocate_and_remove_fail_preflight_without_mutating_target_or_state"),
-    ]:
-        run(action, "compiled_binary_fail_closed", test_filter, "fail_closed", ["--test", "cli_read_only"])
-    for action, test_filter in [
-        ("create_copy", "recovery_keeps_matching_final_copy_create_uncertain_without_known_update"),
-        ("replace_copy", "recovery_cleans_an_exact_copy_temporary_then_fails_and_keeps_old_known"),
-        ("remove_copy", "recovery_removes_copy_known_only_for_the_recorded_missing_postcondition"),
-        ("relocate_copy", "recovery_keeps_a_partial_copy_relocation_uncertain_with_old_known"),
-        ("link_to_copy_handoff", "recovery_classifies_link_to_copy_handoff_aftermath_from_recorded_effects"),
-        ("copy_to_link_handoff", "recovery_classifies_copy_to_link_handoff_aftermath_from_recorded_effects"),
-    ]:
-        run(action, "post_effect_aftermath", test_filter, "fail_closed", ["--lib"])
-        run(action, "recovery", test_filter, "fail_closed", ["--lib"])
+if platform_name == "linux":
+    run(
+        "create_copy",
+        "executor_postcondition",
+        "create_primitive_uses_only_the_recorded_temporary_and_verifies_its_postcondition",
+        "candidate",
+        ["--lib"],
+    )
+    run(
+        "create_copy",
+        "compiled_binary_candidate_success",
+        "copy_create_applies_exact_source_bytes_and_commits_known_state",
+        "candidate",
+        ["--test", "cli_read_only"],
+    )
+    for phase in ["post_effect_aftermath", "recovery"]:
+        run(
+            "create_copy",
+            phase,
+            "recovery_keeps_matching_final_copy_create_uncertain_without_known_update",
+            "candidate",
+            ["--lib"],
+        )
+    for action in ["replace_copy", "remove_copy", "relocate_copy"]:
+        run(
+            action,
+            "preflight_rejection",
+            "copy_replace_relocate_and_remove_fail_preflight_without_mutating_target_or_state",
+            "fail_closed",
+            ["--test", "cli_read_only"],
+        )
+    for action in ["link_to_copy_handoff", "copy_to_link_handoff"]:
+        run(
+            action,
+            "preflight_rejection",
+            "copy_handoffs_fail_preflight_without_mutating_target_or_state",
+            "fail_closed",
+            ["--test", "cli_read_only"],
+        )
+elif platform_name == "darwin":
+    run("create_copy", "preflight_rejection", "copy_capability_preflight_rejection_creates_no_operation_or_target", "fail_closed", ["--test", "cli_read_only"])
+    for action in ["replace_copy", "remove_copy", "relocate_copy"]:
+        run(
+            action,
+            "preflight_rejection",
+            "copy_replace_relocate_and_remove_fail_preflight_without_mutating_target_or_state",
+            "fail_closed",
+            ["--test", "cli_read_only"],
+        )
+    for action in ["link_to_copy_handoff", "copy_to_link_handoff"]:
+        run(
+            action,
+            "preflight_rejection",
+            "copy_handoffs_fail_preflight_without_mutating_target_or_state",
+            "fail_closed",
+            ["--test", "cli_read_only"],
+        )
 else:
     run("create_copy", "preflight_rejection", "copy_capability_preflight_rejection_creates_no_operation_or_target", "fail_closed", ["--test", "cli_read_only"])
     for action in ["replace_copy", "remove_copy", "relocate_copy"]:

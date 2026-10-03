@@ -143,31 +143,6 @@ impl Fixture {
         json!({"definition_hash":format!("sha256:{definition_digest:x}"),"effect":{"kind":"file_copy","source_path":source,"target_path":target,"content_fingerprint":format!("sha256:{content_digest:x}")}})
     }
 }
-#[cfg(target_os = "linux")]
-struct DisposableDirectory {
-    path: PathBuf,
-}
-
-#[cfg(target_os = "linux")]
-impl DisposableDirectory {
-    fn new(parent: &Path, label: &str) -> Self {
-        let path = parent.join(format!(
-            "loadout-cli-{label}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
-        Self { path }
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for DisposableDirectory {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
@@ -899,31 +874,35 @@ fn copy_inspection_reports_typed_known_and_desired_only_facts_without_side_effec
 
 #[cfg(target_os = "linux")]
 #[test]
-fn copy_capability_preflight_rejection_creates_no_operation_or_target() {
+fn copy_create_applies_exact_source_bytes_and_commits_known_state() {
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
         "schema_version: 2\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
-    let home = DisposableDirectory::new(Path::new("/dev/shm"), "copy-preflight");
-    assert!(fs::symlink_metadata(home.path.join(".copy-target")).is_err());
+    let target = f.path("home/.copy-target");
+    assert!(fs::symlink_metadata(&target).is_err());
     assert!(!f.path("state/loadout/state.json").exists());
     let output = f
-        .command_with_home(&home.path)
+        .command()
         .args(["apply", "--yes", "--config", "../portable/config.yaml"])
         .output()
         .unwrap();
 
     expect(
         output,
-        2,
-        &[
-            "apply failed during Preflight",
-            "file-copy publication capability is unsupported",
-        ],
+        0,
+        &["create_copy", "apply completed: 1 committed actions"],
     );
-    assert!(fs::symlink_metadata(home.path.join(".copy-target")).is_err());
-    assert!(!f.path("state/loadout/state.json").exists());
+    assert_eq!(fs::read(&target).unwrap(), b"content\n");
+    let state =
+        serde_json::from_slice::<Value>(&fs::read(f.path("state/loadout/state.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        state["resources"],
+        json!({"base/copied": f.known_copy(".copy-target", b"content\n")})
+    );
+    assert!(state["active_operation"].is_null());
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1054,7 +1033,7 @@ fn copy_replace_relocate_and_remove_fail_preflight_without_mutating_target_or_st
     );
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(unix)]
 #[test]
 fn copy_handoffs_fail_preflight_without_mutating_target_or_state() {
     let link_to_copy = Fixture::new();
@@ -1114,7 +1093,7 @@ fn copy_handoffs_fail_preflight_without_mutating_target_or_state() {
     );
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 #[test]
 fn copy_recovery_closes_a_retained_create_before_presenting_a_fresh_plan() {
     let f = Fixture::new();
@@ -1285,7 +1264,7 @@ fn copy_replacement_recovery_keeps_a_different_final_uncertain_and_blocks_a_fres
     );
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 #[test]
 fn copy_lifecycle_commands_render_typed_actions_and_fail_closed_before_mutation() {
     let f = Fixture::new();
@@ -1392,19 +1371,6 @@ fn copy_declarations_render_in_read_only_queries() {
         0,
         &["executable plan"],
     );
-    expect(
-        f.command()
-            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
-            .output()
-            .unwrap(),
-        2,
-        &[
-            "apply failed during Preflight",
-            "file-copy publication capability is unsupported",
-        ],
-    );
-    assert!(fs::symlink_metadata(f.path("home/.copy-target")).is_err());
-    assert!(!f.path("state/loadout/state.json").exists());
     expect(
         f.run(&["resource", "list", "--config", "../portable/config.yaml"]),
         0,

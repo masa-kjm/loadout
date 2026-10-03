@@ -103,7 +103,41 @@ if platform_name == "linux":
             ["--test", "cli_read_only"],
         )
 elif platform_name == "darwin":
-    run("create_copy", "compiled_cli_success", "copy_lifecycle_commands_render_typed_actions_and_apply_on_apfs", "candidate", ["--test", "cli_read_only"])
+    run(
+        "create_copy",
+        "native_collision_preservation",
+        "retained_parent_no_replace_rejects_an_existing_final_name",
+        "candidate",
+        ["--test", "native_copy_platform"],
+    )
+    run(
+        "create_copy",
+        "executor_postcondition",
+        "create_primitive_uses_only_the_recorded_temporary_and_verifies_its_postcondition",
+        "candidate",
+        ["--lib"],
+    )
+    run(
+        "create_copy",
+        "recovery",
+        "recovery_keeps_matching_final_copy_create_uncertain_without_known_update",
+        "candidate",
+        ["--lib"],
+    )
+    run(
+        "create_copy",
+        "compiled_cli_success",
+        "copy_lifecycle_commands_render_typed_actions_and_apply_on_apfs",
+        "candidate",
+        ["--test", "cli_read_only"],
+    )
+    run(
+        "create_copy",
+        "capability_rejection",
+        "non_apfs_copy_publication_capability_is_a_read_only_preflight_rejection",
+        "candidate",
+        ["--lib"],
+    )
     for action in ["replace_copy", "remove_copy", "relocate_copy"]:
         run(
             action,

@@ -905,7 +905,7 @@ fn copy_create_applies_exact_source_bytes_and_commits_known_state() {
     assert!(state["active_operation"].is_null());
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn copy_capability_preflight_rejection_creates_no_operation_or_target() {
     let f = Fixture::new();
@@ -1095,7 +1095,7 @@ fn copy_handoffs_fail_preflight_without_mutating_target_or_state() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn copy_recovery_closes_a_retained_create_before_presenting_a_fresh_plan() {
+fn copy_recovery_closes_a_retained_create_before_applying_a_fresh_copy_on_apfs() {
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
@@ -1134,20 +1134,20 @@ fn copy_recovery_closes_a_retained_create_before_presenting_a_fresh_plan() {
             .args(["apply", "--yes", "--config", "../portable/config.yaml"])
             .output()
             .unwrap(),
-        2,
-        &[
-            "apply failed during Preflight",
-            "file-copy publication capability is unsupported",
-        ],
+        0,
+        &["create_copy", "apply completed: 1 committed actions"],
     );
     assert!(before_target && before_temporary);
-    assert!(fs::symlink_metadata(f.path("home/.copy-target")).is_err());
+    assert_eq!(fs::read(f.path("home/.copy-target")).unwrap(), b"content\n");
     assert!(fs::symlink_metadata(f.path("home/.loadout-copy-a1")).is_err());
     let recovered =
         serde_json::from_slice::<Value>(&fs::read(f.path("state/loadout/state.json")).unwrap())
             .unwrap();
     assert!(recovered["active_operation"].is_null());
-    assert_eq!(recovered["resources"], json!({}));
+    assert_eq!(
+        recovered["resources"],
+        json!({"base/copied": f.known_copy(".copy-target", b"content\n")})
+    );
 }
 
 #[test]
@@ -1266,7 +1266,7 @@ fn copy_replacement_recovery_keeps_a_different_final_uncertain_and_blocks_a_fres
 
 #[cfg(target_os = "macos")]
 #[test]
-fn copy_lifecycle_commands_render_typed_actions_and_fail_closed_before_mutation() {
+fn copy_lifecycle_commands_render_typed_actions_and_apply_on_apfs() {
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
@@ -1299,14 +1299,18 @@ fn copy_lifecycle_commands_render_typed_actions_and_fail_closed_before_mutation(
             .args(["apply", "--yes", "--config", "../portable/config.yaml"])
             .output()
             .unwrap(),
-        2,
-        &[
-            "apply failed during Preflight",
-            "file-copy publication capability is unsupported",
-        ],
+        0,
+        &["create_copy", "apply completed: 1 committed actions"],
     );
-    assert!(fs::symlink_metadata(f.path("home/.copy-target")).is_err());
-    assert!(!f.path("state/loadout/state.json").exists());
+    assert_eq!(fs::read(f.path("home/.copy-target")).unwrap(), b"content\n");
+    let state =
+        serde_json::from_slice::<Value>(&fs::read(f.path("state/loadout/state.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        state["resources"],
+        json!({"base/copied": f.known_copy(".copy-target", b"content\n")})
+    );
+    assert!(state["active_operation"].is_null());
 
     let conflict = Fixture::new();
     conflict.write(

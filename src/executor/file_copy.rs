@@ -13,6 +13,8 @@ use crate::domain::plan::{
     ActionKind, PlannedEffectHandoff, PlannedFileCopyAction, PlannedResourceAction, TargetCondition,
 };
 use crate::filesystem::ExecutionTarget;
+#[cfg(target_os = "macos")]
+use crate::filesystem::ensure_file_copy_publication_supported;
 use crate::inspection::file_link::{FileLinkInspector, TargetInspectionError};
 use crate::inspection::source::{SourceVerificationError, VerifiedSource};
 use crate::state::operation::RecordedAction;
@@ -154,6 +156,8 @@ impl FileCopyExecutor {
         &self,
         action: &PlannedResourceAction,
     ) -> Result<(), CopyPreflightError> {
+        #[cfg(target_os = "macos")]
+        self.ensure_macos_copy_publication_capability(action)?;
         #[cfg(target_os = "linux")]
         {
             if matches!(
@@ -166,12 +170,50 @@ impl FileCopyExecutor {
                 Err(CopyPreflightError::UnsupportedPlatformCapability)
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            if matches!(
+                action,
+                PlannedResourceAction::FileCopy(action) if action.kind() == ActionKind::CreateCopy
+            ) {
+                Ok(())
+            } else {
+                Err(CopyPreflightError::UnsupportedPlatformCapability)
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = action;
             // Other platforms remain fail-closed until their independent native evidence batches select a primitive.
             Err(CopyPreflightError::UnsupportedPlatformCapability)
         }
+    }
+
+    /// Queries Darwin volume capabilities before an operation record can be created.
+    ///
+    /// The executor repeats the retained-parent capability query at publication time, because the external filesystem concurrency contract permits the parent association to change after preflight.
+    #[cfg(target_os = "macos")]
+    fn ensure_macos_copy_publication_capability(
+        &self,
+        action: &PlannedResourceAction,
+    ) -> Result<(), CopyPreflightError> {
+        let target_path = match action {
+            PlannedResourceAction::FileCopy(action) => action
+                .desired()
+                .map(|desired| desired.target_path())
+                .or_else(|| action.previous().map(|previous| previous.target_path())),
+            PlannedResourceAction::ReplaceEffect(action) => {
+                Some(action.final_effect().target_path())
+            }
+            PlannedResourceAction::FileLink(_) => None,
+        }
+        .ok_or(CopyPreflightError::WrongAction)?;
+        ensure_file_copy_publication_supported(
+            self.inspector.canonical_home(),
+            self.inspector.declared_home(),
+            target_path,
+        )
+        .map_err(CopyPreflightError::PlatformCapability)
     }
 
     /// Materializes one planned and recorded copy only after every immediate recheck succeeds.
@@ -952,6 +994,7 @@ pub(crate) enum CopyPreflightError {
     SourceFingerprintChanged,
     TargetInspection(TargetInspectionError),
     PreconditionNoLongerHolds,
+    PlatformCapability(io::Error),
     UnsupportedPlatformCapability,
 }
 
@@ -980,6 +1023,12 @@ impl fmt::Display for CopyPreflightError {
             Self::TargetInspection(error) => error.fmt(formatter),
             Self::PreconditionNoLongerHolds => {
                 formatter.write_str("copy target precondition no longer holds")
+            }
+            Self::PlatformCapability(error) => {
+                write!(
+                    formatter,
+                    "file-copy publication capability is unavailable: {error}"
+                )
             }
             Self::UnsupportedPlatformCapability => formatter
                 .write_str("file-copy publication capability is unsupported on this platform"),
@@ -1414,14 +1463,21 @@ mod tests {
                 Some(&source),
             )
             .unwrap();
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        executor
+            .preflight(
+                &PlannedResourceAction::FileCopy(action.clone()),
+                Some(&source),
+            )
+            .unwrap();
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let error = executor
             .preflight(
                 &PlannedResourceAction::FileCopy(action.clone()),
                 Some(&source),
             )
             .unwrap_err();
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         assert!(matches!(
             error,
             CopyPreflightError::UnsupportedPlatformCapability

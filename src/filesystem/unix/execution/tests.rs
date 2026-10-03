@@ -55,6 +55,31 @@ impl Drop for Fixture {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn apfs_copy_publication_capability_is_queried_through_the_retained_parent() {
+    let fixture = Fixture::new();
+
+    fixture
+        .target()
+        .ensure_copy_publication_capability()
+        .expect("the macOS CI fixture must be APFS with exclusive rename support");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn non_apfs_copy_publication_capability_is_a_read_only_preflight_rejection() {
+    let root = ResolvedPath::new(fs::canonicalize("/dev").unwrap()).unwrap();
+    let target = ResolvedPath::new(root.as_ref().join("loadout-copy-capability-probe")).unwrap();
+    let error = ExecutionTarget::open(&root, &target)
+        .unwrap()
+        .ensure_copy_publication_capability()
+        .unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    assert!(fs::symlink_metadata(target.as_ref()).is_err());
+}
+
 fn fingerprint(contents: &[u8]) -> ContentFingerprint {
     let mut hasher = Sha256::new();
     hasher.update(contents);

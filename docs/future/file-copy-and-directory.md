@@ -1,37 +1,13 @@
-# File Copy and Directory Resources
+# Directory Resources
 
 ## Status
 
-This is a non-binding design note.
-Regular-file copy is specified for v0.5.0 in [File Copies](../specs/file-copy.md).
-This note remains non-binding and concerns only later directory-resource work.
+This is a non-binding design note for later directory-resource work.
+Regular-file copy is specified for v0.5.0 in [File Copies](../specs/file-copy.md) and is not restated here.
 
 ## Why They Are Separate
 
-A file link exposes a source path directly and has a narrow ownership proof: the target must remain the exact link that Loadout created.
-A copied file and a directory tree need content-based ownership and drift rules instead.
-They must not inherit file-link behavior by implication.
-
-Directory materialization remains independent from the promoted regular-file copy.
-Directory behavior has a larger destructive surface and must not be added as a small variation of file copy.
-
-## Promoted File-Copy Direction
-
-The v0.5 specification owns file-copy Known state, content fingerprints, removal, replacement, and recovery.
-This note must not be used to reinterpret that contract.
-
-Candidate outcomes include:
-
-- source changed while the target still matches the applied fingerprint: a replace may be proposed;
-- target changed while the source has not: block and require an explicit user decision outside the normal apply path;
-- both source and target changed: block as a conflict;
-- target missing: create when desired, or forget the Known-state record when stale; and
-- unexpected target kind or parent: block before mutation.
-
-Replacement should write new content to a safe temporary file in the target parent and use a platform-specific replacement primitive only when it preserves the documented failure aftermath.
-It must not delete the old file before the new content is ready.
-
-The final schema must decide exactly which metadata is part of the ownership fingerprint, including executable permissions, line-ending normalization, timestamps, ACLs, and platform-specific attributes.
+Directory materialization has a larger destructive surface than either current file effect and must not be added as a small variation of file copy or file link.
 
 ## Directory Questions
 
@@ -49,7 +25,7 @@ The future design must account for nested symlinks, junctions, reparse points, c
 
 ## Safety Baseline
 
-Any copy or directory design must preserve the v0.2.0 boundaries:
+Any directory design must preserve the v0.5.0 safety boundaries:
 
 - source and target containment must be proven physically, not lexically;
 - unexpected entries must not be followed, replaced, or removed;

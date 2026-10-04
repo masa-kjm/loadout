@@ -98,10 +98,13 @@ An implementation may use either an exclusive direct final-file create or a temp
 A direct create may leave an incomplete final target after a failed write, flush, close, or verification.
 That entry is not Desired merely because its pathname is the final target: unless the recorded postcondition proves the exact planned bytes, it is `uncertain` and Loadout MUST NOT delete, overwrite, adopt, or retry it automatically.
 
-`replace_copy` prepares, flushes, hashes, and verifies a unique action-local temporary regular file before one replacement attempt against a freshly proved expected owned old copy.
-It MUST NOT delete the final target before the new temporary has been completely written and verified, and it MUST NOT use delete-then-create, a backup-and-restore workflow, a delayed operation, or a fallback primitive.
-Unlike file-link replacement and `copy -> link` handoff, `replace_copy` does not require a failed replacement attempt to leave the old copy at its pathname.
-Its failure aftermath is classified only from the recorded old-copy precondition and new-copy postcondition.
+`replace_copy` prepares, flushes, hashes, and verifies a unique action-local temporary regular file before it removes a freshly proved expected owned old copy.
+It atomically persists `temporary_staged` after that verification and before any old-copy removal.
+Immediately before removal, it repeats the old-copy ownership, target containment, parent safety, and declared-path association checks.
+It then deletes the old target and publishes the verified temporary to the now-missing final name with no-replace semantics.
+It MUST NOT delete the final target before the temporary has been completely written and verified, overwrite an entry that appeared at the final name, use a backup-and-restore workflow, schedule a delayed operation, or retry the old action automatically.
+`replace_copy` deliberately does not preserve the old target pathname when removal or publication fails and does not restore old content.
+Its failure aftermath is classified from the recorded old-copy precondition, new-copy postcondition, and the safe final-target observation defined below.
 
 ### Publication Primitives and Capability Boundary
 
@@ -114,10 +117,12 @@ The following platform entries describe required properties rather than an exclu
 | Linux/local ext4 create | A retained-parent `create-no-replace` implementation | It must reject an already existing final name without changing it. Unsupported required syscall or filesystem behavior is a preflight rejection. |
 | macOS/local APFS create | A retained-parent `create-no-replace` implementation after the required volume capability check | It must reject an already existing final name without changing it. Unsupported volume capability is a preflight rejection. |
 | Windows/local NTFS create | A no-replace implementation after the reparse-point and declared-path rechecks | It must reject an already existing final name without changing it. Any behavior that can replace an existing final name is unsupported and blocks preflight. |
-| Copy replacement | One replacement attempt through the retained target parent after temporary staging | It must permit exact post-mutation classification as new expected copy, old expected copy, or `uncertain`; it need not preserve the old copy at its pathname on failure. |
-| Link replacement and `copy -> link` handoff | The primitives defined by [File Links](file-link.md) | They retain their stronger old-effect preservation requirement. |
+| Copy replacement | Verified temporary staging, rechecked owned-old removal, then retained-parent no-replace publication | It must reject an entry that appears at the final name and permit the copy recovery classification defined below. It need not preserve the old copy at its pathname on failure. |
+| `link -> copy` handoff | Verified copy temporary staging, rechecked owned-link removal, then retained-parent no-replace publication | It follows the copy handoff lifecycle defined below and does not require old-link preservation after removal. |
+| `copy -> link` handoff | The primitive defined by [File Links](file-link.md) | It follows the effect-handoff lifecycle and does not require old-copy preservation after removal. |
 
-No delete-then-create sequence, cross-directory move, backup-name workflow, delayed operation, or fallback primitive is permitted.
+No copy action may use a cross-directory move, backup-name workflow, delayed operation, or fallback primitive.
+The sequential remove-then-no-replace-publication sequence is permitted only for `replace_copy` and `link -> copy` after their required staging and immediate old-effect recheck.
 Native conformance must prove each selected platform/action implementation's success, existing-target collision preservation where `create-no-replace` is used, error aftermath, post-mutation classification, and applicable recovery before that capability is enabled.
 
 ### Link-to-Copy Effect Handoff
@@ -125,12 +130,14 @@ Native conformance must prove each selected platform/action implementation's suc
 `link -> copy` is a `replace_effect` action, not `replace_copy`.
 Its precondition is a fresh no-follow `expected_link` observation matching the complete recorded file-link effect, not an `expected_copy` observation.
 The executor writes the verified final source bytes to its unique recorded temporary regular file, flushes and hashes it, and proves that its fingerprint equals the recorded final copy fingerprint.
-Immediately before one atomic same-filesystem target-name replacement, it rechecks the expected old link, exact temporary fingerprint and entry kind, parent safety, containment, and declared-path association.
+It atomically persists `temporary_staged` before it may remove the old link.
+Immediately before it removes the old link, it rechecks the expected old link, exact temporary fingerprint and entry kind, parent safety, containment, and declared-path association.
+It then removes the old link and publishes the temporary to the missing final name with no-replace semantics.
 Its postcondition is the expected final copy and absence of the recorded temporary.
 
-The primitive MUST NOT delete the expected link before the final copy is ready and MUST NOT fall back to delete-then-create.
-If the platform cannot preserve the old expected link when the replacement operation itself fails, subject to the external-concurrency limit, preflight MUST block `link -> copy` without a new operation record or target mutation.
-The action records its complete old link and final copy predicates, temporary fingerprint, path, and recovery facts as defined by [State and Recovery](state-and-recovery.md#v050-state-schema).
+The primitive MUST NOT delete the expected link before the final copy is ready or overwrite an entry that appears after removal.
+It does not restore the old link if final publication fails.
+The action records its complete old link and final copy predicates, temporary fingerprint, path, and publication facts as defined by [State and Recovery](state-and-recovery.md#v050-state-schema).
 
 For staged publication, the recorded temporary path and expected temporary fingerprint are part of the action until publication is verified.
 Immediately before staged publication, the executor rechecks both the exact temporary and final target.
@@ -139,13 +146,15 @@ It verifies the final target's bytes and, for a staged action, that the temporar
 
 After an attempted `create-no-replace`, the recorded post-condition authorizes `succeeded`; the recorded missing precondition authorizes `failed`; any other, unsafe, or unavailable observation is `uncertain`.
 For a failed create followed by matching final content, the result is `uncertain`, not adoption.
-After an attempted `replace_copy`, the exact recorded new-copy postcondition authorizes `succeeded`; the exact recorded old-copy precondition authorizes `failed` after any authorized exact-temporary cleanup; a missing, different, unsafe, or unavailable final observation is `uncertain`.
-Recovery may remove only the exact recorded temporary after a fresh no-follow proof that it is the expected temporary regular file.
+For `replace_copy` and `link -> copy`, a recorded final-copy postcondition with `publication_attempted` authorizes `succeeded`; the exact recorded old-effect precondition authorizes `failed` after any eligible-temporary cleanup; a missing final target also authorizes `failed` after eligible-temporary cleanup; and a safely observed different entry authorizes `failed` with a conflict.
+An unsafe or unavailable final observation is `uncertain`.
+Recovery may remove only an eligible recorded temporary after a fresh no-follow proof of its recorded pathname, expected regular-file kind, expected fingerprint, and safe parent association.
+This practical cleanup boundary does not identify a hostile substitution at the same random temporary pathname with the same bytes.
 It never scans sibling paths, deletes an unexpected temporary, retries an uncertain action, or rolls back a verified earlier action.
 
 ## Platform Requirements
 
 The intended successful baseline is Linux/local ext4, macOS/local APFS, and Windows/local NTFS.
 Each enabled platform/action combination requires native filesystem, executor, compiled-binary, and applicable recovery evidence.
-Windows coverage includes sharing or ACL denial when the runner can establish it and proves no delete-then-create fallback or premature Known update.
+Windows coverage includes sharing or ACL denial when the runner can establish it and proves no overwrite, premature Known update, backup, or automatic restoration.
 If a required publication or no-follow observation guarantee is unavailable, preflight MUST reject the action without a new operation record or target mutation.

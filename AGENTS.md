@@ -93,6 +93,7 @@ Preserve every applicable invariant:
 - A blocked Plan, validation failure or failed preflight permits no new planned target mutation; dry run performs no mutation at all. A failed execution recheck prevents the next step, not earlier effects. Classify those effects and distinguish permitted prior recovery from new-plan execution.
 - Recheck containment, parent safety, target kind, source safety, and action-specific ownership immediately before each filesystem mutation step, including target and temporary checks after temporary creation and before rename. Verify required declared-path association; a retained parent handle alone does not prove it.
 - Write `running` before a mutation. Update Known state only after the exact post-condition has been verified and commit it atomically with `succeeded`.
+- For staged copy cleanup or old-effect removal, and for sequential copy/effect-handoff recovery, follow the action record's durable `temporary_staged` and `publication_attempted` facts in [State and Recovery](docs/specs/state-and-recovery.md); do not reconstruct them from a pathname or an operating-system return value.
 - After an attempted mutation, classify the result from recorded preconditions and post-conditions, not from an operating-system return value alone.
 - Treat an unprovable result as `uncertain`; do not retry the old action automatically.
 - Apply always creates a fresh plan after recovery. It never resumes or reinterprets an old plan.

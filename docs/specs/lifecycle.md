@@ -187,11 +187,13 @@ It requires current Actual proof of the old Known effect and uses the final effe
 | Either final effect | Either old effect | Missing | Corresponding final-effect create; old Known remains until that action's normal state update rules apply |
 | Either final effect | Either old effect | Any unexpected or unsafe observation | Blocked conflict |
 
-For a handoff, the typed precondition is the complete old Known effect and the typed postcondition is the complete final effect plus absence of its recorded temporary.
+For a handoff, the typed precondition is the complete old Known effect and the typed postcondition is the complete final effect plus absence of its recorded temporary when the final effect is staged.
 The state update removes the old identity's effect and records the final effect atomically with `succeeded`.
 `link -> copy` uses the handoff-specific primitive in [Link-to-Copy Effect Handoff](file-copy.md#link-to-copy-effect-handoff), whose old-target predicate is the expected link; `copy -> link` uses the handoff-specific primitive in [Copy-to-Link Effect Handoff](file-link.md#copy-to-link-effect-handoff), whose old-target predicate is the expected copy.
-Neither handoff is state-only and neither may delete the old target before the final effect is ready.
-The weaker `replace_copy` aftermath does not weaken either handoff: `link -> copy` retains the file-link old-effect preservation guarantee, and `copy -> link` retains the File Links replacement guarantee.
+Neither handoff is state-only.
+Each prepares the final effect as far as its destination type permits, immediately rechecks the old owned effect, removes that old target, creates or publishes the final effect with the destination type's no-replace semantics, verifies the final effect, and then commits Known.
+Handoffs do not promise continuous target availability, old-effect preservation after removal, backup, restoration, or rollback.
+The strong atomic replacement contract remains limited to ordinary `link -> link` replacement and source-changing link ownership replacement; it does not apply to either effect handoff.
 
 For either effect, a desired resource without Known state creates only at a missing target and otherwise blocks.
 An unchanged known link is `noop` only when its expected link is Actual; an unchanged known copy is `noop` only when its target bytes equal the applied fingerprint and its current source fingerprint equals that applied fingerprint.

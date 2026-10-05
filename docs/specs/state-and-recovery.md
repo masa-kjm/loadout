@@ -228,7 +228,20 @@ When its old-target precondition still holds and the recorded temporary path is 
 It may mark the replacement `failed` only after that temporary path is `missing`.
 An observed unexpected or unsafe temporary entry MUST NOT be removed. An unremovable temporary or unprovable cleanup aftermath makes the replacement `uncertain`. Cleanup is limited to the exact recorded path, with no sibling scanning, and shares the recheck-to-syscall limitation. A failed recheck after temporary creation does not imply that no mutation occurred; existing effects are classified using the recorded predicates.
 
-For v0.5 copy replacement and effect handoff, the preceding general table is refined as follows during both execution and recovery. A `replace_copy` or `link -> copy` action whose final copy postcondition holds and whose recorded `publication_attempted` fact is true is `succeeded`. If its old-effect precondition still holds, it is `failed` after eligible-temporary cleanup. If its final target is safely observed as missing, it is `failed` after eligible-temporary cleanup; Known remains the old effect and a fresh plan may create the desired copy at the missing target. If the final target is a safely observed entry matching neither predicate, it is `failed` with a conflict and does not mutate that entry. Unsafe or unavailable observation remains `uncertain`.
+When an action-specific copy classification requires eligible staged-temporary cleanup before it can become `failed` or `failed` with a conflict, cleanup is complete only when the recorded temporary pathname is freshly proven `missing`.
+The temporary may already be missing, or it may become missing after a permitted removal attempt; an operating-system success or error result alone does not decide completion.
+
+| Required staged-temporary cleanup observation | Required result |
+| --- | --- |
+| Recorded temporary is safely observed missing before cleanup, or is safely observed missing after an eligible removal attempt | Cleanup is complete; apply the recorded final-target classification. |
+| Eligible removal is denied or reports an error, and missing cannot be proven afterward | `uncertain`; retain the action and Known state. |
+| An eligible removal attempt reports success but the recorded temporary is not proven missing afterward | `uncertain`; retain the action and Known state. |
+| The recorded temporary is present but different, ineligible, unsafe, or unavailable | Do not remove it; mark `uncertain` and retain the action and Known state. |
+
+An `uncertain` cleanup aftermath retains the active operation as a global barrier.
+An operator may correct the exact recorded temporary artifact manually, after which recovery re-observes the recorded temporary and final-target predicates; it does not infer cleanup from a prior removal attempt.
+
+For v0.5 copy replacement and effect handoff, the preceding general table is refined as follows during both execution and recovery. A `replace_copy`, copy `replace_ownership` with changed bytes, or `link -> copy` action whose final copy postcondition holds and whose recorded `publication_attempted` fact is true is `succeeded`. If its old-effect precondition still holds, it is `failed` after eligible-temporary cleanup. If its final target is safely observed as missing, it is `failed` after eligible-temporary cleanup; Known remains the old effect and a fresh plan may create the desired copy at the missing target. If the final target is a safely observed entry matching neither predicate, it is `failed` with a conflict and does not mutate that entry. Unsafe or unavailable observation remains `uncertain`.
 
 The same final-observation classification applies to `copy -> link`, except that it has no staged copy temporary. Its final-link postcondition with `publication_attempted` is `succeeded`; its old-copy precondition or a safely observed missing final target is `failed`; a safely observed different entry is `failed` with a conflict; and unsafe or unavailable observation is `uncertain`.
 These sequential actions do not restore an old effect, back it up, or roll it back. This exception does not change `replace_link` or source-changing `replace_ownership`, whose temporary cleanup and old-effect-preservation rules remain in force.
@@ -255,8 +268,10 @@ A partial relocation, such as both old and new links existing, is `uncertain`.
 
 `relocate_copy` is also a two-target action. It succeeds only when its complete recorded new-copy and old-target-missing postcondition holds, and fails only when its complete recorded precondition still holds. Any partial relocation remains `uncertain`; the single-target missing-final exception for sequential copy replacement does not apply.
 
-For a running `replace_ownership` action whose resolved link targets are equal, recovery commits the recorded identity handoff only when the old Known resource identity remains present and Actual observation proves the recorded shared expected link.
+For a running state-only `replace_ownership` action, recovery commits the recorded identity handoff only when the old Known resource identity remains present and Actual observation proves the recorded shared expected effect.
 That recovery performs no target mutation.
+This covers equal resolved link targets and copy effects with the same target and applied fingerprint.
+For a copy `replace_ownership` action with changed bytes, recovery instead uses the sequential copy-replacement classification, including `temporary_staged`, `publication_attempted`, and the old-to-new Known identity update on success.
 Any other observation follows the normal recorded-precondition and post-condition classification.
 
 After every action has a final status of `succeeded`, `failed`, or `skipped`, the repository removes `active_operation` in a final atomic commit.
@@ -306,7 +321,7 @@ Its resource definition is the effect-specific resolved definition from [File Li
 The definition hash does not include copy source content; the copy Known record does.
 
 Every copy action records its effect kind, resolved source and target, planned source fingerprint, precondition, and postcondition.
-A staged copy publication, every `replace_copy`, and every `link -> copy` effect handoff also records its action-local temporary path and fingerprint until publication completes.
+A staged copy publication, every `replace_copy`, every copy `replace_ownership` with changed bytes, and every `link -> copy` effect handoff also records its action-local temporary path and fingerprint until publication completes.
 For such an action, `temporary_staged` becomes true only after the temporary has been verified at its recorded path with its expected regular-file kind, fingerprint, and safe parent association.
 The state repository MUST atomically persist `temporary_staged == true` before the executor performs any destructive old-effect mutation.
 An eligible staged copy temporary requires that durable fact and a fresh no-follow observation of the recorded pathname, expected regular-file kind, expected fingerprint, and safe parent association.
@@ -315,7 +330,7 @@ Every copy action that creates or publishes a final copy, and every `copy -> lin
 Neither fact authorizes a Known update without the required postcondition observation.
 For an action with a temporary, that temporary is part of the post-condition and must be missing before `succeeded` is committed.
 A direct `create-no-replace` action has no temporary and records the final missing precondition and exact final-copy postcondition needed to classify an incomplete or otherwise unproved final entry as `uncertain`.
-`replace_effect` records both old and final effects and requires the old effect's ownership predicate before any final-effect publication.
+`replace_effect` and `replace_ownership` record both old and final effects and require the old effect's ownership predicate before any final-effect publication.
 
 An active v2 operation has this exact logical shape; unknown fields are errors.
 
@@ -342,16 +357,17 @@ An active v2 operation has this exact logical shape; unknown fields are errors.
 
 Every action contains `kind`, `resource_id`, typed `precondition`, typed `postcondition`, and `status`.
 Copy publication actions additionally contain the boolean `publication_attempted`; staged copy actions additionally contain the boolean `temporary_staged`.
+A `create_copy` action selected for a missing-target copy identity handoff additionally contains `superseded_resource_id`; no other `create_copy` action contains that field.
 The complete `old_effect` and `final_effect` objects provide the corresponding Known-state update values; predicates repeat the exact target ownership facts needed for recovery.
-`create_copy`, `replace_copy`, `relocate_copy`, `remove_copy`, and `replace_effect` use the `file_copy` predicate with its fingerprint.
-`create_link`, `replace_link`, `relocate_link`, `remove_link`, and `replace_effect` use the `file_link` predicate with its exact link target.
-Staged copy publication, `replace_copy`, and `link -> copy` have `temporary`; direct `create-no-replace`, `copy -> link`, remove, forget, and state-only identity actions do not.
+`create_copy`, `replace_copy`, `relocate_copy`, `remove_copy`, `replace_effect`, and copy `replace_ownership` use the `file_copy` predicate with its fingerprint.
+`create_link`, `replace_link`, `relocate_link`, `remove_link`, `replace_effect`, and link `replace_ownership` use the `file_link` predicate with its exact link target.
+Staged copy publication, `replace_copy`, copy `replace_ownership` with changed bytes, and `link -> copy` have `temporary`; direct `create-no-replace`, `copy -> link`, remove, forget, and state-only identity actions do not.
 Relocation additionally records distinct old and new typed effects.
 
 | Action kind | Typed precondition | Typed postcondition | Known update |
 | --- | --- | --- | --- |
 | `create_link` | target missing | expected final link | record final link |
-| `create_copy` | target missing | expected final copy, and temporary missing when staged | record final copy |
+| `create_copy` | target missing | expected final copy, and temporary missing when staged | record final copy; replace a recorded superseded stale identity when present |
 | `replace_link` | expected old link | expected final link and temporary missing | replace link effect |
 | `replace_copy` | expected old copy | expected final copy and temporary missing | replace copy effect |
 | `replace_effect` | expected complete old effect | expected complete final effect and temporary missing when final copy is staged | replace old effect with final effect |
@@ -361,14 +377,19 @@ Relocation additionally records distinct old and new typed effects.
 | `replace_ownership` | expected old effect | expected final effect | replace old identity with new identity |
 
 `replace_ownership` records `old_resource_id`, `new_resource_id`, and complete old/final effects.
-When its effects are byte-for-byte equal it has no temporary and its `running` transition precedes the final ownership verification; otherwise it uses the final link replacement temporary and the same strong recovery predicates as `replace_link`.
+When its effects share the same target and prove the same expected link or copy fingerprint, it has no temporary and its `running` transition precedes the final ownership verification.
+When both effects are copies at the same target but their fingerprints differ, it records the staged final-copy temporary, `temporary_staged`, and `publication_attempted`, then uses the sequential copy-replacement predicates and aftermath.
+When both effects are links with different resolved targets, it uses the final link replacement temporary and the same strong recovery predicates as `replace_link`.
+Mixed link/copy effects use `replace_effect`, not `replace_ownership`.
+A `create_copy` selected for a missing-target identity handoff records `superseded_resource_id`; its successful Known update removes that stale record and records the final copy under the new resource identity.
 
 For a running `replace_effect`, recovery observes the recorded target and an optional recorded temporary only.
 If the complete final effect holds, every staged temporary is missing, and `publication_attempted` is true, it atomically commits the final Known effect and `succeeded`.
-If the complete old effect holds, it may clean up an eligible staged copy temporary, then marks `failed` and retains the old Known effect.
-If the final target is safely observed as missing, it may clean up an eligible staged copy temporary, then marks `failed` and retains the old Known effect.
-If the final target is safely observed as a different entry, it marks `failed` with a conflict and retains the old Known effect without mutating the final target.
+If the complete old effect holds, a `link -> copy` action requires staged-temporary cleanup under the cleanup table before recovery marks `failed` and retains the old Known effect.
+If the final target is safely observed as missing, a `link -> copy` action likewise requires staged-temporary cleanup under that table before recovery marks `failed` and retains the old Known effect.
+If required cleanup is incomplete, including because the temporary is different, ineligible, unsafe, or unavailable, recovery marks `uncertain` and retains the active operation rather than closing it as `failed`.
+If the final target is safely observed as a different entry, recovery marks `failed` with a conflict and retains the old Known effect without mutating the final target; this classification does not itself require temporary cleanup.
 If the target observation is unsafe or unavailable, it retains `uncertain` and the old Known effect.
-An unexpected or ineligible temporary is preserved and does not change the final-target classification.
+An unexpected or ineligible temporary is preserved; it changes the classification to `uncertain` whenever cleanup is required, and otherwise does not change the safely observed different-final conflict classification.
 For a failed create of either final effect, a matching final observation remains `uncertain` under the non-adoption rule.
 The general mutation classification and recovery tables apply to every other v0.5 action.

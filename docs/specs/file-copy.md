@@ -87,6 +87,10 @@ The following rows apply to a copy at an unchanged target; `expected` means an `
 A definition change that retains the target uses `replace_copy` only when Actual proves the old expected copy.
 A target change uses `relocate_copy`: create and verify the new copy, then remove and verify the old expected copy as one contiguous action.
 The general lifecycle rules define managed identity handoff and `link`/`copy` effect handoff; neither may adopt an unmanaged target.
+A stale managed copy identity at the same target may transfer to one new copy identity through `replace_ownership` only when Actual proves the old expected copy.
+When the final resolved source fingerprint equals the old applied fingerprint, that handoff is state-only.
+When it differs, it uses the staged copy replacement contract below and replaces the old Known identity with the new one only after the final copy is verified.
+If the shared target is missing, the identity handoff uses `create_copy`; its verified success supersedes the stale old Known identity, while an unsuccessful create leaves that old Known identity unchanged.
 
 ## Mutation and Recovery
 
@@ -106,6 +110,9 @@ It MUST NOT delete the final target before the temporary has been completely wri
 `replace_copy` deliberately does not preserve the old target pathname when removal or publication fails and does not restore old content.
 Its failure aftermath is classified from the recorded old-copy precondition, new-copy postcondition, and the safe final-target observation defined below.
 
+A copy `replace_ownership` action with differing old and final fingerprints uses this exact mutation sequence and recovery contract.
+Its action record additionally identifies the old and new resource identities, and its verified success atomically removes the old Known copy while recording the final copy under the new identity.
+
 ### Publication Primitives and Capability Boundary
 
 Every copy mutation addresses the final name, and any action-local temporary name, through the already rechecked target parent; it MUST NOT re-resolve an absolute target pathname for a mutation.
@@ -117,12 +124,12 @@ The following platform entries describe required properties rather than an exclu
 | Linux/local ext4 create | A retained-parent `create-no-replace` implementation | It must reject an already existing final name without changing it. Unsupported required syscall or filesystem behavior is a preflight rejection. |
 | macOS/local APFS create | A retained-parent `create-no-replace` implementation after the required volume capability check | It must reject an already existing final name without changing it. Unsupported volume capability is a preflight rejection. |
 | Windows/local NTFS create | A no-replace implementation after the reparse-point and declared-path rechecks | It must reject an already existing final name without changing it. Any behavior that can replace an existing final name is unsupported and blocks preflight. |
-| Copy replacement | Verified temporary staging, rechecked owned-old removal, then retained-parent no-replace publication | It must reject an entry that appears at the final name and permit the copy recovery classification defined below. It need not preserve the old copy at its pathname on failure. |
+| Copy replacement and copy identity handoff with changed bytes | Verified temporary staging, rechecked owned-old removal, then retained-parent no-replace publication | It must reject an entry that appears at the final name and permit the copy recovery classification defined below. It need not preserve the old copy at its pathname on failure. |
 | `link -> copy` handoff | Verified copy temporary staging, rechecked owned-link removal, then retained-parent no-replace publication | It follows the copy handoff lifecycle defined below and does not require old-link preservation after removal. |
 | `copy -> link` handoff | The primitive defined by [File Links](file-link.md) | It follows the effect-handoff lifecycle and does not require old-copy preservation after removal. |
 
 No copy action may use a cross-directory move, backup-name workflow, delayed operation, or fallback primitive.
-The sequential remove-then-no-replace-publication sequence is permitted only for `replace_copy` and `link -> copy` after their required staging and immediate old-effect recheck.
+The sequential remove-then-no-replace-publication sequence is permitted only for `replace_copy`, copy `replace_ownership` with changed bytes, and `link -> copy` after their required staging and immediate old-effect recheck.
 Native conformance must prove each selected platform/action implementation's success, existing-target collision preservation where `create-no-replace` is used, error aftermath, post-mutation classification, and applicable recovery before that capability is enabled.
 
 ### Link-to-Copy Effect Handoff
@@ -146,9 +153,11 @@ It verifies the final target's bytes and, for a staged action, that the temporar
 
 After an attempted `create-no-replace`, the recorded post-condition authorizes `succeeded`; the recorded missing precondition authorizes `failed`; any other, unsafe, or unavailable observation is `uncertain`.
 For a failed create followed by matching final content, the result is `uncertain`, not adoption.
-For `replace_copy` and `link -> copy`, a recorded final-copy postcondition with `publication_attempted` authorizes `succeeded`; the exact recorded old-effect precondition authorizes `failed` after any eligible-temporary cleanup; a missing final target also authorizes `failed` after eligible-temporary cleanup; and a safely observed different entry authorizes `failed` with a conflict.
+For `replace_copy`, copy `replace_ownership` with changed bytes, and `link -> copy`, a recorded final-copy postcondition with `publication_attempted` authorizes `succeeded`; the exact recorded old-effect precondition authorizes `failed` after any eligible-temporary cleanup; a missing final target also authorizes `failed` after eligible-temporary cleanup; and a safely observed different entry authorizes `failed` with a conflict.
 An unsafe or unavailable final observation is `uncertain`.
 Recovery may remove only an eligible recorded temporary after a fresh no-follow proof of its recorded pathname, expected regular-file kind, expected fingerprint, and safe parent association.
+When eligible-temporary cleanup is required before a `failed` result, it is complete only when the recorded temporary pathname is freshly proven missing; the removal call's return value is not sufficient.
+Denied, unprovable, or non-missing cleanup aftermath is `uncertain` and retains the active operation as a global barrier until an operator corrects the exact recorded artifact and recovery can reclassify it.
 This practical cleanup boundary does not identify a hostile substitution at the same random temporary pathname with the same bytes.
 It never scans sibling paths, deletes an unexpected temporary, retries an uncertain action, or rolls back a verified earlier action.
 

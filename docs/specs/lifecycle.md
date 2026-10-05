@@ -184,6 +184,8 @@ It requires current Actual proof of the old Known effect and uses the final effe
 | --- | --- | --- | --- |
 | Copy at unchanged target | Link | Expected old link | `replace_effect` with `old_effect: file_link`, `final_effect: file_copy` |
 | Link at unchanged target | Copy | Expected old copy | `replace_effect` with `old_effect: file_copy`, `final_effect: file_link` |
+| Copy at unchanged target under a new resource identity | Copy under a stale resource identity | Expected old copy | `replace_ownership` with `old_effect: file_copy`, `final_effect: file_copy` |
+| Copy at unchanged target under a new resource identity | Copy under a stale resource identity | Missing | `create_copy` that supersedes the stale identity on success |
 | Either final effect | Either old effect | Missing | Corresponding final-effect create; old Known remains until that action's normal state update rules apply |
 | Either final effect | Either old effect | Any unexpected or unsafe observation | Blocked conflict |
 
@@ -195,7 +197,15 @@ Each prepares the final effect as far as its destination type permits, immediate
 Handoffs do not promise continuous target availability, old-effect preservation after removal, backup, restoration, or rollback.
 The strong atomic replacement contract remains limited to ordinary `link -> link` replacement and source-changing link ownership replacement; it does not apply to either effect handoff.
 
-For either effect, a desired resource without Known state creates only at a missing target and otherwise blocks.
+A managed identity handoff requires a stale old resource identity, exactly one new Desired identity at the same normalized target, and current Actual proof of the old Known effect.
+For `file_copy` effects, the new Desired source is resolved and fingerprinted before planning.
+When the final copy fingerprint equals the old applied fingerprint, `replace_ownership` is state-only: after a final expected-copy observation, it replaces the old Known identity with the new one without allocating a temporary or mutating the target.
+When the fingerprints differ, `replace_ownership` uses the copy replacement lifecycle: it stages and verifies the final copy, persists `temporary_staged`, rechecks the old owned copy, removes it, publishes the staged copy with no-replace semantics, verifies the final copy, and atomically replaces the old Known identity with the new one.
+This copy identity handoff has the same failure aftermath and recovery classification as `replace_copy`; it does not inherit the strong link-replacement preservation contract.
+When the shared target is missing, the planner uses `create_copy` with the stale identity recorded as superseded state.
+That create still has ordinary no-adoption create semantics, and only its verified success atomically removes the stale old Known identity while recording the new one.
+
+For either effect, a desired resource without Known state creates only at a missing target and otherwise blocks, except for the recorded stale identity superseded by a missing-target identity-handoff create described above.
 An unchanged known link is `noop` only when its expected link is Actual; an unchanged known copy is `noop` only when its target bytes equal the applied fingerprint and its current source fingerprint equals that applied fingerprint.
 An expected copy with a changed source fingerprint is `replace_copy`.
 An expected target whose definition changes at the same path uses the corresponding replacement or managed effect handoff.

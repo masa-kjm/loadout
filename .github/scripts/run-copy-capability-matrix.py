@@ -63,6 +63,52 @@ def record_unrun(action, phase, reason):
     )
 
 
+def run_sequential_copy_candidates():
+    """Record candidate-only executor and recovery evidence for each sequential action."""
+    candidates = [
+        (
+            "replace_copy",
+            "replace_requires_the_recorded_old_copy_and_verifies_the_new_copy",
+            "recovery_commits_or_fails_copy_replacement_from_recorded_conditions",
+            "copy_replace_relocate_and_remove_fail_preflight_without_mutating_target_or_state",
+        ),
+        (
+            "remove_copy",
+            "remove_requires_the_exact_owned_fingerprint",
+            "recovery_removes_copy_known_only_for_the_recorded_missing_postcondition",
+            "copy_replace_relocate_and_remove_fail_preflight_without_mutating_target_or_state",
+        ),
+        (
+            "relocate_copy",
+            "relocate_publishes_the_new_copy_before_removing_the_old_copy",
+            "recovery_commits_or_fails_copy_relocation_from_recorded_conditions",
+            "copy_replace_relocate_and_remove_fail_preflight_without_mutating_target_or_state",
+        ),
+        (
+            "link_to_copy_handoff",
+            "link_to_copy_handoff_replaces_only_the_expected_managed_link",
+            "recovery_classifies_link_to_copy_handoff_aftermath_from_recorded_effects",
+            "copy_handoffs_fail_preflight_without_mutating_target_or_state",
+        ),
+        (
+            "copy_to_link_handoff",
+            "copy_to_link_handoff_replaces_only_the_expected_managed_copy",
+            "recovery_classifies_copy_to_link_handoff_aftermath_from_recorded_effects",
+            "copy_handoffs_fail_preflight_without_mutating_target_or_state",
+        ),
+    ]
+    for action, executor_test, recovery_test, preflight_test in candidates:
+        run(action, "executor_candidate", executor_test, "candidate", ["--lib"])
+        run(action, "recovery_candidate", recovery_test, "candidate", ["--lib"])
+        run(
+            action,
+            "compiled_binary_preflight_rejection",
+            preflight_test,
+            "fail_closed",
+            ["--test", "cli_read_only"],
+        )
+
+
 if platform_name == "linux":
     run(
         "create_copy",
@@ -86,22 +132,21 @@ if platform_name == "linux":
             "candidate",
             ["--lib"],
         )
-    for action in ["replace_copy", "remove_copy", "relocate_copy"]:
-        run(
-            action,
-            "preflight_rejection",
-            "copy_replace_relocate_and_remove_fail_preflight_without_mutating_target_or_state",
-            "fail_closed",
-            ["--test", "cli_read_only"],
-        )
-    for action in ["link_to_copy_handoff", "copy_to_link_handoff"]:
-        run(
-            action,
-            "preflight_rejection",
-            "copy_handoffs_fail_preflight_without_mutating_target_or_state",
-            "fail_closed",
-            ["--test", "cli_read_only"],
-        )
+    run(
+        "replace_copy",
+        "native_no_replace_collision",
+        "retained_parent_no_replace_rejects_an_existing_final_name",
+        "candidate",
+        ["--test", "native_copy_platform"],
+    )
+    run(
+        "replace_copy",
+        "native_no_replace_publication",
+        "retained_parent_no_replace_publishes_exact_bytes_to_a_missing_final_name",
+        "candidate",
+        ["--test", "native_copy_platform"],
+    )
+    run_sequential_copy_candidates()
 elif platform_name == "darwin":
     run(
         "create_copy",
@@ -138,24 +183,22 @@ elif platform_name == "darwin":
         "selected_and_enabled",
         ["--lib"],
     )
-    for action in ["replace_copy", "remove_copy", "relocate_copy"]:
-        run(
-            action,
-            "preflight_rejection",
-            "copy_replace_relocate_and_remove_fail_preflight_without_mutating_target_or_state",
-            "fail_closed",
-            ["--test", "cli_read_only"],
-        )
-    for action in ["link_to_copy_handoff", "copy_to_link_handoff"]:
-        run(
-            action,
-            "preflight_rejection",
-            "copy_handoffs_fail_preflight_without_mutating_target_or_state",
-            "fail_closed",
-            ["--test", "cli_read_only"],
-        )
+    run_sequential_copy_candidates()
 else:
-    run("create_copy", "preflight_rejection", "copy_capability_preflight_rejection_creates_no_operation_or_target", "fail_closed", ["--test", "cli_read_only"])
+    run(
+        "create_copy",
+        "native_direct_create_candidate",
+        "direct_exclusive_create_preserves_collision_and_publishes_exact_bytes",
+        "candidate",
+        ["--test", "native_copy_platform"],
+    )
+    run(
+        "create_copy",
+        "preflight_rejection",
+        "copy_capability_preflight_rejection_creates_no_operation_or_target",
+        "fail_closed",
+        ["--test", "cli_read_only"],
+    )
     for action in ["replace_copy", "remove_copy", "relocate_copy"]:
         run(
             action,
@@ -164,16 +207,25 @@ else:
             "fail_closed",
             ["--test", "cli_read_only"],
         )
-    record_unrun(
-        "link_to_copy_handoff",
-        "native_preflight_rejection",
-        "requires a Windows file-symbolic-link fixture; no native symlink-policy evidence was collected",
-    )
-    record_unrun(
-        "copy_to_link_handoff",
-        "native_preflight_rejection",
-        "requires a Windows file-symbolic-link publication fixture; no native symlink-policy evidence was collected",
-    )
+    for action, reason in [
+        (
+            "replace_copy",
+            "the Windows retained-parent sequential candidate has no action-level native executor evidence",
+        ),
+        (
+            "relocate_copy",
+            "the Windows retained-parent relocation candidate has no action-level native executor evidence",
+        ),
+        (
+            "link_to_copy_handoff",
+            "requires a Windows file-symbolic-link fixture and action-level native executor evidence",
+        ),
+        (
+            "copy_to_link_handoff",
+            "requires a Windows file-symbolic-link fixture and action-level native executor evidence",
+        ),
+    ]:
+        record_unrun(action, "native_executor_candidate", reason)
 
 output.write_text(
     json.dumps(

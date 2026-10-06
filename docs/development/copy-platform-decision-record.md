@@ -148,3 +148,38 @@ The focused native probe passed two Linux tests for temporary no-replace success
 The local candidate batch does not replace the required Ubuntu CI artifact, final gate rerun, or review for the exact candidate commit.
 It also does not prove the native denial and post-error conditions needed for `create_copy` release enablement, or any native safety, denial, or aftermath conditions for the still fail-closed Linux actions, nor any macOS or Windows capability.
 No Linux action is selected or enabled from this batch.
+
+## Phase 7C candidate CI evidence review (2026-10-06; no further enablement)
+
+CI run [#79](https://github.com/masa-kjm/loadout/actions/runs/37461587411) passed for candidate commit `833193dda2038ff086c7189907cda11c16d16c90`.
+All Ubuntu, macOS, and Windows jobs passed `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, the platform's locked test suite, the native copy primitive probe, and the action-level matrix.
+The uploaded artifacts record each command and focused-test result below.
+
+### Linux/ext4
+
+The Ubuntu runner used Linux `6.17.0-1022-azure`, ext4 at `/home/runner/work/_temp`, and Rust/Cargo `1.95.0` on `x86_64-unknown-linux-gnu`.
+The matrix confirmed the existing `create_copy` candidate executor, recovery, and compiled-binary-success records.
+For `replace_copy`, it additionally confirmed native retained-parent no-replace collision preservation and publication, plus candidate executor and recovery records.
+Candidate executor and recovery records passed for `remove_copy`, `relocate_copy`, `link_to_copy_handoff`, and `copy_to_link_handoff`.
+The compiled-binary checks for every non-create action intentionally remained preflight rejection checks.
+
+This is not selection evidence for a sequential action: it lacks an enabled compiled-binary success path and the action-specific native denial and post-error aftermath required by the decision rows.
+All Linux actions other than the existing candidate `create_copy` remain fail-closed.
+
+### macOS/APFS
+
+The `macos-latest` runner used macOS `26.6.2` build `25G83`, APFS at `/Users/runner/work/_temp`, and Rust/Cargo `1.95.0` on `aarch64-apple-darwin`.
+The matrix reconfirmed all five selected-and-enabled `create_copy` records from Phase 7B.
+Candidate executor and recovery records passed for `replace_copy`, `remove_copy`, `relocate_copy`, and both effect handoffs, while their compiled-binary checks intentionally remained preflight rejection checks.
+
+No additional macOS action is selected: native action-specific failure-aftermath and compiled-binary success evidence are still required.
+The existing macOS/APFS `create_copy` enablement remains unchanged.
+
+### Windows/NTFS
+
+The `windows-latest` runner used Windows version `2009`, NTFS at `D:\\a\\_temp`, and Rust/Cargo `1.95.0` on `x86_64-pc-windows-msvc`.
+The direct exclusive-create primitive candidate passed its exact-byte and collision test, and every copy action's compiled-binary preflight-rejection test passed where applicable.
+The matrix deliberately recorded `unrun` native-executor candidates for `replace_copy`, `relocate_copy`, and both effect handoffs; the handoffs also require a file-symbolic-link fixture.
+
+Windows therefore remains fail-closed for every copy action.
+This run does not add the missing action-level native executor, denial, post-error classification, recovery, or compiled-binary success evidence required for selection.

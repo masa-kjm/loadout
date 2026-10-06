@@ -2100,7 +2100,7 @@ mod tests {
         KnownFileCopy::from_resolved(&desired)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn commit_known_link(workspace: &TestWorkspace) -> KnownResource {
         workspace.write("store/git/config", "old link\n");
         workspace
@@ -2115,6 +2115,16 @@ mod tests {
             .get_variant(&FullyQualifiedResourceId::parse("base/git-config").unwrap())
             .unwrap()
             .clone()
+    }
+
+    #[cfg(unix)]
+    fn create_test_file_link(source: &std::path::Path, target: &std::path::Path) {
+        std::os::unix::fs::symlink(source, target).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn create_test_file_link(source: &std::path::Path, target: &std::path::Path) {
+        std::os::windows::fs::symlink_file(source, target).unwrap();
     }
 
     fn begin_running_effect_handoff(
@@ -6862,7 +6872,7 @@ mod tests {
         assert!(locked.state().active_operation().is_none());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn recovery_classifies_link_to_copy_handoff_aftermath_from_recorded_effects() {
         let succeeded = TestWorkspace::new();
@@ -6963,11 +6973,9 @@ mod tests {
         assert_eq!(locked.state().known().get_variant(&resource_id), Some(&old));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn recovery_classifies_copy_to_link_handoff_aftermath_from_recorded_effects() {
-        use std::os::unix::fs::symlink;
-
         let succeeded = TestWorkspace::new();
         let resource_id = FullyQualifiedResourceId::parse("base/git-config").unwrap();
         let target = ResolvedPath::new(succeeded.path("home/.gitconfig")).unwrap();
@@ -6993,7 +7001,7 @@ mod tests {
             ResolvedResource::FileLink(final_link.clone()),
         );
         fs::remove_file(&target).unwrap();
-        symlink(final_link.source_path(), &target).unwrap();
+        create_test_file_link(final_link.source_path().as_path(), target.as_path());
         let action_id = locked
             .state()
             .active_operation()

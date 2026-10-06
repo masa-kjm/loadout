@@ -1033,12 +1033,15 @@ fn copy_replace_relocate_and_remove_fail_preflight_without_mutating_target_or_st
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn copy_handoffs_fail_preflight_without_mutating_target_or_state() {
     let link_to_copy = Fixture::new();
     let target = link_to_copy.path("home/.handoff");
+    #[cfg(unix)]
     std::os::unix::fs::symlink(link_to_copy.path("store/source"), &target).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(link_to_copy.path("store/source"), &target).unwrap();
     link_to_copy.state(
         json!({"base/item": link_to_copy.known(".handoff")}),
         Value::Null,

@@ -310,6 +310,10 @@ struct PersistedRecordedAction {
     postcondition: PersistedTargetCondition,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     temporary_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    temporary_staged: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    publication_attempted: Option<bool>,
     status: PersistedActionStatus,
 }
 
@@ -404,9 +408,11 @@ impl PersistedRecordedAction {
                 .or_else(|| {
                     action
                         .effect_handoff_facts()
-                        .map(|facts| encode_path(facts.temporary_path()))
+                        .and_then(|facts| facts.temporary_path().map(encode_path))
                 })
                 .transpose()?,
+            temporary_staged: action.temporary_staged(),
+            publication_attempted: action.publication_attempted(),
             status: PersistedActionStatus::from_status(action.status()),
         })
     }
@@ -445,9 +451,6 @@ impl PersistedRecordedAction {
             })
             .transpose()?;
         if kind == ActionKind::ReplaceEffect {
-            let temporary_path = self
-                .temporary_path
-                .ok_or(StateDecodeError::InvalidTargetCondition)?;
             let old_effect = self
                 .old_effect
                 .ok_or(StateDecodeError::InvalidTargetCondition)?
@@ -460,9 +463,13 @@ impl PersistedRecordedAction {
                 resource_id,
                 old_effect,
                 final_effect,
-                temporary_path: decode_path(temporary_path)?,
+                temporary_path: self.temporary_path.map(decode_path).transpose()?,
                 precondition,
                 postcondition,
+                temporary_staged: self.temporary_staged,
+                publication_attempted: self
+                    .publication_attempted
+                    .ok_or(StateDecodeError::InvalidTargetCondition)?,
                 status,
             })
             .map_err(StateDecodeError::InvalidOperation);
@@ -485,6 +492,12 @@ impl PersistedRecordedAction {
             let temporary_path = self
                 .temporary_path
                 .ok_or(StateDecodeError::InvalidTargetCondition)?;
+            let temporary_staged = self
+                .temporary_staged
+                .ok_or(StateDecodeError::InvalidTargetCondition)?;
+            let publication_attempted = self
+                .publication_attempted
+                .ok_or(StateDecodeError::InvalidTargetCondition)?;
             let old_effect = self
                 .old_effect
                 .map(|effect| effect.into_known(resource_id.clone()))
@@ -505,6 +518,8 @@ impl PersistedRecordedAction {
                 final_effect,
                 precondition,
                 postcondition,
+                temporary_staged,
+                publication_attempted,
                 status,
             })
             .map_err(StateDecodeError::InvalidOperation);
@@ -1038,6 +1053,8 @@ mod tests {
                         "target": "expected_copy",
                         "content_fingerprint": new_fingerprint.as_str(),
                     },
+                    "temporary_staged": false,
+                    "publication_attempted": false,
                     "status": "running",
                 }},
             },
@@ -1109,6 +1126,8 @@ mod tests {
                             "target": "expected_copy",
                             "content_fingerprint": format!("sha256:{}", "b".repeat(64))
                         },
+                        "temporary_staged": false,
+                        "publication_attempted": false,
                         "status": "running"
                     }
                 }

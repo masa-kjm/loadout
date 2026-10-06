@@ -108,6 +108,8 @@ pub(crate) struct PersistedCopyActionFacts {
     pub(crate) final_effect: KnownResource,
     pub(crate) precondition: TargetCondition,
     pub(crate) postcondition: TargetCondition,
+    pub(crate) temporary_staged: bool,
+    pub(crate) publication_attempted: bool,
     pub(crate) status: ActionStatus,
 }
 
@@ -130,9 +132,11 @@ pub(crate) struct PersistedEffectHandoffFacts {
     pub(crate) resource_id: FullyQualifiedResourceId,
     pub(crate) old_effect: KnownResource,
     pub(crate) final_effect: KnownResource,
-    pub(crate) temporary_path: ResolvedPath,
+    pub(crate) temporary_path: Option<ResolvedPath>,
     pub(crate) precondition: TargetCondition,
     pub(crate) postcondition: TargetCondition,
+    pub(crate) temporary_staged: Option<bool>,
+    pub(crate) publication_attempted: bool,
     pub(crate) status: ActionStatus,
 }
 
@@ -199,14 +203,18 @@ enum ActionFacts {
         final_effect: Box<KnownResource>,
         precondition: TargetCondition,
         postcondition: TargetCondition,
+        temporary_staged: bool,
+        publication_attempted: bool,
     },
     ReplaceEffect {
         resource_id: FullyQualifiedResourceId,
         old_effect: Box<KnownResource>,
         final_effect: Box<KnownResource>,
-        temporary_path: ResolvedPath,
+        temporary_path: Option<ResolvedPath>,
         precondition: TargetCondition,
         postcondition: TargetCondition,
+        temporary_staged: Option<bool>,
+        publication_attempted: bool,
     },
 }
 
@@ -686,6 +694,8 @@ impl RecordedAction {
             final_effect,
             precondition,
             postcondition,
+            temporary_staged,
+            publication_attempted,
             status,
         } = facts;
         if !matches!(
@@ -745,6 +755,8 @@ impl RecordedAction {
                 final_effect: Box::new(final_effect),
                 precondition,
                 postcondition,
+                temporary_staged,
+                publication_attempted,
             },
             status,
         })
@@ -791,6 +803,8 @@ impl RecordedAction {
             )),
             precondition,
             postcondition,
+            temporary_staged: false,
+            publication_attempted: false,
             status: ActionStatus::Pending,
         })
     }
@@ -802,15 +816,33 @@ impl RecordedAction {
         if facts.old_effect.resource_id() != &facts.resource_id
             || facts.final_effect.resource_id() != &facts.resource_id
             || facts.old_effect.target_path() != facts.final_effect.target_path()
-            || facts.temporary_path == *facts.final_effect.target_path()
-            || facts.temporary_path.as_ref().parent()
-                != facts.final_effect.target_path().as_ref().parent()
             || !condition_matches_effect(&facts.precondition, &facts.old_effect)
             || !condition_matches_effect(&facts.postcondition, &facts.final_effect)
         {
             return Err(OperationRecordError::InvalidActionConditions {
                 kind: ActionKind::ReplaceEffect,
             });
+        }
+        match (
+            &facts.old_effect,
+            &facts.final_effect,
+            &facts.temporary_path,
+            facts.temporary_staged,
+        ) {
+            (
+                KnownResource::FileLink(_),
+                KnownResource::FileCopy(_),
+                Some(temporary_path),
+                Some(_),
+            ) if temporary_path != facts.final_effect.target_path()
+                && temporary_path.as_ref().parent()
+                    == facts.final_effect.target_path().as_ref().parent() => {}
+            (KnownResource::FileCopy(_), KnownResource::FileLink(_), None, None) => {}
+            _ => {
+                return Err(OperationRecordError::InvalidActionConditions {
+                    kind: ActionKind::ReplaceEffect,
+                });
+            }
         }
         Ok(Self {
             facts: ActionFacts::ReplaceEffect {
@@ -820,15 +852,17 @@ impl RecordedAction {
                 temporary_path: facts.temporary_path,
                 precondition: facts.precondition,
                 postcondition: facts.postcondition,
+                temporary_staged: facts.temporary_staged,
+                publication_attempted: facts.publication_attempted,
             },
             status: facts.status,
         })
     }
 
-    /// Records a managed cross-effect handoff using its repository-allocated temporary sibling.
+    /// Records a managed cross-effect handoff, staging only a link-to-copy final effect.
     pub(crate) fn replace_effect(
         action: &PlannedEffectHandoff,
-        temporary_path: ResolvedPath,
+        temporary_path: Option<ResolvedPath>,
     ) -> Result<Self, OperationRecordError> {
         let final_effect = match action.final_effect() {
             crate::domain::desired::ResolvedResource::FileLink(resource) => {
@@ -847,6 +881,12 @@ impl RecordedAction {
             temporary_path,
             precondition,
             postcondition,
+            temporary_staged: matches!(
+                action.final_effect(),
+                crate::domain::desired::ResolvedResource::FileCopy(_)
+            )
+            .then_some(false),
+            publication_attempted: false,
             status: ActionStatus::Pending,
         })
     }
@@ -1239,7 +1279,10 @@ impl RecordedAction {
         match &self.facts {
             ActionFacts::ReplaceLink { temporary_path, .. }
             | ActionFacts::Copy { temporary_path, .. }
-            | ActionFacts::ReplaceEffect { temporary_path, .. } => Some(temporary_path),
+            | ActionFacts::ReplaceEffect {
+                temporary_path: Some(temporary_path),
+                ..
+            } => Some(temporary_path),
             ActionFacts::ReplaceOwnership {
                 temporary_path: Some(temporary_path),
                 ..
@@ -1253,7 +1296,39 @@ impl RecordedAction {
                 temporary_path: None,
                 ..
             }
+            | ActionFacts::ReplaceEffect {
+                temporary_path: None,
+                ..
+            }
             | ActionFacts::RelocateLink { .. } => None,
+        }
+    }
+
+    /// Whether a staged copy temporary was durably verified before an old effect may be removed.
+    pub(crate) fn temporary_staged(&self) -> Option<bool> {
+        match &self.facts {
+            ActionFacts::Copy {
+                temporary_staged, ..
+            } => Some(*temporary_staged),
+            ActionFacts::ReplaceEffect {
+                temporary_staged, ..
+            } => *temporary_staged,
+            _ => None,
+        }
+    }
+
+    /// Whether final publication was durably recorded immediately before its attempt.
+    pub(crate) fn publication_attempted(&self) -> Option<bool> {
+        match &self.facts {
+            ActionFacts::Copy {
+                publication_attempted,
+                ..
+            }
+            | ActionFacts::ReplaceEffect {
+                publication_attempted,
+                ..
+            } => Some(*publication_attempted),
+            _ => None,
         }
     }
 
@@ -1318,6 +1393,51 @@ impl RecordedAction {
         }
         self.status = ActionStatus::Running;
         Ok(())
+    }
+
+    fn mark_temporary_staged(&mut self) -> Result<(), OperationRecordError> {
+        if self.status != ActionStatus::Running {
+            return Err(OperationRecordError::InvalidStatusTransition {
+                from: self.status,
+                to: ActionStatus::Running,
+            });
+        }
+        match &mut self.facts {
+            ActionFacts::Copy {
+                temporary_staged, ..
+            }
+            | ActionFacts::ReplaceEffect {
+                temporary_staged: Some(temporary_staged),
+                ..
+            } => {
+                *temporary_staged = true;
+                Ok(())
+            }
+            _ => Err(OperationRecordError::InvalidActionConditions { kind: self.kind() }),
+        }
+    }
+
+    fn mark_publication_attempted(&mut self) -> Result<(), OperationRecordError> {
+        if self.status != ActionStatus::Running {
+            return Err(OperationRecordError::InvalidStatusTransition {
+                from: self.status,
+                to: ActionStatus::Running,
+            });
+        }
+        match &mut self.facts {
+            ActionFacts::Copy {
+                publication_attempted,
+                ..
+            }
+            | ActionFacts::ReplaceEffect {
+                publication_attempted,
+                ..
+            } => {
+                *publication_attempted = true;
+                Ok(())
+            }
+            _ => Err(OperationRecordError::InvalidActionConditions { kind: self.kind() }),
+        }
     }
 
     fn mark_without_known(&mut self, status: ActionStatus) -> Result<(), OperationRecordError> {
@@ -1397,7 +1517,7 @@ impl CopyRemovalFacts {
 pub(crate) struct EffectHandoffFacts {
     old_effect: KnownResource,
     final_effect: KnownResource,
-    temporary_path: ResolvedPath,
+    temporary_path: Option<ResolvedPath>,
 }
 
 impl EffectHandoffFacts {
@@ -1407,8 +1527,8 @@ impl EffectHandoffFacts {
     pub(crate) fn final_effect(&self) -> &KnownResource {
         &self.final_effect
     }
-    pub(crate) fn temporary_path(&self) -> &ResolvedPath {
-        &self.temporary_path
+    pub(crate) fn temporary_path(&self) -> Option<&ResolvedPath> {
+        self.temporary_path.as_ref()
     }
 }
 
@@ -1684,6 +1804,22 @@ impl OperationRecord {
         self.action_mut(action_id)?.mark_running()
     }
 
+    /// Durably records that a copy temporary has been verified before old-effect removal.
+    pub(crate) fn mark_temporary_staged(
+        &mut self,
+        action_id: &ActionId,
+    ) -> Result<(), OperationRecordError> {
+        self.action_mut(action_id)?.mark_temporary_staged()
+    }
+
+    /// Durably records the boundary immediately before final publication is attempted.
+    pub(crate) fn mark_publication_attempted(
+        &mut self,
+        action_id: &ActionId,
+    ) -> Result<(), OperationRecordError> {
+        self.action_mut(action_id)?.mark_publication_attempted()
+    }
+
     /// Records a conclusive failure or uncertainty without changing Known state.
     pub(crate) fn mark_without_known(
         &mut self,
@@ -1911,6 +2047,8 @@ mod tests {
                 target_path: target,
                 content_fingerprint: fingerprint(),
             },
+            temporary_staged: false,
+            publication_attempted: false,
             status: ActionStatus::Pending,
         };
         assert!(RecordedAction::from_persisted_copy(facts.clone()).is_ok());
@@ -1962,6 +2100,8 @@ mod tests {
                 target_path: new_target,
                 content_fingerprint: fingerprint(),
             },
+            temporary_staged: false,
+            publication_attempted: false,
             status: ActionStatus::Pending,
         };
         let action = RecordedAction::from_persisted_copy(facts.clone()).unwrap();
@@ -2000,31 +2140,41 @@ mod tests {
             LinkTarget::new(path("store/git/next")),
         )
         .unwrap();
-        let action = RecordedAction::from_persisted_replace_effect(PersistedEffectHandoffFacts {
-            resource_id,
-            old_effect: old.into(),
-            final_effect: final_link.into(),
-            temporary_path: path("home/.loadout-effect-a1"),
-            precondition: TargetCondition::ExpectedCopy {
-                target_path: target.clone(),
-                content_fingerprint: fingerprint(),
-            },
-            postcondition: TargetCondition::ExpectedLink {
-                target_path: target,
-                link_target: LinkTarget::new(path("store/git/next")),
-            },
-            status: ActionStatus::Pending,
-        })
-        .unwrap();
+        let mut action =
+            RecordedAction::from_persisted_replace_effect(PersistedEffectHandoffFacts {
+                resource_id,
+                old_effect: old.into(),
+                final_effect: final_link.into(),
+                temporary_path: None,
+                precondition: TargetCondition::ExpectedCopy {
+                    target_path: target.clone(),
+                    content_fingerprint: fingerprint(),
+                },
+                postcondition: TargetCondition::ExpectedLink {
+                    target_path: target,
+                    link_target: LinkTarget::new(path("store/git/next")),
+                },
+                temporary_staged: None,
+                publication_attempted: false,
+                status: ActionStatus::Pending,
+            })
+            .unwrap();
         assert_eq!(action.kind(), ActionKind::ReplaceEffect);
         assert!(matches!(
             action.known_state_update_after_success(),
             Ok(RecordedKnownStateUpdate::Upsert(_))
         ));
+        action.mark_running().unwrap();
+        assert!(matches!(
+            action.mark_temporary_staged(),
+            Err(OperationRecordError::InvalidActionConditions {
+                kind: ActionKind::ReplaceEffect
+            })
+        ));
     }
 
     #[test]
-    fn replace_effect_requires_a_temporary_sibling_of_its_target() {
+    fn copy_to_link_replace_effect_rejects_a_temporary() {
         let resource_id = FullyQualifiedResourceId::parse("base/git").unwrap();
         let target = path("home/.gitconfig");
         let old = crate::domain::known::KnownFileCopy::new(
@@ -2047,7 +2197,7 @@ mod tests {
                 resource_id,
                 old_effect: old.into(),
                 final_effect: final_link.into(),
-                temporary_path: path("home/other/.loadout-effect-a1"),
+                temporary_path: Some(path("home/other/.loadout-effect-a1")),
                 precondition: TargetCondition::ExpectedCopy {
                     target_path: target.clone(),
                     content_fingerprint: fingerprint(),
@@ -2056,6 +2206,8 @@ mod tests {
                     target_path: target,
                     link_target: LinkTarget::new(path("store/git/next")),
                 },
+                temporary_staged: Some(false),
+                publication_attempted: false,
                 status: ActionStatus::Pending,
             }),
             Err(OperationRecordError::InvalidActionConditions {
@@ -2093,10 +2245,11 @@ mod tests {
             ResolvedResource::from(final_link.clone()),
         )
         .unwrap();
-        let recorded_handoff =
-            RecordedAction::replace_effect(&handoff, path("home/.loadout-effect-a1")).unwrap();
+        let recorded_handoff = RecordedAction::replace_effect(&handoff, None).unwrap();
         assert_eq!(recorded_handoff.kind(), ActionKind::ReplaceEffect);
         assert_eq!(recorded_handoff.status(), ActionStatus::Pending);
+        assert!(recorded_handoff.temporary_path().is_none());
+        assert!(recorded_handoff.temporary_staged().is_none());
         assert_eq!(
             recorded_handoff
                 .effect_handoff_facts()

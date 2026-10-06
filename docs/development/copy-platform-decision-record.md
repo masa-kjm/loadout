@@ -37,9 +37,9 @@ A new narrow binding or direct FFI declaration needs an API review, maintenance 
 | macOS/APFS replace, relocate, and remove | Retained-parent sequential copy publication or removal with action-specific aftermath | Candidate-shaped retained-parent rustix renameat/unlinkat after APFS/exclusive-rename capability query | Fail-closed pending the Phase 7 evidence batch | Native filesystem, executor/state-recovery, compiled-binary CLI, and recovery evidence must select and enable each action independently. |
 | macOS/APFS link/copy handoff | Verified preparation, owned-old removal, destination-type no-replace publication, and complete effect aftermath | No enabled primitive in this step | Fail-closed | Dedicated compiled-binary success/failure-aftermath/recovery evidence remains required. |
 | Windows/NTFS create | `create-no-replace`, retained-parent/declared-path association, and exact classification | Direct exclusive `NtCreateFile(FILE_CREATE)` and temporary publication through handle-relative `NtSetInformationFile(FileRenameInformation)` | Partial native spike evidence; executor remains fail-closed | Add sharing denial, flush and close failure, post-error classification, state/recovery, executor, and CLI evidence before selecting or enabling either implementation. |
-| Windows/NTFS `replace_copy` | Verified staging, fresh old-copy proof, removal, no-replace publication, and new/old/missing/different classification | No selected primitive; `ReplaceFileW` remains excluded | Unresolved and fail-closed | A separately reviewed native spike proving success, old-copy and missing definite failure, different-entry conflict, unsafe/unavailable uncertainty, recovery, and no overwrite, backup, or restoration. |
-| Windows/NTFS relocate and source-changing handoff | Their independently required verified-new, fresh-old-removal, and destination-publication aftermath | No selected primitive | Unresolved and fail-closed | Do not infer enablement from Windows create or `replace_copy`; prove each action's required aftermath separately. |
-| Windows/NTFS remove and same-source handoff | Rechecked no-follow removal or state-only identity transition | No selection in this record | Unresolved and fail-closed where current capability gating requires it | Retained-parent/no-follow, sharing and ACL denial, executor/CLI, and recovery evidence. |
+| Windows/NTFS `replace_copy` | Verified staging, fresh old-copy proof, removal, no-replace publication, and new/old/missing/different classification | Candidate-shaped `windows-sys` retained-parent staging, owned removal, and no-replace publication; `ReplaceFileW` remains excluded | Candidate executor/recovery evidence; fail-closed | A separately reviewed native spike proving success, old-copy and missing definite failure, different-entry conflict, unsafe/unavailable uncertainty, recovery, and no overwrite, backup, or restoration. |
+| Windows/NTFS relocate and source-changing handoff | Their independently required verified-new, fresh-old-removal, and destination-publication aftermath | Candidate-shaped retained-parent primitives for each destination type | Candidate executor/recovery evidence; fail-closed | Do not infer enablement from Windows create or `replace_copy`; prove each action's required aftermath separately. |
+| Windows/NTFS remove and same-source handoff | Rechecked no-follow removal or state-only identity transition | Candidate-shaped retained-parent no-follow removal or destination create | Candidate executor/recovery evidence; fail-closed where current capability gating requires it | Retained-parent/no-follow, sharing and ACL denial, executor/CLI, and recovery evidence. |
 
 ## Phase 2 local native spike (partial; Step 2 incomplete)
 
@@ -183,3 +183,16 @@ The matrix deliberately recorded `unrun` native-executor candidates for `replace
 
 Windows therefore remains fail-closed for every copy action.
 This run does not add the missing action-level native executor, denial, post-error classification, recovery, or compiled-binary success evidence required for selection.
+
+## Phase 7D Windows candidate executor and recovery evidence (2026-10-06; no enablement)
+
+CI run [#80](https://github.com/masa-kjm/loadout/actions/runs/37468598405) passed for candidate commit `b35fff98efbb53e169cc48df88a28d3dc08cfbcd`.
+The `windows-latest` runner used Windows version `2009`, NTFS at `D:\\a\\_temp`, and Rust/Cargo `1.95.0` on `x86_64-pc-windows-msvc`.
+Its locked suite, native primitive probe, and action-level matrix all passed.
+
+The matrix now records passing Windows candidate executor and recorded-fact recovery tests for `replace_copy`, `remove_copy`, `relocate_copy`, `link_to_copy_handoff`, and `copy_to_link_handoff`.
+The handoff fixture creates a real file symbolic link; it does not leave handoff evidence unrun when that capability is available on the runner.
+For each of those actions, the compiled-binary record still proves only fail-closed preflight rejection without target or state mutation.
+
+This evidence promotes the retained-parent implementations from unrun to candidate execution/recovery evidence only.
+No Windows copy action is selected or enabled: action-specific native denial and post-error aftermath, enabled compiled-binary success, and the remaining recovery evidence in the decision rows are still required.

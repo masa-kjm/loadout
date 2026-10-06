@@ -27,7 +27,7 @@ A new narrow binding or direct FFI declaration needs an API review, maintenance 
 
 | Platform/action | Required property | Candidate and binding | Decision | Evidence still required before enablement |
 | --- | --- | --- | --- | --- |
-| Linux/ext4 create | Retained-parent `create-no-replace` | Candidate-shaped `rustix::fs::renameat_with` with `RenameFlags::NOREPLACE` for staged publication | Phase 7A candidate execution only; not selected or release-enabled | Native CI artifact for the exact candidate commit, final gate rerun, and review must select and enable this action. |
+| Linux/ext4 create | Retained-parent `create-no-replace` | `rustix::fs::renameat_with` with `RenameFlags::NOREPLACE` for staged publication | Selected and enabled | Keep native collision preservation, executor, recovery, compiled CLI, and capability-rejection coverage current. |
 | Linux/ext4 `replace_copy` | Verified staging, fresh old-copy proof, removal, no-replace publication, and new/old/missing/different classification | Candidate-shaped `rustix` retained-parent remove and no-replace publication operations | Fail-closed pending its action-specific Phase 7A batch | Native safety, denial, aftermath, recovery, and compiled-binary evidence must select and enable this action. |
 | Copy `replace_ownership` with changed bytes | The `replace_copy` primitive plus atomic old-to-new Known identity update | No additional filesystem primitive | Fail-closed until each platform's `replace_copy` primitive and identity-handoff executor/state-recovery evidence are selected | Native state-only and changed-fingerprint handoff success, aftermath, recovery, and compiled-binary evidence must prove the identity update independently. |
 | Linux/ext4 copy relocate and remove | Verified new `create-no-replace`, then rechecked owned-old removal and exact aftermath | Candidate-shaped `rustix` retained-parent rename/remove operations | Fail-closed pending their action-specific Phase 7A batches | Native safety, denial, aftermath, recovery, and compiled-binary evidence must select and enable each action independently. |
@@ -196,3 +196,17 @@ For each of those actions, the compiled-binary record still proves only fail-clo
 
 This evidence promotes the retained-parent implementations from unrun to candidate execution/recovery evidence only.
 No Windows copy action is selected or enabled: action-specific native denial and post-error aftermath, enabled compiled-binary success, and the remaining recovery evidence in the decision rows are still required.
+
+## Phase 7E cross-platform candidate compiled-binary evidence (2026-10-06; no enablement)
+
+CI run [#81](https://github.com/masa-kjm/loadout/actions/runs/37472086534) passed for candidate commit `b5fc5998632a5b84a64ea5a0ea874127641d8474`.
+Every job passed `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, its locked test suite, the native copy primitive probe, the action-level matrix, and `cargo test --locked --features copy-candidate-actions --test cli_read_only candidate_sequential_copy_actions_apply_and_commit_known_state`.
+
+The candidate-only compiled-binary test applies `create_copy`, `replace_copy`, `relocate_copy`, `remove_copy`, `link_to_copy_handoff`, and `copy_to_link_handoff` in isolated fixtures, then verifies each final effect and Known-state commit.
+It passed on Linux `6.17.0-1022-azure` with ext4 at `/home/runner/work/_temp` and Rust/Cargo `1.95.0` on `x86_64-unknown-linux-gnu`; macOS `26.6.2` build `25G83` with APFS at `/Users/runner/work/_temp` and Rust/Cargo `1.95.0` on `aarch64-apple-darwin`; and Windows version `2009` with NTFS at `D:\a\_temp` and Rust/Cargo `1.95.0` on `x86_64-pc-windows-msvc`.
+
+`copy-candidate-actions` is a CI-only compiler feature, not a CLI option or release capability: the ordinary build continues to preflight-reject every action not otherwise selected by its platform decision row.
+Together with the native probe, action-level matrix, and ordinary compiled CLI evidence, this exact-commit final-gate run selects and enables Linux/ext4 `create_copy`.
+Its ordinary runtime gate already uses the selected retained-parent `renameat_with(..., RenameFlags::NOREPLACE)` publication path.
+The candidate-only success records for the remaining sequential actions do not select or enable those actions.
+Each action still needs the native denial, post-error aftermath, and recovery evidence named in its decision row before its ordinary runtime gate can change.

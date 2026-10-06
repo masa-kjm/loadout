@@ -148,7 +148,6 @@ impl Drop for Fixture {
         let _ = fs::remove_dir_all(&self.root);
     }
 }
-#[cfg(feature = "copy-candidate-actions")]
 fn state(fixture: &Fixture) -> Value {
     serde_json::from_slice(&fs::read(fixture.path("state/loadout/state.json")).unwrap()).unwrap()
 }
@@ -909,7 +908,7 @@ fn copy_create_applies_exact_source_bytes_and_commits_known_state() {
     assert!(state["active_operation"].is_null());
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 #[test]
 fn copy_capability_preflight_rejection_creates_no_operation_or_target() {
     let f = Fixture::new();
@@ -933,6 +932,7 @@ fn copy_capability_preflight_rejection_creates_no_operation_or_target() {
     assert!(!f.path("state/loadout/state.json").exists());
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 #[test]
 fn copy_replace_relocate_and_remove_fail_preflight_without_mutating_target_or_state() {
     let replace = Fixture::new();
@@ -1037,7 +1037,7 @@ fn copy_replace_relocate_and_remove_fail_preflight_without_mutating_target_or_st
     );
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 #[test]
 fn copy_handoffs_fail_preflight_without_mutating_target_or_state() {
     let link_to_copy = Fixture::new();
@@ -1100,9 +1100,9 @@ fn copy_handoffs_fail_preflight_without_mutating_target_or_state() {
     );
 }
 
-#[cfg(all(feature = "copy-candidate-actions", any(unix, windows)))]
+#[cfg(any(unix, windows))]
 #[test]
-fn candidate_sequential_copy_actions_apply_and_commit_known_state() {
+fn sequential_copy_actions_apply_and_commit_known_state() {
     let create = Fixture::new();
     create.write("portable/profiles/base.yaml", "schema_version: 2\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n");
     expect(

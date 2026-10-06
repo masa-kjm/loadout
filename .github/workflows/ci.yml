@@ -75,13 +75,13 @@ jobs:
           LOADOUT_NATIVE_FIXTURE_ROOT: ${{ runner.temp }}
         run: cargo test --locked --test native_copy_platform
 
-      - name: Candidate copy-action compiled CLI evidence
-        id: candidate_copy_cli
+      - name: Sequential copy-action compiled CLI evidence
+        id: sequential_copy_cli
         env:
           TMPDIR: ${{ runner.temp }}
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
-        run: cargo test --locked --features copy-candidate-actions --test cli_read_only candidate_sequential_copy_actions_apply_and_commit_known_state
+        run: cargo test --locked --test cli_read_only sequential_copy_actions_apply_and_commit_known_state
 
       - name: Record file-copy capability matrix
         id: copy_capability_matrix
@@ -111,8 +111,8 @@ jobs:
             echo "test_step_outcome=${{ steps.non_macos_test.outcome }}"
             echo "native_copy_probe_command=cargo test --locked --test native_copy_platform"
             echo "native_copy_probe_outcome=${{ steps.native_copy_probe.outcome }}"
-            echo "candidate_copy_cli_command=cargo test --locked --features copy-candidate-actions --test cli_read_only candidate_sequential_copy_actions_apply_and_commit_known_state"
-            echo "candidate_copy_cli_outcome=${{ steps.candidate_copy_cli.outcome }}"
+            echo "sequential_copy_cli_command=cargo test --locked --test cli_read_only sequential_copy_actions_apply_and_commit_known_state"
+            echo "sequential_copy_cli_outcome=${{ steps.sequential_copy_cli.outcome }}"
             echo "copy_capability_matrix_command=python .github/scripts/run-copy-capability-matrix.py"
             echo "copy_capability_matrix_outcome=${{ steps.copy_capability_matrix.outcome }}"
           } | tee linux-platform-evidence.txt
@@ -136,8 +136,8 @@ jobs:
             echo "test_step_outcome=${{ steps.macos_test.outcome }}"
             echo "native_copy_probe_command=cargo test --locked --test native_copy_platform"
             echo "native_copy_probe_outcome=${{ steps.native_copy_probe.outcome }}"
-            echo "candidate_copy_cli_command=cargo test --locked --features copy-candidate-actions --test cli_read_only candidate_sequential_copy_actions_apply_and_commit_known_state"
-            echo "candidate_copy_cli_outcome=${{ steps.candidate_copy_cli.outcome }}"
+            echo "sequential_copy_cli_command=cargo test --locked --test cli_read_only sequential_copy_actions_apply_and_commit_known_state"
+            echo "sequential_copy_cli_outcome=${{ steps.sequential_copy_cli.outcome }}"
             echo "copy_capability_matrix_command=python .github/scripts/run-copy-capability-matrix.py"
             echo "copy_capability_matrix_outcome=${{ steps.copy_capability_matrix.outcome }}"
           } | tee macos-platform-evidence.txt
@@ -163,8 +163,8 @@ jobs:
             'test_step_outcome=${{ steps.non_macos_test.outcome }}'
             'native_copy_probe_command=cargo test --locked --test native_copy_platform'
             'native_copy_probe_outcome=${{ steps.native_copy_probe.outcome }}'
-            'candidate_copy_cli_command=cargo test --locked --features copy-candidate-actions --test cli_read_only candidate_sequential_copy_actions_apply_and_commit_known_state'
-            'candidate_copy_cli_outcome=${{ steps.candidate_copy_cli.outcome }}'
+            'sequential_copy_cli_command=cargo test --locked --test cli_read_only sequential_copy_actions_apply_and_commit_known_state'
+            'sequential_copy_cli_outcome=${{ steps.sequential_copy_cli.outcome }}'
             'copy_capability_matrix_command=python .github/scripts/run-copy-capability-matrix.py'
             'copy_capability_matrix_outcome=${{ steps.copy_capability_matrix.outcome }}'
           ) | Set-Content -Encoding utf8 windows-platform-evidence.txt

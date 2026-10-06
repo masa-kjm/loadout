@@ -654,12 +654,14 @@ impl FileCopyExecutor {
         let facts = recorded
             .effect_handoff_facts()
             .ok_or(LinkToCopyHandoffExecutionError::MissingRecordedFacts)?;
+        let temporary_path = facts
+            .temporary_path()
+            .ok_or(LinkToCopyHandoffExecutionError::MissingRecordedFacts)?;
         let final_known = crate::domain::known::KnownFileCopy::from_resolved(final_copy);
         if facts.old_effect() != &crate::domain::known::KnownResource::FileLink(old_link.clone())
             || facts.final_effect() != &crate::domain::known::KnownResource::FileCopy(final_known)
-            || facts.temporary_path().as_ref().parent()
-                != final_copy.target_path().as_ref().parent()
-            || facts.temporary_path() == final_copy.target_path()
+            || temporary_path.as_ref().parent() != final_copy.target_path().as_ref().parent()
+            || temporary_path == final_copy.target_path()
         {
             return Err(LinkToCopyHandoffExecutionError::RecordDoesNotMatchAction);
         }
@@ -685,7 +687,7 @@ impl FileCopyExecutor {
             .map_err(LinkToCopyHandoffExecutionError::TargetInspection)?;
         let temporary = self
             .inspector
-            .physical_target_path_for_execution(facts.temporary_path())
+            .physical_target_path_for_execution(temporary_path)
             .map_err(LinkToCopyHandoffExecutionError::TemporaryInspection)?;
         let target_context = ExecutionTarget::open_with_declared_root(
             self.inspector.canonical_home(),
@@ -723,7 +725,7 @@ impl FileCopyExecutor {
         let temporary_observation = self
             .inspector
             .inspect_target_for_expected_copy(
-                facts.temporary_path(),
+                temporary_path,
                 final_copy.source_content_fingerprint(),
             )
             .map_err(LinkToCopyHandoffExecutionError::TemporaryInspection)?;
@@ -763,12 +765,14 @@ impl FileCopyExecutor {
         let facts = recorded
             .effect_handoff_facts()
             .ok_or(CopyToLinkHandoffExecutionError::MissingRecordedFacts)?;
+        let temporary_path = facts
+            .temporary_path()
+            .ok_or(CopyToLinkHandoffExecutionError::MissingRecordedFacts)?;
         let final_known = crate::domain::known::KnownFileLink::from_resolved(final_link);
         if facts.old_effect() != &crate::domain::known::KnownResource::FileCopy(old_copy.clone())
             || facts.final_effect() != &crate::domain::known::KnownResource::FileLink(final_known)
-            || facts.temporary_path().as_ref().parent()
-                != final_link.target_path().as_ref().parent()
-            || facts.temporary_path() == final_link.target_path()
+            || temporary_path.as_ref().parent() != final_link.target_path().as_ref().parent()
+            || temporary_path == final_link.target_path()
         {
             return Err(CopyToLinkHandoffExecutionError::RecordDoesNotMatchAction);
         }
@@ -797,7 +801,7 @@ impl FileCopyExecutor {
             .map_err(CopyToLinkHandoffExecutionError::TargetInspection)?;
         let temporary = self
             .inspector
-            .physical_target_path_for_execution(facts.temporary_path())
+            .physical_target_path_for_execution(temporary_path)
             .map_err(CopyToLinkHandoffExecutionError::TemporaryInspection)?;
         let target_context = ExecutionTarget::open_with_declared_root(
             self.inspector.canonical_home(),
@@ -827,7 +831,7 @@ impl FileCopyExecutor {
             .map_err(CopyToLinkHandoffExecutionError::PostconditionInspection)?;
         let temporary_observation = self
             .inspector
-            .inspect_target_for_expected_link(facts.temporary_path(), final_link.link_target())
+            .inspect_target_for_expected_link(temporary_path, final_link.link_target())
             .map_err(CopyToLinkHandoffExecutionError::TemporaryInspection)?;
         if matches!(
             final_observation.observation(),
@@ -1451,6 +1455,8 @@ mod tests {
                 target_path: target.clone(),
                 content_fingerprint: desired.source_content_fingerprint().clone(),
             },
+            temporary_staged: false,
+            publication_attempted: false,
             status: ActionStatus::Running,
         })
         .unwrap();
@@ -1588,6 +1594,8 @@ mod tests {
                 target_path: target.clone(),
                 content_fingerprint: desired.source_content_fingerprint().clone(),
             },
+            temporary_staged: false,
+            publication_attempted: false,
             status: ActionStatus::Running,
         })
         .unwrap();
@@ -1690,6 +1698,8 @@ mod tests {
                 target_path: new_target.clone(),
                 content_fingerprint: desired.source_content_fingerprint().clone(),
             },
+            temporary_staged: false,
+            publication_attempted: false,
             status: ActionStatus::Running,
         })
         .unwrap();
@@ -1747,7 +1757,7 @@ mod tests {
             resource_id: old_link.resource_id().clone(),
             old_effect: KnownResource::from(KnownFileLink::from_resolved(&old_link)),
             final_effect: KnownResource::from(KnownFileCopy::from_resolved(&final_copy)),
-            temporary_path: temporary.clone(),
+            temporary_path: Some(temporary.clone()),
             precondition: TargetCondition::ExpectedLink {
                 target_path: target.clone(),
                 link_target: old_link.link_target().clone(),
@@ -1756,6 +1766,8 @@ mod tests {
                 target_path: target.clone(),
                 content_fingerprint: final_copy.source_content_fingerprint().clone(),
             },
+            temporary_staged: Some(false),
+            publication_attempted: false,
             status: ActionStatus::Running,
         })
         .unwrap();
@@ -1793,7 +1805,6 @@ mod tests {
             verify_regular_source(&source_root, &SourceRelativePath::parse("config").unwrap())
                 .unwrap();
         let target = ResolvedPath::new(root.join("home/.config")).unwrap();
-        let temporary = ResolvedPath::new(root.join("home/.loadout-effect-a1")).unwrap();
         fs::write(&target, b"old owned copy\n").unwrap();
         let old_copy = KnownFileCopy::new(
             FullyQualifiedResourceId::parse("base/config").unwrap(),
@@ -1817,7 +1828,7 @@ mod tests {
             resource_id: old_copy.resource_id().clone(),
             old_effect: KnownResource::from(old_copy),
             final_effect: KnownResource::from(KnownFileLink::from_resolved(&final_link)),
-            temporary_path: temporary.clone(),
+            temporary_path: None,
             precondition: TargetCondition::ExpectedCopy {
                 target_path: target.clone(),
                 content_fingerprint: fingerprint(b"old owned copy\n"),
@@ -1826,23 +1837,19 @@ mod tests {
                 target_path: target.clone(),
                 link_target: final_link.link_target().clone(),
             },
+            temporary_staged: None,
+            publication_attempted: false,
             status: ActionStatus::Running,
         })
         .unwrap();
 
-        FileCopyExecutor::new(&root.join("home"))
-            .unwrap()
-            .execute_copy_to_link_handoff(&action, &recorded, &source)
-            .unwrap();
-
-        assert_eq!(fs::read_link(&target).unwrap(), source.path().as_ref());
-        assert!(
-            fs::symlink_metadata(&target)
+        assert!(matches!(
+            FileCopyExecutor::new(&root.join("home"))
                 .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert!(fs::symlink_metadata(&temporary).is_err());
+                .execute_copy_to_link_handoff(&action, &recorded, &source),
+            Err(CopyToLinkHandoffExecutionError::MissingRecordedFacts)
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"old owned copy\n");
         let _ = fs::remove_dir_all(root);
     }
 }

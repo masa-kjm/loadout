@@ -1398,11 +1398,19 @@ where
                     .unwrap_or(RecoveryDecision::Uncertain);
                 if decision == RecoveryDecision::Uncertain
                     && action.temporary_path().is_some()
+                    && action.temporary_staged().is_none_or(|staged| staged)
                     && inspector.as_ref().is_some_and(|inspector| {
                         condition_holds(inspector, &action.precondition()).unwrap_or(false)
+                            || condition_holds(
+                                inspector,
+                                &TargetCondition::Missing {
+                                    target_path: action.target_path().clone(),
+                                },
+                            )
+                            .unwrap_or(false)
                     })
                 {
-                    // Cleanup is permitted only when the old recorded effect still holds; a final or unprovable effect must retain its temporary and remain uncertain.
+                    // Cleanup is permitted only after the old effect or a missing final target is proven; a final or unprovable effect retains its temporary and remains uncertain.
                     let cleaned = if action.replacement_facts().is_some() {
                         cleanup_executor().is_some_and(|executor| {
                             executor
@@ -1603,15 +1611,64 @@ fn recovery_decision(
             return Ok(RecoveryDecision::Uncertain);
         }
         let postcondition = condition_holds(inspector, &action.postcondition())?;
-        if postcondition && temporary_missing {
+        if postcondition && temporary_missing && action.publication_attempted() == Some(true) {
             return Ok(RecoveryDecision::Succeeded);
         }
+        let cleanup_required = action.temporary_staged() == Some(true);
         let precondition = condition_holds(inspector, &action.precondition())?;
-        return Ok(if precondition && temporary_missing {
-            RecoveryDecision::Failed
-        } else {
-            RecoveryDecision::Uncertain
-        });
+        if precondition && (!cleanup_required || temporary_missing) {
+            return Ok(RecoveryDecision::Failed);
+        }
+        let final_missing = condition_holds(
+            inspector,
+            &TargetCondition::Missing {
+                target_path: action.target_path().clone(),
+            },
+        )?;
+        if final_missing && (!cleanup_required || temporary_missing) {
+            return Ok(RecoveryDecision::Failed);
+        }
+        return Ok(
+            if !precondition
+                && !final_missing
+                && safely_observed_different(inspector, &action.postcondition())?
+            {
+                RecoveryDecision::Failed
+            } else {
+                RecoveryDecision::Uncertain
+            },
+        );
+    }
+
+    if action.kind() == ActionKind::ReplaceEffect {
+        let postcondition = condition_holds(inspector, &action.postcondition())?;
+        if postcondition && temporary_missing && action.publication_attempted() == Some(true) {
+            return Ok(RecoveryDecision::Succeeded);
+        }
+        let cleanup_required = action.temporary_staged() == Some(true);
+        let precondition = condition_holds(inspector, &action.precondition())?;
+        if precondition && (!cleanup_required || temporary_missing) {
+            return Ok(RecoveryDecision::Failed);
+        }
+        let final_missing = condition_holds(
+            inspector,
+            &TargetCondition::Missing {
+                target_path: action.target_path().clone(),
+            },
+        )?;
+        if final_missing && (!cleanup_required || temporary_missing) {
+            return Ok(RecoveryDecision::Failed);
+        }
+        return Ok(
+            if !precondition
+                && !final_missing
+                && safely_observed_different(inspector, &action.postcondition())?
+            {
+                RecoveryDecision::Failed
+            } else {
+                RecoveryDecision::Uncertain
+            },
+        );
     }
 
     if action.replacement_facts().is_some() {
@@ -1635,6 +1692,36 @@ fn recovery_decision(
         return Ok(RecoveryDecision::Failed);
     }
     Ok(RecoveryDecision::Uncertain)
+}
+
+fn safely_observed_different(
+    inspector: &FileLinkInspector,
+    expected: &TargetCondition,
+) -> Result<bool, TargetInspectionError> {
+    match expected {
+        TargetCondition::ExpectedCopy {
+            target_path,
+            content_fingerprint,
+        } => Ok(matches!(
+            inspector
+                .inspect_target_for_expected_copy(target_path, content_fingerprint)?
+                .observation(),
+            crate::domain::actual::CopyTargetObservation::OtherRegularFile { .. }
+                | crate::domain::actual::CopyTargetObservation::OtherEntry { .. }
+        )),
+        TargetCondition::ExpectedLink {
+            target_path,
+            link_target,
+        } => Ok(matches!(
+            inspector
+                .inspect_target_for_expected_link(target_path, link_target)?
+                .observation(),
+            TargetObservation::MatchingUnmanagedLink { .. }
+                | TargetObservation::OtherLink { .. }
+                | TargetObservation::OtherEntry { .. }
+        )),
+        TargetCondition::Missing { .. } => Ok(false),
+    }
 }
 
 fn condition_holds(
@@ -1962,6 +2049,18 @@ mod tests {
             .unwrap()[0]
             .clone();
         locked.mark_running(&action_id).unwrap();
+        if locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .action(&action_id)
+            .unwrap()
+            .temporary_staged()
+            .is_some()
+        {
+            locked.mark_temporary_staged(&action_id).unwrap();
+            locked.mark_publication_attempted(&action_id).unwrap();
+        }
         action_id
     }
 
@@ -2006,7 +2105,7 @@ mod tests {
         locked: &mut LockedStateRepository,
         old_effect: KnownResource,
         final_effect: ResolvedResource,
-    ) -> ResolvedPath {
+    ) -> Option<ResolvedPath> {
         let desired = ResolvedDesired::new(
             ProfileId::parse("workstation").unwrap(),
             [final_effect.clone()],
@@ -2026,9 +2125,20 @@ mod tests {
             .action(&action_id)
             .unwrap()
             .temporary_path()
-            .unwrap()
-            .clone();
+            .cloned();
         locked.mark_running(&action_id).unwrap();
+        if locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .action(&action_id)
+            .unwrap()
+            .temporary_staged()
+            .is_some()
+        {
+            locked.mark_temporary_staged(&action_id).unwrap();
+        }
+        locked.mark_publication_attempted(&action_id).unwrap();
         temporary
     }
 
@@ -6146,6 +6256,60 @@ mod tests {
         assert!(locked.state().active_operation().is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn recovery_leaves_an_unrecorded_copy_temporary_and_fails_with_the_old_effect() {
+        let workspace = TestWorkspace::new();
+        let resource_id = FullyQualifiedResourceId::parse("base/git-config").unwrap();
+        let target = ResolvedPath::new(workspace.path("home/.gitconfig")).unwrap();
+        let old = copy_desired(
+            &workspace,
+            resource_id.clone(),
+            "store/git/old",
+            target.clone(),
+            b"old\n",
+        );
+        let previous = commit_known_copy(&workspace, old);
+        let desired = copy_desired(
+            &workspace,
+            resource_id.clone(),
+            "store/git/new",
+            target,
+            b"new\n",
+        );
+        let desired_set = copy_desired_set(desired.clone());
+        let action = PlannedResourceAction::FileCopy(PlannedFileCopyAction::Replace {
+            desired,
+            previous: previous.clone(),
+        });
+        let mut locked = workspace.repository().acquire_exclusive().unwrap();
+        let action_id = locked
+            .begin_resource_actions(desired_hash(&desired_set).unwrap(), &[action])
+            .unwrap()[0]
+            .clone();
+        locked.mark_running(&action_id).unwrap();
+        let temporary = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .action(&action_id)
+            .unwrap()
+            .temporary_path()
+            .unwrap()
+            .clone();
+        fs::write(&temporary, b"new\n").unwrap();
+
+        assert!(
+            !reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap()
+        );
+        assert_eq!(fs::read(&temporary).unwrap(), b"new\n");
+        assert_eq!(
+            locked.state().known().get_variant(&resource_id),
+            Some(&KnownResource::FileCopy(previous))
+        );
+        assert!(locked.state().active_operation().is_none());
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_recovery_keeps_an_exact_copy_temporary_uncertain_when_cleanup_is_unproven() {
@@ -6283,6 +6447,44 @@ mod tests {
             locked.state().known().get_variant(&resource_id),
             Some(&KnownResource::FileCopy(previous))
         );
+    }
+
+    #[test]
+    fn recovery_keeps_a_final_copy_uncertain_without_publication_attempted() {
+        let workspace = TestWorkspace::new();
+        let resource_id = FullyQualifiedResourceId::parse("base/git-config").unwrap();
+        let target = ResolvedPath::new(workspace.path("home/.gitconfig")).unwrap();
+        let old = copy_desired(
+            &workspace,
+            resource_id.clone(),
+            "store/git/old",
+            target.clone(),
+            b"old\n",
+        );
+        let previous = commit_known_copy(&workspace, old);
+        let desired = copy_desired(&workspace, resource_id, "store/git/new", target, b"new\n");
+        let desired_set = copy_desired_set(desired.clone());
+        let action = PlannedResourceAction::FileCopy(PlannedFileCopyAction::Replace {
+            desired: desired.clone(),
+            previous,
+        });
+        let mut locked = workspace.repository().acquire_exclusive().unwrap();
+        let action_id = locked
+            .begin_resource_actions(desired_hash(&desired_set).unwrap(), &[action])
+            .unwrap()[0]
+            .clone();
+        locked.mark_running(&action_id).unwrap();
+        fs::write(desired.target_path(), b"new\n").unwrap();
+
+        assert!(reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap());
+        let recorded = locked
+            .state()
+            .active_operation()
+            .unwrap()
+            .action(&action_id)
+            .unwrap();
+        assert_eq!(recorded.status(), ActionStatus::Uncertain);
+        assert_eq!(recorded.publication_attempted(), Some(false));
     }
 
     #[test]
@@ -6712,7 +6914,8 @@ mod tests {
             &mut locked,
             old.clone(),
             ResolvedResource::FileCopy(final_copy),
-        );
+        )
+        .unwrap();
         fs::write(&temporary, b"final copy\n").unwrap();
         assert!(!reconcile_active_operation(&mut locked, failed.path("home").as_path()).unwrap());
         assert!(fs::symlink_metadata(temporary).is_err());
@@ -6733,7 +6936,8 @@ mod tests {
             &mut locked,
             old.clone(),
             ResolvedResource::FileCopy(final_copy),
-        );
+        )
+        .unwrap();
         fs::write(&temporary, b"substituted temporary\n").unwrap();
         assert!(reconcile_active_operation(&mut locked, uncertain.path("home").as_path()).unwrap());
         let (_, action) = locked
@@ -6823,14 +7027,12 @@ mod tests {
         )
         .unwrap();
         let mut locked = failed.repository().acquire_exclusive().unwrap();
-        let temporary = begin_running_effect_handoff(
+        begin_running_effect_handoff(
             &mut locked,
             old.clone(),
             ResolvedResource::FileLink(final_link.clone()),
         );
-        symlink(final_link.source_path(), &temporary).unwrap();
         assert!(!reconcile_active_operation(&mut locked, failed.path("home").as_path()).unwrap());
-        assert!(fs::symlink_metadata(temporary).is_err());
         assert_eq!(locked.state().known().get_variant(&resource_id), Some(&old));
 
         let uncertain = TestWorkspace::new();
@@ -6851,22 +7053,15 @@ mod tests {
         )
         .unwrap();
         let mut locked = uncertain.repository().acquire_exclusive().unwrap();
-        let temporary = begin_running_effect_handoff(
+        begin_running_effect_handoff(
             &mut locked,
             old.clone(),
             ResolvedResource::FileLink(final_link),
         );
-        fs::write(&temporary, b"substituted temporary\n").unwrap();
-        assert!(reconcile_active_operation(&mut locked, uncertain.path("home").as_path()).unwrap());
-        let (_, action) = locked
-            .state()
-            .active_operation()
-            .unwrap()
-            .actions()
-            .next()
-            .unwrap();
-        assert_eq!(action.status(), ActionStatus::Uncertain);
-        assert_eq!(fs::read(temporary).unwrap(), b"substituted temporary\n");
+        assert!(
+            !reconcile_active_operation(&mut locked, uncertain.path("home").as_path()).unwrap()
+        );
+        assert!(locked.state().active_operation().is_none());
         assert_eq!(locked.state().known().get_variant(&resource_id), Some(&old));
     }
 }

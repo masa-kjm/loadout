@@ -347,10 +347,17 @@ impl LockedStateRepository {
                     _ => Err(OperationRecordError::UnsupportedActionKind { kind: copy.kind() }),
                 },
                 PlannedResourceAction::ReplaceEffect(handoff) => {
-                    let temporary = self.allocate_temporary_sibling(
-                        handoff.final_effect().target_path(),
-                        &reserved,
-                    )?;
+                    let temporary = matches!(
+                        handoff.final_effect(),
+                        crate::domain::desired::ResolvedResource::FileCopy(_)
+                    )
+                    .then(|| {
+                        self.allocate_temporary_sibling(
+                            handoff.final_effect().target_path(),
+                            &reserved,
+                        )
+                    })
+                    .transpose()?;
                     RecordedAction::replace_effect(handoff, temporary)
                 }
             }
@@ -465,6 +472,36 @@ impl LockedStateRepository {
             .ok_or(StateRepositoryError::NoActiveOperation)?;
         operation
             .mark_running(action_id)
+            .map_err(StateRepositoryError::Operation)?;
+        self.commit_candidate(candidate)
+    }
+
+    /// Atomically records verified staged-copy evidence before an old effect can be removed.
+    pub(crate) fn mark_temporary_staged(
+        &mut self,
+        action_id: &ActionId,
+    ) -> Result<(), StateRepositoryError> {
+        let mut candidate = self.state.clone();
+        candidate
+            .active_operation
+            .as_mut()
+            .ok_or(StateRepositoryError::NoActiveOperation)?
+            .mark_temporary_staged(action_id)
+            .map_err(StateRepositoryError::Operation)?;
+        self.commit_candidate(candidate)
+    }
+
+    /// Atomically records final publication intent immediately before its filesystem attempt.
+    pub(crate) fn mark_publication_attempted(
+        &mut self,
+        action_id: &ActionId,
+    ) -> Result<(), StateRepositoryError> {
+        let mut candidate = self.state.clone();
+        candidate
+            .active_operation
+            .as_mut()
+            .ok_or(StateRepositoryError::NoActiveOperation)?
+            .mark_publication_attempted(action_id)
             .map_err(StateRepositoryError::Operation)?;
         self.commit_candidate(candidate)
     }

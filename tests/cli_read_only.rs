@@ -1122,6 +1122,8 @@ fn copy_recovery_closes_a_retained_create_before_applying_a_fresh_copy_on_apfs()
                 },
                 "precondition": {"target": "missing"},
                 "postcondition": {"target": "expected_copy", "content_fingerprint": fingerprint},
+                "temporary_staged": false,
+                "publication_attempted": false,
                 "status": "running"
             }}
         }),
@@ -1178,6 +1180,8 @@ fn copy_recovery_keeps_matching_create_uncertain_and_blocks_a_fresh_plan() {
                 },
                 "precondition": {"target": "missing"},
                 "postcondition": {"target": "expected_copy", "content_fingerprint": fingerprint},
+                "temporary_staged": false,
+                "publication_attempted": false,
                 "status": "running"
             }}
         }),
@@ -1204,7 +1208,7 @@ fn copy_recovery_keeps_matching_create_uncertain_and_blocks_a_fresh_plan() {
 }
 
 #[test]
-fn copy_replacement_recovery_keeps_a_different_final_uncertain_and_blocks_a_fresh_plan() {
+fn copy_replacement_recovery_closes_a_different_final_as_conflict() {
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
@@ -1236,6 +1240,8 @@ fn copy_replacement_recovery_keeps_a_different_final_uncertain_and_blocks_a_fres
                 "final_effect": final_effect,
                 "precondition": {"target": "expected_copy", "content_fingerprint": old_fingerprint},
                 "postcondition": {"target": "expected_copy", "content_fingerprint": new_fingerprint},
+                "temporary_staged": false,
+                "publication_attempted": false,
                 "status": "running"
             }}
         }),
@@ -1248,7 +1254,7 @@ fn copy_replacement_recovery_keeps_a_different_final_uncertain_and_blocks_a_fres
             .output()
             .unwrap(),
         2,
-        &["apply failed during Recovery", "must be recovered"],
+        &["blocked plan", "conflict: base/copied"],
     );
     assert_eq!(
         fs::read(f.path("home/.copy-target")).unwrap(),
@@ -1258,10 +1264,7 @@ fn copy_replacement_recovery_keeps_a_different_final_uncertain_and_blocks_a_fres
         serde_json::from_slice::<Value>(&fs::read(f.path("state/loadout/state.json")).unwrap())
             .unwrap();
     assert_eq!(state["resources"]["base/copied"], old_known);
-    assert_eq!(
-        state["active_operation"]["actions"]["a1"]["status"],
-        "uncertain"
-    );
+    assert!(state["active_operation"].is_null());
 }
 
 #[cfg(target_os = "macos")]

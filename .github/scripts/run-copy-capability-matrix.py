@@ -199,33 +199,7 @@ else:
         "fail_closed",
         ["--test", "cli_read_only"],
     )
-    for action in ["replace_copy", "remove_copy", "relocate_copy"]:
-        run(
-            action,
-            "preflight_rejection",
-            "copy_replace_relocate_and_remove_fail_preflight_without_mutating_target_or_state",
-            "fail_closed",
-            ["--test", "cli_read_only"],
-        )
-    for action, reason in [
-        (
-            "replace_copy",
-            "the Windows retained-parent sequential candidate has no action-level native executor evidence",
-        ),
-        (
-            "relocate_copy",
-            "the Windows retained-parent relocation candidate has no action-level native executor evidence",
-        ),
-        (
-            "link_to_copy_handoff",
-            "requires a Windows file-symbolic-link fixture and action-level native executor evidence",
-        ),
-        (
-            "copy_to_link_handoff",
-            "requires a Windows file-symbolic-link fixture and action-level native executor evidence",
-        ),
-    ]:
-        record_unrun(action, "native_executor_candidate", reason)
+    run_sequential_copy_candidates()
 
 output.write_text(
     json.dumps(

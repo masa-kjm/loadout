@@ -176,9 +176,9 @@ impl FileCopyExecutor {
             {
                 if matches!(
                     action,
-                    PlannedResourceAction::FileCopy(action) if action.kind() == ActionKind::CreateCopy
+                    PlannedResourceAction::FileCopy(_) | PlannedResourceAction::ReplaceEffect(_)
                 ) {
-                    // The Linux Phase 7A candidate batch currently proves only retained-parent create-no-replace publication.
+                    // Linux/ext4 create uses the selected retained-parent no-replace publication capability.
                     Ok(())
                 } else {
                     Err(CopyPreflightError::UnsupportedPlatformCapability)
@@ -188,7 +188,7 @@ impl FileCopyExecutor {
             {
                 if matches!(
                     action,
-                    PlannedResourceAction::FileCopy(action) if action.kind() == ActionKind::CreateCopy
+                    PlannedResourceAction::FileCopy(_) | PlannedResourceAction::ReplaceEffect(_)
                 ) {
                     Ok(())
                 } else {
@@ -198,8 +198,7 @@ impl FileCopyExecutor {
             #[cfg(windows)]
             {
                 let _ = action;
-                // Windows primitives remain candidates until native executor, recovery, and CLI evidence selects each action.
-                Err(CopyPreflightError::UnsupportedPlatformCapability)
+                Ok(())
             }
             #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
             {
@@ -1512,6 +1511,38 @@ mod tests {
         std::os::windows::fs::symlink_file(source, target)
     }
 
+    #[cfg(windows)]
+    fn hold_without_delete_sharing(path: &Path) -> io::Result<fs::File> {
+        use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
+        use windows_sys::Win32::{
+            Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE},
+            Storage::FileSystem::{
+                CreateFileW, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                OPEN_EXISTING,
+            },
+        };
+
+        let mut name = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        name.push(0);
+        // SAFETY: `name` is NUL-terminated and every other argument is valid for synchronous read access to the disposable fixture entry.
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: CreateFileW returned a newly owned handle.
+        Ok(unsafe { fs::File::from_raw_handle(handle as _) })
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn create_primitive_uses_only_the_recorded_temporary_and_verifies_its_postcondition() {
@@ -1728,6 +1759,41 @@ mod tests {
         assert!(staged);
         assert_eq!(fs::read(&target).unwrap(), b"old owned bytes\n");
         assert_eq!(fs::read(&temporary).unwrap(), b"substituted temporary\n");
+
+        fs::remove_file(&temporary).unwrap();
+        let mut publication_attempted = false;
+        let error = FileCopyExecutor::new(&root.join("home"))
+            .unwrap()
+            .execute_replace_with_progress(&action, &recorded, &source, &mut |progress| {
+                match progress {
+                    CopyExecutionProgress::TemporaryStaged => Ok(()),
+                    CopyExecutionProgress::PublicationAttempted => {
+                        publication_attempted = true;
+                        fs::write(&target, b"external final bytes\n")
+                    }
+                }
+            })
+            .unwrap_err();
+        assert!(matches!(error, ReplaceCopyExecutionError::Filesystem(_)));
+        assert!(publication_attempted);
+        assert_eq!(fs::read(&target).unwrap(), b"external final bytes\n");
+        assert_eq!(fs::read(&temporary).unwrap(), b"replacement source bytes\n");
+
+        #[cfg(windows)]
+        {
+            fs::remove_file(&target).unwrap();
+            fs::remove_file(&temporary).unwrap();
+            fs::write(&target, b"old owned bytes\n").unwrap();
+            let held = hold_without_delete_sharing(target.as_path()).unwrap();
+            let error = FileCopyExecutor::new(&root.join("home"))
+                .unwrap()
+                .execute_replace(&action, &recorded, &source)
+                .unwrap_err();
+            assert!(matches!(error, ReplaceCopyExecutionError::Filesystem(_)));
+            assert_eq!(fs::read(&target).unwrap(), b"old owned bytes\n");
+            assert_eq!(fs::read(&temporary).unwrap(), b"replacement source bytes\n");
+            drop(held);
+        }
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1760,6 +1826,19 @@ mod tests {
             .unwrap();
 
         assert!(fs::symlink_metadata(&target).is_err());
+
+        #[cfg(windows)]
+        {
+            fs::write(&target, b"owned copy bytes\n").unwrap();
+            let held = hold_without_delete_sharing(target.as_path()).unwrap();
+            let error = FileCopyExecutor::new(&root.join("home"))
+                .unwrap()
+                .execute_remove(&action)
+                .unwrap_err();
+            assert!(matches!(error, RemoveCopyExecutionError::Filesystem(_)));
+            assert_eq!(fs::read(&target).unwrap(), b"owned copy bytes\n");
+            drop(held);
+        }
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1833,6 +1912,43 @@ mod tests {
         assert!(fs::symlink_metadata(&old_target).is_err());
         assert_eq!(fs::read(&new_target).unwrap(), b"relocated source bytes\n");
         assert!(fs::symlink_metadata(&temporary).is_err());
+
+        fs::remove_file(&new_target).unwrap();
+        fs::write(&old_target, b"old owned bytes\n").unwrap();
+        let mut publication_attempted = false;
+        let error = FileCopyExecutor::new(&root.join("home"))
+            .unwrap()
+            .execute_relocate_with_progress(&action, &recorded, &source, &mut |progress| {
+                match progress {
+                    CopyExecutionProgress::TemporaryStaged => Ok(()),
+                    CopyExecutionProgress::PublicationAttempted => {
+                        publication_attempted = true;
+                        fs::write(&new_target, b"external final bytes\n")
+                    }
+                }
+            })
+            .unwrap_err();
+        assert!(matches!(error, RelocateCopyExecutionError::Filesystem(_)));
+        assert!(publication_attempted);
+        assert_eq!(fs::read(&old_target).unwrap(), b"old owned bytes\n");
+        assert_eq!(fs::read(&new_target).unwrap(), b"external final bytes\n");
+        assert_eq!(fs::read(&temporary).unwrap(), b"relocated source bytes\n");
+
+        #[cfg(windows)]
+        {
+            fs::remove_file(&new_target).unwrap();
+            fs::remove_file(&temporary).unwrap();
+            let held = hold_without_delete_sharing(old_target.as_path()).unwrap();
+            let error = FileCopyExecutor::new(&root.join("home"))
+                .unwrap()
+                .execute_relocate(&action, &recorded, &source)
+                .unwrap_err();
+            assert!(matches!(error, RelocateCopyExecutionError::Filesystem(_)));
+            assert_eq!(fs::read(&old_target).unwrap(), b"old owned bytes\n");
+            assert_eq!(fs::read(&new_target).unwrap(), b"relocated source bytes\n");
+            assert!(fs::symlink_metadata(&temporary).is_err());
+            drop(held);
+        }
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1934,6 +2050,53 @@ mod tests {
             old_link.link_target().as_path().as_ref()
         );
         assert_eq!(fs::read(&temporary).unwrap(), b"substituted temporary\n");
+
+        fs::remove_file(&temporary).unwrap();
+        let mut publication_attempted = false;
+        let error = FileCopyExecutor::new(&root.join("home"))
+            .unwrap()
+            .execute_link_to_copy_handoff_with_progress(
+                &action,
+                &recorded,
+                &source,
+                &mut |progress| match progress {
+                    CopyExecutionProgress::TemporaryStaged => Ok(()),
+                    CopyExecutionProgress::PublicationAttempted => {
+                        publication_attempted = true;
+                        fs::write(&target, b"external final bytes\n")
+                    }
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            LinkToCopyHandoffExecutionError::Filesystem(_)
+        ));
+        assert!(publication_attempted);
+        assert_eq!(fs::read(&target).unwrap(), b"external final bytes\n");
+        assert_eq!(fs::read(&temporary).unwrap(), b"final copy bytes\n");
+
+        #[cfg(windows)]
+        {
+            fs::remove_file(&target).unwrap();
+            fs::remove_file(&temporary).unwrap();
+            create_file_link(old_link.link_target().as_path().as_path(), target.as_path()).unwrap();
+            let held = hold_without_delete_sharing(target.as_path()).unwrap();
+            let error = FileCopyExecutor::new(&root.join("home"))
+                .unwrap()
+                .execute_link_to_copy_handoff(&action, &recorded, &source)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                LinkToCopyHandoffExecutionError::Filesystem(_)
+            ));
+            assert_eq!(
+                fs::read_link(&target).unwrap(),
+                old_link.link_target().as_path().as_ref()
+            );
+            assert_eq!(fs::read(&temporary).unwrap(), b"final copy bytes\n");
+            drop(held);
+        }
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1997,6 +2160,45 @@ mod tests {
             .execute_copy_to_link_handoff(&action, &recorded, &source)
             .unwrap();
         assert_eq!(fs::read_link(&target).unwrap(), source.path().as_ref());
+
+        fs::remove_file(&target).unwrap();
+        fs::write(&target, b"old owned copy\n").unwrap();
+        let mut publication_attempted = false;
+        let error = FileCopyExecutor::new(&root.join("home"))
+            .unwrap()
+            .execute_copy_to_link_handoff_with_progress(
+                &action,
+                &recorded,
+                &source,
+                &mut |progress| {
+                    assert_eq!(progress, CopyExecutionProgress::PublicationAttempted);
+                    publication_attempted = true;
+                    fs::write(&target, b"external final bytes\n")
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CopyToLinkHandoffExecutionError::Filesystem(_)
+        ));
+        assert!(publication_attempted);
+        assert_eq!(fs::read(&target).unwrap(), b"external final bytes\n");
+
+        #[cfg(windows)]
+        {
+            fs::write(&target, b"old owned copy\n").unwrap();
+            let held = hold_without_delete_sharing(target.as_path()).unwrap();
+            let error = FileCopyExecutor::new(&root.join("home"))
+                .unwrap()
+                .execute_copy_to_link_handoff(&action, &recorded, &source)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                CopyToLinkHandoffExecutionError::Filesystem(_)
+            ));
+            assert_eq!(fs::read(&target).unwrap(), b"old owned copy\n");
+            drop(held);
+        }
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -148,6 +148,10 @@ impl Drop for Fixture {
         let _ = fs::remove_dir_all(&self.root);
     }
 }
+#[cfg(feature = "copy-candidate-actions")]
+fn state(fixture: &Fixture) -> Value {
+    serde_json::from_slice(&fs::read(fixture.path("state/loadout/state.json")).unwrap()).unwrap()
+}
 fn text(output: &Output) -> String {
     format!(
         "{}{}",
@@ -1093,6 +1097,152 @@ fn copy_handoffs_fail_preflight_without_mutating_target_or_state() {
     assert_eq!(
         fs::read(copy_to_link.path("state/loadout/state.json")).unwrap(),
         before_state
+    );
+}
+
+#[cfg(all(feature = "copy-candidate-actions", any(unix, windows)))]
+#[test]
+fn candidate_sequential_copy_actions_apply_and_commit_known_state() {
+    let create = Fixture::new();
+    create.write("portable/profiles/base.yaml", "schema_version: 2\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n");
+    expect(
+        create
+            .command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        0,
+        &["create_copy", "apply completed: 1 committed actions"],
+    );
+    assert_eq!(
+        fs::read(create.path("home/.copy-target")).unwrap(),
+        b"content\n"
+    );
+    assert_eq!(
+        state(&create)["resources"],
+        json!({"base/item": create.known_copy(".copy-target", b"content\n")})
+    );
+
+    let replace = Fixture::new();
+    replace.write("store/source", "new\n");
+    replace.write("home/.copy-target", "old\n");
+    replace.state(
+        json!({"base/item": replace.known_copy(".copy-target", b"old\n")}),
+        Value::Null,
+    );
+    replace.write("portable/profiles/base.yaml", "schema_version: 2\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n");
+    expect(
+        replace
+            .command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        0,
+        &["replace_copy", "apply completed: 1 committed actions"],
+    );
+    assert_eq!(
+        fs::read(replace.path("home/.copy-target")).unwrap(),
+        b"new\n"
+    );
+    assert_eq!(
+        state(&replace)["resources"],
+        json!({"base/item": replace.known_copy(".copy-target", b"new\n")})
+    );
+
+    let relocate = Fixture::new();
+    relocate.write("home/.old-target", "content\n");
+    relocate.state(
+        json!({"base/item": relocate.known_copy(".old-target", b"content\n")}),
+        Value::Null,
+    );
+    relocate.write("portable/profiles/base.yaml", "schema_version: 2\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.new-target\n");
+    expect(
+        relocate
+            .command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        0,
+        &["relocate_copy", "apply completed: 1 committed actions"],
+    );
+    assert!(fs::symlink_metadata(relocate.path("home/.old-target")).is_err());
+    assert_eq!(
+        fs::read(relocate.path("home/.new-target")).unwrap(),
+        b"content\n"
+    );
+
+    let remove = Fixture::new();
+    remove.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 2\nid: base\nresources: {}\n",
+    );
+    remove.write("home/.copy-target", "content\n");
+    remove.state(
+        json!({"base/item": remove.known_copy(".copy-target", b"content\n")}),
+        Value::Null,
+    );
+    expect(
+        remove
+            .command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        0,
+        &["remove_copy", "apply completed: 1 committed actions"],
+    );
+    assert!(fs::symlink_metadata(remove.path("home/.copy-target")).is_err());
+    assert!(state(&remove)["resources"].as_object().unwrap().is_empty());
+
+    let link_to_copy = Fixture::new();
+    let target = link_to_copy.path("home/.handoff");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(link_to_copy.path("store/source"), &target).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(link_to_copy.path("store/source"), &target).unwrap();
+    link_to_copy.state(
+        json!({"base/item": link_to_copy.known(".handoff")}),
+        Value::Null,
+    );
+    link_to_copy.write("portable/profiles/base.yaml", "schema_version: 2\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.handoff\n");
+    expect(
+        link_to_copy
+            .command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        0,
+        &["replace_effect", "apply completed: 1 committed actions"],
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"content\n");
+    assert_eq!(
+        state(&link_to_copy)["resources"],
+        json!({"base/item": link_to_copy.known_copy(".handoff", b"content\n")})
+    );
+
+    let copy_to_link = Fixture::new();
+    let target = copy_to_link.path("home/.handoff");
+    fs::write(&target, b"content\n").unwrap();
+    copy_to_link.state(
+        json!({"base/item": copy_to_link.known_copy(".handoff", b"content\n")}),
+        Value::Null,
+    );
+    copy_to_link.profile("base", "item", "~/.handoff");
+    expect(
+        copy_to_link
+            .command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        0,
+        &["replace_effect", "apply completed: 1 committed actions"],
+    );
+    assert_eq!(
+        fs::read_link(&target).unwrap(),
+        copy_to_link.path("store/source")
+    );
+    assert_eq!(
+        state(&copy_to_link)["resources"],
+        json!({"base/item": copy_to_link.known(".handoff")})
     );
 }
 

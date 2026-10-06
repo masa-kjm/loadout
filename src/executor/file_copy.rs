@@ -164,40 +164,49 @@ impl FileCopyExecutor {
     ) -> Result<(), CopyPreflightError> {
         #[cfg(target_os = "macos")]
         self.ensure_macos_copy_publication_capability(action)?;
-        #[cfg(target_os = "linux")]
-        {
-            if matches!(
-                action,
-                PlannedResourceAction::FileCopy(action) if action.kind() == ActionKind::CreateCopy
-            ) {
-                // The Linux Phase 7A candidate batch currently proves only retained-parent create-no-replace publication.
-                Ok(())
-            } else {
-                Err(CopyPreflightError::UnsupportedPlatformCapability)
-            }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            if matches!(
-                action,
-                PlannedResourceAction::FileCopy(action) if action.kind() == ActionKind::CreateCopy
-            ) {
-                Ok(())
-            } else {
-                Err(CopyPreflightError::UnsupportedPlatformCapability)
-            }
-        }
-        #[cfg(windows)]
+        #[cfg(feature = "copy-candidate-actions")]
         {
             let _ = action;
-            // Windows primitives remain candidates until native executor, recovery, and CLI evidence selects each action.
-            Err(CopyPreflightError::UnsupportedPlatformCapability)
+            // This feature is used only by candidate CI to exercise compiled-binary action success before a capability decision enables the production gate.
+            Ok(())
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        #[cfg(not(feature = "copy-candidate-actions"))]
         {
-            let _ = action;
-            // Other platforms remain fail-closed until their independent native evidence batches select a primitive.
-            Err(CopyPreflightError::UnsupportedPlatformCapability)
+            #[cfg(target_os = "linux")]
+            {
+                if matches!(
+                    action,
+                    PlannedResourceAction::FileCopy(action) if action.kind() == ActionKind::CreateCopy
+                ) {
+                    // The Linux Phase 7A candidate batch currently proves only retained-parent create-no-replace publication.
+                    Ok(())
+                } else {
+                    Err(CopyPreflightError::UnsupportedPlatformCapability)
+                }
+            }
+            #[cfg(target_os = "macos")]
+            {
+                if matches!(
+                    action,
+                    PlannedResourceAction::FileCopy(action) if action.kind() == ActionKind::CreateCopy
+                ) {
+                    Ok(())
+                } else {
+                    Err(CopyPreflightError::UnsupportedPlatformCapability)
+                }
+            }
+            #[cfg(windows)]
+            {
+                let _ = action;
+                // Windows primitives remain candidates until native executor, recovery, and CLI evidence selects each action.
+                Err(CopyPreflightError::UnsupportedPlatformCapability)
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+            {
+                let _ = action;
+                // Other platforms remain fail-closed until their independent native evidence batches select a primitive.
+                Err(CopyPreflightError::UnsupportedPlatformCapability)
+            }
         }
     }
 

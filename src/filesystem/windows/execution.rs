@@ -2,11 +2,13 @@
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read, Write};
+use std::os::windows::fs::MetadataExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Component, PathBuf};
 
+use sha2::{Digest, Sha256};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
@@ -114,61 +116,111 @@ impl ExecutionTarget {
         Ok(observation)
     }
 
-    /// Copy publication is fail-closed until Windows-native no-replace and failure-aftermath evidence exists.
     pub(crate) fn copy_source_to_temporary(
         &self,
-        _: &ResolvedPath,
-        _: &ResolvedPath,
-        _: &ContentFingerprint,
+        source_root: &ResolvedPath,
+        source_path: &ResolvedPath,
+        expected_fingerprint: &ContentFingerprint,
     ) -> io::Result<()> {
-        Err(copy_unsupported())
+        let source = ExecutionTarget::open(source_root, source_path)?;
+        source.check_association()?;
+        let source_file = open_relative_no_follow(source.parent(), &source.name, false)?;
+        require_regular_file(&source_file)?;
+        self.check_association()?;
+        if !matches!(
+            self.copy_observation_for_name(&self.name, None)?,
+            CopyTargetObservation::Missing
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "recorded temporary is not missing",
+            ));
+        }
+        let temporary = create_relative_file_no_replace(self.parent(), &self.name)?;
+        let fingerprint = copy_and_fingerprint(source_file, temporary)?;
+        if &fingerprint != expected_fingerprint {
+            return Err(invalid(
+                "source bytes do not match the planned content fingerprint",
+            ));
+        }
+        self.check_association()
     }
 
-    /// Copy publication is fail-closed until Windows-native no-replace and failure-aftermath evidence exists.
     pub(crate) fn publish_copy_no_replace(
         &self,
-        _: &ResolvedPath,
-        _: &ContentFingerprint,
+        temporary_path: &ResolvedPath,
+        expected_fingerprint: &ContentFingerprint,
     ) -> io::Result<()> {
-        Err(copy_unsupported())
+        let temporary_name = self.sibling_name(temporary_path)?;
+        self.check_association()?;
+        if !matches!(
+            self.copy_observation_for_name(&self.name, None)?,
+            CopyTargetObservation::Missing
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "final target is not missing",
+            ));
+        }
+        require_expected_copy(
+            &open_relative_no_follow(self.parent(), &temporary_name, false)?,
+            expected_fingerprint,
+        )?;
+        let temporary = open_relative_file_for_delete(self.parent(), &temporary_name)?;
+        rename_relative_from_handle(&temporary, self.parent(), &self.name, false)?;
+        drop(temporary);
+        self.check_association()
     }
 
-    /// Copy replacement is fail-closed until Windows-native failure-aftermath evidence exists.
     pub(crate) fn replace_copy_from_temporary(
         &self,
-        _: &ResolvedPath,
-        _: &ContentFingerprint,
-        _: &ContentFingerprint,
+        temporary_path: &ResolvedPath,
+        old_fingerprint: &ContentFingerprint,
+        new_fingerprint: &ContentFingerprint,
     ) -> io::Result<()> {
-        Err(copy_unsupported())
+        self.remove_expected_copy(old_fingerprint)?;
+        self.publish_copy_no_replace(temporary_path, new_fingerprint)
     }
 
-    /// Copy removal is fail-closed until Windows-native ownership and aftermath evidence exists.
-    pub(crate) fn remove_expected_copy(&self, _: &ContentFingerprint) -> io::Result<()> {
-        Err(copy_unsupported())
+    pub(crate) fn remove_expected_copy(
+        &self,
+        expected_fingerprint: &ContentFingerprint,
+    ) -> io::Result<()> {
+        self.check_association()?;
+        let file = open_relative_file_for_delete(self.parent(), &self.name)?;
+        require_expected_copy(&file, expected_fingerprint)?;
+        mark_file_for_deletion_on_close(&file)?;
+        drop(file);
+        self.check_association()
     }
 
-    /// Copy observation is unavailable until the native no-follow byte-reading boundary is proven.
     pub(crate) fn observe_copy(
         &self,
-        _: Option<&ContentFingerprint>,
+        expected_fingerprint: Option<&ContentFingerprint>,
     ) -> io::Result<CopyTargetObservation> {
-        Err(copy_unsupported())
+        self.check_association()?;
+        let observation = self.copy_observation_for_name(&self.name, expected_fingerprint)?;
+        self.check_association()?;
+        Ok(observation)
     }
 
-    /// Link-to-copy replacement is fail-closed until Windows-native failure-aftermath evidence exists.
     pub(crate) fn replace_link_with_copy_temporary(
         &self,
-        _: &ResolvedPath,
-        _: &LinkTarget,
-        _: &ContentFingerprint,
+        temporary_path: &ResolvedPath,
+        old_link_target: &LinkTarget,
+        new_fingerprint: &ContentFingerprint,
     ) -> io::Result<()> {
-        Err(copy_unsupported())
+        self.prepare_remove(old_link_target)?.attempt()?;
+        self.publish_copy_no_replace(temporary_path, new_fingerprint)
     }
 
-    /// Copy-to-link replacement is fail-closed until Windows-native failure-aftermath evidence exists.
-    pub(crate) fn create_link_temporary(&self, _: &ResolvedPath, _: &LinkTarget) -> io::Result<()> {
-        Err(copy_unsupported())
+    /// Creates a final link only after retained-parent missingness and source checks.
+    pub(crate) fn create_link_temporary(
+        &self,
+        source_root: &ResolvedPath,
+        link_target: &LinkTarget,
+    ) -> io::Result<()> {
+        self.prepare_create(source_root, link_target)?.attempt()
     }
 
     /// Copy-to-link replacement is fail-closed until Windows-native failure-aftermath evidence exists.
@@ -372,6 +424,89 @@ impl CheckedRemove<'_> {
         drop(file);
         target.check_association()
     }
+}
+
+impl ExecutionTarget {
+    fn copy_observation_for_name(
+        &self,
+        name: &std::ffi::OsString,
+        expected: Option<&ContentFingerprint>,
+    ) -> io::Result<CopyTargetObservation> {
+        let file = match open_relative_no_follow(self.parent(), name, false) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(CopyTargetObservation::Missing);
+            }
+            Err(error) => return Err(error),
+        };
+        let metadata = file.metadata()?;
+        let attributes = metadata.file_attributes();
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_file() {
+            return Ok(CopyTargetObservation::OtherEntry {
+                kind: if metadata.is_dir() {
+                    OtherEntryKind::Directory
+                } else {
+                    OtherEntryKind::Unsupported
+                },
+            });
+        }
+        let fingerprint = fingerprint_regular_file(file)?;
+        Ok(if expected == Some(&fingerprint) {
+            CopyTargetObservation::ExpectedCopy {
+                content_fingerprint: fingerprint,
+            }
+        } else {
+            CopyTargetObservation::OtherRegularFile {
+                content_fingerprint: fingerprint,
+            }
+        })
+    }
+}
+
+fn require_regular_file(file: &File) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_file() {
+        return Err(invalid("entry is not a no-follow regular file"));
+    }
+    Ok(())
+}
+
+fn require_expected_copy(file: &File, expected: &ContentFingerprint) -> io::Result<()> {
+    require_regular_file(file)?;
+    if &fingerprint_regular_file(file.try_clone()?)? != expected {
+        return Err(invalid("entry does not have the expected owned content"));
+    }
+    Ok(())
+}
+
+fn fingerprint_regular_file(mut file: File) -> io::Result<ContentFingerprint> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    ContentFingerprint::parse(format!("sha256:{:x}", hasher.finalize()))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn copy_and_fingerprint(mut source: File, mut destination: File) -> io::Result<ContentFingerprint> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        destination.write_all(&buffer[..read])?;
+        hasher.update(&buffer[..read]);
+    }
+    destination.sync_all()?;
+    ContentFingerprint::parse(format!("sha256:{:x}", hasher.finalize()))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn reparse_buffer(file: &File) -> io::Result<Vec<u8>> {

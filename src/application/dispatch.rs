@@ -6,9 +6,9 @@ use crate::domain::ids::FullyQualifiedResourceId;
 use crate::domain::known::KnownResource;
 use crate::domain::plan::{ActionKind, PlannedResourceAction};
 use crate::executor::file_copy::{
-    CopyPreflightError, CopyToLinkHandoffExecutionError, CreateCopyExecutionError,
-    FileCopyExecutor, LinkToCopyHandoffExecutionError, RelocateCopyExecutionError,
-    RemoveCopyExecutionError, ReplaceCopyExecutionError,
+    CopyExecutionProgress, CopyPreflightError, CopyToLinkHandoffExecutionError,
+    CreateCopyExecutionError, FileCopyExecutor, LinkToCopyHandoffExecutionError,
+    RelocateCopyExecutionError, RemoveCopyExecutionError, ReplaceCopyExecutionError,
 };
 use crate::executor::file_link::{
     CreateLinkExecutionError, FileLinkExecutor, RelocateLinkExecutionError,
@@ -17,6 +17,7 @@ use crate::executor::file_link::{
 use crate::inspection::source::VerifiedSource;
 use crate::resolver::ResolvedApplyInput;
 use crate::state::operation::RecordedAction;
+use std::io;
 
 #[derive(Debug)]
 pub(crate) enum ResourceExecutionError {
@@ -154,6 +155,7 @@ pub(super) fn execute(
     resource_action: &PlannedResourceAction,
     recorded: &RecordedAction,
     resolved: &ResolvedApplyInput,
+    progress: &mut dyn FnMut(CopyExecutionProgress) -> io::Result<()>,
 ) -> Result<(), ResourceExecutionError> {
     match resource_action {
         PlannedResourceAction::FileLink(action) => match action.kind() {
@@ -215,27 +217,30 @@ pub(super) fn execute(
         },
         PlannedResourceAction::FileCopy(action) => match action.kind() {
             ActionKind::CreateCopy => copy_executor
-                .execute_create(
+                .execute_create_with_progress(
                     action,
                     recorded,
                     source(resolved, action.resource_id())
                         .map_err(|_| ResourceExecutionError::InvalidEffectHandoff)?,
+                    progress,
                 )
                 .map_err(ResourceExecutionError::CreateCopy),
             ActionKind::ReplaceCopy => copy_executor
-                .execute_replace(
+                .execute_replace_with_progress(
                     action,
                     recorded,
                     source(resolved, action.resource_id())
                         .map_err(|_| ResourceExecutionError::InvalidEffectHandoff)?,
+                    progress,
                 )
                 .map_err(ResourceExecutionError::ReplaceCopy),
             ActionKind::RelocateCopy => copy_executor
-                .execute_relocate(
+                .execute_relocate_with_progress(
                     action,
                     recorded,
                     source(resolved, action.resource_id())
                         .map_err(|_| ResourceExecutionError::InvalidEffectHandoff)?,
+                    progress,
                 )
                 .map_err(ResourceExecutionError::RelocateCopy),
             ActionKind::RemoveCopy => copy_executor
@@ -250,19 +255,21 @@ pub(super) fn execute(
         PlannedResourceAction::ReplaceEffect(action) => {
             match (action.old_effect(), action.final_effect()) {
                 (KnownResource::FileLink(_), ResolvedResource::FileCopy(_)) => copy_executor
-                    .execute_link_to_copy_handoff(
+                    .execute_link_to_copy_handoff_with_progress(
                         action,
                         recorded,
                         source(resolved, action.resource_id())
                             .map_err(|_| ResourceExecutionError::InvalidEffectHandoff)?,
+                        progress,
                     )
                     .map_err(ResourceExecutionError::LinkToCopyHandoff),
                 (KnownResource::FileCopy(_), ResolvedResource::FileLink(_)) => copy_executor
-                    .execute_copy_to_link_handoff(
+                    .execute_copy_to_link_handoff_with_progress(
                         action,
                         recorded,
                         source(resolved, action.resource_id())
                             .map_err(|_| ResourceExecutionError::InvalidEffectHandoff)?,
+                        progress,
                     )
                     .map_err(ResourceExecutionError::CopyToLinkHandoff),
                 _ => Err(ResourceExecutionError::InvalidEffectHandoff),

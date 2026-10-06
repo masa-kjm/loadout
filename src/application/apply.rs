@@ -175,8 +175,22 @@ fn apply_request_with_hooks(
                 &mut committed,
                 &mut affected_action,
                 after_running,
-                |action, recorded| {
-                    super::dispatch::execute(&executor, &copy_executor, action, recorded, &resolved)
+                |action, recorded, locked, action_id| {
+                    super::dispatch::execute(
+                        &executor,
+                        &copy_executor,
+                        action,
+                        recorded,
+                        &resolved,
+                        &mut |progress| match progress {
+                            crate::executor::file_copy::CopyExecutionProgress::TemporaryStaged => locked
+                                .mark_temporary_staged(action_id)
+                                .map_err(std::io::Error::other),
+                            crate::executor::file_copy::CopyExecutionProgress::PublicationAttempted => locked
+                                .mark_publication_attempted(action_id)
+                                .map_err(std::io::Error::other),
+                        },
+                    )
                 },
             )
             .map_err(lifecycle)?;
@@ -230,6 +244,8 @@ fn execute_resource_actions(
     mut execute: impl FnMut(
         &PlannedResourceAction,
         &RecordedAction,
+        &mut LockedStateRepository,
+        &crate::state::operation::ActionId,
     ) -> Result<(), super::dispatch::ResourceExecutionError>,
 ) -> Result<(), ApplyError> {
     for (index, (action, id)) in actions.iter().zip(ids).enumerate() {
@@ -246,7 +262,7 @@ fn execute_resource_actions(
             .and_then(|op| op.action(id))
             .expect("complete operation was persisted before execution")
             .clone();
-        let execution = execute(action, &recorded);
+        let execution = execute(action, &recorded, locked, id);
         let classification = match &execution {
             Ok(()) => ExecutionClassification::Succeeded,
             Err(error) => classify_resource_execution_error(home_directory, &recorded, error),
@@ -2898,7 +2914,7 @@ mod tests {
             &mut committed,
             &mut None,
             |_, _| {},
-            |action, recorded| {
+            |action, recorded, _, _| {
                 match action.kind() {
                     ActionKind::RelocateLink => {
                         let facts = recorded.relocation_facts().unwrap();

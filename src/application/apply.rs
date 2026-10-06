@@ -6328,7 +6328,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_recovery_keeps_an_exact_copy_temporary_uncertain_when_cleanup_is_unproven() {
+    fn windows_recovery_cleans_an_exact_staged_copy_temporary_and_keeps_old_known() {
         let workspace = TestWorkspace::new();
         let resource_id = FullyQualifiedResourceId::parse("base/git-config").unwrap();
         let target = ResolvedPath::new(workspace.path("home/.gitconfig")).unwrap();
@@ -6370,20 +6370,15 @@ mod tests {
             .clone();
         fs::write(&temporary, b"new\n").unwrap();
 
-        assert!(reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap());
-        assert_eq!(fs::read(&temporary).unwrap(), b"new\n");
+        assert!(
+            !reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap()
+        );
+        assert!(fs::symlink_metadata(&temporary).is_err());
         assert_eq!(
             locked.state().known().get_variant(&resource_id),
             Some(&KnownResource::FileCopy(previous))
         );
-        let (_, action) = locked
-            .state()
-            .active_operation()
-            .unwrap()
-            .actions()
-            .next()
-            .unwrap();
-        assert_eq!(action.status(), ActionStatus::Uncertain);
+        assert!(locked.state().active_operation().is_none());
     }
 
     #[test]

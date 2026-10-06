@@ -25,6 +25,12 @@ pub(crate) struct FileCopyExecutor {
     inspector: FileLinkInspector,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CopyExecutionProgress {
+    TemporaryStaged,
+    PublicationAttempted,
+}
+
 impl FileCopyExecutor {
     /// Creates an executor rooted at the user's declared and canonical home paths.
     pub(crate) fn new(home_directory: &Path) -> Result<Self, TargetInspectionError> {
@@ -181,7 +187,13 @@ impl FileCopyExecutor {
                 Err(CopyPreflightError::UnsupportedPlatformCapability)
             }
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(windows)]
+        {
+            let _ = action;
+            // Windows primitives remain candidates until native executor, recovery, and CLI evidence selects each action.
+            Err(CopyPreflightError::UnsupportedPlatformCapability)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             let _ = action;
             // Other platforms remain fail-closed until their independent native evidence batches select a primitive.
@@ -225,6 +237,16 @@ impl FileCopyExecutor {
         action: &PlannedFileCopyAction,
         recorded: &RecordedAction,
         source: &VerifiedSource,
+    ) -> Result<(), CreateCopyExecutionError> {
+        self.execute_create_with_progress(action, recorded, source, &mut |_| Ok(()))
+    }
+
+    pub(crate) fn execute_create_with_progress(
+        &self,
+        action: &PlannedFileCopyAction,
+        recorded: &RecordedAction,
+        source: &VerifiedSource,
+        progress: &mut dyn FnMut(CopyExecutionProgress) -> io::Result<()>,
     ) -> Result<(), CreateCopyExecutionError> {
         if action.kind() != ActionKind::CreateCopy || recorded.kind() != ActionKind::CreateCopy {
             return Err(CreateCopyExecutionError::UnsupportedAction {
@@ -297,6 +319,10 @@ impl FileCopyExecutor {
                 facts.content_fingerprint(),
             )
             .map_err(CreateCopyExecutionError::Filesystem)?;
+        progress(CopyExecutionProgress::TemporaryStaged)
+            .map_err(CreateCopyExecutionError::Filesystem)?;
+        progress(CopyExecutionProgress::PublicationAttempted)
+            .map_err(CreateCopyExecutionError::Filesystem)?;
         target_context
             .publish_copy_no_replace(&temporary, facts.content_fingerprint())
             .map_err(CreateCopyExecutionError::Filesystem)?;
@@ -332,6 +358,16 @@ impl FileCopyExecutor {
         action: &PlannedFileCopyAction,
         recorded: &RecordedAction,
         source: &VerifiedSource,
+    ) -> Result<(), ReplaceCopyExecutionError> {
+        self.execute_replace_with_progress(action, recorded, source, &mut |_| Ok(()))
+    }
+
+    pub(crate) fn execute_replace_with_progress(
+        &self,
+        action: &PlannedFileCopyAction,
+        recorded: &RecordedAction,
+        source: &VerifiedSource,
+        progress: &mut dyn FnMut(CopyExecutionProgress) -> io::Result<()>,
     ) -> Result<(), ReplaceCopyExecutionError> {
         if action.kind() != ActionKind::ReplaceCopy || recorded.kind() != ActionKind::ReplaceCopy {
             return Err(ReplaceCopyExecutionError::UnsupportedAction);
@@ -406,12 +442,28 @@ impl FileCopyExecutor {
                 facts.content_fingerprint(),
             )
             .map_err(ReplaceCopyExecutionError::Filesystem)?;
+        progress(CopyExecutionProgress::TemporaryStaged)
+            .map_err(ReplaceCopyExecutionError::Filesystem)?;
+        let temporary_before_removal = temporary_context
+            .observe_copy(Some(facts.content_fingerprint()))
+            .map_err(ReplaceCopyExecutionError::Filesystem)?;
+        if !matches!(
+            temporary_before_removal,
+            CopyTargetObservation::ExpectedCopy { .. }
+        ) {
+            return Err(
+                ReplaceCopyExecutionError::TemporaryPreconditionNoLongerHolds {
+                    observation: temporary_before_removal,
+                },
+            );
+        }
         target_context
-            .replace_copy_from_temporary(
-                &temporary,
-                previous.content_fingerprint(),
-                facts.content_fingerprint(),
-            )
+            .remove_expected_copy(previous.content_fingerprint())
+            .map_err(ReplaceCopyExecutionError::Filesystem)?;
+        progress(CopyExecutionProgress::PublicationAttempted)
+            .map_err(ReplaceCopyExecutionError::Filesystem)?;
+        target_context
+            .publish_copy_no_replace(&temporary, facts.content_fingerprint())
             .map_err(ReplaceCopyExecutionError::Filesystem)?;
         let final_observation = self
             .inspector
@@ -497,6 +549,16 @@ impl FileCopyExecutor {
         action: &PlannedFileCopyAction,
         recorded: &RecordedAction,
         source: &VerifiedSource,
+    ) -> Result<(), RelocateCopyExecutionError> {
+        self.execute_relocate_with_progress(action, recorded, source, &mut |_| Ok(()))
+    }
+
+    pub(crate) fn execute_relocate_with_progress(
+        &self,
+        action: &PlannedFileCopyAction,
+        recorded: &RecordedAction,
+        source: &VerifiedSource,
+        progress: &mut dyn FnMut(CopyExecutionProgress) -> io::Result<()>,
     ) -> Result<(), RelocateCopyExecutionError> {
         if action.kind() != ActionKind::RelocateCopy || recorded.kind() != ActionKind::RelocateCopy
         {
@@ -587,6 +649,10 @@ impl FileCopyExecutor {
                 facts.content_fingerprint(),
             )
             .map_err(RelocateCopyExecutionError::Filesystem)?;
+        progress(CopyExecutionProgress::TemporaryStaged)
+            .map_err(RelocateCopyExecutionError::Filesystem)?;
+        progress(CopyExecutionProgress::PublicationAttempted)
+            .map_err(RelocateCopyExecutionError::Filesystem)?;
         new_context
             .publish_copy_no_replace(&temporary, facts.content_fingerprint())
             .map_err(RelocateCopyExecutionError::Filesystem)?;
@@ -638,6 +704,16 @@ impl FileCopyExecutor {
         action: &PlannedEffectHandoff,
         recorded: &RecordedAction,
         source: &VerifiedSource,
+    ) -> Result<(), LinkToCopyHandoffExecutionError> {
+        self.execute_link_to_copy_handoff_with_progress(action, recorded, source, &mut |_| Ok(()))
+    }
+
+    pub(crate) fn execute_link_to_copy_handoff_with_progress(
+        &self,
+        action: &PlannedEffectHandoff,
+        recorded: &RecordedAction,
+        source: &VerifiedSource,
+        progress: &mut dyn FnMut(CopyExecutionProgress) -> io::Result<()>,
     ) -> Result<(), LinkToCopyHandoffExecutionError> {
         let crate::domain::known::KnownResource::FileLink(old_link) = action.old_effect() else {
             return Err(LinkToCopyHandoffExecutionError::InvalidEffectPair);
@@ -708,12 +784,30 @@ impl FileCopyExecutor {
                 final_copy.source_content_fingerprint(),
             )
             .map_err(LinkToCopyHandoffExecutionError::Filesystem)?;
+        progress(CopyExecutionProgress::TemporaryStaged)
+            .map_err(LinkToCopyHandoffExecutionError::Filesystem)?;
+        let temporary_before_removal = temporary_context
+            .observe_copy(Some(final_copy.source_content_fingerprint()))
+            .map_err(LinkToCopyHandoffExecutionError::Filesystem)?;
+        if !matches!(
+            temporary_before_removal,
+            CopyTargetObservation::ExpectedCopy { .. }
+        ) {
+            return Err(
+                LinkToCopyHandoffExecutionError::TemporaryPreconditionNoLongerHolds {
+                    observation: temporary_before_removal,
+                },
+            );
+        }
         target_context
-            .replace_link_with_copy_temporary(
-                &temporary,
-                old_link.link_target(),
-                final_copy.source_content_fingerprint(),
-            )
+            .prepare_remove(old_link.link_target())
+            .map_err(LinkToCopyHandoffExecutionError::Filesystem)?
+            .attempt()
+            .map_err(LinkToCopyHandoffExecutionError::Filesystem)?;
+        progress(CopyExecutionProgress::PublicationAttempted)
+            .map_err(LinkToCopyHandoffExecutionError::Filesystem)?;
+        target_context
+            .publish_copy_no_replace(&temporary, final_copy.source_content_fingerprint())
             .map_err(LinkToCopyHandoffExecutionError::Filesystem)?;
         let final_observation = self
             .inspector
@@ -742,13 +836,23 @@ impl FileCopyExecutor {
         }
     }
 
-    /// Replaces one expected managed copy with a verified link using the recorded handoff temporary.
+    /// Replaces one expected managed copy with a no-replace final link without a temporary.
     #[allow(dead_code)] // M3-B connects this executor to the operation coordinator after handoff actions are recorded.
     pub(crate) fn execute_copy_to_link_handoff(
         &self,
         action: &PlannedEffectHandoff,
         recorded: &RecordedAction,
         source: &VerifiedSource,
+    ) -> Result<(), CopyToLinkHandoffExecutionError> {
+        self.execute_copy_to_link_handoff_with_progress(action, recorded, source, &mut |_| Ok(()))
+    }
+
+    pub(crate) fn execute_copy_to_link_handoff_with_progress(
+        &self,
+        action: &PlannedEffectHandoff,
+        recorded: &RecordedAction,
+        source: &VerifiedSource,
+        progress: &mut dyn FnMut(CopyExecutionProgress) -> io::Result<()>,
     ) -> Result<(), CopyToLinkHandoffExecutionError> {
         let crate::domain::known::KnownResource::FileCopy(old_copy) = action.old_effect() else {
             return Err(CopyToLinkHandoffExecutionError::InvalidEffectPair);
@@ -765,14 +869,10 @@ impl FileCopyExecutor {
         let facts = recorded
             .effect_handoff_facts()
             .ok_or(CopyToLinkHandoffExecutionError::MissingRecordedFacts)?;
-        let temporary_path = facts
-            .temporary_path()
-            .ok_or(CopyToLinkHandoffExecutionError::MissingRecordedFacts)?;
         let final_known = crate::domain::known::KnownFileLink::from_resolved(final_link);
         if facts.old_effect() != &crate::domain::known::KnownResource::FileCopy(old_copy.clone())
             || facts.final_effect() != &crate::domain::known::KnownResource::FileLink(final_known)
-            || temporary_path.as_ref().parent() != final_link.target_path().as_ref().parent()
-            || temporary_path == final_link.target_path()
+            || facts.temporary_path().is_some()
         {
             return Err(CopyToLinkHandoffExecutionError::RecordDoesNotMatchAction);
         }
@@ -799,46 +899,27 @@ impl FileCopyExecutor {
             .inspector
             .physical_target_path_for_execution(final_link.target_path())
             .map_err(CopyToLinkHandoffExecutionError::TargetInspection)?;
-        let temporary = self
-            .inspector
-            .physical_target_path_for_execution(temporary_path)
-            .map_err(CopyToLinkHandoffExecutionError::TemporaryInspection)?;
         let target_context = ExecutionTarget::open_with_declared_root(
             self.inspector.canonical_home(),
             self.inspector.declared_home(),
             &target,
         )
         .map_err(CopyToLinkHandoffExecutionError::Filesystem)?;
-        let temporary_context = ExecutionTarget::open_with_declared_root(
-            self.inspector.canonical_home(),
-            self.inspector.declared_home(),
-            &temporary,
-        )
-        .map_err(CopyToLinkHandoffExecutionError::Filesystem)?;
-        temporary_context
-            .create_link_temporary(source.physical_root(), final_link.link_target())
+        target_context
+            .remove_expected_copy(old_copy.content_fingerprint())
+            .map_err(CopyToLinkHandoffExecutionError::Filesystem)?;
+        progress(CopyExecutionProgress::PublicationAttempted)
             .map_err(CopyToLinkHandoffExecutionError::Filesystem)?;
         target_context
-            .replace_copy_with_link_temporary(
-                &temporary,
-                old_copy.content_fingerprint(),
-                final_link.link_target(),
-            )
+            .create_link_temporary(source.physical_root(), final_link.link_target())
             .map_err(CopyToLinkHandoffExecutionError::Filesystem)?;
         let final_observation = self
             .inspector
             .inspect_target_for_expected_link(final_link.target_path(), final_link.link_target())
             .map_err(CopyToLinkHandoffExecutionError::PostconditionInspection)?;
-        let temporary_observation = self
-            .inspector
-            .inspect_target_for_expected_link(temporary_path, final_link.link_target())
-            .map_err(CopyToLinkHandoffExecutionError::TemporaryInspection)?;
         if matches!(
             final_observation.observation(),
             crate::domain::actual::TargetObservation::ExpectedLink { .. }
-        ) && matches!(
-            temporary_observation.observation(),
-            crate::domain::actual::TargetObservation::Missing
         ) {
             Ok(())
         } else {
@@ -1131,6 +1212,7 @@ pub(crate) enum ReplaceCopyExecutionError {
     TemporaryInspection(TargetInspectionError),
     Filesystem(io::Error),
     PreconditionNoLongerHolds { observation: CopyTargetObservation },
+    TemporaryPreconditionNoLongerHolds { observation: CopyTargetObservation },
     PostconditionInspection(TargetInspectionError),
     PostconditionNotMet,
 }
@@ -1159,6 +1241,10 @@ impl fmt::Display for ReplaceCopyExecutionError {
             Self::PreconditionNoLongerHolds { observation } => write!(
                 formatter,
                 "copy target precondition no longer holds: {observation:?}"
+            ),
+            Self::TemporaryPreconditionNoLongerHolds { observation } => write!(
+                formatter,
+                "copy temporary precondition no longer holds: {observation:?}"
             ),
             Self::PostconditionNotMet => {
                 formatter.write_str("copy replacement postcondition was not met")
@@ -1288,6 +1374,7 @@ pub(crate) enum LinkToCopyHandoffExecutionError {
     TemporaryInspection(TargetInspectionError),
     Filesystem(io::Error),
     PreconditionNoLongerHolds,
+    TemporaryPreconditionNoLongerHolds { observation: CopyTargetObservation },
     PostconditionInspection(TargetInspectionError),
     PostconditionNotMet,
 }
@@ -1316,6 +1403,10 @@ impl fmt::Display for LinkToCopyHandoffExecutionError {
             Self::PreconditionNoLongerHolds => {
                 formatter.write_str("old managed link precondition no longer holds")
             }
+            Self::TemporaryPreconditionNoLongerHolds { observation } => write!(
+                formatter,
+                "copy temporary precondition no longer holds: {observation:?}"
+            ),
             Self::PostconditionNotMet => {
                 formatter.write_str("link-to-copy handoff postcondition was not met")
             }
@@ -1584,7 +1675,7 @@ mod tests {
             target_path: target.clone(),
             content_fingerprint: desired.source_content_fingerprint().clone(),
             temporary_path: temporary.clone(),
-            old_effect: Some(KnownResource::from(previous)),
+            old_effect: Some(KnownResource::from(previous.clone())),
             final_effect: KnownResource::from(KnownFileCopy::from_resolved(&desired)),
             precondition: TargetCondition::ExpectedCopy {
                 target_path: target.clone(),
@@ -1607,6 +1698,25 @@ mod tests {
 
         assert_eq!(fs::read(&target).unwrap(), b"replacement source bytes\n");
         assert!(fs::symlink_metadata(&temporary).is_err());
+
+        fs::write(&target, b"old owned bytes\n").unwrap();
+        let mut staged = false;
+        let error = FileCopyExecutor::new(&root.join("home"))
+            .unwrap()
+            .execute_replace_with_progress(&action, &recorded, &source, &mut |progress| {
+                assert_eq!(progress, CopyExecutionProgress::TemporaryStaged);
+                staged = true;
+                fs::remove_file(&temporary)?;
+                fs::write(&temporary, b"substituted temporary\n")
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ReplaceCopyExecutionError::TemporaryPreconditionNoLongerHolds { .. }
+        ));
+        assert!(staged);
+        assert_eq!(fs::read(&target).unwrap(), b"old owned bytes\n");
+        assert_eq!(fs::read(&temporary).unwrap(), b"substituted temporary\n");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1785,6 +1895,34 @@ mod tests {
                 .is_symlink()
         );
         assert!(fs::symlink_metadata(&temporary).is_err());
+
+        fs::remove_file(&target).unwrap();
+        symlink(old_link.link_target().as_path(), &target).unwrap();
+        let mut staged = false;
+        let error = FileCopyExecutor::new(&root.join("home"))
+            .unwrap()
+            .execute_link_to_copy_handoff_with_progress(
+                &action,
+                &recorded,
+                &source,
+                &mut |progress| {
+                    assert_eq!(progress, CopyExecutionProgress::TemporaryStaged);
+                    staged = true;
+                    fs::remove_file(&temporary)?;
+                    fs::write(&temporary, b"substituted temporary\n")
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            LinkToCopyHandoffExecutionError::TemporaryPreconditionNoLongerHolds { .. }
+        ));
+        assert!(staged);
+        assert_eq!(
+            fs::read_link(&target).unwrap(),
+            old_link.link_target().as_path().as_ref()
+        );
+        assert_eq!(fs::read(&temporary).unwrap(), b"substituted temporary\n");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1843,13 +1981,11 @@ mod tests {
         })
         .unwrap();
 
-        assert!(matches!(
-            FileCopyExecutor::new(&root.join("home"))
-                .unwrap()
-                .execute_copy_to_link_handoff(&action, &recorded, &source),
-            Err(CopyToLinkHandoffExecutionError::MissingRecordedFacts)
-        ));
-        assert_eq!(fs::read(&target).unwrap(), b"old owned copy\n");
+        FileCopyExecutor::new(&root.join("home"))
+            .unwrap()
+            .execute_copy_to_link_handoff(&action, &recorded, &source)
+            .unwrap();
+        assert_eq!(fs::read_link(&target).unwrap(), source.path().as_ref());
         let _ = fs::remove_dir_all(root);
     }
 }

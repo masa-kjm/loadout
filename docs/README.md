@@ -1,7 +1,7 @@
 # Loadout Documentation
 
-This directory contains the released v0.4.0 baseline and the v0.5.0 development contract.
-The v0.5.0 documents define the contract to be implemented for the next release.
+This directory contains the released v0.4.0 baseline and the released v0.5.0 contract.
+The v0.5.0 documents define the current published contract.
 It describes a resource-oriented local environment manager.
 
 ## Status and Authority

@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.5.0
+
+- Added content-owned `file` copy resources with exact-byte fingerprint ownership, no-replace publication, verified staged replacement, link/copy effect handoff, and durable recovery classification.
+
 ## v0.4.0
 
 - Added read-only `status`, `profile`, and `resource` inspection commands for declared profiles, Resolved Desired resources, validated Known records, active operations, and no-follow Actual observations.

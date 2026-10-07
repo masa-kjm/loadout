@@ -4,8 +4,7 @@ Loadout is a local environment manager built around explicit desired state, owne
 
 ## Status
 
-v0.3.0 and v0.4.0 are released.
-v0.5.0 is the current development contract. It defines `init`, `config`, `validate`, `diff`, `plan`, `apply`, `status`, `profile`, and `resource` as described in the [CLI specification](docs/specs/cli.md).
+v0.5.0 defines `init`, `config`, `validate`, `diff`, `plan`, `apply`, `status`, `profile`, and `resource` as described in the [CLI specification](docs/specs/cli.md).
 Platform conformance for v0.5.0 requires recorded native evidence for the complete lifecycle and inspection observations on Linux/local ext4, macOS/local APFS, and Windows/local NTFS. Other combinations are not claimed supported merely because a capability is enabled.
 Release archives can be installed with the Unix and Windows installer scripts in `scripts/`.
 The published package's Rust library target is not yet a supported public API.
@@ -15,7 +14,7 @@ The published `loadout` v0.1.0 crate is preserved by the `v0.1.0` archive tag, a
 v0.4.0 retains the v0.3.0 safe core and does not provide compatibility with v0.1 or v0.2 configuration, state, commands, resources, or behavior.
 v0.5.0 deliberately provides no migration or compatibility reader for v0.4 profile or state schemas.
 
-## v0.5.0 Direction
+## v0.5.0 Capabilities
 
 v0.5.0 materializes a regular file from a local store below the current user's home directory as either a file symbolic link or a content-owned regular-file copy.
 It provides profile composition, validation, planning, drift inspection, conflict detection, state locking, verified application, crash recovery, and read-only inspection of declarations, Desired resources, Known state, and Actual observations.

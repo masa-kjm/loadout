@@ -875,7 +875,7 @@ fn copy_inspection_reports_typed_known_and_desired_only_facts_without_side_effec
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(unix, windows))]
 #[test]
 fn copy_create_applies_exact_source_bytes_and_commits_known_state() {
     let f = Fixture::new();

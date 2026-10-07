@@ -164,48 +164,27 @@ impl FileCopyExecutor {
     ) -> Result<(), CopyPreflightError> {
         #[cfg(target_os = "macos")]
         self.ensure_macos_copy_publication_capability(action)?;
-        #[cfg(feature = "copy-candidate-actions")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            let _ = action;
-            // This feature is used only by candidate CI to exercise compiled-binary action success before a capability decision enables the production gate.
-            Ok(())
-        }
-        #[cfg(not(feature = "copy-candidate-actions"))]
-        {
-            #[cfg(target_os = "linux")]
-            {
-                if matches!(
-                    action,
-                    PlannedResourceAction::FileCopy(_) | PlannedResourceAction::ReplaceEffect(_)
-                ) {
-                    // Linux/ext4 create uses the selected retained-parent no-replace publication capability.
-                    Ok(())
-                } else {
-                    Err(CopyPreflightError::UnsupportedPlatformCapability)
-                }
-            }
-            #[cfg(target_os = "macos")]
-            {
-                if matches!(
-                    action,
-                    PlannedResourceAction::FileCopy(_) | PlannedResourceAction::ReplaceEffect(_)
-                ) {
-                    Ok(())
-                } else {
-                    Err(CopyPreflightError::UnsupportedPlatformCapability)
-                }
-            }
-            #[cfg(windows)]
-            {
-                let _ = action;
+            if matches!(
+                action,
+                PlannedResourceAction::FileCopy(_) | PlannedResourceAction::ReplaceEffect(_)
+            ) {
                 Ok(())
-            }
-            #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-            {
-                let _ = action;
-                // Other platforms remain fail-closed until their independent native evidence batches select a primitive.
+            } else {
                 Err(CopyPreflightError::UnsupportedPlatformCapability)
             }
+        }
+        #[cfg(windows)]
+        {
+            let _ = action;
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        {
+            let _ = action;
+            // Other platforms remain fail-closed until their independent native evidence batches select a primitive.
+            Err(CopyPreflightError::UnsupportedPlatformCapability)
         }
     }
 
@@ -1595,28 +1574,21 @@ mod tests {
         .unwrap();
 
         let executor = FileCopyExecutor::new(&root.join("home")).unwrap();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         executor
             .preflight(
                 &PlannedResourceAction::FileCopy(action.clone()),
                 Some(&source),
             )
             .unwrap();
-        #[cfg(target_os = "macos")]
-        executor
-            .preflight(
-                &PlannedResourceAction::FileCopy(action.clone()),
-                Some(&source),
-            )
-            .unwrap();
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         let error = executor
             .preflight(
                 &PlannedResourceAction::FileCopy(action.clone()),
                 Some(&source),
             )
             .unwrap_err();
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         assert!(matches!(
             error,
             CopyPreflightError::UnsupportedPlatformCapability

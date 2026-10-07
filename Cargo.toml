@@ -11,10 +11,6 @@ repository = "https://github.com/masa-kjm/loadout"
 name = "loadout"
 path = "src/lib.rs"
 
-[features]
-# CI-only candidate execution for platform capability selection; release builds must not enable it.
-copy-candidate-actions = []
-
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }

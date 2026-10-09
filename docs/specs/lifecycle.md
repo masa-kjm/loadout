@@ -217,3 +217,28 @@ If either target cannot be proven by the action's recorded precondition or postc
 Within a phase, actions sort lexicographically by fully qualified resource ID; a managed identity handoff sorts by `<old-resource-id>\u0000<new-resource-id>`.
 The phases are: (1) creates, (2) replacements, effect handoffs, identity handoffs, and relocations, then (3) removals and forgets.
 No later action begins after an earlier action fails, and verified earlier actions are not rolled back.
+
+## Directory-Link Effect
+
+DirectoryLink adds the typed `directory_link` effect without changing the planner boundary or the deterministic phase rule.
+Its complete Desired/Known/Actual transition table, including create, replace, relocate, remove, forget-missing, same-effect identity handoff, unmanaged matching-link rejection, and mixed-effect conflict, is owned by [Directory Links](directory-link.md#planning-transitions).
+
+`create_directory_link` belongs to the create phase.
+`replace_directory_link`, DirectoryLink `replace_ownership`, and `relocate_directory_link` belong to phase 2.
+`remove_directory_link` and `forget_missing` belong to phase 3.
+A DirectoryLink action retains the existing fully qualified resource-ID tie-break and its relocate steps are contiguous.
+
+A DirectoryLink may hand off identity only to another DirectoryLink with the same normalized target and typed old-effect proof.
+FileLink/FileCopy to DirectoryLink handoff, and the reverse, are blocked conflicts with no executable target action.
+
+## Schema Gate
+
+Before a lifecycle command observes a target, reconciles an active operation, produces a plan, rewrites state, or mutates a target, it validates every profile and state document in that command's read set against the [Current Profile Schema](profiles.md#current-profile-schema) and [Current State Schema](state-and-recovery.md#current-state-schema).
+For non-dry-run apply, acquiring the exclusive lock may precede this gate, but the gate precedes recovery and every other mutable state-repository operation.
+
+If any required document has an unsupported schema version or invalid schema shape, the command reports invalid input and performs none of those actions.
+In particular, it does not recover a version-2 active operation, inspect a target that matches a version-2 Known effect, or create a replacement state document.
+An absent state file is the only state input that the current contract treats as an empty Known state.
+
+Inspection commands apply the same gate only to documents their read-only contract names.
+They remain prohibited from acquiring the apply lock, recovery, state rewrite, and target mutation.

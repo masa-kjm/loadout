@@ -21,7 +21,7 @@ An observable CLI or filesystem contract also requires an integration or accepta
 
 ## Contract Matrix
 
-The following matrix is the minimum evidence required before v0.5.0 is considered complete.
+The following matrix is the minimum evidence required before the version that owns each contract is considered complete.
 
 | Contract owner | Required evidence |
 | --- | --- |
@@ -29,6 +29,8 @@ The following matrix is the minimum evidence required before v0.5.0 is considere
 | [Profiles](../specs/profiles.md) | Include order; cycle and missing-ID rejection; deduplication through multiple paths; fully qualified identity; target-collision rejection; deterministic ordering independent of input-map iteration. |
 | [File Links](../specs/file-link.md) | Create, no-op, replace, relocate, remove, forget-missing, and managed identity-handoff outcomes; observed unmanaged-target rejection and the external-concurrency limits; wrong-link and regular-file conflicts; parent-escape rejection; source and target containment; no parent removal. |
 | [File Copies](../specs/file-copy.md) | Create, no-op, replace, relocate, remove, forget-missing, link/copy handoff, source and target content drift, no-follow regular-file and exact-byte-fingerprint ownership, `create-no-replace` collision preservation, staged and direct-create failure aftermath, sequential copy replacement and handoff classification, and recovery without adoption of unmanaged final targets. |
+| [Directory Links](../specs/directory-link.md) | Directory-source validation without descendant traversal; typed directory-link hash, Known ownership, and no-follow Actual classification; every DirectoryLink transition; unmanaged matching directory-link, file-link, junction/reparse point, regular directory/file, and unsafe-parent conflicts; mixed-effect handoff rejection; creation, replacement, relocation, removal, post-mutation failure, and recovery evidence on Unix and Windows. |
+| [Current Profile and State Schemas](../specs/profiles.md#current-profile-schema) | Profile schema-3 and state schema-3 strict decoding; unknown-field and invalid `(kind, operation)` rejection; exact DirectoryLink and desired-set canonical hashes; rejection of every v0.5/unknown profile/state version before target observation, recovery, planning, state rewrite, or implicit conversion; and preservation without adoption of old Known effects. |
 | [Lifecycle](../specs/lifecycle.md) | Every Desired/Known/Actual table row; blocked Plans and preflight failures perform no new planned target mutation; preflight failure creates no new operation record; permitted prior-operation recovery cleanup and state commits are asserted separately; executor recheck rejects observable changes since planning; phase ordering; contiguous relocation; and stop-after-failure behavior. |
 | [State and Recovery](../specs/state-and-recovery.md) | Corrupt-state rejection; canonical-hash fixtures; exclusive-lock contention; atomic-commit failure; every operation-status transition; same-source identity-handoff recovery; recovery to succeeded, failed, skipped, and uncertain; no rollback of verified earlier actions. |
 | [CLI](../specs/cli.md) | Positional root-profile selection; `validate` default-profile and `--all` behavior; `diff` Known-to-Actual reporting and zero mutation; `plan` and `apply` default-profile behavior; confirmation after successful preflight and before an operation record; non-interactive `--yes` requirement; dry-run zero mutation; all documented exit-status classes. |
@@ -52,6 +54,16 @@ Managed identity-handoff planning cases distinguish equal and differing resolved
 
 Tests for a blocked plan must assert that the plan has blocking diagnostics and no executable action for the conflicting target.
 
+DirectoryLink domain tests cover every row in [its transition table](../specs/directory-link.md#planning-transitions), including same-effect state-only and missing-target identity handoffs and the blocked FileLink/FileCopy mixed-effect handoffs.
+They assert typed `directory_link` definition and desired hashes, the complete old and final typed effects where applicable, deterministic phase/order selection, and no executable action for every conflict.
+
+Version-boundary tests use disposable profile, state, target, and store paths.
+They prove that version-2 profiles and state files, unknown future versions, unknown fields, invalid effect shapes, and `directory/copy` stop before target observation or state rewrite.
+They prove that a version-2 state file with a matching target or active operation remains unchanged, is neither recovered nor adopted, and prevents a fresh plan.
+State-decoder tests additionally prove exact schema-3 `directory_link` and canonical-hash decoding, while rejecting every non-v3 state before it can enter recovery.
+They table-drive every DirectoryLink operation-record shape, including ordinary and superseding create, remove, forget, relocate, state-only handoff, source-changing handoff, and replacement, and reject every missing, extra, or forbidden field before recovery.
+Replacement fixtures prove the nested temporary predicate and compound postcondition have the exact recorded target paths and link targets, including the required equality between the temporary record and its missing postcondition and between the temporary link target and final effect link target.
+
 ## Filesystem Contract Tests
 
 Filesystem contract tests run in a fresh temporary home, state directory, configuration directory, and local store.
@@ -70,6 +82,9 @@ The required negative cases include:
 - a source path that escapes or traverses an unexpected entry beneath the store root;
 - a target outside the home root or inside a store or control path; and
 - a replacement or removal whose actual link no longer matches Known state.
+
+DirectoryLink filesystem tests additionally prove that the final source is a real directory without traversing its children, that an unmanaged matching directory link, file link, junction/reparse point, regular directory/file, and unsafe parent are all preserved conflicts, and that removal preserves the link referent and parent even when the former source has disappeared or changed.
+For every DirectoryLink mutation path they snapshot disposable target, state, store, and control trees for validation, conflict, preflight, and dry-run rejection.
 
 Tests that introduce changes observable at the immediate recheck must prove rejection before that mutation step without replanning. If an earlier action or temporary/relocation creation already ran, assert its recorded aftermath rather than zero mutation for the entire apply.
 
@@ -110,6 +125,12 @@ Copy recovery tests additionally cover a running sequential `replace_copy`, chan
 Relocation recovery tests inject an interruption after the new link is verified and before the old link is removed.
 They assert that recovery retains that partial relocation as `uncertain` without target mutation.
 
+DirectoryLink state tests cover `running` persistence before every mutation, the atomic verified Known update, and recovery from pending, expected old predicate, verified final predicate, and unsafe or unprovable observation.
+Replacement and source-changing DirectoryLink identity-handoff tests cover the exact recorded temporary sibling after creation, before replacement, and during cleanup; only the recorded expected temporary may be removed, while a different, unsafe, unavailable, unremovable, or not-proven-missing temporary retains `uncertain` and the active-operation barrier.
+They prove that the durable record precedes temporary creation, that replacement rechecks source, parent, target, temporary, containment, and declared-path association, and that an atomic-replacement error is classified from the final and temporary observations rather than its return value.
+They separately prove final-postcondition success, old-precondition failure only after temporary cleanup, and preservation of the old Known identity when replacement or source-changing ownership handoff is uncertain.
+DirectoryLink recovery tests construct each complete action record and prove its action-specific Known update, while a malformed record or a forbidden extra field is rejected before any target observation.
+
 State-only identity-handoff recovery tests interrupt a `running` action before its atomic state commit.
 They assert that the old Known identity and shared expected link or same-fingerprint copy atomically recover to the new identity and `succeeded` without target mutation.
 
@@ -126,10 +147,13 @@ CLI acceptance tests invoke the compiled binary in an isolated environment.
 They assert behavior rather than exact prose formatting.
 For example, they check that a blocked plan identifies a conflict and exits with status `2`, not the precise English wording of that diagnostic.
 Apply confirmation tests prove that prompting follows successful preflight and that declined or unavailable confirmation creates no new operation record or planned target mutation. Include prior-operation recovery effects separately.
+Schema-boundary acceptance tests prove status `2` for profile/state version mismatch and snapshot the target tree, state file, store, configuration, lock, and operation paths to show that no target inspection, recovery, conversion, or rewrite occurred.
+They distinguish that status from status `1` for malformed JSON, unknown state fields, or violated state invariants.
 
 `diff` acceptance tests construct Known state and expected, missing, wrong-link, other-entry, unsafe-parent, and unfinished-operation observations.
 They assert that the command reports each category while leaving the target tree, state directory, store, configuration files, and operation record unchanged.
 They also prove that `diff` neither needs nor reads a portable environment configuration.
+DirectoryLink `diff` and `status` cases prove no-follow `expected_directory_link`, missing, other-link, other-entry, unsafe-path, and unavailable observations without following a directory-link referent.
 
 Inspection acceptance tests invoke every v0.4.0 inspection command with disposable home, state, configuration, and store directories.
 They assert command selection and output categories rather than exact human-readable prose.
@@ -158,6 +182,8 @@ Unix coverage must exercise no-follow final-link inspection, symlinked-parent re
 Windows coverage must exercise file symbolic-link behavior when available and reject junctions or unsupported reparse points.
 It must also cover a replacement or removal rejected by access control or sharing when the test environment can create that condition, proving no final-entry overwrite, premature Known-state update, backup, or automatic restoration.
 It must prove that a same-source managed identity handoff does not require replacement capability, while a source-changing handoff does require the documented replacement guarantee.
+DirectoryLink native evidence separately proves directory-symbolic-link create, no-follow classification, replacement, relocation, and link-entry-only removal on Linux/ext4, macOS/APFS, and Windows/NTFS.
+Windows evidence distinguishes directory symbolic links from file symbolic links, junctions, and other reparse points; it records a preflight rejection when directory-link creation or replacement guarantees are unavailable rather than skipping that action.
 When the host cannot create a file symbolic link, cannot provide the required replacement guarantee, or cannot provide the required rechecked no-follow removal and observation guarantees, the test must prove the documented preflight failure rather than silently skipping the behavior.
 Ordinary file-link replacement and source-changing link ownership replacement tests must cover interruption or failure after the action-local temporary link is created, proving that only the exact recorded temporary link may be cleaned up and that an unexpected or unremovable temporary entry leaves the action uncertain. Copy replacement and effect handoff requirements are defined above in the File Copies evidence section.
 

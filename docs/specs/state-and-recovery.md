@@ -393,3 +393,184 @@ If the target observation is unsafe or unavailable, it retains `uncertain` and t
 An unexpected or ineligible temporary is preserved; it changes the classification to `uncertain` whenever cleanup is required, and otherwise does not change the safely observed different-final conflict classification.
 For a failed create of either final effect, a matching final observation remains `uncertain` under the non-adoption rule.
 The general mutation classification and recovery tables apply to every other v0.5 action.
+
+## Directory-Link Operation Records
+
+The [Current State Schema](#current-state-schema) defines `directory_link` as a third typed Known effect and its serialized schema version and exact JSON shape.
+Its definition and ownership fields are the resolved source path, resolved target path, exact normalized link target, and definition hash in [Directory Links](directory-link.md#typed-actual-and-known-effects).
+
+DirectoryLink action records have no extension fields: every field not required below is forbidden.
+Every record contains `kind`, `status`, and the listed fields.
+`expected_directory_link` predicates have exactly `kind`, `target_path`, and `link_target`; `missing` predicates have exactly `kind` and `target_path`.
+Every effect object is the exact `directory_link` effect defined by the [Current State Schema](#current-state-schema).
+
+| Action | Required fields and predicates | Forbidden fields | Verified Known update |
+| --- | --- | --- | --- |
+| `create_directory_link` | `resource_id`, `final_effect`, `precondition: missing(final target)`, `postcondition: expected_directory_link(final target)` | `old_effect`, `temporary`, `old_resource_id`, `new_resource_id`, except `superseded_resource_id` below | Record `final_effect` under `resource_id`. |
+| Missing-target identity-handoff `create_directory_link` | The ordinary create fields plus `superseded_resource_id` naming the stale DirectoryLink identity at that same target | `old_effect`, `temporary`, `old_resource_id`, `new_resource_id` | Remove `superseded_resource_id` and record `final_effect` under `resource_id` atomically. Failed or uncertain create retains the stale Known record. |
+| `remove_directory_link` | `resource_id`, `old_effect`, `precondition: expected_directory_link(old target)`, `postcondition: missing(old target)` | `final_effect`, `temporary`, `superseded_resource_id`, `old_resource_id`, `new_resource_id` | Remove `resource_id`. |
+| `forget_missing` | `resource_id`, `old_effect`, `precondition: missing(old target)`, `postcondition: missing(old target)` | `final_effect`, `temporary`, `superseded_resource_id`, `old_resource_id`, `new_resource_id` | Remove `resource_id` without a target mutation. |
+| `relocate_directory_link` | `resource_id`, `old_effect`, `final_effect`, `precondition: {"old": expected_directory_link, "new": missing}`, `postcondition: {"old": missing, "new": expected_directory_link}` | `temporary`, `superseded_resource_id`, `old_resource_id`, `new_resource_id` | Replace `resource_id`'s old effect with `final_effect`. |
+| State-only `replace_ownership` | `resource_id` equal to `new_resource_id`, `old_resource_id`, `new_resource_id`, `old_effect`, `final_effect`, and matching `precondition`/`postcondition: expected_directory_link(shared target)` | `temporary`, `superseded_resource_id` | Remove `old_resource_id` and record `final_effect` under `new_resource_id` atomically. |
+| Source-changing `replace_ownership` | `resource_id` equal to `new_resource_id`, `old_resource_id`, `new_resource_id`, `old_effect`, `final_effect`, old expected precondition, compound final postcondition, and `temporary` | `superseded_resource_id` | Remove `old_resource_id` and record `final_effect` under `new_resource_id` atomically. |
+| `replace_directory_link` | `resource_id`, `old_effect`, `final_effect`, old expected precondition, compound final postcondition, and `temporary` | `superseded_resource_id`, `old_resource_id`, `new_resource_id` | Replace `resource_id`'s effect with `final_effect`. |
+
+For every DirectoryLink action, `resource_id` is the affected final identity except that `forget_missing` and `remove_directory_link` use the stale identity.
+`old_effect.target_path` and `final_effect.target_path` must agree with every corresponding predicate path.
+`old_effect` and `final_effect` are forbidden where the table does not require them, including for an ordinary create.
+The status is exactly one of the state-record statuses defined above.
+
+The relocate predicates have this exact shape, with no additional keys:
+
+```json
+{
+  "old": { "kind": "expected_directory_link", "target_path": "/home/example/.config/nvim", "link_target": "/home/example/dotfiles/nvim" },
+  "new": { "kind": "missing", "target_path": "/home/example/.config/nvim-next" }
+}
+```
+
+For a state-only handoff, `old_effect.target_path`, `final_effect.target_path`, and both predicate target paths are equal, and the exact link targets are equal.
+For a source-changing handoff, the target paths are equal and the old/final link targets differ.
+
+For `replace_directory_link`, the complete record contains the old and final `directory_link` effects, the old expected-directory-link precondition, the compound final postcondition, and this exact `temporary` shape:
+
+```json
+{
+  "path": "/home/example/.config/.nvim.loadout-tmp-opaque",
+  "predicate": {
+    "kind": "expected_directory_link",
+    "target_path": "/home/example/.config/.nvim.loadout-tmp-opaque",
+    "link_target": "/home/example/dotfiles/nvim-next"
+  }
+}
+```
+
+`temporary.path` and `temporary.predicate.target_path` MUST be byte-for-byte equal.
+For both `replace_directory_link` and source-changing `replace_ownership`, `temporary.predicate.link_target` MUST equal `final_effect.link_target` byte-for-byte in its exact normalized representation.
+No other temporary fields are permitted.
+Any record that violates either equality is invalid state and is rejected before recovery or target inspection.
+The compound final postcondition has exactly this shape:
+
+```json
+{
+  "target": {
+    "kind": "expected_directory_link",
+    "target_path": "/home/example/.config/nvim",
+    "link_target": "/home/example/dotfiles/nvim-next"
+  },
+  "temporary": {
+    "kind": "missing",
+    "target_path": "/home/example/.config/.nvim.loadout-tmp-opaque"
+  }
+}
+```
+
+`postcondition.target.target_path` MUST equal `final_effect.target_path`, `postcondition.target.link_target` MUST equal `final_effect.link_target`, and `postcondition.temporary.target_path` MUST equal `temporary.path`.
+The complete postcondition is true only when both nested predicates and containment, safe-parent, and declared-path association for both names are proved.
+The temporary is an action-local sibling under the final target's safe parent, is not a declared resource target, and is the only temporary name the executor or recovery may address.
+The operation record is durable before temporary creation; `running` is durable before that mutation.
+
+A source-changing `replace_ownership` has the same predicates and temporary record, and additionally records `old_resource_id` and `new_resource_id`.
+Its success update removes the old Known identity and records the final DirectoryLink under the new identity atomically with `succeeded`.
+A `replace_directory_link` updates the existing resource identity to the final effect atomically with `succeeded`.
+
+### Directory-Link Replacement Rechecks
+
+Immediately before temporary creation, the executor rechecks final-source real-directory safety, containment, the shared safe parent, target `expected_directory_link` for the recorded old link target, temporary `missing`, and declared-path association for target and temporary.
+After creation, it verifies the temporary against its exact recorded expected-directory-link predicate and rechecks the required path association.
+
+Immediately before the atomic name replacement, it repeats final-source safety, containment, shared-parent safety, target old-effect ownership, temporary expected-link ownership, and target/temporary declared-path association checks.
+It MUST NOT replace after a failed recheck, delete the old target before replacement, or create an unrecorded temporary.
+If the platform or filesystem cannot provide atomic same-filesystem name replacement that preserves the expected old link when that replacement fails, preflight rejects the action before a new operation record or target mutation.
+
+After any replacement attempt, the executor observes the recorded final target and temporary and classifies from those recorded predicates, not the operating-system result alone.
+The exact final postcondition authorizes the Known update and `succeeded`, including after an error return.
+If the old target precondition still holds, failure is definite only after required temporary cleanup is proven complete.
+Every different, unsafe, unavailable, or otherwise unprovable target/temporary observation is `uncertain` and retains the old Known effect and active-operation barrier.
+
+### Directory-Link Temporary Cleanup and Recovery
+
+Cleanup may address only the exact recorded temporary sibling after a fresh no-follow recheck proves its expected directory-link predicate, safe parent, containment, and declared-path association.
+It MUST NOT scan siblings, remove a different link or entry, follow the temporary link, remove its referent, or remove a parent.
+If the temporary is already safely proved missing, cleanup is complete.
+After an eligible removal attempt, cleanup is complete only when the exact recorded temporary is safely proved missing; an operating-system success or error return does not establish completion.
+
+During execution and recovery, a complete final postcondition marks the action `succeeded` and performs the corresponding Known update.
+When the old precondition holds, recovery or execution marks the action `failed` only after cleanup is complete and leaves the prior Known effect unchanged.
+A different temporary, unsafe or unavailable observation, denied removal, a removal result whose missing aftermath cannot be proved, or any final observation that proves neither recorded predicate is `uncertain`.
+It preserves the observed entry, retains the active operation, and does not retry, replan, restore, or otherwise mutate a target.
+Recovery observes only recorded predicates and may perform only this exact temporary cleanup; it never resumes the old plan.
+
+## Current State Schema
+
+This section supersedes the v0.5.0 State Schema for every lifecycle or inspection command that reads state.
+`state.json` has `schema_version: 3`; schema version `2`, every earlier version, and every unknown future version are invalid.
+The state repository rejects an invalid state version before target inspection, operation recovery, planning, state rewrite, or any target mutation.
+It does not decode the older document for conversion, recalculate its hashes, reinterpret an active operation, or write a replacement state file.
+
+An absent state file is an empty Known state.
+An existing version-2 state file is not an empty state: it is an error that preserves the file and prevents a new plan.
+Its recorded effects and active operation are not ownership evidence and MUST NOT be observed, adopted, recovered, removed, replaced, or otherwise acted upon.
+
+The current logical Known-state structure is:
+
+```json
+{
+  "schema_version": 3,
+  "resources": {
+    "base/nvim-config": {
+      "definition_hash": "sha256:...",
+      "effect": {
+        "kind": "directory_link",
+        "source_path": "/home/example/dotfiles/nvim",
+        "target_path": "/home/example/.config/nvim",
+        "link_target": "/home/example/dotfiles/nvim"
+      }
+    }
+  },
+  "active_operation": null
+}
+```
+
+`schema_version`, `resources`, and `active_operation` are REQUIRED.
+Unknown fields are errors at every object level.
+Each resource member contains exactly `definition_hash` and `effect`.
+`effect.kind` is exactly `file_link`, `file_copy`, or `directory_link`.
+A `file_link` records `source_path`, `target_path`, and `link_target`; a `file_copy` records `source_path`, `target_path`, and `content_fingerprint`; and a `directory_link` records `source_path`, `target_path`, and `link_target`.
+Each effect rejects fields that do not belong to its kind.
+Resource IDs and normalized target paths are unique, all paths are absolute platform-normalized paths, and every definition hash and fingerprint has the required canonical form.
+
+`active_operation` is either `null` or an operation record using the retained action shapes or the [Directory-Link Operation Records](#directory-link-operation-records) shapes.
+An unrecognized action kind, predicate, effect, field, status, or invariant is invalid state and is rejected before recovery or target inspection.
+
+### Current Canonical Hashes
+
+`definition_hash` and `desired_hash` are SHA-256 hashes of UTF-8 JCS values and use `sha256:<lowercase-hex>` representation.
+The exact per-effect definition value is the value owned by [File Links](file-link.md), [File Copies](file-copy.md), or [Directory Links](directory-link.md#declaration-and-resolution).
+The DirectoryLink definition is `loadout.resolved-directory-link.v1`; it includes `format`, `type`, `kind`, `operation`, `source_path`, and `target_path`, and excludes the resource ID, raw YAML, store ID, source-directory contents, metadata, and schema version.
+
+The current desired hash is exactly the hash of this JCS value:
+
+```json
+{
+  "format": "loadout.resolved-desired.v3",
+  "resources": [
+    {
+      "definition": {
+        "format": "loadout.resolved-directory-link.v1",
+        "kind": "directory",
+        "operation": "link",
+        "source_path": "/home/example/dotfiles/nvim",
+        "target_path": "/home/example/.config/nvim",
+        "type": "file"
+      },
+      "resource_id": "base/nvim-config"
+    }
+  ]
+}
+```
+
+`resources` sorts lexicographically by fully qualified `resource_id`.
+The resource ID is an input only to `desired_hash`; it is not an input to `definition_hash`.
+Schema versions, YAML mapping order, profile discovery/include order, raw declaration syntax, store IDs, source file content, source-directory contents, and metadata are not hash inputs.
+Version-2 hashes are not aliases for version-3 hashes and MUST NOT be accepted, recalculated, or compared to establish ownership.

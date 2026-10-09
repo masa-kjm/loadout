@@ -12,7 +12,8 @@ It does not reimplement package managers, runtime version resolution, secret man
 
 v0.5.0 supports two closed effects for one regular file from a local store: a link or a content-owned copy at a target path.
 It retains read-only inspection of profiles, resources, and selected Desired/Known/Actual relations.
-Task resources, directory resources, remote stores, and parameters are not part of the v0.5.0 executable surface.
+Task resources, remote stores, and parameters are not part of the v0.5.0 executable surface.
+The current contract adds one closed directory resource effect: a local-store real directory materialized as a directory symbolic link; it does not add directory copying or a generic plugin surface.
 
 The first implementation must prefer a narrow, complete file-link lifecycle over generic extension mechanisms.
 In particular, v0.5.0 does not expose an external resource-plugin API.
@@ -77,7 +78,7 @@ Known state is evidence of a past operation, not proof that the current filesyst
 ### Actual
 
 Actual state is the current observation of a resource target and its relevant parents.
-For a file-link resource it distinguishes the expected link from other links and entries; for a file-copy resource it distinguishes a regular file whose bytes match the recorded ownership fingerprint from another regular file, other entries, and unsafe paths.
+For a file-link resource it distinguishes the expected link from other links and entries; for a file-copy resource it distinguishes a regular file whose bytes match the recorded ownership fingerprint from another regular file, other entries, and unsafe paths; and for a directory-link resource it distinguishes the typed expected directory symbolic link from unmanaged links, file links, junctions, reparse points, other entries, and unsafe paths.
 Actual state is not persisted as an assertion of ownership.
 
 ### Plan

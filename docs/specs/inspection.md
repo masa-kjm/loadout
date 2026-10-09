@@ -103,7 +103,7 @@ If state cannot be read and validated, `status` MUST fail without inspecting a t
 If state is valid but selected-declaration loading or resolution fails, `status` MUST report the active operation when one exists, report that Desired state is unavailable, return the applicable failure status, and MUST NOT inspect a target.
 
 When both Desired and Known state are available, `status` compares the union of their fully qualified resource IDs in lexicographic order.
-For every Known resource it performs the effect-specific no-follow target and parent observation required by [File Links](file-link.md) or [File Copies](file-copy.md), using that record's ownership evidence.
+For every Known resource it performs the effect-specific no-follow target and parent observation required by [File Links](file-link.md), [File Copies](file-copy.md), or [Directory Links](directory-link.md), using that record's ownership evidence.
 For every Desired-only resource it performs the corresponding observation using the resolved desired effect.
 An observation is informational only and does not prove ownership for a Desired-only resource.
 
@@ -134,8 +134,8 @@ Every displayed category MUST retain enough identity, path, observation, or diag
 Observed drift, a Desired-only resource, a Known-only resource, a definition difference, and an active operation are reportable facts, not an inspection runtime failure.
 When all required reads and observations complete, inspection commands return status `0` even when the report requires operator attention.
 
-Invalid arguments, an unknown requested ID, invalid declaration input, unsupported configuration or profile schema, declaration-resolution failure, or an unavailable required default profile return status `2`.
-Unreadable state or configuration files, state decoding failures, and unrecoverable filesystem-observation failures return status `1`.
+Invalid arguments, an unknown requested ID, invalid declaration input, unsupported configuration or profile schema, unsupported state schema version, declaration-resolution failure, or an unavailable required default profile return status `2`.
+Unreadable state or configuration files, malformed JSON, state invariant or unknown-field failures, and unrecoverable filesystem-observation failures return status `1`.
 The command MUST perform no mutation for either outcome.
 
 An unsafe parent or unexpected target entry that the no-follow inspector can classify is a reported observation, not an I/O failure.
@@ -144,3 +144,10 @@ If an observation cannot be established because of an I/O failure, the report id
 ## Non-Goals
 
 v0.5.0 inspection does not provide configuration editing, state repair, operation recovery, migration, import, target adoption, forceful takeover, a repair form of `diff`, a saved plan, or machine-readable output.
+
+## Schema Gate
+
+Before an inspection command observes a target, it validates every profile or state document in that command's read set against the [Current Profile Schema](profiles.md#current-profile-schema) and [Current State Schema](state-and-recovery.md#current-state-schema).
+An unsupported version-2 or unknown profile/state document returns status `2` and prevents target observation; malformed state contents return status `1` and likewise prevent target observation.
+Both outcomes preserve the target tree, state file, and active operation.
+In particular, `status` and Known-resource inspection do not inspect or adopt a target recorded by a version-2 state file, and they do not recover its active operation.

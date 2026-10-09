@@ -2,80 +2,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::domain::actual::{ParentSafety, TargetObservation};
+use crate::domain::actual::TargetObservation;
 use crate::domain::desired::{ResolvedDesired, ResolvedResource};
-use crate::domain::directory_link::ResolvedDirectoryLink;
+use crate::domain::directory_link::{ActualDirectoryLinkState, ResolvedDirectoryLink};
 use crate::domain::ids::FullyQualifiedResourceId;
 use crate::domain::known::{KnownDirectoryLink, KnownResource, KnownState};
 use crate::domain::paths::ResolvedPath;
 use crate::planner::ordering::ActionPhase;
-
-/// A no-follow DirectoryLink observation supplied to the pure transition table.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DirectoryLinkActual {
-    target_path: ResolvedPath,
-    observation: TargetObservation,
-}
-
-impl DirectoryLinkActual {
-    pub(crate) fn new(
-        target_path: ResolvedPath,
-        observation: TargetObservation,
-    ) -> Result<Self, DirectoryLinkActualError> {
-        if matches!(
-            observation,
-            TargetObservation::UnsafePath {
-                parent_safety: ParentSafety::Safe
-            }
-        ) {
-            return Err(DirectoryLinkActualError::UnsafePathMarkedSafe);
-        }
-        Ok(Self {
-            target_path,
-            observation,
-        })
-    }
-    pub(crate) fn target_path(&self) -> &ResolvedPath {
-        &self.target_path
-    }
-    pub(crate) fn observation(&self) -> &TargetObservation {
-        &self.observation
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DirectoryLinkActualError {
-    UnsafePathMarkedSafe,
-}
-
-/// The complete no-follow observations supplied to DirectoryLink planning.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct DirectoryLinkActualState(BTreeMap<ResolvedPath, DirectoryLinkActual>);
-
-impl DirectoryLinkActualState {
-    pub(crate) fn new(
-        values: impl IntoIterator<Item = DirectoryLinkActual>,
-    ) -> Result<Self, DirectoryLinkActualStateError> {
-        let mut targets = BTreeMap::new();
-        for value in values {
-            let target_path = value.target_path.clone();
-            if targets.insert(target_path.clone(), value).is_some() {
-                return Err(DirectoryLinkActualStateError::DuplicateTargetObservation {
-                    target_path,
-                });
-            }
-        }
-        Ok(Self(targets))
-    }
-    fn get(&self, target: &ResolvedPath) -> Option<&TargetObservation> {
-        self.0.get(target).map(DirectoryLinkActual::observation)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum DirectoryLinkActualStateError {
-    DuplicateTargetObservation { target_path: ResolvedPath },
-}
 
 /// A non-executor-ready DirectoryLink transition selected by the pure table.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -146,7 +79,7 @@ impl DirectoryLinkTransitionPlan {
 pub(crate) fn plan(
     desired: &ResolvedDesired,
     known: &KnownState,
-    actual: &DirectoryLinkActualState,
+    actual: &ActualDirectoryLinkState,
 ) -> DirectoryLinkTransitionPlan {
     let desired_links = desired
         .variants()
@@ -290,7 +223,7 @@ pub(crate) fn plan(
 fn existing(
     value: &ResolvedDirectoryLink,
     old: &KnownDirectoryLink,
-    actual: &DirectoryLinkActualState,
+    actual: &ActualDirectoryLinkState,
     result: &mut DirectoryLinkTransitionPlan,
 ) {
     if value.target_path() != old.target_path() {
@@ -358,7 +291,7 @@ fn new_identity(
     value: &ResolvedDirectoryLink,
     known: &[&KnownDirectoryLink],
     desired_ids: &BTreeSet<FullyQualifiedResourceId>,
-    actual: &DirectoryLinkActualState,
+    actual: &ActualDirectoryLinkState,
     result: &mut DirectoryLinkTransitionPlan,
 ) {
     if let Some(old) = known.iter().find(|old| {
@@ -409,7 +342,7 @@ fn new_identity(
 }
 
 fn observe<'a>(
-    actual: &'a DirectoryLinkActualState,
+    actual: &'a ActualDirectoryLinkState,
     target: &ResolvedPath,
     result: &mut DirectoryLinkTransitionPlan,
 ) -> Option<&'a TargetObservation> {
@@ -466,6 +399,13 @@ fn transition_order(value: &DirectoryLinkTransition) -> (ActionPhase, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::actual::ParentSafety;
+    use crate::domain::directory_link::{
+        ActualDirectoryLink as DirectoryLinkActual,
+        ActualDirectoryLinkError as DirectoryLinkActualError,
+        ActualDirectoryLinkState as DirectoryLinkActualState,
+        ActualDirectoryLinkStateError as DirectoryLinkActualStateError,
+    };
     use crate::domain::file_link::LinkTarget;
     use crate::domain::ids::ProfileId;
 

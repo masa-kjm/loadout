@@ -33,6 +33,8 @@ compile_error!("Loadout v0.2 supports only Unix and Windows filesystems");
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NoFollowEntryKind {
     FileSymbolicLink,
+    #[cfg_attr(unix, allow(dead_code))]
+    DirectorySymbolicLink,
     RegularFile,
     Directory,
     #[cfg_attr(unix, allow(dead_code))]
@@ -43,13 +45,24 @@ pub(crate) enum NoFollowEntryKind {
 impl NoFollowEntryKind {
     /// Whether source or discovery traversal must reject this entry.
     pub(crate) fn is_link_or_reparse_point(self) -> bool {
-        matches!(self, Self::FileSymbolicLink | Self::ReparsePoint)
+        matches!(
+            self,
+            Self::FileSymbolicLink | Self::DirectorySymbolicLink | Self::ReparsePoint
+        )
     }
 }
 
 /// Classifies metadata obtained with a no-follow observation.
 pub(crate) fn classify_nofollow_entry(metadata: &fs::Metadata) -> NoFollowEntryKind {
     platform::classify_nofollow_entry(metadata)
+}
+
+/// Classifies a no-follow final entry, consulting a Windows reparse tag when needed.
+pub(crate) fn classify_nofollow_entry_at(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> NoFollowEntryKind {
+    platform::classify_nofollow_entry_at(path, metadata)
 }
 
 /// Whether metadata identifies an entry that discovery and source verification

@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::io;
+use std::path::Path;
 
 pub(super) mod execution;
 
@@ -22,6 +23,10 @@ pub(super) fn classify_nofollow_entry(metadata: &fs::Metadata) -> NoFollowEntryK
     } else {
         NoFollowEntryKind::Unsupported
     }
+}
+
+pub(super) fn classify_nofollow_entry_at(_: &Path, metadata: &fs::Metadata) -> NoFollowEntryKind {
+    classify_nofollow_entry(metadata)
 }
 
 #[allow(dead_code)]

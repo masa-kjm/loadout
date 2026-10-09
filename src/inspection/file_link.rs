@@ -11,12 +11,17 @@ use crate::domain::actual::{
     ParentSafety, TargetObservation,
 };
 use crate::domain::desired::ResolvedDesired;
+use crate::domain::directory_link::{
+    ActualDirectoryLink, ActualDirectoryLinkError, ActualDirectoryLinkState,
+    ActualDirectoryLinkStateError,
+};
 use crate::domain::file_copy::ContentFingerprint;
 use crate::domain::file_link::LinkTarget;
 use crate::domain::known::KnownState;
 use crate::domain::paths::{ResolvedPath, ResolvedPathError};
 use crate::filesystem::{
-    NoFollowEntryKind, classify_nofollow_entry, normalize_observed_absolute_path,
+    NoFollowEntryKind, classify_nofollow_entry, classify_nofollow_entry_at,
+    normalize_observed_absolute_path,
 };
 use sha2::{Digest, Sha256};
 
@@ -162,6 +167,44 @@ impl FileLinkInspector {
         ActualState::new(observations).map_err(TargetInspectionError::InvalidActualState)
     }
 
+    /// Observes every DirectoryLink target named by Desired or Known state exactly once.
+    ///
+    /// This shares the file-link no-follow target and parent checks, but keeps the typed Actual value outside the currently enabled file-link lifecycle.
+    pub(crate) fn inspect_directory_links(
+        &self,
+        desired: &ResolvedDesired,
+        known: &KnownState,
+    ) -> Result<ActualDirectoryLinkState, TargetInspectionError> {
+        let mut expectations = BTreeMap::<ResolvedPath, TargetExpectations>::new();
+        for resource in desired.variants() {
+            let crate::domain::desired::ResolvedResource::DirectoryLink(resource) = resource else {
+                continue;
+            };
+            expectations
+                .entry(resource.target_path().clone())
+                .or_default()
+                .desired_link_target = Some(resource.link_target().clone());
+        }
+        for resource in known.variants() {
+            let crate::domain::known::KnownResource::DirectoryLink(resource) = resource else {
+                continue;
+            };
+            expectations
+                .entry(resource.target_path().clone())
+                .or_default()
+                .known_link_target = Some(resource.link_target().clone());
+        }
+
+        let observations = expectations
+            .into_iter()
+            .map(|(target_path, expectations)| {
+                self.inspect_directory_target(target_path, expectations)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        ActualDirectoryLinkState::new(observations)
+            .map_err(TargetInspectionError::InvalidActualDirectoryLinkState)
+    }
+
     /// Rechecks one target against the exact link target required by an executor post-condition. This does not confer ownership or mutate.
     pub(crate) fn inspect_target_for_expected_link(
         &self,
@@ -281,6 +324,33 @@ impl FileLinkInspector {
             .map_err(TargetInspectionError::InvalidActualFileLink)
     }
 
+    fn inspect_directory_target(
+        &self,
+        target_path: ResolvedPath,
+        expectations: TargetExpectations,
+    ) -> Result<ActualDirectoryLink, TargetInspectionError> {
+        let observation = if let Some(physical_target_path) =
+            self.physical_target_path(&target_path)?
+        {
+            let parent_safety = self.inspect_parent_safety(&target_path, &physical_target_path)?;
+            if !parent_safety.is_safe() {
+                TargetObservation::UnsafePath { parent_safety }
+            } else {
+                self.inspect_final_directory_target(
+                    &target_path,
+                    &physical_target_path,
+                    &expectations,
+                )?
+            }
+        } else {
+            TargetObservation::UnsafePath {
+                parent_safety: ParentSafety::OutsideHome,
+            }
+        };
+        ActualDirectoryLink::new(target_path, observation)
+            .map_err(TargetInspectionError::InvalidActualDirectoryLink)
+    }
+
     fn physical_target_path(
         &self,
         target_path: &ResolvedPath,
@@ -338,7 +408,9 @@ impl FileLinkInspector {
         };
         match classify_nofollow_entry(&home_metadata) {
             NoFollowEntryKind::Directory => {}
-            NoFollowEntryKind::FileSymbolicLink => return Ok(ParentSafety::Symlink),
+            NoFollowEntryKind::FileSymbolicLink | NoFollowEntryKind::DirectorySymbolicLink => {
+                return Ok(ParentSafety::Symlink);
+            }
             NoFollowEntryKind::ReparsePoint => return Ok(ParentSafety::ReparsePoint),
             NoFollowEntryKind::RegularFile | NoFollowEntryKind::Unsupported => {
                 return Ok(ParentSafety::NotDirectory);
@@ -372,7 +444,9 @@ impl FileLinkInspector {
 
             match classify_nofollow_entry(&metadata) {
                 NoFollowEntryKind::Directory => {}
-                NoFollowEntryKind::FileSymbolicLink => return Ok(ParentSafety::Symlink),
+                NoFollowEntryKind::FileSymbolicLink | NoFollowEntryKind::DirectorySymbolicLink => {
+                    return Ok(ParentSafety::Symlink);
+                }
                 NoFollowEntryKind::ReparsePoint => return Ok(ParentSafety::ReparsePoint),
                 NoFollowEntryKind::RegularFile | NoFollowEntryKind::Unsupported => {
                     return Ok(ParentSafety::NotDirectory);
@@ -402,7 +476,7 @@ impl FileLinkInspector {
             }
         };
 
-        match classify_nofollow_entry(&metadata) {
+        match classify_nofollow_entry_at(physical_target_path.as_ref(), &metadata) {
             NoFollowEntryKind::FileSymbolicLink => {
                 let link_target = read_normalized_link_target(target_path, physical_target_path)?;
                 if expectations.known_link_target.as_ref() == Some(&link_target) {
@@ -413,6 +487,9 @@ impl FileLinkInspector {
                     Ok(TargetObservation::OtherLink { link_target })
                 }
             }
+            NoFollowEntryKind::DirectorySymbolicLink => Ok(TargetObservation::OtherEntry {
+                kind: OtherEntryKind::ReparsePoint,
+            }),
             NoFollowEntryKind::RegularFile => Ok(TargetObservation::OtherEntry {
                 kind: OtherEntryKind::RegularFile,
             }),
@@ -426,6 +503,60 @@ impl FileLinkInspector {
                 kind: OtherEntryKind::Unsupported,
             }),
         }
+    }
+
+    fn inspect_final_directory_target(
+        &self,
+        target_path: &ResolvedPath,
+        physical_target_path: &ResolvedPath,
+        expectations: &TargetExpectations,
+    ) -> Result<TargetObservation, TargetInspectionError> {
+        let metadata = match fs::symlink_metadata(physical_target_path.as_ref()) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                return Ok(TargetObservation::Missing);
+            }
+            Err(source) => {
+                return Err(TargetInspectionError::TargetMetadata {
+                    target_path: target_path.clone(),
+                    source,
+                });
+            }
+        };
+        let kind = classify_nofollow_entry_at(physical_target_path.as_ref(), &metadata);
+        let directory_link = matches!(kind, NoFollowEntryKind::FileSymbolicLink) && cfg!(unix)
+            || matches!(kind, NoFollowEntryKind::DirectorySymbolicLink) && cfg!(windows);
+        if directory_link {
+            let link_target = read_normalized_link_target(target_path, physical_target_path)?;
+            return Ok(
+                if expectations.known_link_target.as_ref() == Some(&link_target) {
+                    TargetObservation::ExpectedLink { link_target }
+                } else if expectations.desired_link_target.as_ref() == Some(&link_target) {
+                    TargetObservation::MatchingUnmanagedLink { link_target }
+                } else {
+                    TargetObservation::OtherLink { link_target }
+                },
+            );
+        }
+        Ok(match kind {
+            NoFollowEntryKind::RegularFile => TargetObservation::OtherEntry {
+                kind: OtherEntryKind::RegularFile,
+            },
+            NoFollowEntryKind::Directory => TargetObservation::OtherEntry {
+                kind: OtherEntryKind::Directory,
+            },
+            NoFollowEntryKind::FileSymbolicLink | NoFollowEntryKind::DirectorySymbolicLink => {
+                TargetObservation::OtherEntry {
+                    kind: OtherEntryKind::Unsupported,
+                }
+            }
+            NoFollowEntryKind::ReparsePoint => TargetObservation::OtherEntry {
+                kind: OtherEntryKind::ReparsePoint,
+            },
+            NoFollowEntryKind::Unsupported => TargetObservation::OtherEntry {
+                kind: OtherEntryKind::Unsupported,
+            },
+        })
     }
 
     fn inspect_final_copy(
@@ -488,11 +619,11 @@ impl FileLinkInspector {
             NoFollowEntryKind::ReparsePoint => Ok(CopyTargetObservation::OtherEntry {
                 kind: OtherEntryKind::ReparsePoint,
             }),
-            NoFollowEntryKind::FileSymbolicLink | NoFollowEntryKind::Unsupported => {
-                Ok(CopyTargetObservation::OtherEntry {
-                    kind: OtherEntryKind::Unsupported,
-                })
-            }
+            NoFollowEntryKind::FileSymbolicLink
+            | NoFollowEntryKind::DirectorySymbolicLink
+            | NoFollowEntryKind::Unsupported => Ok(CopyTargetObservation::OtherEntry {
+                kind: OtherEntryKind::Unsupported,
+            }),
         }
     }
 }
@@ -590,6 +721,8 @@ pub(crate) enum TargetInspectionError {
     InvalidActualFileLink(crate::domain::actual::ActualFileLinkError),
     InvalidActualFileCopy(crate::domain::actual::ActualFileCopyError),
     InvalidActualState(crate::domain::actual::ActualStateError),
+    InvalidActualDirectoryLink(ActualDirectoryLinkError),
+    InvalidActualDirectoryLinkState(ActualDirectoryLinkStateError),
 }
 
 impl fmt::Display for TargetInspectionError {
@@ -659,6 +792,8 @@ impl fmt::Display for TargetInspectionError {
             Self::InvalidActualFileLink(error) => error.fmt(formatter),
             Self::InvalidActualFileCopy(error) => error.fmt(formatter),
             Self::InvalidActualState(error) => error.fmt(formatter),
+            Self::InvalidActualDirectoryLink(error) => error.fmt(formatter),
+            Self::InvalidActualDirectoryLinkState(error) => error.fmt(formatter),
         }
     }
 }
@@ -677,6 +812,8 @@ impl std::error::Error for TargetInspectionError {
             Self::InvalidActualFileLink(error) => Some(error),
             Self::InvalidActualFileCopy(error) => Some(error),
             Self::InvalidActualState(error) => Some(error),
+            Self::InvalidActualDirectoryLink(error) => Some(error),
+            Self::InvalidActualDirectoryLinkState(error) => Some(error),
             Self::HomeDirectoryNotDirectory { .. }
             | Self::TargetHasNoParent { .. }
             | Self::InvalidTargetPath { .. } => None,
@@ -691,9 +828,12 @@ mod tests {
 
     use super::*;
     use crate::domain::desired::ResolvedDesired;
+    use crate::domain::directory_link::ResolvedDirectoryLink;
     use crate::domain::file_copy::{ContentFingerprint, ResolvedFileCopy};
     use crate::domain::file_link::ResolvedFileLink;
     use crate::domain::ids::{FullyQualifiedResourceId, ProfileId};
+    #[cfg(unix)]
+    use crate::domain::known::KnownDirectoryLink;
     #[cfg(any(unix, windows))]
     use crate::domain::known::KnownFileLink;
     use crate::domain::known::{KnownFileCopy, KnownState};
@@ -781,6 +921,21 @@ mod tests {
             FullyQualifiedResourceId::parse(id).unwrap(),
             ResolvedPath::new(workspace.path("store").join(source_relative_path)).unwrap(),
             target_path,
+        )
+        .unwrap()
+    }
+
+    fn directory_resource(
+        workspace: &TestWorkspace,
+        id: &str,
+        source_relative_path: &str,
+        target_relative_path: &str,
+    ) -> ResolvedDirectoryLink {
+        workspace.create_dir(&format!("store/{source_relative_path}"));
+        ResolvedDirectoryLink::new(
+            FullyQualifiedResourceId::parse(id).unwrap(),
+            ResolvedPath::new(workspace.path("store").join(source_relative_path)).unwrap(),
+            ResolvedPath::new(workspace.path("home").join(target_relative_path)).unwrap(),
         )
         .unwrap()
     }
@@ -1090,6 +1245,80 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn directory_link_inspection_is_no_follow_and_retains_typed_ownership() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new();
+        workspace.create_dir("home/config");
+        let expected = directory_resource(
+            &workspace,
+            "workstation/expected-directory",
+            "expected-directory",
+            "config/expected-directory",
+        );
+        let unmanaged = directory_resource(
+            &workspace,
+            "workstation/unmanaged-directory",
+            "unmanaged-directory",
+            "config/unmanaged-directory",
+        );
+        let other = directory_resource(
+            &workspace,
+            "workstation/other-directory",
+            "other-directory",
+            "config/other-directory",
+        );
+        symlink(
+            expected.link_target().as_path().as_ref(),
+            expected.target_path().as_ref(),
+        )
+        .unwrap();
+        symlink(
+            unmanaged.link_target().as_path().as_ref(),
+            unmanaged.target_path().as_ref(),
+        )
+        .unwrap();
+        symlink("../unfollowed-directory", other.target_path().as_ref()).unwrap();
+        let desired = ResolvedDesired::new(
+            ProfileId::parse("workstation").unwrap(),
+            [expected.clone(), unmanaged.clone(), other.clone()],
+        )
+        .unwrap();
+        let known = KnownState::new([KnownDirectoryLink::from_resolved(&expected)]).unwrap();
+
+        let actual = workspace
+            .inspector()
+            .inspect_directory_links(&desired, &known)
+            .unwrap();
+
+        assert_eq!(
+            actual.get(expected.target_path()),
+            Some(&TargetObservation::ExpectedLink {
+                link_target: expected.link_target().clone(),
+            })
+        );
+        assert_eq!(
+            actual.get(unmanaged.target_path()),
+            Some(&TargetObservation::MatchingUnmanagedLink {
+                link_target: unmanaged.link_target().clone(),
+            })
+        );
+        assert_eq!(
+            actual.get(other.target_path()),
+            Some(&TargetObservation::OtherLink {
+                link_target: LinkTarget::new(
+                    ResolvedPath::new(workspace.path("home/unfollowed-directory")).unwrap(),
+                ),
+            })
+        );
+        assert!(
+            !workspace.path("home/unfollowed-directory").exists(),
+            "inspection must not follow the final directory link"
+        );
+    }
+
     #[cfg(windows)]
     fn create_junction(link: &Path, target: &Path) {
         use std::os::windows::process::CommandExt;
@@ -1211,6 +1440,118 @@ mod tests {
         assert_eq!(
             fs::read_link(directory_link.target_path().as_ref()).unwrap(),
             workspace.path("outside")
+        );
+        assert!(
+            !workspace.path("outside/target").exists(),
+            "inspection must not follow a junction parent"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn directory_link_inspector_distinguishes_directory_links_junctions_and_unsafe_parents() {
+        use std::os::windows::fs::symlink_dir;
+
+        let workspace = TestWorkspace::new();
+        workspace.create_dir("home/config");
+        workspace.create_dir("outside");
+        let expected = directory_resource(
+            &workspace,
+            "workstation/expected-directory",
+            "expected-directory",
+            "config/expected-directory",
+        );
+        let unmanaged = directory_resource(
+            &workspace,
+            "workstation/unmanaged-directory",
+            "unmanaged-directory",
+            "config/unmanaged-directory",
+        );
+        let other = directory_resource(
+            &workspace,
+            "workstation/other-directory",
+            "other-directory",
+            "config/other-directory",
+        );
+        let junction = directory_resource(
+            &workspace,
+            "workstation/junction-directory",
+            "junction-directory",
+            "config/junction-directory",
+        );
+        let unsafe_parent = directory_resource(
+            &workspace,
+            "workstation/unsafe-parent-directory",
+            "unsafe-parent-directory",
+            "junction-parent/target",
+        );
+        symlink_dir(
+            expected.link_target().as_path().as_ref(),
+            expected.target_path().as_ref(),
+        )
+        .expect("the Windows test runner must support directory symbolic links");
+        symlink_dir(
+            unmanaged.link_target().as_path().as_ref(),
+            unmanaged.target_path().as_ref(),
+        )
+        .expect("the Windows test runner must support directory symbolic links");
+        symlink_dir(workspace.path("outside"), other.target_path().as_ref())
+            .expect("the Windows test runner must support directory symbolic links");
+        create_junction(junction.target_path().as_ref(), &workspace.path("outside"));
+        create_junction(
+            &workspace.path("home/junction-parent"),
+            &workspace.path("outside"),
+        );
+        let desired = ResolvedDesired::new(
+            ProfileId::parse("workstation").unwrap(),
+            [
+                expected.clone(),
+                unmanaged.clone(),
+                other.clone(),
+                junction.clone(),
+                unsafe_parent.clone(),
+            ],
+        )
+        .unwrap();
+        let known = KnownState::new([crate::domain::known::KnownDirectoryLink::from_resolved(
+            &expected,
+        )])
+        .unwrap();
+
+        let actual = workspace
+            .inspector()
+            .inspect_directory_links(&desired, &known)
+            .unwrap();
+
+        assert_eq!(
+            actual.get(expected.target_path()),
+            Some(&TargetObservation::ExpectedLink {
+                link_target: expected.link_target().clone(),
+            })
+        );
+        assert_eq!(
+            actual.get(unmanaged.target_path()),
+            Some(&TargetObservation::MatchingUnmanagedLink {
+                link_target: unmanaged.link_target().clone(),
+            })
+        );
+        assert_eq!(
+            actual.get(other.target_path()),
+            Some(&TargetObservation::OtherLink {
+                link_target: LinkTarget::new(ResolvedPath::new(workspace.path("outside")).unwrap()),
+            })
+        );
+        assert_eq!(
+            actual.get(junction.target_path()),
+            Some(&TargetObservation::OtherEntry {
+                kind: OtherEntryKind::ReparsePoint,
+            })
+        );
+        assert_eq!(
+            actual.get(unsafe_parent.target_path()),
+            Some(&TargetObservation::UnsafePath {
+                parent_safety: ParentSafety::ReparsePoint,
+            })
         );
         assert!(
             !workspace.path("outside/target").exists(),

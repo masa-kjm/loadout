@@ -141,6 +141,63 @@ pub(crate) fn verify_regular_source(
     })
 }
 
+/// Verifies a directory source without following any source component or traversing children.
+pub(crate) fn verify_directory_source(
+    store_root: &PhysicalStoreRoot,
+    source_path: &SourceRelativePath,
+) -> Result<ResolvedPath, SourceVerificationError> {
+    let root_metadata = fs::symlink_metadata(store_root.as_path().as_ref()).map_err(|source| {
+        SourceVerificationError::StoreRootIo {
+            path: store_root.as_path().as_ref().to_path_buf(),
+            source,
+        }
+    })?;
+    if is_link_or_reparse_point(&root_metadata) {
+        return Err(SourceVerificationError::StoreRootLinkOrReparsePoint {
+            path: store_root.as_path().as_ref().to_path_buf(),
+        });
+    }
+    if !root_metadata.is_dir() {
+        return Err(SourceVerificationError::StoreRootNotDirectory {
+            path: store_root.as_path().as_ref().to_path_buf(),
+        });
+    }
+    let (final_component, parent_components) = source_path
+        .components()
+        .split_last()
+        .expect("SourcePath always contains at least one validated component");
+    let mut current = store_root.as_path().as_ref().to_path_buf();
+    for component in parent_components {
+        current.push(component);
+        let metadata = fs::symlink_metadata(&current).map_err(|source| {
+            SourceVerificationError::SourceComponentIo {
+                path: current.clone(),
+                source,
+            }
+        })?;
+        if is_link_or_reparse_point(&metadata) {
+            return Err(SourceVerificationError::SourceParentLinkOrReparsePoint { path: current });
+        }
+        if !metadata.file_type().is_dir() {
+            return Err(SourceVerificationError::SourceParentNotDirectory { path: current });
+        }
+    }
+    current.push(final_component);
+    let metadata = fs::symlink_metadata(&current).map_err(|source| {
+        SourceVerificationError::SourceComponentIo {
+            path: current.clone(),
+            source,
+        }
+    })?;
+    if is_link_or_reparse_point(&metadata) {
+        return Err(SourceVerificationError::SourceLinkOrReparsePoint { path: current });
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(SourceVerificationError::SourceNotDirectory { path: current });
+    }
+    ResolvedPath::new(current).map_err(SourceVerificationError::InvalidResolvedPath)
+}
+
 /// The reason a local-store source cannot be treated as verified input.
 #[derive(Debug)]
 pub(crate) enum SourceVerificationError {
@@ -152,6 +209,7 @@ pub(crate) enum SourceVerificationError {
     SourceParentNotDirectory { path: PathBuf },
     SourceLinkOrReparsePoint { path: PathBuf },
     SourceNotRegular { path: PathBuf },
+    SourceNotDirectory { path: PathBuf },
     InvalidResolvedPath(ResolvedPathError),
 }
 
@@ -214,6 +272,9 @@ impl fmt::Display for SourceVerificationError {
                     path.display()
                 )
             }
+            Self::SourceNotDirectory { path } => {
+                write!(formatter, "source is not a directory: {}", path.display())
+            }
             Self::InvalidResolvedPath(error) => error.fmt(formatter),
         }
     }
@@ -232,6 +293,7 @@ impl std::error::Error for SourceVerificationError {
             | Self::SourceParentNotDirectory { .. }
             | Self::SourceLinkOrReparsePoint { .. }
             | Self::SourceNotRegular { .. } => None,
+            Self::SourceNotDirectory { .. } => None,
         }
     }
 }

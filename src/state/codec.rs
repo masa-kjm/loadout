@@ -7,15 +7,17 @@ use std::path::{Component, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::domain::directory_link::ResolvedDirectoryLink;
 use crate::domain::file_copy::{ContentFingerprint, ResolvedFileCopy};
 use crate::domain::file_link::{LinkTarget, ResolvedFileLink};
 use crate::domain::hashes::{
     CanonicalHashError, DefinitionHash, DesiredHash, HashParseError, definition_hash,
+    directory_link_definition_hash,
 };
 use crate::domain::ids::{FullyQualifiedResourceId, FullyQualifiedResourceIdError};
 use crate::domain::known::{
-    KnownFileCopy, KnownFileCopyError, KnownFileLink, KnownFileLinkError, KnownResource,
-    KnownState, KnownStateError,
+    KnownDirectoryLink, KnownDirectoryLinkError, KnownFileCopy, KnownFileCopyError, KnownFileLink,
+    KnownFileLinkError, KnownResource, KnownState, KnownStateError,
 };
 use crate::domain::paths::{ResolvedPath, ResolvedPathError};
 use crate::domain::plan::{ActionKind, TargetCondition};
@@ -26,7 +28,7 @@ use crate::state::operation::{
 };
 use crate::state::repository::{CommitError, PersistedState};
 
-const STATE_SCHEMA_VERSION: u32 = 2;
+const STATE_SCHEMA_VERSION: u32 = 3;
 
 /// A strict on-disk representation of `state.json`.
 #[derive(Debug, Deserialize, Serialize)]
@@ -100,6 +102,11 @@ enum PersistedKnownEffect {
         target_path: String,
         content_fingerprint: String,
     },
+    DirectoryLink {
+        source_path: String,
+        target_path: String,
+        link_target: String,
+    },
 }
 
 impl PersistedKnownResource {
@@ -125,6 +132,17 @@ impl PersistedKnownResource {
                     source_path: encode_path(resource.source_path())?,
                     target_path: encode_path(resource.target_path())?,
                     content_fingerprint: resource.content_fingerprint().as_str().to_owned(),
+                },
+            }),
+            KnownResource::DirectoryLink(resource) => Ok(Self {
+                definition_hash: definition_hash_for_directory_known(resource)
+                    .map_err(CommitError::Hash)?
+                    .as_str()
+                    .to_owned(),
+                effect: PersistedKnownEffect::DirectoryLink {
+                    source_path: encode_path(resource.source_path())?,
+                    target_path: encode_path(resource.target_path())?,
+                    link_target: encode_path(resource.link_target().as_path())?,
                 },
             }),
         }
@@ -174,6 +192,11 @@ impl PersistedKnownEffect {
                 target_path: encode_path(resource.target_path())?,
                 content_fingerprint: resource.content_fingerprint().as_str().to_owned(),
             }),
+            KnownResource::DirectoryLink(resource) => Ok(Self::DirectoryLink {
+                source_path: encode_path(resource.source_path())?,
+                target_path: encode_path(resource.target_path())?,
+                link_target: encode_path(resource.link_target().as_path())?,
+            }),
         }
     }
 
@@ -209,6 +232,18 @@ impl PersistedKnownEffect {
                 })?,
             )
             .map_err(StateDecodeError::InvalidKnownFileCopy)?
+            .into(),
+            PersistedKnownEffect::DirectoryLink {
+                source_path,
+                target_path,
+                link_target,
+            } => KnownDirectoryLink::new(
+                resource_id.clone(),
+                decode_path(source_path)?,
+                decode_path(target_path)?,
+                LinkTarget::new(decode_path(link_target)?),
+            )
+            .map_err(StateDecodeError::InvalidKnownDirectoryLink)?
             .into(),
         };
         Ok(known)
@@ -352,6 +387,7 @@ impl PersistedRecordedAction {
                                         Some(encode_path(copy.target_path()))
                                     }
                                     KnownResource::FileLink(_) => None,
+                                    KnownResource::DirectoryLink(_) => None,
                                 })
                             })
                         })
@@ -758,12 +794,25 @@ fn definition_hash_for_copy_known(
     crate::domain::hashes::file_copy_definition_hash(&resolved)
 }
 
+fn definition_hash_for_directory_known(
+    resource: &KnownDirectoryLink,
+) -> Result<DefinitionHash, CanonicalHashError> {
+    let resolved = ResolvedDirectoryLink::new(
+        resource.resource_id().clone(),
+        resource.source_path().clone(),
+        resource.target_path().clone(),
+    )
+    .expect("KnownDirectoryLink already rejects equal source and target paths");
+    directory_link_definition_hash(&resolved)
+}
+
 fn definition_hash_for_known_resource(
     resource: &KnownResource,
 ) -> Result<DefinitionHash, CanonicalHashError> {
     match resource {
         KnownResource::FileLink(resource) => definition_hash_for_known(resource),
         KnownResource::FileCopy(resource) => definition_hash_for_copy_known(resource),
+        KnownResource::DirectoryLink(resource) => definition_hash_for_directory_known(resource),
     }
 }
 
@@ -819,6 +868,7 @@ pub(crate) enum StateDecodeError {
     },
     InvalidKnownFileLink(KnownFileLinkError),
     InvalidKnownFileCopy(KnownFileCopyError),
+    InvalidKnownDirectoryLink(KnownDirectoryLinkError),
     InvalidContentFingerprint {
         resource_id: FullyQualifiedResourceId,
         source: crate::domain::file_copy::ContentFingerprintError,
@@ -880,6 +930,7 @@ impl fmt::Display for StateDecodeError {
             }
             Self::InvalidKnownFileLink(error) => error.fmt(formatter),
             Self::InvalidKnownFileCopy(error) => error.fmt(formatter),
+            Self::InvalidKnownDirectoryLink(error) => error.fmt(formatter),
             Self::InvalidContentFingerprint {
                 resource_id,
                 source,
@@ -920,6 +971,7 @@ impl std::error::Error for StateDecodeError {
             Self::InvalidPath { source, .. } => Some(source),
             Self::InvalidKnownFileLink(error) => Some(error),
             Self::InvalidKnownFileCopy(error) => Some(error),
+            Self::InvalidKnownDirectoryLink(error) => Some(error),
             Self::InvalidContentFingerprint { source, .. } => Some(source),
             Self::InvalidKnownState(error) => Some(error),
             Self::InvalidDesiredHash(error) => Some(error),
@@ -972,7 +1024,7 @@ mod tests {
             });
         }
         json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "resources": resources,
             "active_operation": {
                 "id": "op-fixture",
@@ -989,6 +1041,28 @@ mod tests {
                 },
             },
         })
+    }
+
+    #[test]
+    fn directory_link_known_effect_round_trips_with_its_typed_hash() {
+        let root = std::env::temp_dir().join("loadout-directory-link-codec");
+        let resolved = ResolvedDirectoryLink::new(
+            FullyQualifiedResourceId::parse("base/nvim").unwrap(),
+            ResolvedPath::new(root.join("store/nvim")).unwrap(),
+            ResolvedPath::new(root.join("home/.config/nvim")).unwrap(),
+        )
+        .unwrap();
+        let known = KnownDirectoryLink::from_resolved(&resolved);
+        let state = PersistedState::from_parts(KnownState::new([known]).unwrap(), None).unwrap();
+
+        let document = StateDocument::from_state(&state).unwrap();
+        let encoded = serde_json::to_value(&document).unwrap();
+        assert_eq!(encoded["schema_version"], 3);
+        assert_eq!(
+            encoded["resources"]["base/nvim"]["effect"]["kind"],
+            "directory_link"
+        );
+        assert_eq!(document.into_state().unwrap(), state);
     }
 
     #[test]
@@ -1012,7 +1086,7 @@ mod tests {
         .unwrap();
         let definition_hash = definition_hash_for_copy_known(&old_copy).unwrap();
         let document = json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "resources": {"base/config": {
                 "definition_hash": definition_hash.as_str(),
                 "effect": {
@@ -1102,7 +1176,7 @@ mod tests {
         let target = root.join("home").join(".config");
         let fingerprint = format!("sha256:{}", "b".repeat(64));
         let document = json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "resources": {},
             "active_operation": {
                 "id": "op-copy",
@@ -1159,7 +1233,7 @@ mod tests {
     fn active_copy_without_its_recorded_temporary_is_rejected() {
         let root = std::env::temp_dir().join("loadout-codec-copy-operation-missing-temp");
         let document = json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "resources": {},
             "active_operation": {
                 "id": "op-copy",
@@ -1226,7 +1300,7 @@ mod tests {
         .unwrap();
         let definition = definition_hash_for_copy_known(&copy).unwrap();
         let fixture = json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "resources": {"base/config": {
                 "definition_hash": definition.as_str(),
                 "effect": {"kind": "file_copy", "source_path": source.as_ref(), "target_path": target.as_ref(), "content_fingerprint": fingerprint.as_str()}

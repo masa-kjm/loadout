@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::declaration::environment_config::EnvironmentConfig;
-use crate::declaration::profile::{FileOperation, ProfileDeclaration};
+use crate::declaration::profile::{FileKind, FileOperation, ProfileDeclaration};
 use crate::domain::desired::{ResolvedDesired, ResolvedDesiredError, ResolvedResource};
+use crate::domain::directory_link::ResolvedDirectoryLink;
 use crate::domain::file_copy::{ContentFingerprint, ResolvedFileCopy};
 use crate::domain::file_link::{ResolvedFileLink, ResolvedFileLinkError};
 use crate::domain::ids::{
@@ -22,7 +23,7 @@ use crate::domain::paths::{
 use crate::filesystem::is_link_or_reparse_point;
 use crate::inspection::source::{
     PhysicalStoreRoot, SourceVerificationError, VerifiedSource, resolve_store_root,
-    verify_regular_source,
+    verify_directory_source, verify_regular_source,
 };
 
 /// Canonical Desired state and the source proofs needed to execute it safely.
@@ -248,6 +249,16 @@ pub(crate) fn resolve_for_apply(
     let mut resolved_resources = Vec::new();
     let mut verified_sources = BTreeMap::new();
     for resource in resources {
+        if resource.kind == FileKind::Directory {
+            let _source = verify_directory_source(&resource.store_root, &resource.source_path)
+                .map_err(|source| ResolverError::SourceVerification {
+                    resource_id: resource.resolved.resource_id().clone(),
+                    source,
+                })?;
+            return Err(ResolverError::DirectoryLinkApplyNotImplemented {
+                resource_id: resource.resolved.resource_id().clone(),
+            });
+        }
         let verified_source = verify_regular_source(&resource.store_root, &resource.source_path)
             .map_err(|source| ResolverError::SourceVerification {
                 resource_id: resource.resolved.resource_id().clone(),
@@ -260,9 +271,9 @@ pub(crate) fn resolve_for_apply(
         )
         .map_err(ResolverError::InvalidResolvedFileLink)?;
         verified_sources.insert(resolved.resource_id().clone(), verified_source.clone());
-        resolved_resources.push(match resource.operation {
-            FileOperation::Link => ResolvedResource::FileLink(resolved),
-            FileOperation::Copy => ResolvedResource::FileCopy(
+        resolved_resources.push(match (resource.kind, resource.operation) {
+            (FileKind::File, FileOperation::Link) => ResolvedResource::FileLink(resolved),
+            (FileKind::File, FileOperation::Copy) => ResolvedResource::FileCopy(
                 ResolvedFileCopy::new(
                     resolved.resource_id().clone(),
                     resolved.source_path().clone(),
@@ -271,6 +282,14 @@ pub(crate) fn resolve_for_apply(
                 )
                 .map_err(ResolverError::InvalidResolvedFileCopy)?,
             ),
+            (FileKind::Directory, FileOperation::Link) => {
+                return Err(ResolverError::DirectoryLinkApplyNotImplemented {
+                    resource_id: resolved.resource_id().clone(),
+                });
+            }
+            (FileKind::Directory, FileOperation::Copy) => {
+                unreachable!("profile decoder rejects directory copies")
+            }
         });
     }
     let desired = ResolvedDesired::new(root_profile, resolved_resources)
@@ -284,6 +303,7 @@ pub(crate) fn resolve_for_apply(
 struct ResolvedResourceInput {
     resolved: ResolvedFileLink,
     operation: FileOperation,
+    kind: FileKind,
     store_root: PhysicalStoreRoot,
     source_path: SourceRelativePath,
 }
@@ -291,9 +311,22 @@ struct ResolvedResourceInput {
 fn resolve_resource_for_desired(
     resource: ResolvedResourceInput,
 ) -> Result<ResolvedResource, ResolverError> {
-    match resource.operation {
-        FileOperation::Link => Ok(ResolvedResource::FileLink(resource.resolved)),
-        FileOperation::Copy => {
+    match (resource.kind, resource.operation) {
+        (FileKind::File, FileOperation::Link) => Ok(ResolvedResource::FileLink(resource.resolved)),
+        (FileKind::Directory, FileOperation::Link) => Ok(ResolvedResource::DirectoryLink(
+            ResolvedDirectoryLink::new(
+                resource.resolved.resource_id().clone(),
+                verify_directory_source(&resource.store_root, &resource.source_path).map_err(
+                    |source| ResolverError::SourceVerification {
+                        resource_id: resource.resolved.resource_id().clone(),
+                        source,
+                    },
+                )?,
+                resource.resolved.target_path().clone(),
+            )
+            .map_err(ResolverError::InvalidResolvedDirectoryLink)?,
+        )),
+        (FileKind::File, FileOperation::Copy) => {
             let verified_source =
                 verify_regular_source(&resource.store_root, &resource.source_path).map_err(
                     |source| ResolverError::SourceVerification {
@@ -310,6 +343,9 @@ fn resolve_resource_for_desired(
                 )
                 .map_err(ResolverError::InvalidResolvedFileCopy)?,
             ))
+        }
+        (FileKind::Directory, FileOperation::Copy) => {
+            unreachable!("profile decoder rejects directory copies")
         }
     }
 }
@@ -376,6 +412,7 @@ fn resolve_resource_inputs(
             resources.push(ResolvedResourceInput {
                 resolved,
                 operation: properties.operation(),
+                kind: properties.kind(),
                 store_root: store.root.clone(),
                 source_path: source_components,
             });
@@ -951,6 +988,10 @@ pub(crate) enum ResolverError {
         operation: &'static str,
     },
     InvalidResolvedFileLink(ResolvedFileLinkError),
+    InvalidResolvedDirectoryLink(crate::domain::directory_link::ResolvedDirectoryLinkError),
+    DirectoryLinkApplyNotImplemented {
+        resource_id: FullyQualifiedResourceId,
+    },
     InvalidResolvedFileCopy(crate::domain::file_copy::ResolvedFileCopyError),
     ReadCopySource {
         path: ResolvedPath,
@@ -1088,6 +1129,11 @@ impl fmt::Display for ResolverError {
                 "resource {resource_id} uses {operation:?}, which is not executable in this implementation slice"
             ),
             Self::InvalidResolvedFileLink(error) => error.fmt(formatter),
+            Self::InvalidResolvedDirectoryLink(error) => error.fmt(formatter),
+            Self::DirectoryLinkApplyNotImplemented { resource_id } => write!(
+                formatter,
+                "directory-link application is not implemented for {resource_id}"
+            ),
             Self::InvalidResolvedFileCopy(error) => error.fmt(formatter),
             Self::ReadCopySource { path, source } => {
                 write!(formatter, "cannot read copy source {path}: {source}")
@@ -1112,6 +1158,8 @@ impl std::error::Error for ResolverError {
                 Some(source)
             }
             Self::InvalidResolvedFileLink(error) => Some(error),
+            Self::InvalidResolvedDirectoryLink(error) => Some(error),
+            Self::DirectoryLinkApplyNotImplemented { .. } => None,
             Self::InvalidResolvedFileCopy(error) => Some(error),
             Self::ReadCopySource { source, .. } => Some(source),
             Self::InvalidContentFingerprint(error) => Some(error),
@@ -1246,7 +1294,7 @@ mod tests {
                 .collect::<String>();
             format!("includes:\n{entries}")
         };
-        format!("schema_version: 2\nid: {id}\n{includes}resources:\n{resources}")
+        format!("schema_version: 3\nid: {id}\n{includes}resources:\n{resources}")
     }
 
     fn file_resource(resource_id: &str, source: &str, target: &str) -> String {

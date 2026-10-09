@@ -4,14 +4,14 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-use crate::declaration::schema::ProfileSchemaVersionV2;
+use crate::declaration::schema::ProfileSchemaVersionV3;
 
 /// One profile file before identifier validation, include composition, and path binding.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProfileDeclaration {
     #[allow(dead_code)]
-    schema_version: ProfileSchemaVersionV2,
+    schema_version: ProfileSchemaVersionV3,
     id: String,
     #[serde(default)]
     includes: Vec<IncludeDeclaration>,
@@ -83,14 +83,41 @@ enum FileResourceType {
 }
 
 /// Raw properties of the only v0.2.0 file-link resource.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FileLinkProperties {
     #[allow(dead_code)]
     kind: FileKind,
     source: SourceDeclaration,
     target: String,
     operation: FileOperation,
+}
+
+impl<'de> Deserialize<'de> for FileLinkProperties {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            kind: FileKind,
+            source: SourceDeclaration,
+            target: String,
+            operation: FileOperation,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.kind == FileKind::Directory && raw.operation == FileOperation::Copy {
+            return Err(serde::de::Error::custom(
+                "directory resources support only operation: link",
+            ));
+        }
+        Ok(Self {
+            kind: raw.kind,
+            source: raw.source,
+            target: raw.target,
+            operation: raw.operation,
+        })
+    }
 }
 
 impl FileLinkProperties {
@@ -107,6 +134,10 @@ impl FileLinkProperties {
     /// The declared closed file materialization effect.
     pub(crate) fn operation(&self) -> FileOperation {
         self.operation
+    }
+
+    pub(crate) fn kind(&self) -> FileKind {
+        self.kind
     }
 }
 
@@ -132,9 +163,11 @@ impl SourceDeclaration {
 
 /// The only permitted file-link kind.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-enum FileKind {
+pub(crate) enum FileKind {
     #[serde(rename = "file")]
     File,
+    #[serde(rename = "directory")]
+    Directory,
 }
 
 /// The only permitted file-link operation.
@@ -150,7 +183,7 @@ pub(crate) enum FileOperation {
 mod tests {
     use super::*;
 
-    const VALID_PROFILE: &str = "schema_version: 2\nid: workstation\nincludes:\n  - id: base\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/.gitconfig\n      operation: link\n";
+    const VALID_PROFILE: &str = "schema_version: 3\nid: workstation\nincludes:\n  - id: base\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/.gitconfig\n      operation: link\n";
 
     #[test]
     fn profile_declaration_preserves_raw_profile_resource_and_path_syntax() {
@@ -171,31 +204,31 @@ mod tests {
             ("missing schema version", "id: workstation\nresources: {}\n"),
             (
                 "unsupported schema version",
-                "schema_version: 1\nid: workstation\nresources: {}\n",
+                "schema_version: 2\nid: workstation\nresources: {}\n",
             ),
             (
                 "unknown top-level field",
-                "schema_version: 2\nid: workstation\nresources: {}\nname: workstation\n",
+                "schema_version: 3\nid: workstation\nresources: {}\nname: workstation\n",
             ),
             (
                 "unknown include field",
-                "schema_version: 2\nid: workstation\nincludes:\n  - id: base\n    path: profiles/base.yaml\nresources: {}\n",
+                "schema_version: 3\nid: workstation\nincludes:\n  - id: base\n    path: profiles/base.yaml\nresources: {}\n",
             ),
             (
                 "unsupported resource type",
-                "schema_version: 2\nid: workstation\nresources:\n  install:\n    type: task\n    properties: {}\n",
+                "schema_version: 3\nid: workstation\nresources:\n  install:\n    type: task\n    properties: {}\n",
             ),
             (
                 "unknown resource field",
-                "schema_version: 2\nid: workstation\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/.gitconfig\n      operation: link\n    optional: true\n",
+                "schema_version: 3\nid: workstation\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/.gitconfig\n      operation: link\n    optional: true\n",
             ),
             (
                 "unknown properties field",
-                "schema_version: 2\nid: workstation\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/.gitconfig\n      operation: link\n      mode: 0600\n",
+                "schema_version: 3\nid: workstation\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/.gitconfig\n      operation: link\n      mode: 0600\n",
             ),
             (
                 "unknown source field",
-                "schema_version: 2\nid: workstation\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n        revision: main\n      target: ~/.gitconfig\n      operation: link\n",
+                "schema_version: 3\nid: workstation\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n        revision: main\n      target: ~/.gitconfig\n      operation: link\n",
             ),
         ] {
             assert!(
@@ -208,9 +241,18 @@ mod tests {
     #[test]
     fn profile_declaration_defaults_includes_to_empty() {
         let profile =
-            ProfileDeclaration::parse("schema_version: 2\nid: workstation\nresources: {}\n")
+            ProfileDeclaration::parse("schema_version: 3\nid: workstation\nresources: {}\n")
                 .unwrap();
 
         assert!(profile.includes().is_empty());
+    }
+
+    #[test]
+    fn profile_declaration_accepts_directory_link_and_rejects_directory_copy() {
+        let directory_link = "schema_version: 3\nid: workstation\nresources:\n  config:\n    type: file\n    properties:\n      kind: directory\n      source: { store: dotfiles, path: nvim }\n      target: ~/.config/nvim\n      operation: link\n";
+        assert!(ProfileDeclaration::parse(directory_link).is_ok());
+
+        let directory_copy = directory_link.replace("operation: link", "operation: copy");
+        assert!(ProfileDeclaration::parse(&directory_copy).is_err());
     }
 }

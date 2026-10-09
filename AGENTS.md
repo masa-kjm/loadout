@@ -21,6 +21,14 @@ Architecture and specifications are authoritative.
 
 If requirements conflict or leave a safety-, ownership-, persistence-, platform-, or schema-sensitive choice unclear, report the ambiguity before making that choice.
 
+## Staged Pull-Request Reviews
+
+An explicitly ordered implementation plan may establish the final public contract before every implementation commit in the same pull request has landed.
+When reviewing a named intermediate commit in that plan, assess it against both its declared commit scope and the final pull-request contract.
+Do not require an earlier commit to implement work explicitly assigned to a later commit in the same pull request.
+An intermediate commit must fail closed, must not silently report unsupported behavior as success, and must preserve every applicable safety invariant.
+The final pull-request review must verify the aggregate worktree against the full published contract; a later planned commit never excuses a remaining mismatch at that point.
+
 ## v0.5.0 Architecture
 
 Keep the lifecycle boundaries explicit:

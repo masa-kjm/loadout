@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use crate::domain::directory_link::ResolvedDirectoryLink;
 use crate::domain::file_copy::{ContentFingerprint, ResolvedFileCopy};
 use crate::domain::file_link::{LinkTarget, ResolvedFileLink};
 use crate::domain::ids::FullyQualifiedResourceId;
@@ -163,6 +164,7 @@ impl std::error::Error for KnownFileCopyError {}
 pub(crate) enum KnownResource {
     FileLink(KnownFileLink),
     FileCopy(KnownFileCopy),
+    DirectoryLink(KnownDirectoryLink),
 }
 
 impl KnownResource {
@@ -170,12 +172,14 @@ impl KnownResource {
         match self {
             Self::FileLink(resource) => resource.resource_id(),
             Self::FileCopy(resource) => resource.resource_id(),
+            Self::DirectoryLink(resource) => resource.resource_id(),
         }
     }
     pub(crate) fn target_path(&self) -> &ResolvedPath {
         match self {
             Self::FileLink(resource) => resource.target_path(),
             Self::FileCopy(resource) => resource.target_path(),
+            Self::DirectoryLink(resource) => resource.target_path(),
         }
     }
 }
@@ -188,6 +192,82 @@ impl From<KnownFileLink> for KnownResource {
 impl From<KnownFileCopy> for KnownResource {
     fn from(resource: KnownFileCopy) -> Self {
         Self::FileCopy(resource)
+    }
+}
+
+/// A previously verified directory-link post-condition recorded in Known state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KnownDirectoryLink {
+    resource_id: FullyQualifiedResourceId,
+    source_path: ResolvedPath,
+    target_path: ResolvedPath,
+    link_target: LinkTarget,
+}
+
+impl KnownDirectoryLink {
+    pub(crate) fn new(
+        resource_id: FullyQualifiedResourceId,
+        source_path: ResolvedPath,
+        target_path: ResolvedPath,
+        link_target: LinkTarget,
+    ) -> Result<Self, KnownDirectoryLinkError> {
+        if source_path == target_path {
+            return Err(KnownDirectoryLinkError::SourceEqualsTarget);
+        }
+        if link_target.as_path() != &source_path {
+            return Err(KnownDirectoryLinkError::LinkTargetDiffersFromSource);
+        }
+        Ok(Self {
+            resource_id,
+            source_path,
+            target_path,
+            link_target,
+        })
+    }
+    pub(crate) fn from_resolved(resource: &ResolvedDirectoryLink) -> Self {
+        Self {
+            resource_id: resource.resource_id().clone(),
+            source_path: resource.source_path().clone(),
+            target_path: resource.target_path().clone(),
+            link_target: resource.link_target().clone(),
+        }
+    }
+    pub(crate) fn resource_id(&self) -> &FullyQualifiedResourceId {
+        &self.resource_id
+    }
+    pub(crate) fn source_path(&self) -> &ResolvedPath {
+        &self.source_path
+    }
+    pub(crate) fn target_path(&self) -> &ResolvedPath {
+        &self.target_path
+    }
+    pub(crate) fn link_target(&self) -> &LinkTarget {
+        &self.link_target
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KnownDirectoryLinkError {
+    SourceEqualsTarget,
+    LinkTargetDiffersFromSource,
+}
+
+impl fmt::Display for KnownDirectoryLinkError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SourceEqualsTarget => formatter
+                .write_str("a Known directory-link source and target must not be the same path"),
+            Self::LinkTargetDiffersFromSource => formatter.write_str(
+                "a Known directory-link target must equal its recorded resolved source path",
+            ),
+        }
+    }
+}
+impl std::error::Error for KnownDirectoryLinkError {}
+
+impl From<KnownDirectoryLink> for KnownResource {
+    fn from(resource: KnownDirectoryLink) -> Self {
+        Self::DirectoryLink(resource)
     }
 }
 
@@ -253,6 +333,7 @@ impl KnownState {
             .filter_map(|resource| match resource {
                 KnownResource::FileLink(resource) => Some(resource),
                 KnownResource::FileCopy(_) => None,
+                KnownResource::DirectoryLink(_) => None,
             })
     }
 

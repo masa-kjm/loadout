@@ -871,6 +871,11 @@ impl RecordedAction {
             crate::domain::desired::ResolvedResource::FileCopy(resource) => {
                 KnownResource::from(crate::domain::known::KnownFileCopy::from_resolved(resource))
             }
+            crate::domain::desired::ResolvedResource::DirectoryLink(_) => {
+                return Err(OperationRecordError::UnsupportedActionKind {
+                    kind: ActionKind::ReplaceEffect,
+                });
+            }
         };
         let precondition = condition_for_known_effect(action.old_effect());
         let postcondition = condition_for_known_effect(&final_effect);
@@ -1176,6 +1181,11 @@ impl RecordedAction {
                 }
                 KnownResource::FileCopy(resource) => {
                     Ok(RecordedKnownStateUpdate::UpsertCopy(resource.clone()))
+                }
+                KnownResource::DirectoryLink(_) => {
+                    Err(OperationRecordError::UnsupportedActionKind {
+                        kind: ActionKind::ReplaceEffect,
+                    })
                 }
             },
         }
@@ -1599,6 +1609,9 @@ fn condition_for_known_effect(effect: &KnownResource) -> TargetCondition {
             target_path: resource.target_path().clone(),
             content_fingerprint: resource.content_fingerprint().clone(),
         },
+        KnownResource::DirectoryLink(_) => {
+            unreachable!("directory-link operations are not implemented")
+        }
     }
 }
 

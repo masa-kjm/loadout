@@ -90,6 +90,7 @@ impl FileLinkInspector {
             .filter_map(|resource| match resource {
                 crate::domain::known::KnownResource::FileCopy(resource) => Some(resource),
                 crate::domain::known::KnownResource::FileLink(_) => None,
+                crate::domain::known::KnownResource::DirectoryLink(_) => None,
             })
             .collect::<Vec<_>>();
         let mut observations = known_copy_targets

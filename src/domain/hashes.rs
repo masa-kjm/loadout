@@ -7,13 +7,15 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::domain::desired::{ResolvedDesired, ResolvedResource};
+use crate::domain::directory_link::ResolvedDirectoryLink;
 use crate::domain::file_copy::ResolvedFileCopy;
 use crate::domain::file_link::ResolvedFileLink;
 
 const SHA256_PREFIX: &str = "sha256:";
 const RESOLVED_FILE_LINK_FORMAT: &str = "loadout.resolved-file-link.v1";
 const RESOLVED_FILE_COPY_FORMAT: &str = "loadout.resolved-file-copy.v1";
-const RESOLVED_DESIRED_FORMAT: &str = "loadout.resolved-desired.v2";
+const RESOLVED_DIRECTORY_LINK_FORMAT: &str = "loadout.resolved-directory-link.v1";
+const RESOLVED_DESIRED_FORMAT: &str = "loadout.resolved-desired.v3";
 
 /// A SHA-256 hash of one canonical resolved file-link definition.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -76,6 +78,14 @@ pub(crate) fn file_copy_definition_hash(
     resource: &ResolvedFileCopy,
 ) -> Result<DefinitionHash, CanonicalHashError> {
     let definition = CanonicalFileCopy::from_resolved(resource)?;
+    Ok(DefinitionHash(sha256(&canonical_json(&definition))))
+}
+
+/// Produces the definition hash for a resolved directory-link definition.
+pub(crate) fn directory_link_definition_hash(
+    resource: &ResolvedDirectoryLink,
+) -> Result<DefinitionHash, CanonicalHashError> {
+    let definition = CanonicalDirectoryLink::from_resolved(resource)?;
     Ok(DefinitionHash(sha256(&canonical_json(&definition))))
 }
 
@@ -157,6 +167,30 @@ struct CanonicalFileCopy {
     format: &'static str,
 }
 
+#[derive(Serialize)]
+struct CanonicalDirectoryLink {
+    #[serde(rename = "type")]
+    resource_type: &'static str,
+    target_path: String,
+    operation: &'static str,
+    kind: &'static str,
+    source_path: String,
+    format: &'static str,
+}
+
+impl CanonicalDirectoryLink {
+    fn from_resolved(resource: &ResolvedDirectoryLink) -> Result<Self, CanonicalHashError> {
+        Ok(Self {
+            resource_type: "file",
+            target_path: resolved_path_utf8(resource.target_path())?,
+            operation: "link",
+            kind: "directory",
+            source_path: resolved_path_utf8(resource.source_path())?,
+            format: RESOLVED_DIRECTORY_LINK_FORMAT,
+        })
+    }
+}
+
 impl CanonicalFileCopy {
     fn from_resolved(resource: &ResolvedFileCopy) -> Result<Self, CanonicalHashError> {
         Ok(Self {
@@ -187,6 +221,7 @@ struct CanonicalDesiredResource {
 enum CanonicalResolvedDefinition {
     FileLink(CanonicalFileLink),
     FileCopy(CanonicalFileCopy),
+    DirectoryLink(CanonicalDirectoryLink),
 }
 
 impl CanonicalDesiredResource {
@@ -197,6 +232,11 @@ impl CanonicalDesiredResource {
             }
             ResolvedResource::FileCopy(resource) => {
                 CanonicalResolvedDefinition::FileCopy(CanonicalFileCopy::from_resolved(resource)?)
+            }
+            ResolvedResource::DirectoryLink(resource) => {
+                CanonicalResolvedDefinition::DirectoryLink(CanonicalDirectoryLink::from_resolved(
+                    resource,
+                )?)
             }
         };
         Ok(Self {
@@ -331,7 +371,27 @@ mod tests {
         .unwrap();
         assert_eq!(
             desired_hash(&desired).unwrap().as_str(),
-            "sha256:c659c640473e4d8bdc69db2253991ba4fa9889f6eb742df91ebefe596b2dc8a3"
+            "sha256:943faeabbd3d23bd2feaaa9cd9eb89f0ffa9a962ddf6c48bc9b7d85f83ccb422"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_link_definition_hash_uses_its_effect_specific_canonical_value() {
+        let resource = ResolvedDirectoryLink::new(
+            FullyQualifiedResourceId::parse("base/nvim").unwrap(),
+            ResolvedPath::new("/home/example/dotfiles/nvim").unwrap(),
+            ResolvedPath::new("/home/example/.config/nvim").unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            canonical_json(&CanonicalDirectoryLink::from_resolved(&resource).unwrap()),
+            br#"{"format":"loadout.resolved-directory-link.v1","kind":"directory","operation":"link","source_path":"/home/example/dotfiles/nvim","target_path":"/home/example/.config/nvim","type":"file"}"#
+        );
+        assert_eq!(
+            directory_link_definition_hash(&resource).unwrap().as_str(),
+            "sha256:b2a80fead25b86a0a6043d23ede8179d12bc3c775fe73d02541c4d25aad38930"
         );
     }
 
@@ -376,7 +436,7 @@ mod tests {
 
         assert_eq!(
             desired_hash(&desired).unwrap().as_str(),
-            "sha256:01b178b4059b64f1debd6f6ff4e092a403551eaca6b9d5b0d11720a162c0db7e"
+            "sha256:1730c7d062b4dc0ae58cb54265dbd00d05fc04d47f3abd32f2b0660a76747b5f"
         );
     }
 

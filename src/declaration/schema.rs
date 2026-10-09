@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde::de::Error as _;
 
 const DECLARATION_SCHEMA_VERSION_V1: u32 = 1;
-const PROFILE_SCHEMA_VERSION_V2: u32 = 2;
+const PROFILE_SCHEMA_VERSION_V3: u32 = 3;
 const V0_3_ENVIRONMENT_SCHEMA_VERSION: u32 = 2;
 
 /// The version retained by runtime and profile declarations in v0.3.0.
@@ -13,19 +13,19 @@ pub(crate) struct SchemaVersionV1;
 
 /// The supported profile schema version for v0.5.0.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ProfileSchemaVersionV2;
+pub(crate) struct ProfileSchemaVersionV3;
 
-impl<'de> Deserialize<'de> for ProfileSchemaVersionV2 {
+impl<'de> Deserialize<'de> for ProfileSchemaVersionV3 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let version = u32::deserialize(deserializer)?;
-        if version == PROFILE_SCHEMA_VERSION_V2 {
+        if version == PROFILE_SCHEMA_VERSION_V3 {
             Ok(Self)
         } else {
             Err(D::Error::custom(format!(
-                "unsupported schema_version {version}; expected {PROFILE_SCHEMA_VERSION_V2}"
+                "unsupported schema_version {version}; expected {PROFILE_SCHEMA_VERSION_V3}"
             )))
         }
     }

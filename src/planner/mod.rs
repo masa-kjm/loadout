@@ -1,5 +1,6 @@
 //! Pure Desired/Known/Actual classification and deterministic plan construction.
 
+pub(crate) mod directory_link;
 pub(crate) mod file_copy;
 pub(crate) mod file_link;
 pub(crate) mod ordering;

@@ -285,6 +285,15 @@ pub(super) fn status(out: &mut impl Write, report: &StatusReport) -> io::Result<
                         let (comparison, category) = unavailable_status_category(resource);
                         writeln!(out, "  {comparison}: {category}: unavailable: {error}")?;
                     }
+                    StatusActual::Unavailable(
+                        StatusUnavailable::DirectoryLinkInspectionNotImplemented,
+                    ) => {
+                        let (comparison, category) = unavailable_status_category(resource);
+                        writeln!(
+                            out,
+                            "  {comparison}: {category}: unavailable: directory-link inspection is not implemented"
+                        )?;
+                    }
                 }
             }
         }
@@ -349,6 +358,13 @@ fn render_resolved_resource(
             resource.source_path(),
             resource.target_path()
         ),
+        crate::domain::desired::ResolvedResource::DirectoryLink(resource) => writeln!(
+            out,
+            "{}: directory link: source {}: target {}: operation link",
+            resource.resource_id(),
+            resource.source_path(),
+            resource.target_path()
+        ),
     }
 }
 
@@ -371,6 +387,13 @@ fn render_known_resource(
             resource.source_path(),
             resource.target_path(),
             resource.content_fingerprint().as_str()
+        ),
+        crate::domain::known::KnownResource::DirectoryLink(resource) => writeln!(
+            out,
+            "{}: directory link: source {}: target {}",
+            resource.resource_id(),
+            resource.source_path(),
+            resource.target_path()
         ),
     }
 }
@@ -487,6 +510,12 @@ pub(super) fn query_error(error: &QueryError) -> String {
         QueryError::Resolution(error) => error.to_string(),
         QueryError::State(error) => error.to_string(),
         QueryError::Inspection(error) => error.to_string(),
+        QueryError::DirectoryLinkInspectionNotImplemented { resource_id } => {
+            format!("directory-link inspection is not implemented for {resource_id}")
+        }
+        QueryError::DirectoryLinkPlanningNotImplemented { resource_id } => {
+            format!("directory-link planning is not implemented for {resource_id}")
+        }
         QueryError::ConfigField(field) => format!("unsupported configuration field: {field}"),
     }
 }

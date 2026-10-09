@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::domain::directory_link::ResolvedDirectoryLink;
 use crate::domain::file_copy::ResolvedFileCopy;
 use crate::domain::file_link::ResolvedFileLink;
 use crate::domain::ids::{FullyQualifiedResourceId, ProfileId};
@@ -21,6 +22,7 @@ pub(crate) struct ResolvedDesired {
 pub(crate) enum ResolvedResource {
     FileLink(ResolvedFileLink),
     FileCopy(ResolvedFileCopy),
+    DirectoryLink(ResolvedDirectoryLink),
 }
 
 impl ResolvedResource {
@@ -28,6 +30,7 @@ impl ResolvedResource {
         match self {
             Self::FileLink(resource) => resource.resource_id(),
             Self::FileCopy(resource) => resource.resource_id(),
+            Self::DirectoryLink(resource) => resource.resource_id(),
         }
     }
 
@@ -35,6 +38,7 @@ impl ResolvedResource {
         match self {
             Self::FileLink(resource) => resource.target_path(),
             Self::FileCopy(resource) => resource.target_path(),
+            Self::DirectoryLink(resource) => resource.target_path(),
         }
     }
 }
@@ -48,6 +52,12 @@ impl From<ResolvedFileLink> for ResolvedResource {
 impl From<ResolvedFileCopy> for ResolvedResource {
     fn from(resource: ResolvedFileCopy) -> Self {
         Self::FileCopy(resource)
+    }
+}
+
+impl From<ResolvedDirectoryLink> for ResolvedResource {
+    fn from(resource: ResolvedDirectoryLink) -> Self {
+        Self::DirectoryLink(resource)
     }
 }
 
@@ -87,6 +97,7 @@ impl ResolvedDesired {
             .filter_map(|resource| match resource {
                 ResolvedResource::FileLink(resource) => Some(resource.clone()),
                 ResolvedResource::FileCopy(_) => None,
+                ResolvedResource::DirectoryLink(_) => None,
             })
             .collect();
 

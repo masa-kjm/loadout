@@ -112,6 +112,7 @@ pub(crate) enum StatusActual {
 pub(crate) enum StatusUnavailable {
     InspectorInitialization,
     Observation(TargetInspectionError),
+    DirectoryLinkInspectionNotImplemented,
 }
 
 /// The identity and definition relation before interpreting its Actual observation.
@@ -177,6 +178,12 @@ pub(crate) enum QueryError {
     Resolution(ResolverError),
     State(StateRepositoryError),
     Inspection(TargetInspectionError),
+    DirectoryLinkInspectionNotImplemented {
+        resource_id: FullyQualifiedResourceId,
+    },
+    DirectoryLinkPlanningNotImplemented {
+        resource_id: FullyQualifiedResourceId,
+    },
     ConfigField(String),
 }
 
@@ -392,6 +399,19 @@ fn status_with_inspector(
                 (None, Some(ResolvedResource::FileCopy(desired))) => inspector
                     .inspect_target_for_desired_copy(desired.target_path())
                     .map(ActualResource::from),
+                (Some(KnownResource::DirectoryLink(_)), _)
+                | (None, Some(ResolvedResource::DirectoryLink(_))) => {
+                    has_unavailable_observation = true;
+                    resources.push(StatusResource {
+                        resource_id,
+                        desired: desired_resource,
+                        known: known_resource,
+                        actual: StatusActual::Unavailable(
+                            StatusUnavailable::DirectoryLinkInspectionNotImplemented,
+                        ),
+                    });
+                    continue;
+                }
                 (None, None) => unreachable!("the union key has one source"),
             };
             match observation {
@@ -472,6 +492,11 @@ pub(crate) fn diff(
                         resource.content_fingerprint(),
                     )
                     .map(ActualResource::from),
+                KnownResource::DirectoryLink(resource) => {
+                    return Err(QueryError::DirectoryLinkInspectionNotImplemented {
+                        resource_id: resource.resource_id().clone(),
+                    });
+                }
             }
             .map_err(QueryError::Inspection)?;
             resources.push((resource.resource_id().clone(), actual));
@@ -485,25 +510,48 @@ pub(crate) fn diff(
 
 /// Shared plan/dry-run path: no exclusive lock, recovery, or mutation preflight.
 pub(crate) fn plan_request(request: &DeclarationRequest) -> Result<PlanReport, QueryError> {
-    let resolved = resolve_request(request)?;
+    let desired = resolve_desired(request)?;
     let state = StateRepository::new(request.context.state_directory().clone())
         .load()
         .map_err(QueryError::State)?;
+    if let Some(resource_id) = directory_link_resource_id(&desired, state.known()) {
+        return Err(QueryError::DirectoryLinkPlanningNotImplemented { resource_id });
+    }
     let inspector = FileLinkInspector::new(request.context.home_directory().as_ref())
         .map_err(QueryError::Inspection)?;
     let actual = inspector
-        .inspect(resolved.desired(), state.known())
+        .inspect(&desired, state.known())
         .map_err(QueryError::Inspection)?;
     Ok(PlanReport {
-        profile: resolved.desired().root_profile().clone(),
-        plan: plan(resolved.desired(), state.known(), &actual),
+        profile: desired.root_profile().clone(),
+        plan: plan(&desired, state.known(), &actual),
     })
+}
+
+/// Returns the first resource that requires DirectoryLink lifecycle support.
+pub(crate) fn directory_link_resource_id(
+    desired: &ResolvedDesired,
+    known: &crate::domain::known::KnownState,
+) -> Option<FullyQualifiedResourceId> {
+    desired
+        .variants()
+        .iter()
+        .find(|resource| matches!(resource, ResolvedResource::DirectoryLink(_)))
+        .map(|resource| resource.resource_id().clone())
+        .or_else(|| {
+            known
+                .variants()
+                .find(|resource| matches!(resource, KnownResource::DirectoryLink(_)))
+                .map(|resource| resource.resource_id().clone())
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::directory_link::ResolvedDirectoryLink;
     use crate::domain::file_link::ResolvedFileLink;
+    use crate::domain::known::KnownDirectoryLink;
     use crate::test_support::{
         forbid_desired_dependencies, forbid_mutation, forbid_target_inspection,
     };
@@ -535,7 +583,7 @@ mod tests {
             .unwrap();
             fs::write(
                 root.join("portable/profiles/base.yaml"),
-                "schema_version: 2\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.item\n",
+                "schema_version: 3\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.item\n",
             )
             .unwrap();
             let root = crate::domain::paths::ResolvedPath::from_platform_canonicalized(
@@ -601,6 +649,57 @@ mod tests {
         .unwrap();
         assert_eq!(desired.root_profile.as_str(), "base");
         assert_eq!(desired.resources[0].resource_id().as_str(), "base/item");
+    }
+
+    #[test]
+    fn old_profile_schema_is_rejected_before_status_inspects_a_target() {
+        let workspace = Workspace::new();
+        fs::write(
+            workspace.root.join("portable/profiles/base.yaml"),
+            "schema_version: 2\nid: base\nresources: {}\n",
+        )
+        .unwrap();
+        let _no_target_inspection = forbid_target_inspection();
+
+        let report = status(
+            &DeclarationRequest {
+                context: workspace.context(),
+                root: None,
+            },
+            &workspace.repository(),
+        )
+        .unwrap();
+        assert!(matches!(
+            report.desired,
+            StatusDesired::Unavailable(QueryError::Resolution(
+                ResolverError::InvalidProfileSchema { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn known_only_directory_link_requires_fail_closed_planning() {
+        let root = std::env::temp_dir().join("loadout-known-only-directory-link");
+        let directory_link = ResolvedDirectoryLink::new(
+            FullyQualifiedResourceId::parse("base/nvim").unwrap(),
+            crate::domain::paths::ResolvedPath::new(root.join("store/nvim")).unwrap(),
+            crate::domain::paths::ResolvedPath::new(root.join("home/.config/nvim")).unwrap(),
+        )
+        .unwrap();
+        let desired = ResolvedDesired::new(
+            ProfileId::parse("base").unwrap(),
+            Vec::<ResolvedResource>::new(),
+        )
+        .unwrap();
+        let known = crate::domain::known::KnownState::new([KnownDirectoryLink::from_resolved(
+            &directory_link,
+        )])
+        .unwrap();
+
+        assert_eq!(
+            directory_link_resource_id(&desired, &known),
+            Some(FullyQualifiedResourceId::parse("base/nvim").unwrap())
+        );
     }
 
     #[cfg(windows)]
@@ -717,7 +816,7 @@ mod tests {
         fs::write(
             workspace.root.join("state/state.json"),
             serde_json::json!({
-                "schema_version":2,
+                "schema_version":3,
                 "resources": {},
                 "active_operation": {
                     "id": "interrupted-operation",
@@ -766,7 +865,7 @@ mod tests {
         let workspace = Workspace::new();
         fs::write(
             workspace.root.join("portable/profiles/base.yaml"),
-            "schema_version: 2\nid: base\nresources:\n  changed:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.changed\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.item\n",
+            "schema_version: 3\nid: base\nresources:\n  changed:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.changed\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.item\n",
         )
         .unwrap();
         let desired_item = desired_resources(&DeclarationRequest {
@@ -817,7 +916,7 @@ mod tests {
         fs::write(
             workspace.root.join("state/state.json"),
             serde_json::json!({
-                "schema_version":2,
+                "schema_version":3,
                 "resources": resources,
                 "active_operation": null,
             })
@@ -882,7 +981,7 @@ mod tests {
         fs::write(
             workspace.root.join("state/state.json"),
             serde_json::json!({
-                "schema_version":2,
+                "schema_version":3,
                 "resources": {
                     "base/item": persisted_known_file_link(&desired),
                 },
@@ -983,7 +1082,7 @@ mod tests {
         let workspace = Workspace::new();
         fs::write(
             workspace.root.join("portable/profiles/base.yaml"),
-            "schema_version: 2\nid: base\nresources:\n  another:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.another\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.blocked/item\n",
+            "schema_version: 3\nid: base\nresources:\n  another:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.another\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.blocked/item\n",
         )
         .unwrap();
         let blocked = workspace.root.join("home/.blocked");

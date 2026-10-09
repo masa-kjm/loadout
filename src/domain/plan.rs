@@ -711,6 +711,9 @@ fn condition_for_known_effect(effect: &KnownResource) -> TargetCondition {
     match effect {
         KnownResource::FileLink(resource) => expected(resource),
         KnownResource::FileCopy(resource) => expected_copy(resource),
+        KnownResource::DirectoryLink(_) => {
+            unreachable!("directory-link planning is not implemented")
+        }
     }
 }
 
@@ -718,6 +721,9 @@ fn condition_for_resolved_effect(effect: &ResolvedResource) -> TargetCondition {
     match effect {
         ResolvedResource::FileLink(resource) => expected_desired(resource),
         ResolvedResource::FileCopy(resource) => expected_desired_copy(resource),
+        ResolvedResource::DirectoryLink(_) => {
+            unreachable!("directory-link planning is not implemented")
+        }
     }
 }
 
@@ -725,6 +731,9 @@ fn known_from_resolved_effect(effect: &ResolvedResource) -> KnownResource {
     match effect {
         ResolvedResource::FileLink(resource) => KnownFileLink::from_resolved(resource).into(),
         ResolvedResource::FileCopy(resource) => KnownFileCopy::from_resolved(resource).into(),
+        ResolvedResource::DirectoryLink(_) => {
+            unreachable!("directory-link planning is not implemented")
+        }
     }
 }
 

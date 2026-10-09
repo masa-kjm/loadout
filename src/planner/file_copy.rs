@@ -100,6 +100,7 @@ pub(super) fn contribute(
                     _ => conflict(resource, None, &mut diagnostics),
                 }
             }
+            Some(KnownResource::DirectoryLink(_)) => conflict(resource, None, &mut diagnostics),
             None => match copy_observation(actual, resource.target_path()) {
                 Some(CopyTargetObservation::Missing) => actions.push(
                     PlannedFileCopyAction::Create {

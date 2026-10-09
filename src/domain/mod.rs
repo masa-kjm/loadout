@@ -10,6 +10,9 @@ pub(crate) mod actual;
 pub(crate) mod desired;
 
 #[allow(dead_code)]
+pub(crate) mod directory_link;
+
+#[allow(dead_code)]
 pub(crate) mod diagnostic;
 
 #[allow(dead_code)]

@@ -58,6 +58,7 @@ impl FileCopyExecutor {
                     Some(desired.source_content_fingerprint()),
                 )),
                 ResolvedResource::FileLink(desired) => Some((desired.source_path(), None)),
+                ResolvedResource::DirectoryLink(_) => None,
             },
             PlannedResourceAction::FileLink(_) => return Err(CopyPreflightError::WrongAction),
         };
@@ -1001,6 +1002,9 @@ impl FileCopyExecutor {
                 ) {
                     return Err(CopyTemporaryCleanupError::CleanupNotProven);
                 }
+            }
+            crate::domain::known::KnownResource::DirectoryLink(_) => {
+                return Err(CopyTemporaryCleanupError::UnexpectedTemporary);
             }
         }
         Ok(())

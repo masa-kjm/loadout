@@ -494,6 +494,8 @@ fn query_exit_code(error: &QueryError) -> u8 {
         }
         QueryError::Resolution(error) => resolver_exit_code(error),
         QueryError::Configuration(_) | QueryError::ConfigField(_) => 2,
+        QueryError::DirectoryLinkInspectionNotImplemented { .. } => 1,
+        QueryError::DirectoryLinkPlanningNotImplemented { .. } => 2,
     }
 }
 
@@ -536,7 +538,7 @@ mod tests {
             }
             fs::write(root.join("store/source"), "source").unwrap();
             fs::write(root.join("config.yaml"), "schema_version: 2\ndefault_profile: base\nprofile_discovery:\n  paths: [profiles]\nstores:\n  files:\n    type: local\n    properties:\n      path: store\n").unwrap();
-            fs::write(root.join("profiles/base.yaml"), "schema_version: 2\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/absent-parent/target\n").unwrap();
+            fs::write(root.join("profiles/base.yaml"), "schema_version: 3\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/absent-parent/target\n").unwrap();
             Self { root }
         }
         fn machine(&self) -> MachinePaths {

@@ -1862,7 +1862,7 @@ mod tests {
 
         for json in [
             b"not JSON".as_slice(),
-            br#"{"schema_version":3,"resources":{},"active_operation":null}"#,
+            br#"{"schema_version":2,"resources":{},"active_operation":null}"#,
             br#"{"schema_version":1,"resources":{},"active_operation":null,"extra":true}"#,
             br#"{"schema_version":1,"resources":{"base/git":{"definition_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","file_link":{"source_path":"/tmp/source","target_path":"/tmp/./target","link_target":"/tmp/source"}}},"active_operation":null}"#,
         ] {
@@ -1962,7 +1962,7 @@ mod tests {
 
         let json: serde_json::Value =
             serde_json::from_slice(&fs::read(directory.state_file()).unwrap()).unwrap();
-        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["schema_version"], 3);
         assert!(
             json["resources"]["base/git"]["definition_hash"]
                 .as_str()

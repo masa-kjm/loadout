@@ -120,6 +120,13 @@ fn apply_request_with_hooks(
         stage = ApplyStage::Resolution;
         let resolved =
             super::queries::resolve_request(request).map_err(ApplyFailureCause::Input)?;
+        if let Some(resource_id) =
+            super::queries::directory_link_resource_id(resolved.desired(), locked.state().known())
+        {
+            return Err(ApplyFailureCause::Input(
+                super::queries::QueryError::DirectoryLinkPlanningNotImplemented { resource_id },
+            ));
+        }
         stage = ApplyStage::Planning;
         let inspector = FileLinkInspector::new(request.context.home_directory().as_ref())
             .map_err(|error| lifecycle(ApplyError::InitialInspection(error)))?;
@@ -1870,7 +1877,7 @@ mod tests {
 
         fn request(&self, resources: &[(&str, &str)]) -> super::super::queries::DeclarationRequest {
             self.write("config/environment.yaml", "schema_version: 2\ndefault_profile: base\nprofile_discovery:\n  paths: [../profiles]\nstores:\n  dotfiles:\n    type: local\n    properties:\n      path: ../store\n");
-            let mut profile = String::from("schema_version: 2\nid: base\nresources:");
+            let mut profile = String::from("schema_version: 3\nid: base\nresources:");
             if resources.is_empty() {
                 profile.push_str(" {}\n");
             } else {
@@ -1997,7 +2004,7 @@ mod tests {
             self.write("config/environment.yaml", "schema_version: 1\n");
             self.write(
                 "profiles/workstation.yaml",
-                "schema_version: 2\nid: workstation\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/.gitconfig\n      operation: link\n",
+                "schema_version: 3\nid: workstation\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/.gitconfig\n      operation: link\n",
             );
             let context = ResolverContext::new(
                 self.path("home"),
@@ -3176,7 +3183,7 @@ mod tests {
         let request = workspace.request(&[("a", "a")]);
         workspace.write(
             "profiles/other.yaml",
-            "schema_version: 2\nid: other\nincludes: [{id: missing}]\nresources: {}\n",
+            "schema_version: 3\nid: other\nincludes: [{id: missing}]\nresources: {}\n",
         );
         let before = workspace.snapshot();
         let _read_only = crate::test_support::forbid_mutation();

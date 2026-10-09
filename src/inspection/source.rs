@@ -372,6 +372,27 @@ mod tests {
     }
 
     #[test]
+    fn directory_verifier_accepts_only_the_real_final_directory_without_traversing_children() {
+        let store = TestStore::new();
+        store.create_dir("store/editor/plugin");
+        store.write("store/editor/plugin/child", "unread child\n");
+        let root = store.physical_store_root();
+
+        let verified = verify_directory_source(&root, &source_path("editor/plugin")).unwrap();
+
+        assert_eq!(
+            verified.as_ref(),
+            root.as_path().as_ref().join("editor/plugin")
+        );
+        let file_error =
+            verify_directory_source(&root, &source_path("editor/plugin/child")).unwrap_err();
+        assert!(matches!(
+            file_error,
+            SourceVerificationError::SourceNotDirectory { .. }
+        ));
+    }
+
+    #[test]
     fn verifier_rejects_a_non_directory_parent_and_non_regular_final_entry() {
         let store = TestStore::new();
         store.write("store/not-a-directory", "contents\n");
@@ -444,6 +465,36 @@ mod tests {
         ));
 
         let final_error = verify_regular_source(&root, &source_path("linked-file")).unwrap_err();
+        assert!(matches!(
+            final_error,
+            SourceVerificationError::SourceLinkOrReparsePoint { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_verifier_rejects_symlinked_parents_and_final_entries() {
+        use std::os::unix::fs::symlink;
+
+        let store = TestStore::new();
+        store.create_dir("outside/directory");
+        store.create_dir("store");
+        symlink(store.path("outside"), store.path("store/linked-parent")).unwrap();
+        symlink(
+            store.path("outside/directory"),
+            store.path("store/linked-directory"),
+        )
+        .unwrap();
+        let root = store.physical_store_root();
+
+        let parent_error =
+            verify_directory_source(&root, &source_path("linked-parent/directory")).unwrap_err();
+        assert!(matches!(
+            parent_error,
+            SourceVerificationError::SourceParentLinkOrReparsePoint { .. }
+        ));
+        let final_error =
+            verify_directory_source(&root, &source_path("linked-directory")).unwrap_err();
         assert!(matches!(
             final_error,
             SourceVerificationError::SourceLinkOrReparsePoint { .. }

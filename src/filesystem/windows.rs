@@ -10,6 +10,7 @@ use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::path::Path;
 
 use crate::domain::file_link::LinkTarget;
 use crate::domain::paths::ResolvedPath;
@@ -25,13 +26,9 @@ pub(super) fn classify_nofollow_entry(metadata: &fs::Metadata) -> NoFollowEntryK
     let file_type = metadata.file_type();
     let attributes = metadata.file_attributes();
     if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        if file_type.is_symlink() && attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
-            NoFollowEntryKind::FileSymbolicLink
-        } else {
-            // Metadata exposes the reparse attribute but not a stable tag.
-            // Conservatively reject every non-file-link reparse point.
-            NoFollowEntryKind::ReparsePoint
-        }
+        // Metadata cannot distinguish a junction from a directory symbolic link.
+        // Final-entry inspection obtains the tag through a no-follow handle.
+        NoFollowEntryKind::ReparsePoint
     } else if file_type.is_file() {
         NoFollowEntryKind::RegularFile
     } else if file_type.is_dir() {
@@ -41,19 +38,45 @@ pub(super) fn classify_nofollow_entry(metadata: &fs::Metadata) -> NoFollowEntryK
     }
 }
 
-#[allow(dead_code)] // S6 execution context consumes tag-based classification after native traversal evidence.
+pub(super) fn classify_nofollow_entry_at(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> NoFollowEntryKind {
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+        return classify_nofollow_entry(metadata);
+    }
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(_) => return NoFollowEntryKind::ReparsePoint,
+    };
+    match reparse_tag_from_no_follow_handle(&file) {
+        Ok(tag) => classify_reparse_tag(
+            tag,
+            metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0,
+        ),
+        Err(_) => NoFollowEntryKind::ReparsePoint,
+    }
+}
+
 fn classify_reparse_tag(tag: u32, is_directory: bool) -> NoFollowEntryKind {
     match (tag, is_directory) {
         (IO_REPARSE_TAG_SYMLINK, false) => NoFollowEntryKind::FileSymbolicLink,
-        (IO_REPARSE_TAG_MOUNT_POINT, _) | (IO_REPARSE_TAG_SYMLINK, true) => {
-            NoFollowEntryKind::ReparsePoint
-        }
+        (IO_REPARSE_TAG_SYMLINK, true) => NoFollowEntryKind::DirectorySymbolicLink,
+        (IO_REPARSE_TAG_MOUNT_POINT, _) => NoFollowEntryKind::ReparsePoint,
         _ => NoFollowEntryKind::ReparsePoint,
     }
 }
 
 /// Reads the reparse tag from an already-opened no-follow final-entry handle without authorizing mutation.
-#[allow(dead_code)]
 fn reparse_tag_from_no_follow_handle(file: &fs::File) -> io::Result<u32> {
     use windows_sys::Win32::System::IO::DeviceIoControl;
     use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
@@ -449,16 +472,20 @@ mod reparse_tag_tests {
     use super::*;
 
     #[test]
-    fn reparse_tags_accept_only_file_symbolic_links() {
+    fn reparse_tags_distinguish_file_and_directory_links_from_other_reparse_points() {
         assert_eq!(
             classify_reparse_tag(IO_REPARSE_TAG_SYMLINK, false),
             NoFollowEntryKind::FileSymbolicLink
         );
+        assert_eq!(
+            classify_reparse_tag(IO_REPARSE_TAG_SYMLINK, true),
+            NoFollowEntryKind::DirectorySymbolicLink
+        );
         for (tag, directory) in [
-            (IO_REPARSE_TAG_SYMLINK, true),
             (IO_REPARSE_TAG_MOUNT_POINT, false),
             (IO_REPARSE_TAG_MOUNT_POINT, true),
             (0xDEAD_BEEF, false),
+            (0xDEAD_BEEF, true),
         ] {
             assert_eq!(
                 classify_reparse_tag(tag, directory),

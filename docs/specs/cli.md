@@ -95,6 +95,8 @@ For each Known `file_link` resource, `diff` performs the no-follow target and pa
 It reports whether the target is the expected link, missing, another link, another entry kind, or unreachable through a safe parent path.
 For each Known `file_copy` resource, `diff` performs the effect-specific no-follow target and parent observation required by [File Copies](file-copy.md).
 It reports `expected_copy`, `missing`, `other_regular_file`, `other_entry`, `unsafe_path`, or `unavailable`; an `expected_copy` report means only that the recorded applied fingerprint matches the current target bytes.
+For each Known `directory_link` resource, `diff` performs the effect-specific no-follow target and parent observation required by [Directory Links](directory-link.md#typed-actual-and-known-effects).
+It reports `expected_directory_link`, `missing`, `other_link`, `other_entry`, `unsafe_path`, or `unavailable` without following the final link or its referent.
 It also reports any active operation and each action with `pending`, `running`, or `uncertain` status.
 
 `diff` does not produce an executable Plan, plan a repair, reconcile an operation, acquire the exclusive state lock, write state, create a directory, or mutate a target.
@@ -207,4 +209,12 @@ When recovery retains an active operation containing `uncertain`, `apply` report
 
 ## Excluded Commands
 
-v0.5.0 does not provide configuration reset, generic YAML editing, resource import, partial apply, task execution, directory materialization, remote store management, forceful takeover, rollback, parallel execution, state repair, migration, operation recovery on inspection, or machine-readable inspection output.
+The current contract does not provide configuration reset, generic YAML editing, resource import, partial apply, task execution, directory copy or tree synchronization, remote store management, forceful takeover, rollback, parallel execution, state repair, migration, operation recovery on inspection, or machine-readable inspection output.
+
+## Schema Boundary
+
+Every lifecycle command and every inspection command that reads a profile or state document uses the version-specific decoding rules in [Profiles](profiles.md#current-profile-schema) and [State and Recovery](state-and-recovery.md#current-state-schema).
+An unsupported profile or state schema version exits with the documented invalid-input category before target inspection, planning, recovery, state rewrite, or target mutation.
+
+The current contract provides no `migrate` command, old-schema reader, implicit conversion, compatibility alias, or schema-repair path.
+In particular, a v0.5 state file does not authorize observing or adopting a matching target and its active operation is not recovered.

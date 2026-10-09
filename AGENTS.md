@@ -4,26 +4,20 @@ Follow these instructions for every change in this repository.
 
 ## Project Status
 
-v0.3.0 and v0.4.0 are released.
-v0.5.0 is the current development contract and deliberately has no migration path from v0.4 profile or state schemas.
-v0.1 and v0.2 are retired, unsupported, and have no compatibility contract with v0.5.0.
-The `v0.1.0` and `legacy/v0.1-final` tags preserve the historical implementation; do not change them.
-
-The existing `crates/`, legacy tests, and scripts are historical material only.
-They must not determine v0.5.0 behavior, architecture, schemas, or compatibility decisions.
+v0.5.0 is released.
 
 ## Sources of Truth
 
-Before changing v0.5.0 behavior, read the documents that own it:
+Before changing v0.6.0 behavior, read the documents that own it:
 
-- [`docs/README.md`](docs/README.md) explains document authority and v0.5.0 scope.
+- [`docs/README.md`](docs/README.md) explains document authority.
 - [`docs/architecture/`](docs/architecture/README.md) owns responsibility and safety boundaries.
 - [`docs/specs/`](docs/specs/README.md) owns observable behavior, schemas, state transitions, CLI contracts, and failure aftermath.
 - [`docs/development/testing.md`](docs/development/testing.md) owns required test evidence.
 
 Architecture and specifications are authoritative.
-`docs/future/` is non-binding and may identify constraints for later work, but it does not change v0.5.0 behavior.
-`tmp/draft/` and any other draft material are exploratory only and must never override published documentation.
+`docs/future/` is non-binding and may identify constraints for later work.
+`local/` and any other draft material are exploratory only and must never override published documentation.
 
 If requirements conflict or leave a safety-, ownership-, persistence-, platform-, or schema-sensitive choice unclear, report the ambiguity before making that choice.
 
@@ -47,10 +41,6 @@ Declared Configuration
 - The executor performs only actions already selected by the Plan. It may reject an action after an immediate safety recheck, but it must not replan or choose a different action.
 - The state repository exclusively owns locks, operation records, Known state, and atomic commits.
 - Resource implementations must not write state, format CLI output, or accept unresolved YAML, store IDs, home shorthand, or relative paths.
-
-Build the v0.5.0 implementation from a narrow foundation.
-Use closed `FileLink` and `FileCopy` variants; do not add a generic resource trait or plugin registry.
-An isolated legacy algorithm may be mined only after it has been checked against the v0.5.0 contract; do not carry forward legacy resource models, command semantics, compatibility paths, or broad abstractions.
 
 ## Design Principles
 

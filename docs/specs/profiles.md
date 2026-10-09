@@ -111,3 +111,25 @@ It must not inspect, create, replace, remove, or otherwise mutate a resource tar
 Changing a resource's source or target while keeping the same fully qualified resource ID is a definition change.
 Changing the profile ID or resource ID creates a distinct resource identity.
 The lifecycle specification determines whether that change creates, replaces, relocates, removes, or blocks an action.
+
+## Current Profile Schema
+
+This section supersedes the v0.5.0 profile schema for every lifecycle and inspection command that reads a profile.
+A current profile has `schema_version: 3`; schema version `2`, every earlier version, and every unknown future version are invalid.
+Loadout rejects that version mismatch before it resolves a store source, normalizes a target, observes a target, creates a plan, recovers an operation, or writes state.
+
+The profile object, include objects, resource envelope, and resource `properties` objects reject unknown fields at every level.
+`type` remains exactly `file`.
+The accepted `(properties.kind, properties.operation)` pairs are exactly:
+
+| `kind` | `operation` | Resolved effect |
+| --- | --- | --- |
+| `file` | `link` | `file_link` |
+| `file` | `copy` | `file_copy` |
+| `directory` | `link` | `directory_link` |
+
+`directory` with `copy`, and every other pair, are invalid.
+The `directory_link` declaration and resolution rules are defined by [Directory Links](directory-link.md).
+
+The current contract does not decode a version-2 profile for conversion, reinterpret it as version 3, or provide a profile migration command.
+An invalid version is a validation diagnostic, not an input from which a target or existing effect may be inspected or adopted.

@@ -28,6 +28,10 @@ pub(super) fn action_name(kind: ActionKind) -> &'static str {
         ActionKind::RelocateCopy => "relocate_copy",
         ActionKind::RemoveCopy => "remove_copy",
         ActionKind::ReplaceEffect => "replace_effect",
+        ActionKind::CreateDirectoryLink => "create_directory_link",
+        ActionKind::ReplaceDirectoryLink => "replace_directory_link",
+        ActionKind::RelocateDirectoryLink => "relocate_directory_link",
+        ActionKind::RemoveDirectoryLink => "remove_directory_link",
         ActionKind::Noop => "noop",
     }
 }

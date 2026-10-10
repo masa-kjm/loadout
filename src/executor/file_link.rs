@@ -24,6 +24,8 @@ pub(crate) struct FileLinkExecutor {
     force_capability_failure: bool,
     #[cfg(test)]
     force_capability_success: bool,
+    #[cfg(test)]
+    force_directory_temporary_cleanup_failure: bool,
 }
 
 impl FileLinkExecutor {
@@ -35,6 +37,8 @@ impl FileLinkExecutor {
             force_capability_failure: false,
             #[cfg(test)]
             force_capability_success: false,
+            #[cfg(test)]
+            force_directory_temporary_cleanup_failure: false,
         })
     }
 
@@ -763,6 +767,61 @@ impl FileLinkExecutor {
         }
     }
 
+    /// Removes only a recorded DirectoryLink temporary after exact typed no-follow rechecks.
+    pub(crate) fn cleanup_recorded_directory_link_temporary(
+        &self,
+        recorded: &RecordedAction,
+    ) -> Result<(), ReplacementTemporaryCleanupError> {
+        let facts = recorded
+            .directory_link_facts()
+            .ok_or(ReplacementTemporaryCleanupError::MissingRecordedFacts)?;
+        let (Some(old), Some(final_effect), Some(temporary)) = (
+            facts.old_effect(),
+            facts.final_effect(),
+            facts.temporary_path(),
+        ) else {
+            return Err(ReplacementTemporaryCleanupError::MissingRecordedFacts);
+        };
+        let target = self
+            .inspector
+            .inspect_target_for_expected_directory_link(old.target_path(), old.link_target())
+            .map_err(ReplacementTemporaryCleanupError::TargetInspection)?;
+        if !matches!(target.observation(), TargetObservation::ExpectedLink { .. }) {
+            return Err(ReplacementTemporaryCleanupError::PostconditionNotMet {
+                temporary_path: temporary.clone(),
+                observation: target.observation().clone(),
+            });
+        }
+        let temporary_observation = self
+            .inspector
+            .inspect_target_for_expected_directory_link(temporary, final_effect.link_target())
+            .map_err(ReplacementTemporaryCleanupError::TemporaryInspection)?;
+        if matches!(
+            temporary_observation.observation(),
+            TargetObservation::Missing
+        ) {
+            return Ok(());
+        }
+        if !matches!(
+            temporary_observation.observation(),
+            TargetObservation::ExpectedLink { .. }
+        ) {
+            return Err(ReplacementTemporaryCleanupError::PostconditionNotMet {
+                temporary_path: temporary.clone(),
+                observation: temporary_observation.observation().clone(),
+            });
+        }
+        #[cfg(test)]
+        if self.force_directory_temporary_cleanup_failure {
+            return Err(ReplacementTemporaryCleanupError::RemoveAttemptFailed {
+                temporary_path: temporary.clone(),
+                source: io::Error::other("injected directory temporary removal failure"),
+                aftermath: temporary_observation.observation().clone(),
+            });
+        }
+        self.cleanup_recorded_replacement_temporary(recorded)
+    }
+
     #[cfg(any(unix, windows))]
     fn observe_execution_target(
         &self,
@@ -1167,6 +1226,12 @@ impl FileLinkExecutor {
     pub(crate) fn with_forced_capability_success_for_test(mut self) -> Self {
         assert!(!self.force_capability_failure);
         self.force_capability_success = true;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_forced_directory_temporary_cleanup_failure_for_test(mut self) -> Self {
+        self.force_directory_temporary_cleanup_failure = true;
         self
     }
 

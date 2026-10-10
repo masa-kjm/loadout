@@ -331,28 +331,262 @@ struct PersistedRecordedAction {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     old_resource_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseded_resource_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     old_target_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     old_effect: Option<PersistedKnownEffect>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     final_effect: Option<PersistedKnownEffect>,
-    target_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     content_fingerprint: Option<String>,
-    precondition: PersistedTargetCondition,
-    postcondition: PersistedTargetCondition,
+    precondition: PersistedActionCondition,
+    postcondition: PersistedActionCondition,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     temporary_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     temporary_staged: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     publication_attempted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    temporary: Option<PersistedDirectoryTemporary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    new_resource_id: Option<String>,
     status: PersistedActionStatus,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum PersistedActionCondition {
+    Legacy(PersistedTargetCondition),
+    Directory(PersistedDirectoryCondition),
+}
+
+#[derive(Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(untagged)]
+enum PersistedDirectoryCondition {
+    Single(PersistedDirectoryPredicate),
+    Relocate(PersistedDirectoryRelocateCondition),
+    Final(PersistedDirectoryFinalCondition),
+}
+
+#[derive(Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PersistedDirectoryRelocateCondition {
+    old: PersistedDirectoryPredicate,
+    new: PersistedDirectoryPredicate,
+}
+
+#[derive(Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PersistedDirectoryFinalCondition {
+    target: PersistedDirectoryPredicate,
+    temporary: PersistedDirectoryPredicate,
+}
+
+#[derive(Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PersistedDirectoryTemporary {
+    path: String,
+    predicate: PersistedDirectoryPredicate,
+}
+
+#[derive(Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PersistedDirectoryPredicate {
+    kind: PersistedDirectoryPredicateKind,
+    target_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    link_target: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum PersistedDirectoryPredicateKind {
+    Missing,
+    ExpectedDirectoryLink,
+}
+
 impl PersistedRecordedAction {
+    fn into_directory_action(
+        self,
+        kind: ActionKind,
+        resource_id: FullyQualifiedResourceId,
+    ) -> Result<RecordedAction, StateDecodeError> {
+        if self.target_path.is_some()
+            || self.old_target_path.is_some()
+            || self.source_path.is_some()
+            || self.content_fingerprint.is_some()
+            || self.temporary_path.is_some()
+            || self.temporary_staged.is_some()
+            || self.publication_attempted.is_some()
+        {
+            return Err(StateDecodeError::InvalidTargetCondition);
+        }
+        let PersistedActionCondition::Directory(declared_precondition) = self.precondition else {
+            return Err(StateDecodeError::InvalidTargetCondition);
+        };
+        let PersistedActionCondition::Directory(declared_postcondition) = self.postcondition else {
+            return Err(StateDecodeError::InvalidTargetCondition);
+        };
+        let old_resource_id = self
+            .old_resource_id
+            .map(|value| {
+                FullyQualifiedResourceId::parse(&value)
+                    .map_err(|source| StateDecodeError::InvalidResourceId { value, source })
+            })
+            .transpose()?;
+        let superseded_resource_id = self
+            .superseded_resource_id
+            .map(|value| {
+                FullyQualifiedResourceId::parse(&value)
+                    .map_err(|source| StateDecodeError::InvalidResourceId { value, source })
+            })
+            .transpose()?;
+        let old_effect_resource_id = if kind == ActionKind::ReplaceOwnership {
+            old_resource_id
+                .clone()
+                .ok_or(StateDecodeError::InvalidTargetCondition)?
+        } else {
+            resource_id.clone()
+        };
+        let old_effect = self
+            .old_effect
+            .map(|effect| effect.into_known(old_effect_resource_id.clone()))
+            .transpose()?
+            .map(|effect| match effect {
+                KnownResource::DirectoryLink(value) => Ok(value),
+                _ => Err(StateDecodeError::InvalidTargetCondition),
+            })
+            .transpose()?;
+        let final_effect = self
+            .final_effect
+            .map(|effect| effect.into_known(resource_id.clone()))
+            .transpose()?
+            .map(|effect| match effect {
+                KnownResource::DirectoryLink(value) => Ok(value),
+                _ => Err(StateDecodeError::InvalidTargetCondition),
+            })
+            .transpose()?;
+        let temporary_path = self
+            .temporary
+            .as_ref()
+            .map(|temporary| decode_path(temporary.path.clone()))
+            .transpose()?;
+        if self
+            .new_resource_id
+            .as_deref()
+            .map(FullyQualifiedResourceId::parse)
+            .transpose()
+            .map_err(|source| StateDecodeError::InvalidResourceId {
+                value: self.new_resource_id.clone().unwrap_or_default(),
+                source,
+            })?
+            .as_ref()
+            .is_some_and(|new_resource_id| new_resource_id != &resource_id)
+        {
+            return Err(StateDecodeError::InvalidTargetCondition);
+        }
+        let (precondition, postcondition) = directory_simple_conditions(
+            kind,
+            old_effect.as_ref(),
+            final_effect.as_ref(),
+            temporary_path.as_ref(),
+        )?;
+        let action = RecordedAction::from_persisted_directory_link(
+            kind,
+            resource_id,
+            old_effect,
+            final_effect,
+            match kind {
+                ActionKind::CreateDirectoryLink => superseded_resource_id,
+                ActionKind::ReplaceOwnership => old_resource_id,
+                _ => {
+                    if old_resource_id.is_some() || superseded_resource_id.is_some() {
+                        return Err(StateDecodeError::InvalidTargetCondition);
+                    }
+                    None
+                }
+            },
+            temporary_path,
+            precondition,
+            postcondition,
+            self.status.into_status(),
+        )
+        .map_err(StateDecodeError::InvalidOperation)?;
+        let (expected_precondition, expected_postcondition, expected_temporary) =
+            directory_conditions_for(&action)
+                .map_err(|_| StateDecodeError::InvalidTargetCondition)?;
+        if declared_precondition != expected_precondition
+            || declared_postcondition != expected_postcondition
+            || self.temporary != expected_temporary
+            || (action.kind() == ActionKind::ReplaceOwnership && self.new_resource_id.is_none())
+            || (action.kind() != ActionKind::ReplaceOwnership && self.new_resource_id.is_some())
+        {
+            return Err(StateDecodeError::InvalidTargetCondition);
+        }
+        Ok(action)
+    }
+
+    fn from_directory_action(
+        action: &RecordedAction,
+        kind: PersistedActionKind,
+    ) -> Result<Self, CommitError> {
+        let facts = action.directory_link_facts().expect("checked above");
+        let (precondition, postcondition, temporary) = directory_conditions_for(action)?;
+        let old_effect = facts
+            .old_effect()
+            .map(|effect| PersistedKnownEffect::from_known(&effect.clone().into()))
+            .transpose()?;
+        let final_effect = facts
+            .final_effect()
+            .map(|effect| PersistedKnownEffect::from_known(&effect.clone().into()))
+            .transpose()?;
+        let source_changing_handoff =
+            action.kind() == ActionKind::ReplaceOwnership && facts.temporary_path().is_some();
+        Ok(Self {
+            kind,
+            resource_id: action.resource_id().as_str().to_owned(),
+            old_resource_id: if action.kind() == ActionKind::ReplaceOwnership {
+                facts
+                    .superseded_resource_id()
+                    .map(|id| id.as_str().to_owned())
+            } else {
+                None
+            },
+            superseded_resource_id: if action.kind() == ActionKind::CreateDirectoryLink {
+                facts
+                    .superseded_resource_id()
+                    .map(|id| id.as_str().to_owned())
+            } else {
+                None
+            },
+            old_target_path: None,
+            old_effect,
+            final_effect,
+            target_path: None,
+            source_path: None,
+            content_fingerprint: None,
+            precondition: PersistedActionCondition::Directory(precondition),
+            postcondition: PersistedActionCondition::Directory(postcondition),
+            temporary_path: None,
+            temporary_staged: None,
+            publication_attempted: None,
+            temporary,
+            new_resource_id: source_changing_handoff
+                .then(|| action.resource_id().as_str().to_owned())
+                .or_else(|| {
+                    (action.kind() == ActionKind::ReplaceOwnership)
+                        .then(|| action.resource_id().as_str().to_owned())
+                }),
+            status: PersistedActionStatus::from_status(action.status()),
+        })
+    }
+
     fn from_action(action: &RecordedAction) -> Result<Self, CommitError> {
         let kind = match action.kind() {
             ActionKind::CreateLink => PersistedActionKind::CreateLink,
@@ -366,14 +600,22 @@ impl PersistedRecordedAction {
             ActionKind::RelocateCopy => PersistedActionKind::RelocateCopy,
             ActionKind::RemoveCopy => PersistedActionKind::RemoveCopy,
             ActionKind::ReplaceEffect => PersistedActionKind::ReplaceEffect,
+            ActionKind::CreateDirectoryLink => PersistedActionKind::CreateDirectoryLink,
+            ActionKind::ReplaceDirectoryLink => PersistedActionKind::ReplaceDirectoryLink,
+            ActionKind::RelocateDirectoryLink => PersistedActionKind::RelocateDirectoryLink,
+            ActionKind::RemoveDirectoryLink => PersistedActionKind::RemoveDirectoryLink,
             kind => return Err(CommitError::UnsupportedOperationAction { kind }),
         };
+        if action.directory_link_facts().is_some() {
+            return Self::from_directory_action(action, kind);
+        }
         Ok(Self {
             kind,
             resource_id: action.resource_id().as_str().to_owned(),
             old_resource_id: action
                 .replaced_resource_id()
                 .map(|id| id.as_str().to_owned()),
+            superseded_resource_id: None,
             old_target_path: action
                 .relocation_facts()
                 .map(|facts| encode_path(facts.old_target_path()))
@@ -393,6 +635,17 @@ impl PersistedRecordedAction {
                         })
                         .flatten()
                 })
+                .or_else(|| {
+                    action.directory_link_facts().and_then(|facts| {
+                        (action.kind() == ActionKind::RelocateDirectoryLink)
+                            .then(|| {
+                                facts
+                                    .old_effect()
+                                    .map(|effect| encode_path(effect.target_path()))
+                            })
+                            .flatten()
+                    })
+                })
                 .transpose()?,
             old_effect: action
                 .copy_facts()
@@ -401,6 +654,11 @@ impl PersistedRecordedAction {
                     action
                         .effect_handoff_facts()
                         .map(|facts| facts.old_effect().clone())
+                })
+                .or_else(|| {
+                    action
+                        .directory_link_facts()
+                        .and_then(|facts| facts.old_effect().cloned().map(KnownResource::from))
                 })
                 .map(|effect| PersistedKnownEffect::from_known(&effect))
                 .transpose()?,
@@ -412,8 +670,14 @@ impl PersistedRecordedAction {
                         .effect_handoff_facts()
                         .map(|facts| PersistedKnownEffect::from_known(facts.final_effect()))
                 })
+                .or_else(|| {
+                    action
+                        .directory_link_facts()
+                        .and_then(|facts| facts.final_effect().cloned())
+                        .map(|effect| PersistedKnownEffect::from_known(&effect.into()))
+                })
                 .transpose()?,
-            target_path: encode_path(action.target_path())?,
+            target_path: Some(encode_path(action.target_path())?),
             source_path: action
                 .copy_facts()
                 .map(|facts| encode_path(facts.source_path()))
@@ -431,8 +695,12 @@ impl PersistedRecordedAction {
                         .copy_removal_facts()
                         .map(|facts| facts.content_fingerprint().as_str().to_owned())
                 }),
-            precondition: PersistedTargetCondition::from_condition(&action.precondition())?,
-            postcondition: PersistedTargetCondition::from_condition(&action.postcondition())?,
+            precondition: PersistedActionCondition::Legacy(
+                PersistedTargetCondition::from_condition(&action.precondition())?,
+            ),
+            postcondition: PersistedActionCondition::Legacy(
+                PersistedTargetCondition::from_condition(&action.postcondition())?,
+            ),
             temporary_path: action
                 .replacement_facts()
                 .map(|facts| encode_path(facts.temporary_path()))
@@ -446,9 +714,16 @@ impl PersistedRecordedAction {
                         .effect_handoff_facts()
                         .and_then(|facts| facts.temporary_path().map(encode_path))
                 })
+                .or_else(|| {
+                    action
+                        .directory_link_facts()
+                        .and_then(|facts| facts.temporary_path().map(encode_path))
+                })
                 .transpose()?,
             temporary_staged: action.temporary_staged(),
             publication_attempted: action.publication_attempted(),
+            temporary: None,
+            new_resource_id: None,
             status: PersistedActionStatus::from_status(action.status()),
         })
     }
@@ -456,7 +731,7 @@ impl PersistedRecordedAction {
     fn into_action(self) -> Result<RecordedAction, StateDecodeError> {
         let resource_id = FullyQualifiedResourceId::parse(&self.resource_id).map_err(|source| {
             StateDecodeError::InvalidResourceId {
-                value: self.resource_id,
+                value: self.resource_id.clone(),
                 source,
             }
         })?;
@@ -472,12 +747,42 @@ impl PersistedRecordedAction {
             PersistedActionKind::RelocateCopy => ActionKind::RelocateCopy,
             PersistedActionKind::RemoveCopy => ActionKind::RemoveCopy,
             PersistedActionKind::ReplaceEffect => ActionKind::ReplaceEffect,
+            PersistedActionKind::CreateDirectoryLink => ActionKind::CreateDirectoryLink,
+            PersistedActionKind::ReplaceDirectoryLink => ActionKind::ReplaceDirectoryLink,
+            PersistedActionKind::RelocateDirectoryLink => ActionKind::RelocateDirectoryLink,
+            PersistedActionKind::RemoveDirectoryLink => ActionKind::RemoveDirectoryLink,
         };
-        let target_path = decode_path(self.target_path)?;
+        let is_directory = matches!(
+            kind,
+            ActionKind::CreateDirectoryLink
+                | ActionKind::ReplaceDirectoryLink
+                | ActionKind::RelocateDirectoryLink
+                | ActionKind::RemoveDirectoryLink
+        ) || (kind == ActionKind::ForgetMissing
+            && self.old_effect.as_ref().is_some_and(|effect| {
+                matches!(effect, PersistedKnownEffect::DirectoryLink { .. })
+            }))
+            || (kind == ActionKind::ReplaceOwnership
+                && self.old_effect.as_ref().is_some_and(|effect| {
+                    matches!(effect, PersistedKnownEffect::DirectoryLink { .. })
+                }));
+        if is_directory {
+            return self.into_directory_action(kind, resource_id);
+        }
+        let target_path = decode_path(
+            self.target_path
+                .ok_or(StateDecodeError::InvalidTargetCondition)?,
+        )?;
         let old_target_path = self.old_target_path.map(decode_path).transpose()?;
         let precondition_target = old_target_path.as_ref().unwrap_or(&target_path);
-        let precondition = self.precondition.into_condition(precondition_target)?;
-        let postcondition = self.postcondition.into_condition(&target_path)?;
+        let PersistedActionCondition::Legacy(precondition) = self.precondition else {
+            return Err(StateDecodeError::InvalidTargetCondition);
+        };
+        let PersistedActionCondition::Legacy(postcondition) = self.postcondition else {
+            return Err(StateDecodeError::InvalidTargetCondition);
+        };
+        let precondition = precondition.into_condition(precondition_target)?;
+        let postcondition = postcondition.into_condition(&target_path)?;
         let status = self.status.into_status();
         let old_resource_id = self
             .old_resource_id
@@ -486,6 +791,16 @@ impl PersistedRecordedAction {
                     .map_err(|source| StateDecodeError::InvalidResourceId { value, source })
             })
             .transpose()?;
+        let superseded_resource_id = self
+            .superseded_resource_id
+            .map(|value| {
+                FullyQualifiedResourceId::parse(&value)
+                    .map_err(|source| StateDecodeError::InvalidResourceId { value, source })
+            })
+            .transpose()?;
+        if superseded_resource_id.is_some() {
+            return Err(StateDecodeError::InvalidTargetCondition);
+        }
         if kind == ActionKind::ReplaceEffect {
             let old_effect = self
                 .old_effect
@@ -644,6 +959,152 @@ impl PersistedRecordedAction {
     }
 }
 
+fn directory_conditions_for(
+    action: &RecordedAction,
+) -> Result<
+    (
+        PersistedDirectoryCondition,
+        PersistedDirectoryCondition,
+        Option<PersistedDirectoryTemporary>,
+    ),
+    CommitError,
+> {
+    let facts = action
+        .directory_link_facts()
+        .expect("directory action required");
+    let predicate =
+        |condition: &TargetCondition| -> Result<PersistedDirectoryPredicate, CommitError> {
+            match condition {
+                TargetCondition::Missing { target_path } => Ok(PersistedDirectoryPredicate {
+                    kind: PersistedDirectoryPredicateKind::Missing,
+                    target_path: encode_path(target_path)?,
+                    link_target: None,
+                }),
+                TargetCondition::ExpectedDirectoryLink {
+                    target_path,
+                    link_target,
+                } => Ok(PersistedDirectoryPredicate {
+                    kind: PersistedDirectoryPredicateKind::ExpectedDirectoryLink,
+                    target_path: encode_path(target_path)?,
+                    link_target: Some(encode_path(link_target.as_path())?),
+                }),
+                _ => unreachable!("directory facts only derive directory predicates"),
+            }
+        };
+    let missing = |path: &ResolvedPath| {
+        predicate(&TargetCondition::Missing {
+            target_path: path.clone(),
+        })
+    };
+    let expected = |effect: &KnownDirectoryLink| {
+        predicate(&TargetCondition::ExpectedDirectoryLink {
+            target_path: effect.target_path().clone(),
+            link_target: effect.link_target().clone(),
+        })
+    };
+    let (precondition, postcondition, temporary) = match action.kind() {
+        ActionKind::CreateDirectoryLink => (
+            PersistedDirectoryCondition::Single(predicate(&action.precondition())?),
+            PersistedDirectoryCondition::Single(predicate(&action.postcondition())?),
+            None,
+        ),
+        ActionKind::RemoveDirectoryLink | ActionKind::ForgetMissing => (
+            PersistedDirectoryCondition::Single(predicate(&action.precondition())?),
+            PersistedDirectoryCondition::Single(predicate(&action.postcondition())?),
+            None,
+        ),
+        ActionKind::RelocateDirectoryLink => {
+            let old = facts
+                .old_effect()
+                .expect("validated relocation has old effect");
+            let final_effect = facts
+                .final_effect()
+                .expect("validated relocation has final effect");
+            (
+                PersistedDirectoryCondition::Relocate(PersistedDirectoryRelocateCondition {
+                    old: expected(old)?,
+                    new: missing(final_effect.target_path())?,
+                }),
+                PersistedDirectoryCondition::Relocate(PersistedDirectoryRelocateCondition {
+                    old: missing(old.target_path())?,
+                    new: expected(final_effect)?,
+                }),
+                None,
+            )
+        }
+        ActionKind::ReplaceDirectoryLink | ActionKind::ReplaceOwnership => {
+            let old = facts
+                .old_effect()
+                .expect("validated replacement has old effect");
+            let final_effect = facts
+                .final_effect()
+                .expect("validated replacement has final effect");
+            if let Some(path) = facts.temporary_path() {
+                let temporary_expected = predicate(&TargetCondition::ExpectedDirectoryLink {
+                    target_path: path.clone(),
+                    link_target: final_effect.link_target().clone(),
+                })?;
+                (
+                    PersistedDirectoryCondition::Single(expected(old)?),
+                    PersistedDirectoryCondition::Final(PersistedDirectoryFinalCondition {
+                        target: expected(final_effect)?,
+                        temporary: missing(path)?,
+                    }),
+                    Some(PersistedDirectoryTemporary {
+                        path: encode_path(path)?,
+                        predicate: temporary_expected,
+                    }),
+                )
+            } else {
+                (
+                    PersistedDirectoryCondition::Single(expected(old)?),
+                    PersistedDirectoryCondition::Single(expected(final_effect)?),
+                    None,
+                )
+            }
+        }
+        _ => unreachable!("validated directory facts have a directory action kind"),
+    };
+    Ok((precondition, postcondition, temporary))
+}
+
+fn directory_simple_conditions(
+    kind: ActionKind,
+    old_effect: Option<&KnownDirectoryLink>,
+    final_effect: Option<&KnownDirectoryLink>,
+    _temporary_path: Option<&ResolvedPath>,
+) -> Result<(TargetCondition, TargetCondition), StateDecodeError> {
+    let expected = |effect: &KnownDirectoryLink| TargetCondition::ExpectedDirectoryLink {
+        target_path: effect.target_path().clone(),
+        link_target: effect.link_target().clone(),
+    };
+    let missing = |path: &ResolvedPath| TargetCondition::Missing {
+        target_path: path.clone(),
+    };
+    match kind {
+        ActionKind::CreateDirectoryLink => {
+            let effect = final_effect.ok_or(StateDecodeError::InvalidTargetCondition)?;
+            Ok((missing(effect.target_path()), expected(effect)))
+        }
+        ActionKind::RemoveDirectoryLink => {
+            let effect = old_effect.ok_or(StateDecodeError::InvalidTargetCondition)?;
+            Ok((expected(effect), missing(effect.target_path())))
+        }
+        ActionKind::ForgetMissing => {
+            let effect = old_effect.ok_or(StateDecodeError::InvalidTargetCondition)?;
+            Ok((missing(effect.target_path()), missing(effect.target_path())))
+        }
+        ActionKind::RelocateDirectoryLink
+        | ActionKind::ReplaceDirectoryLink
+        | ActionKind::ReplaceOwnership => {
+            let old = old_effect.ok_or(StateDecodeError::InvalidTargetCondition)?;
+            let final_effect = final_effect.ok_or(StateDecodeError::InvalidTargetCondition)?;
+            Ok((expected(old), expected(final_effect)))
+        }
+        _ => Err(StateDecodeError::InvalidTargetCondition),
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum PersistedActionKind {
@@ -658,6 +1119,10 @@ enum PersistedActionKind {
     RelocateCopy,
     RemoveCopy,
     ReplaceEffect,
+    CreateDirectoryLink,
+    ReplaceDirectoryLink,
+    RelocateDirectoryLink,
+    RemoveDirectoryLink,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -726,6 +1191,11 @@ impl PersistedTargetCondition {
                 link_target: None,
                 content_fingerprint: Some(content_fingerprint.as_str().to_owned()),
             }),
+            TargetCondition::ExpectedDirectoryLink { link_target, .. } => Ok(Self {
+                target: PersistedTargetKind::ExpectedDirectoryLink,
+                link_target: Some(encode_path(link_target.as_path())?),
+                content_fingerprint: None,
+            }),
         }
     }
 
@@ -757,6 +1227,15 @@ impl PersistedTargetCondition {
             (PersistedTargetKind::ExpectedCopy, _, _) => {
                 Err(StateDecodeError::InvalidTargetCondition)
             }
+            (PersistedTargetKind::ExpectedDirectoryLink, Some(link_target), None) => {
+                Ok(TargetCondition::ExpectedDirectoryLink {
+                    target_path: target_path.clone(),
+                    link_target: LinkTarget::new(decode_path(link_target)?),
+                })
+            }
+            (PersistedTargetKind::ExpectedDirectoryLink, _, _) => {
+                Err(StateDecodeError::InvalidTargetCondition)
+            }
         }
     }
 }
@@ -767,6 +1246,7 @@ enum PersistedTargetKind {
     Missing,
     ExpectedLink,
     ExpectedCopy,
+    ExpectedDirectoryLink,
 }
 
 fn definition_hash_for_known(
@@ -990,6 +1470,208 @@ impl std::error::Error for StateDecodeError {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    #[test]
+    fn directory_replacement_round_trips_its_temporary_and_exact_predicates() {
+        let root = std::env::temp_dir().join("loadout-directory-replacement-codec");
+        let old_source = root.join("store/old");
+        let new_source = root.join("store/new");
+        let target = root.join("home/.config/nvim");
+        let temporary = root.join("home/.config/.nvim.loadout-tmp");
+        let old = ResolvedDirectoryLink::new(
+            FullyQualifiedResourceId::parse("base/nvim").unwrap(),
+            ResolvedPath::new(old_source.clone()).unwrap(),
+            ResolvedPath::new(target.clone()).unwrap(),
+        )
+        .unwrap();
+        let document = json!({
+            "schema_version": 3,
+            "resources": { "base/nvim": { "definition_hash": directory_link_definition_hash(&old).unwrap().as_str(), "effect": { "kind": "directory_link", "source_path": old_source, "target_path": target, "link_target": old.source_path().as_ref() } } },
+            "active_operation": { "id": "op-directory", "desired_hash": format!("sha256:{}", "a".repeat(64)), "actions": { "a1": {
+                "kind": "replace_directory_link", "resource_id": "base/nvim",
+                "old_effect": { "kind": "directory_link", "source_path": old.source_path().as_ref(), "target_path": old.target_path().as_ref(), "link_target": old.source_path().as_ref() },
+                "final_effect": { "kind": "directory_link", "source_path": new_source, "target_path": old.target_path().as_ref(), "link_target": root.join("store/new") },
+                "precondition": { "kind": "expected_directory_link", "target_path": old.target_path().as_ref(), "link_target": old.source_path().as_ref() },
+                "postcondition": {
+                    "target": { "kind": "expected_directory_link", "target_path": old.target_path().as_ref(), "link_target": root.join("store/new") },
+                    "temporary": { "kind": "missing", "target_path": temporary }
+                },
+                "temporary": { "path": root.join("home/.config/.nvim.loadout-tmp"), "predicate": { "kind": "expected_directory_link", "target_path": root.join("home/.config/.nvim.loadout-tmp"), "link_target": root.join("store/new") } },
+                "status": "running"
+            } } }
+        });
+        let decoded: StateDocument = serde_json::from_value(document).unwrap();
+        let state = decoded.into_state().unwrap();
+        let mut encoded = serde_json::to_value(StateDocument::from_state(&state).unwrap()).unwrap();
+        assert_eq!(
+            encoded["active_operation"]["actions"]["a1"]["temporary"]["path"],
+            root.join("home/.config/.nvim.loadout-tmp")
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(
+            encoded["active_operation"]["actions"]["a1"]["precondition"]["kind"],
+            "expected_directory_link"
+        );
+        let mut extra_postcondition_field = encoded.clone();
+        extra_postcondition_field["active_operation"]["actions"]["a1"]["postcondition"]["unexpected"] =
+            json!(true);
+        assert!(serde_json::from_value::<StateDocument>(extra_postcondition_field).is_err());
+        encoded["active_operation"]["actions"]["a1"]["temporary"]["predicate"]["link_target"] =
+            json!(root.join("store/unexpected"));
+        let corrupt: StateDocument = serde_json::from_value(encoded).unwrap();
+        assert!(matches!(
+            corrupt.into_state(),
+            Err(StateDecodeError::InvalidTargetCondition)
+        ));
+    }
+
+    #[test]
+    fn directory_relocation_uses_only_the_exact_old_new_predicate_objects() {
+        let root = std::env::temp_dir().join("loadout-directory-relocation-codec");
+        let old = KnownDirectoryLink::from_resolved(
+            &ResolvedDirectoryLink::new(
+                FullyQualifiedResourceId::parse("base/nvim").unwrap(),
+                ResolvedPath::new(root.join("store/nvim")).unwrap(),
+                ResolvedPath::new(root.join("home/.config/nvim")).unwrap(),
+            )
+            .unwrap(),
+        );
+        let final_effect = KnownDirectoryLink::from_resolved(
+            &ResolvedDirectoryLink::new(
+                FullyQualifiedResourceId::parse("base/nvim").unwrap(),
+                ResolvedPath::new(root.join("store/nvim")).unwrap(),
+                ResolvedPath::new(root.join("home/.config/nvim-next")).unwrap(),
+            )
+            .unwrap(),
+        );
+        let action = RecordedAction::from_persisted_directory_link(
+            ActionKind::RelocateDirectoryLink,
+            old.resource_id().clone(),
+            Some(old.clone()),
+            Some(final_effect.clone()),
+            None,
+            None,
+            TargetCondition::ExpectedDirectoryLink {
+                target_path: old.target_path().clone(),
+                link_target: old.link_target().clone(),
+            },
+            TargetCondition::ExpectedDirectoryLink {
+                target_path: final_effect.target_path().clone(),
+                link_target: final_effect.link_target().clone(),
+            },
+            ActionStatus::Pending,
+        )
+        .unwrap();
+        let operation = OperationRecord::from_actions(
+            OperationId::parse("directory-relocation").unwrap(),
+            DesiredHash::parse(format!("sha256:{}", "a".repeat(64))).unwrap(),
+            [(ActionId::parse("a1").unwrap(), action)],
+        )
+        .unwrap();
+        let state =
+            PersistedState::from_parts(KnownState::new([old]).unwrap(), Some(operation)).unwrap();
+        let encoded = serde_json::to_value(StateDocument::from_state(&state).unwrap()).unwrap();
+        let action = &encoded["active_operation"]["actions"]["a1"];
+        assert!(action.get("target_path").is_none());
+        assert!(action.get("directory_predicates").is_none());
+        assert_eq!(action["precondition"].as_object().unwrap().len(), 2);
+        assert_eq!(
+            action["precondition"]["old"]["kind"],
+            "expected_directory_link"
+        );
+        assert_eq!(action["precondition"]["new"]["kind"], "missing");
+        assert_eq!(action["postcondition"]["old"]["kind"], "missing");
+        assert_eq!(
+            action["postcondition"]["new"]["kind"],
+            "expected_directory_link"
+        );
+        let mut corrupt = encoded;
+        corrupt["active_operation"]["actions"]["a1"]["precondition"]["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<StateDocument>(corrupt).is_err());
+    }
+
+    #[test]
+    fn directory_ownership_handoffs_restore_the_old_effect_under_its_old_identity() {
+        let root = std::env::temp_dir().join("loadout-directory-handoff-codec");
+        for (name, old_source, final_source, temporary) in [
+            ("same", "store/nvim", "store/nvim", None),
+            (
+                "changed",
+                "store/nvim-old",
+                "store/nvim-new",
+                Some("home/.config/.nvim.loadout-tmp"),
+            ),
+        ] {
+            let target = ResolvedPath::new(root.join("home/.config/nvim")).unwrap();
+            let old = KnownDirectoryLink::from_resolved(
+                &ResolvedDirectoryLink::new(
+                    FullyQualifiedResourceId::parse("base/nvim-old").unwrap(),
+                    ResolvedPath::new(root.join(old_source)).unwrap(),
+                    target.clone(),
+                )
+                .unwrap(),
+            );
+            let final_effect = KnownDirectoryLink::from_resolved(
+                &ResolvedDirectoryLink::new(
+                    FullyQualifiedResourceId::parse("base/nvim-new").unwrap(),
+                    ResolvedPath::new(root.join(final_source)).unwrap(),
+                    target,
+                )
+                .unwrap(),
+            );
+            let action = RecordedAction::from_persisted_directory_link(
+                ActionKind::ReplaceOwnership,
+                final_effect.resource_id().clone(),
+                Some(old.clone()),
+                Some(final_effect.clone()),
+                Some(old.resource_id().clone()),
+                temporary.map(|path| ResolvedPath::new(root.join(path)).unwrap()),
+                TargetCondition::ExpectedDirectoryLink {
+                    target_path: old.target_path().clone(),
+                    link_target: old.link_target().clone(),
+                },
+                TargetCondition::ExpectedDirectoryLink {
+                    target_path: final_effect.target_path().clone(),
+                    link_target: final_effect.link_target().clone(),
+                },
+                ActionStatus::Running,
+            )
+            .unwrap();
+            let operation = OperationRecord::from_actions(
+                OperationId::parse(format!("directory-handoff-{name}")).unwrap(),
+                DesiredHash::parse(format!("sha256:{}", "a".repeat(64))).unwrap(),
+                [(ActionId::parse("a1").unwrap(), action)],
+            )
+            .unwrap();
+            let state = PersistedState::from_parts(
+                KnownState::new([old.clone()]).unwrap(),
+                Some(operation),
+            )
+            .unwrap();
+            let decoded = StateDocument::from_state(&state)
+                .unwrap()
+                .into_state()
+                .unwrap();
+            let facts = decoded
+                .active_operation()
+                .unwrap()
+                .action(&ActionId::parse("a1").unwrap())
+                .unwrap()
+                .directory_link_facts()
+                .unwrap();
+            assert_eq!(
+                facts.old_effect().unwrap().resource_id(),
+                old.resource_id(),
+                "{name}"
+            );
+            assert_eq!(
+                facts.final_effect().unwrap().resource_id(),
+                final_effect.resource_id(),
+                "{name}"
+            );
+        }
+    }
 
     // Construct the existing wire format directly, independently of the DTO encoder.
     // Paths are platform-local values only; these tests never access the filesystem.

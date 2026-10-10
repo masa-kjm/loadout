@@ -142,7 +142,11 @@ pub(super) fn preflight(
             | ActionKind::ReplaceCopy
             | ActionKind::RelocateCopy
             | ActionKind::RemoveCopy
-            | ActionKind::ReplaceEffect => {
+            | ActionKind::ReplaceEffect
+            | ActionKind::CreateDirectoryLink
+            | ActionKind::ReplaceDirectoryLink
+            | ActionKind::RelocateDirectoryLink
+            | ActionKind::RemoveDirectoryLink => {
                 Err(ApplyError::CopyPreflight(CopyPreflightError::WrongAction))
             }
         },

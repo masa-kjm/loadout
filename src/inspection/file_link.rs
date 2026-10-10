@@ -220,6 +220,20 @@ impl FileLinkInspector {
         )
     }
 
+    pub(crate) fn inspect_target_for_expected_directory_link(
+        &self,
+        target_path: &ResolvedPath,
+        expected_link_target: &LinkTarget,
+    ) -> Result<ActualDirectoryLink, TargetInspectionError> {
+        self.inspect_directory_target(
+            target_path.clone(),
+            TargetExpectations {
+                desired_link_target: None,
+                known_link_target: Some(expected_link_target.clone()),
+            },
+        )
+    }
+
     /// Rechecks one target as a regular file owned by an expected byte fingerprint.
     pub(crate) fn inspect_target_for_expected_copy(
         &self,

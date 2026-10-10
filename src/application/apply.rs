@@ -1434,7 +1434,13 @@ where
                     })
                 {
                     // Cleanup is permitted only after the old effect or a missing final target is proven; a final or unprovable effect retains its temporary and remains uncertain.
-                    let cleaned = if action.replacement_facts().is_some() {
+                    let cleaned = if action.directory_link_facts().is_some() {
+                        cleanup_executor().is_some_and(|executor| {
+                            executor
+                                .cleanup_recorded_directory_link_temporary(&action)
+                                .is_ok()
+                        })
+                    } else if action.replacement_facts().is_some() {
                         cleanup_executor().is_some_and(|executor| {
                             executor
                                 .cleanup_recorded_replacement_temporary(&action)
@@ -1536,7 +1542,7 @@ fn recovery_decision(
         .unwrap_or(true);
     if matches!(
         action.kind(),
-        ActionKind::CreateLink | ActionKind::CreateCopy
+        ActionKind::CreateLink | ActionKind::CreateCopy | ActionKind::CreateDirectoryLink
     ) {
         // A matching effect does not prove that this create created it.
         if condition_holds(inspector, &action.precondition())? && temporary_missing {
@@ -1576,6 +1582,49 @@ fn recovery_decision(
             inspector,
             &TargetCondition::Missing {
                 target_path: facts.new_target_path().clone(),
+            },
+        )?;
+        return Ok(if old_expected && new_missing && temporary_missing {
+            RecoveryDecision::Failed
+        } else {
+            RecoveryDecision::Uncertain
+        });
+    }
+
+    if action.kind() == ActionKind::RelocateDirectoryLink {
+        let Some(facts) = action.directory_link_facts() else {
+            return Ok(RecoveryDecision::Uncertain);
+        };
+        let (Some(old), Some(final_effect)) = (facts.old_effect(), facts.final_effect()) else {
+            return Ok(RecoveryDecision::Uncertain);
+        };
+        let old_missing = condition_holds(
+            inspector,
+            &TargetCondition::Missing {
+                target_path: old.target_path().clone(),
+            },
+        )?;
+        let new_expected = condition_holds(
+            inspector,
+            &TargetCondition::ExpectedDirectoryLink {
+                target_path: final_effect.target_path().clone(),
+                link_target: final_effect.link_target().clone(),
+            },
+        )?;
+        if old_missing && new_expected && temporary_missing {
+            return Ok(RecoveryDecision::Succeeded);
+        }
+        let old_expected = condition_holds(
+            inspector,
+            &TargetCondition::ExpectedDirectoryLink {
+                target_path: old.target_path().clone(),
+                link_target: old.link_target().clone(),
+            },
+        )?;
+        let new_missing = condition_holds(
+            inspector,
+            &TargetCondition::Missing {
+                target_path: final_effect.target_path().clone(),
             },
         )?;
         return Ok(if old_expected && new_missing && temporary_missing {
@@ -1743,6 +1792,15 @@ fn safely_observed_different(
                 | TargetObservation::OtherLink { .. }
                 | TargetObservation::OtherEntry { .. }
         )),
+        TargetCondition::ExpectedDirectoryLink {
+            target_path,
+            link_target,
+        } => Ok(matches!(
+            inspector
+                .inspect_target_for_expected_directory_link(target_path, link_target)?
+                .observation(),
+            TargetObservation::ExpectedLink { .. }
+        )),
         TargetCondition::Missing { .. } => Ok(false),
     }
 }
@@ -1761,11 +1819,23 @@ fn condition_holds(
                 .observation(),
             crate::domain::actual::CopyTargetObservation::ExpectedCopy { .. }
         )),
+        TargetCondition::ExpectedDirectoryLink {
+            target_path,
+            link_target,
+        } => Ok(matches!(
+            inspector
+                .inspect_target_for_expected_directory_link(target_path, link_target)?
+                .observation(),
+            TargetObservation::ExpectedLink { .. }
+        )),
         TargetCondition::ExpectedLink { .. } | TargetCondition::Missing { .. } => {
             let expected = match condition {
                 TargetCondition::ExpectedLink { link_target, .. } => link_target.clone(),
                 TargetCondition::Missing { target_path } => LinkTarget::new(target_path.clone()),
                 TargetCondition::ExpectedCopy { .. } => unreachable!("copy handled above"),
+                TargetCondition::ExpectedDirectoryLink { .. } => {
+                    unreachable!("directory link handled above")
+                }
             };
             let actual =
                 inspector.inspect_target_for_expected_link(condition.target_path(), &expected)?;
@@ -1777,6 +1847,9 @@ fn condition_holds(
                     matches!(actual.observation(), TargetObservation::Missing)
                 }
                 TargetCondition::ExpectedCopy { .. } => unreachable!("copy handled above"),
+                TargetCondition::ExpectedDirectoryLink { .. } => {
+                    unreachable!("directory link handled above")
+                }
             })
         }
     }
@@ -1799,18 +1872,252 @@ mod tests {
     use crate::domain::desired::{ResolvedDesired, ResolvedResource};
     use crate::domain::file_copy::{ContentFingerprint, ResolvedFileCopy};
     use crate::domain::file_link::ResolvedFileLink;
-    use crate::domain::hashes::desired_hash;
+    use crate::domain::hashes::{DesiredHash, desired_hash};
     use crate::domain::ids::ProfileId;
-    use crate::domain::known::{KnownFileCopy, KnownResource};
+    use crate::domain::known::{KnownDirectoryLink, KnownFileCopy, KnownResource, KnownState};
     use crate::domain::paths::SourceRelativePath;
     use crate::domain::plan::{PlannedEffectHandoff, PlannedFileCopyAction};
     use crate::inspection::source::{VerifiedSource, resolve_store_root, verify_regular_source};
     use crate::resolver::{ResolverContext, resolve_for_apply};
-    use crate::state::operation::ActionStatus;
-    use crate::state::repository::{CommitError, CommitStage};
+    use crate::state::operation::{
+        ActionId, ActionStatus, OperationId, OperationRecord, RecordedAction,
+    };
+    use crate::state::repository::{CommitError, CommitStage, StateRepository};
     use sha2::{Digest, Sha256};
 
     static NEXT_WORKSPACE_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_relocation_with_both_old_and_new_entries_is_uncertain() {
+        use std::os::unix::fs::symlink;
+        let workspace = TestWorkspace::new();
+        fs::create_dir_all(workspace.path("store/old")).unwrap();
+        fs::create_dir_all(workspace.path("store/new")).unwrap();
+        let old = KnownDirectoryLink::new(
+            FullyQualifiedResourceId::parse("base/nvim").unwrap(),
+            ResolvedPath::new(workspace.path("store/old")).unwrap(),
+            ResolvedPath::new(workspace.path("home/old")).unwrap(),
+            LinkTarget::new(ResolvedPath::new(workspace.path("store/old")).unwrap()),
+        )
+        .unwrap();
+        let new = KnownDirectoryLink::new(
+            old.resource_id().clone(),
+            ResolvedPath::new(workspace.path("store/new")).unwrap(),
+            ResolvedPath::new(workspace.path("home/new")).unwrap(),
+            LinkTarget::new(ResolvedPath::new(workspace.path("store/new")).unwrap()),
+        )
+        .unwrap();
+        symlink(old.link_target().as_path(), old.target_path().as_ref()).unwrap();
+        symlink(new.link_target().as_path(), new.target_path().as_ref()).unwrap();
+        let action = RecordedAction::from_persisted_directory_link(
+            ActionKind::RelocateDirectoryLink,
+            old.resource_id().clone(),
+            Some(old.clone()),
+            Some(new),
+            None,
+            None,
+            TargetCondition::ExpectedDirectoryLink {
+                target_path: old.target_path().clone(),
+                link_target: old.link_target().clone(),
+            },
+            TargetCondition::ExpectedDirectoryLink {
+                target_path: ResolvedPath::new(workspace.path("home/new")).unwrap(),
+                link_target: LinkTarget::new(
+                    ResolvedPath::new(workspace.path("store/new")).unwrap(),
+                ),
+            },
+            ActionStatus::Running,
+        )
+        .unwrap();
+        let inspector = FileLinkInspector::new(workspace.path("home").as_path()).unwrap();
+        assert_eq!(
+            recovery_decision(&inspector, &action).unwrap(),
+            RecoveryDecision::Uncertain
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_ownership_handoff_recovery_succeeds_for_same_and_changed_sources() {
+        use std::os::unix::fs::symlink;
+        for (name, old_source, final_source, temporary) in [
+            ("same", "store/nvim", "store/nvim", None),
+            (
+                "changed",
+                "store/nvim-old",
+                "store/nvim-new",
+                Some("home/.config/.nvim.loadout-tmp"),
+            ),
+        ] {
+            let workspace = TestWorkspace::new();
+            fs::create_dir_all(workspace.path(old_source)).unwrap();
+            fs::create_dir_all(workspace.path(final_source)).unwrap();
+            fs::create_dir_all(workspace.path("home/.config")).unwrap();
+            let target = ResolvedPath::new(workspace.path("home/.config/nvim")).unwrap();
+            let old = KnownDirectoryLink::new(
+                FullyQualifiedResourceId::parse("base/nvim-old").unwrap(),
+                ResolvedPath::new(workspace.path(old_source)).unwrap(),
+                target.clone(),
+                LinkTarget::new(ResolvedPath::new(workspace.path(old_source)).unwrap()),
+            )
+            .unwrap();
+            let final_effect = KnownDirectoryLink::new(
+                FullyQualifiedResourceId::parse("base/nvim-new").unwrap(),
+                ResolvedPath::new(workspace.path(final_source)).unwrap(),
+                target.clone(),
+                LinkTarget::new(ResolvedPath::new(workspace.path(final_source)).unwrap()),
+            )
+            .unwrap();
+            symlink(final_effect.link_target().as_path(), target.as_ref()).unwrap();
+            let action = RecordedAction::from_persisted_directory_link(
+                ActionKind::ReplaceOwnership,
+                final_effect.resource_id().clone(),
+                Some(old.clone()),
+                Some(final_effect.clone()),
+                Some(old.resource_id().clone()),
+                temporary.map(|path| ResolvedPath::new(workspace.path(path)).unwrap()),
+                TargetCondition::ExpectedDirectoryLink {
+                    target_path: old.target_path().clone(),
+                    link_target: old.link_target().clone(),
+                },
+                TargetCondition::ExpectedDirectoryLink {
+                    target_path: final_effect.target_path().clone(),
+                    link_target: final_effect.link_target().clone(),
+                },
+                ActionStatus::Running,
+            )
+            .unwrap();
+            let inspector = FileLinkInspector::new(workspace.path("home").as_path()).unwrap();
+            assert_eq!(
+                recovery_decision(&inspector, &action).unwrap(),
+                RecoveryDecision::Succeeded,
+                "{name}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_replacement_cleanup_failure_aftermaths_retain_the_record_and_old_known() {
+        use std::os::unix::fs::symlink;
+        for aftermath in ["unexpected", "unsafe", "unremovable", "unavailable"] {
+            let workspace = TestWorkspace::new();
+            fs::create_dir_all(workspace.path("store/old")).unwrap();
+            fs::create_dir_all(workspace.path("store/new")).unwrap();
+            fs::create_dir_all(workspace.path("store/other")).unwrap();
+            fs::create_dir_all(workspace.path("home/.config")).unwrap();
+            let target = ResolvedPath::new(workspace.path("home/.config/nvim")).unwrap();
+            let temporary =
+                ResolvedPath::new(workspace.path("home/.config/.nvim.loadout-tmp")).unwrap();
+            let old = KnownDirectoryLink::new(
+                FullyQualifiedResourceId::parse("base/nvim").unwrap(),
+                ResolvedPath::new(workspace.path("store/old")).unwrap(),
+                target.clone(),
+                LinkTarget::new(ResolvedPath::new(workspace.path("store/old")).unwrap()),
+            )
+            .unwrap();
+            let final_effect = KnownDirectoryLink::new(
+                old.resource_id().clone(),
+                ResolvedPath::new(workspace.path("store/new")).unwrap(),
+                target.clone(),
+                LinkTarget::new(ResolvedPath::new(workspace.path("store/new")).unwrap()),
+            )
+            .unwrap();
+            symlink(old.link_target().as_path(), target.as_ref()).unwrap();
+            match aftermath {
+                "unexpected" => symlink(workspace.path("store/other"), temporary.as_ref()).unwrap(),
+                "unremovable" => symlink(workspace.path("store/new"), temporary.as_ref()).unwrap(),
+                "unsafe" => {
+                    fs::remove_file(target.as_ref()).unwrap();
+                    fs::remove_dir(workspace.path("home/.config")).unwrap();
+                    symlink(
+                        workspace.path("store/other"),
+                        workspace.path("home/.config"),
+                    )
+                    .unwrap();
+                }
+                "unavailable" => fs::remove_dir_all(workspace.path("home")).unwrap(),
+                _ => unreachable!(),
+            }
+            let action = RecordedAction::from_persisted_directory_link(
+                ActionKind::ReplaceDirectoryLink,
+                old.resource_id().clone(),
+                Some(old.clone()),
+                Some(final_effect),
+                None,
+                Some(temporary.clone()),
+                TargetCondition::ExpectedDirectoryLink {
+                    target_path: old.target_path().clone(),
+                    link_target: old.link_target().clone(),
+                },
+                TargetCondition::ExpectedDirectoryLink {
+                    target_path: target.clone(),
+                    link_target: LinkTarget::new(
+                        ResolvedPath::new(workspace.path("store/new")).unwrap(),
+                    ),
+                },
+                ActionStatus::Running,
+            )
+            .unwrap();
+            let action_id = ActionId::parse("a1").unwrap();
+            let operation = OperationRecord::from_actions(
+                OperationId::parse(format!("directory-cleanup-{aftermath}")).unwrap(),
+                DesiredHash::parse(format!("sha256:{}", "a".repeat(64))).unwrap(),
+                [(action_id.clone(), action)],
+            )
+            .unwrap();
+            let repository =
+                StateRepository::new(ResolvedPath::new(workspace.path("state")).unwrap());
+            let mut locked = repository.acquire_exclusive().unwrap();
+            locked
+                .install_state_for_test(KnownState::new([old.clone()]).unwrap(), operation)
+                .unwrap();
+            let retained = if aftermath == "unremovable" {
+                reconcile_active_operation_with_action_and_cleanup(
+                    &mut locked,
+                    workspace.path("home").as_path(),
+                    &mut None,
+                    || {
+                        FileLinkExecutor::new(workspace.path("home").as_path())
+                            .ok()
+                            .map(FileLinkExecutor::with_forced_capability_success_for_test)
+                            .map(FileLinkExecutor::with_forced_directory_temporary_cleanup_failure_for_test)
+                    },
+                )
+            } else {
+                reconcile_active_operation_with_retained_token_capability_for_test(
+                    &mut locked,
+                    workspace.path("home").as_path(),
+                )
+            };
+            assert!(retained.unwrap(), "{aftermath}");
+            let recorded = locked
+                .state()
+                .active_operation()
+                .unwrap()
+                .action(&action_id)
+                .unwrap();
+            assert_eq!(recorded.status(), ActionStatus::Uncertain, "{aftermath}");
+            assert_eq!(recorded.temporary_path(), Some(&temporary), "{aftermath}");
+            if aftermath == "unremovable" {
+                assert!(
+                    fs::symlink_metadata(temporary.as_ref())
+                        .unwrap()
+                        .is_symlink()
+                );
+                assert_eq!(
+                    fs::read_link(temporary.as_ref()).unwrap(),
+                    workspace.path("store/new")
+                );
+            }
+            assert_eq!(
+                locked.state().known().get_variant(old.resource_id()),
+                Some(&KnownResource::DirectoryLink(old)),
+                "{aftermath}"
+            );
+        }
+    }
 
     struct TestWorkspace {
         root: PathBuf,

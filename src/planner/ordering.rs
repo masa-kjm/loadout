@@ -26,16 +26,22 @@ impl ActionPhase {
     fn for_kind(kind: ActionKind) -> Self {
         match kind {
             ActionKind::Noop => Self::Noop,
-            ActionKind::CreateLink | ActionKind::CreateCopy => Self::Create,
+            ActionKind::CreateLink | ActionKind::CreateCopy | ActionKind::CreateDirectoryLink => {
+                Self::Create
+            }
             ActionKind::ReplaceLink
             | ActionKind::ReplaceOwnership
             | ActionKind::RelocateLink
             | ActionKind::ReplaceCopy
             | ActionKind::ReplaceEffect
             | ActionKind::RelocateCopy => Self::ReplaceOrRelocate,
-            ActionKind::RemoveLink | ActionKind::ForgetMissing | ActionKind::RemoveCopy => {
-                Self::RemoveOrForget
+            ActionKind::ReplaceDirectoryLink | ActionKind::RelocateDirectoryLink => {
+                Self::ReplaceOrRelocate
             }
+            ActionKind::RemoveLink
+            | ActionKind::ForgetMissing
+            | ActionKind::RemoveCopy
+            | ActionKind::RemoveDirectoryLink => Self::RemoveOrForget,
         }
     }
 }

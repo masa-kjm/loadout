@@ -190,6 +190,21 @@ impl LockedStateRepository {
         &self.state
     }
 
+    #[cfg(test)]
+    pub(crate) fn install_state_for_test(
+        &mut self,
+        known: KnownState,
+        operation: OperationRecord,
+    ) -> Result<(), StateRepositoryError> {
+        let state = PersistedState::from_parts(known, Some(operation)).map_err(|source| {
+            StateRepositoryError::InvalidState {
+                path: self.repository.state_file_path(),
+                source,
+            }
+        })?;
+        self.commit_candidate(state)
+    }
+
     pub(crate) fn operation_outcome(&self) -> OperationOutcome {
         match (&self.state.active_operation, &self.last_closed_operation) {
             (Some(operation), _) => OperationOutcome::Retained(operation.clone()),
@@ -563,6 +578,28 @@ impl LockedStateRepository {
                 .known
                 .with_replaced_identity(&old_resource, new_resource)
                 .map_err(StateRepositoryError::KnownState)?,
+            RecordedKnownStateUpdate::UpsertDirectoryLink(known) => candidate
+                .known
+                .with_upserted_directory_link(known)
+                .map_err(StateRepositoryError::KnownState)?,
+            RecordedKnownStateUpdate::RemoveExpectedDirectoryLink(known) => candidate
+                .known
+                .with_removed_directory_link(&known)
+                .map_err(StateRepositoryError::KnownState)?,
+            RecordedKnownStateUpdate::ReplaceDirectoryIdentity {
+                old_resource,
+                new_resource,
+            } => candidate
+                .known
+                .with_replaced_directory_identity(&old_resource, new_resource)
+                .map_err(StateRepositoryError::KnownState)?,
+            RecordedKnownStateUpdate::ReplaceDirectoryIdentityById {
+                old_resource_id,
+                new_resource,
+            } => candidate
+                .known
+                .with_directory_identity_replaced_by_id(&old_resource_id, new_resource)
+                .map_err(StateRepositoryError::KnownState)?,
         };
         self.commit_candidate(candidate)
     }
@@ -822,6 +859,35 @@ fn validate_succeeded_actions(
                 known.get(old_resource.resource_id()).is_none()
                     && known.get(new_resource.resource_id()) == Some(&new_resource)
             }
+            RecordedKnownStateUpdate::UpsertDirectoryLink(expected) => {
+                known.get_variant(expected.resource_id())
+                    == Some(&crate::domain::known::KnownResource::DirectoryLink(
+                        expected,
+                    ))
+            }
+            RecordedKnownStateUpdate::RemoveExpectedDirectoryLink(expected) => {
+                known.get_variant(expected.resource_id()).is_none()
+            }
+            RecordedKnownStateUpdate::ReplaceDirectoryIdentity {
+                old_resource,
+                new_resource,
+            } => {
+                known.get_variant(old_resource.resource_id()).is_none()
+                    && known.get_variant(new_resource.resource_id())
+                        == Some(&crate::domain::known::KnownResource::DirectoryLink(
+                            new_resource,
+                        ))
+            }
+            RecordedKnownStateUpdate::ReplaceDirectoryIdentityById {
+                old_resource_id,
+                new_resource,
+            } => {
+                known.get_variant(&old_resource_id).is_none()
+                    && known.get_variant(new_resource.resource_id())
+                        == Some(&crate::domain::known::KnownResource::DirectoryLink(
+                            new_resource,
+                        ))
+            }
         };
         if !matches {
             return Err(StateDecodeError::SucceededActionKnownMismatch {
@@ -905,6 +971,14 @@ fn validate_unfinished_stale_action_known_state(
                     known.get(old_resource.resource_id()) == Some(&old_resource)
                         && known.get(new_resource.resource_id()).is_none()
                 }
+                RecordedKnownStateUpdate::ReplaceDirectoryIdentity {
+                    old_resource,
+                    new_resource,
+                } => {
+                    known.get_variant(old_resource.resource_id())
+                        == Some(&crate::domain::known::KnownResource::DirectoryLink(old_resource))
+                        && known.get_variant(new_resource.resource_id()).is_none()
+                }
                 _ => {
                     unreachable!("a validated ownership handoff has an identity replacement update")
                 }
@@ -932,6 +1006,11 @@ fn validate_unfinished_stale_action_known_state(
                 known.get_variant(facts.old_effect().resource_id()) == Some(facts.old_effect())
             }),
             ActionKind::CreateLink => true,
+            ActionKind::CreateDirectoryLink => action.directory_link_facts().is_some_and(|facts| {
+                facts.superseded_resource_id().is_none_or(|old_resource_id| {
+                    matches!(known.get_variant(old_resource_id), Some(crate::domain::known::KnownResource::DirectoryLink(old)) if old.target_path() == action.target_path())
+                })
+            }),
             _ => true,
         };
         if !matches {
@@ -1367,11 +1446,14 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+    use crate::domain::directory_link::ResolvedDirectoryLink;
     use crate::domain::file_copy::{ContentFingerprint, ResolvedFileCopy};
     use crate::domain::file_link::ResolvedFileLink;
     use crate::domain::hashes::definition_hash;
     use crate::domain::ids::FullyQualifiedResourceId;
-    use crate::domain::known::{KnownFileCopy, KnownFileLink, KnownState};
+    use crate::domain::known::{
+        KnownDirectoryLink, KnownFileCopy, KnownFileLink, KnownResource, KnownState,
+    };
     use crate::domain::plan::{PlannedFileCopyAction, PlannedResourceAction, TargetCondition};
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -1514,6 +1596,196 @@ mod tests {
             .action(action_id)
             .unwrap()
             .status()
+    }
+
+    fn directory_create_record(
+        root: &Path,
+        status: ActionStatus,
+    ) -> (RecordedAction, KnownDirectoryLink) {
+        let desired = ResolvedDirectoryLink::new(
+            FullyQualifiedResourceId::parse("base/nvim").unwrap(),
+            ResolvedPath::new(root.join("store/nvim")).unwrap(),
+            ResolvedPath::new(root.join("home/.config/nvim")).unwrap(),
+        )
+        .unwrap();
+        let final_effect = KnownDirectoryLink::from_resolved(&desired);
+        let action = RecordedAction::from_persisted_directory_link(
+            ActionKind::CreateDirectoryLink,
+            final_effect.resource_id().clone(),
+            None,
+            Some(final_effect.clone()),
+            None,
+            None,
+            TargetCondition::Missing {
+                target_path: final_effect.target_path().clone(),
+            },
+            TargetCondition::ExpectedDirectoryLink {
+                target_path: final_effect.target_path().clone(),
+                link_target: final_effect.link_target().clone(),
+            },
+            status,
+        )
+        .unwrap();
+        (action, final_effect)
+    }
+
+    fn install_recorded_directory_action(
+        locked: &mut LockedStateRepository,
+        action: RecordedAction,
+        known: KnownState,
+    ) -> ActionId {
+        let action_id = ActionId::parse("a1").unwrap();
+        let operation = OperationRecord::from_actions(
+            OperationId::parse("directory-operation").unwrap(),
+            desired_hash(),
+            [(action_id.clone(), action)],
+        )
+        .unwrap();
+        locked
+            .commit_candidate(PersistedState::from_parts(known, Some(operation)).unwrap())
+            .unwrap();
+        action_id
+    }
+
+    #[test]
+    fn directory_link_records_persist_pending_running_terminal_states_and_atomic_known_update() {
+        let workspace = TestStateDirectory::new();
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let (action, final_effect) =
+            directory_create_record(&workspace.root, ActionStatus::Pending);
+        let action_id = install_recorded_directory_action(
+            &mut locked,
+            action,
+            KnownState::new(Vec::<KnownResource>::new()).unwrap(),
+        );
+        assert_eq!(
+            active_status(&repository.load().unwrap(), &action_id),
+            ActionStatus::Pending
+        );
+        locked.mark_running(&action_id).unwrap();
+        assert_eq!(
+            active_status(&repository.load().unwrap(), &action_id),
+            ActionStatus::Running
+        );
+        locked.commit_succeeded(&action_id).unwrap();
+        let succeeded = repository.load().unwrap();
+        assert_eq!(
+            active_status(&succeeded, &action_id),
+            ActionStatus::Succeeded
+        );
+        assert!(succeeded.known().resources().any(|resource| {
+            resource.resource_id() == final_effect.resource_id()
+                && resource.target_path() == final_effect.target_path()
+        }));
+
+        locked.close_finished_operation().unwrap();
+        let (action, _) = directory_create_record(&workspace.root, ActionStatus::Pending);
+        let failed_id = install_recorded_directory_action(
+            &mut locked,
+            action,
+            KnownState::new(Vec::<KnownResource>::new()).unwrap(),
+        );
+        locked.mark_running(&failed_id).unwrap();
+        locked
+            .mark_without_known(&failed_id, ActionStatus::Failed)
+            .unwrap();
+        assert_eq!(
+            active_status(&repository.load().unwrap(), &failed_id),
+            ActionStatus::Failed
+        );
+
+        locked.close_finished_operation().unwrap();
+        let (action, _) = directory_create_record(&workspace.root, ActionStatus::Pending);
+        let uncertain_id = install_recorded_directory_action(
+            &mut locked,
+            action,
+            KnownState::new(Vec::<KnownResource>::new()).unwrap(),
+        );
+        locked.mark_running(&uncertain_id).unwrap();
+        locked
+            .mark_without_known(&uncertain_id, ActionStatus::Uncertain)
+            .unwrap();
+        let uncertain = repository.load().unwrap();
+        assert_eq!(
+            active_status(&uncertain, &uncertain_id),
+            ActionStatus::Uncertain
+        );
+        assert!(uncertain.known().resources().next().is_none());
+    }
+
+    #[test]
+    fn directory_link_success_commit_failure_retains_running_record_and_prior_known_state() {
+        let workspace = TestStateDirectory::new();
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let (action, _) = directory_create_record(&workspace.root, ActionStatus::Pending);
+        let action_id = install_recorded_directory_action(
+            &mut locked,
+            action,
+            KnownState::new(Vec::<KnownResource>::new()).unwrap(),
+        );
+        locked.mark_running(&action_id).unwrap();
+        locked.fail_next_commit_at(CommitStage::ReplaceState);
+        assert!(locked.commit_succeeded(&action_id).is_err());
+        let persisted = repository.load().unwrap();
+        assert_eq!(active_status(&persisted, &action_id), ActionStatus::Running);
+        assert!(persisted.known().resources().next().is_none());
+    }
+
+    #[test]
+    fn directory_handoff_running_record_atomically_replaces_old_known_identity_on_success() {
+        let workspace = TestStateDirectory::new();
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let target = ResolvedPath::new(workspace.root.join("home/.config/nvim")).unwrap();
+        let old = KnownDirectoryLink::from_resolved(
+            &ResolvedDirectoryLink::new(
+                FullyQualifiedResourceId::parse("base/nvim-old").unwrap(),
+                ResolvedPath::new(workspace.root.join("store/nvim")).unwrap(),
+                target.clone(),
+            )
+            .unwrap(),
+        );
+        let final_effect = KnownDirectoryLink::from_resolved(
+            &ResolvedDirectoryLink::new(
+                FullyQualifiedResourceId::parse("base/nvim-new").unwrap(),
+                ResolvedPath::new(workspace.root.join("store/nvim")).unwrap(),
+                target,
+            )
+            .unwrap(),
+        );
+        let action = RecordedAction::from_persisted_directory_link(
+            ActionKind::ReplaceOwnership,
+            final_effect.resource_id().clone(),
+            Some(old.clone()),
+            Some(final_effect.clone()),
+            Some(old.resource_id().clone()),
+            None,
+            TargetCondition::ExpectedDirectoryLink {
+                target_path: old.target_path().clone(),
+                link_target: old.link_target().clone(),
+            },
+            TargetCondition::ExpectedDirectoryLink {
+                target_path: final_effect.target_path().clone(),
+                link_target: final_effect.link_target().clone(),
+            },
+            ActionStatus::Running,
+        )
+        .unwrap();
+        let action_id = install_recorded_directory_action(
+            &mut locked,
+            action,
+            KnownState::new([old.clone()]).unwrap(),
+        );
+        locked.commit_succeeded(&action_id).unwrap();
+        let state = repository.load().unwrap();
+        assert_eq!(active_status(&state, &action_id), ActionStatus::Succeeded);
+        assert!(state.known().get_variant(old.resource_id()).is_none());
+        assert!(
+            matches!(state.known().get_variant(final_effect.resource_id()),
+            Some(KnownResource::DirectoryLink(effect)) if effect == &final_effect)
+        );
     }
 
     #[test]

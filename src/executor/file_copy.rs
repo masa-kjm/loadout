@@ -133,6 +133,7 @@ impl FileCopyExecutor {
                     Err(CopyPreflightError::PreconditionNoLongerHolds)
                 }
             }
+            TargetCondition::ExpectedDirectoryLink { .. } => Err(CopyPreflightError::WrongAction),
         }
     }
 

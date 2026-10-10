@@ -369,6 +369,78 @@ impl KnownState {
         Self::new(resources.into_values())
     }
 
+    pub(crate) fn with_upserted_directory_link(
+        &self,
+        resource: KnownDirectoryLink,
+    ) -> Result<Self, KnownStateError> {
+        let mut resources = self.resources.clone();
+        resources.insert(resource.resource_id().clone(), resource.into());
+        Self::new(resources.into_values())
+    }
+
+    pub(crate) fn with_removed_directory_link(
+        &self,
+        expected: &KnownDirectoryLink,
+    ) -> Result<Self, KnownStateError> {
+        if self.resources.get(expected.resource_id())
+            != Some(&KnownResource::DirectoryLink(expected.clone()))
+        {
+            return Err(KnownStateError::ResourceMismatch {
+                resource_id: expected.resource_id().clone(),
+            });
+        }
+        let mut resources = self.resources.clone();
+        resources.remove(expected.resource_id());
+        Self::new(resources.into_values())
+    }
+
+    pub(crate) fn with_replaced_directory_identity(
+        &self,
+        expected_old: &KnownDirectoryLink,
+        new_resource: KnownDirectoryLink,
+    ) -> Result<Self, KnownStateError> {
+        if self.resources.get(expected_old.resource_id())
+            != Some(&KnownResource::DirectoryLink(expected_old.clone()))
+        {
+            return Err(KnownStateError::ResourceMismatch {
+                resource_id: expected_old.resource_id().clone(),
+            });
+        }
+        if self.resources.contains_key(new_resource.resource_id()) {
+            return Err(KnownStateError::DestinationResourcePresent {
+                resource_id: new_resource.resource_id().clone(),
+            });
+        }
+        let mut resources = self.resources.clone();
+        resources.remove(expected_old.resource_id());
+        resources.insert(new_resource.resource_id().clone(), new_resource.into());
+        Self::new(resources.into_values())
+    }
+
+    pub(crate) fn with_directory_identity_replaced_by_id(
+        &self,
+        old_resource_id: &FullyQualifiedResourceId,
+        new_resource: KnownDirectoryLink,
+    ) -> Result<Self, KnownStateError> {
+        let Some(KnownResource::DirectoryLink(old_resource)) = self.resources.get(old_resource_id)
+        else {
+            return Err(KnownStateError::MissingResource {
+                resource_id: old_resource_id.clone(),
+            });
+        };
+        if old_resource.target_path() != new_resource.target_path()
+            || self.resources.contains_key(new_resource.resource_id())
+        {
+            return Err(KnownStateError::ResourceMismatch {
+                resource_id: old_resource_id.clone(),
+            });
+        }
+        let mut resources = self.resources.clone();
+        resources.remove(old_resource_id);
+        resources.insert(new_resource.resource_id().clone(), new_resource.into());
+        Self::new(resources.into_values())
+    }
+
     /// Returns a new Known state without one exact previously verified fact.
     ///
     /// The state repository uses this only in the same atomic commit that marks a verified `remove_link` action as succeeded. Requiring the complete expected fact prevents an action record from deleting a newer or different Known resource under the same identity.

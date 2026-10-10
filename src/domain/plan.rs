@@ -25,6 +25,10 @@ pub(crate) enum ActionKind {
     RelocateCopy,
     RemoveCopy,
     ReplaceEffect,
+    CreateDirectoryLink,
+    ReplaceDirectoryLink,
+    RelocateDirectoryLink,
+    RemoveDirectoryLink,
     Noop,
 }
 
@@ -206,6 +210,10 @@ pub(crate) enum TargetCondition {
         target_path: ResolvedPath,
         content_fingerprint: crate::domain::file_copy::ContentFingerprint,
     },
+    ExpectedDirectoryLink {
+        target_path: ResolvedPath,
+        link_target: LinkTarget,
+    },
 }
 
 impl TargetCondition {
@@ -215,6 +223,7 @@ impl TargetCondition {
             Self::Missing { target_path }
             | Self::ExpectedLink { target_path, .. }
             | Self::ExpectedCopy { target_path, .. } => target_path,
+            Self::ExpectedDirectoryLink { target_path, .. } => target_path,
         }
     }
 }

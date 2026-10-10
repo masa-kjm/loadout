@@ -8,7 +8,7 @@ use crate::domain::file_link::LinkTarget;
 use crate::domain::hashes::DesiredHash;
 use crate::domain::ids::FullyQualifiedResourceId;
 use crate::domain::known::KnownResource;
-use crate::domain::known::{KnownFileLink, KnownFileLinkError};
+use crate::domain::known::{KnownDirectoryLink, KnownFileLink, KnownFileLinkError};
 use crate::domain::paths::ResolvedPath;
 use crate::domain::plan::{
     ActionKind, PlannedAction, PlannedEffectHandoff, PlannedFileCopyAction, TargetCondition,
@@ -86,6 +86,16 @@ pub(crate) enum RecordedKnownStateUpdate {
         old_resource: KnownFileLink,
         new_resource: KnownFileLink,
     },
+    UpsertDirectoryLink(KnownDirectoryLink),
+    RemoveExpectedDirectoryLink(KnownDirectoryLink),
+    ReplaceDirectoryIdentity {
+        old_resource: KnownDirectoryLink,
+        new_resource: KnownDirectoryLink,
+    },
+    ReplaceDirectoryIdentityById {
+        old_resource_id: FullyQualifiedResourceId,
+        new_resource: KnownDirectoryLink,
+    },
 }
 
 /// One action whose recorded facts are sufficient for future recovery.
@@ -144,6 +154,16 @@ pub(crate) struct PersistedEffectHandoffFacts {
 /// Preconditions and post-conditions are derived from these facts rather than stored independently where they could contradict the action kind.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ActionFacts {
+    DirectoryLink {
+        kind: ActionKind,
+        resource_id: FullyQualifiedResourceId,
+        old_effect: Option<KnownDirectoryLink>,
+        final_effect: Option<KnownDirectoryLink>,
+        superseded_resource_id: Option<FullyQualifiedResourceId>,
+        temporary_path: Option<ResolvedPath>,
+        precondition: TargetCondition,
+        postcondition: TargetCondition,
+    },
     CreateLink {
         resource_id: FullyQualifiedResourceId,
         target_path: ResolvedPath,
@@ -219,6 +239,117 @@ enum ActionFacts {
 }
 
 impl RecordedAction {
+    /// Reconstructs a DirectoryLink action from complete, effect-specific durable facts.
+    /// This remains separate from executor-ready plans until DirectoryLink execution is enabled.
+    #[allow(clippy::too_many_arguments)] // Durable facts are deliberately explicit so decoder validation cannot omit one.
+    pub(crate) fn from_persisted_directory_link(
+        kind: ActionKind,
+        resource_id: FullyQualifiedResourceId,
+        old_effect: Option<KnownDirectoryLink>,
+        final_effect: Option<KnownDirectoryLink>,
+        superseded_resource_id: Option<FullyQualifiedResourceId>,
+        temporary_path: Option<ResolvedPath>,
+        precondition: TargetCondition,
+        postcondition: TargetCondition,
+        status: ActionStatus,
+    ) -> Result<Self, OperationRecordError> {
+        if !matches!(
+            kind,
+            ActionKind::CreateDirectoryLink
+                | ActionKind::ReplaceDirectoryLink
+                | ActionKind::RelocateDirectoryLink
+                | ActionKind::RemoveDirectoryLink
+                | ActionKind::ForgetMissing
+                | ActionKind::ReplaceOwnership
+        ) {
+            return Err(OperationRecordError::UnsupportedActionKind { kind });
+        }
+        let expected = |effect: &KnownDirectoryLink| TargetCondition::ExpectedDirectoryLink {
+            target_path: effect.target_path().clone(),
+            link_target: effect.link_target().clone(),
+        };
+        let missing = |path: &ResolvedPath| TargetCondition::Missing {
+            target_path: path.clone(),
+        };
+        let valid = match kind {
+            ActionKind::CreateDirectoryLink => {
+                let Some(final_effect) = final_effect.as_ref() else {
+                    return Err(OperationRecordError::InvalidActionConditions { kind });
+                };
+                old_effect.is_none()
+                    && temporary_path.is_none()
+                    && precondition == missing(final_effect.target_path())
+                    && postcondition == expected(final_effect)
+            }
+            ActionKind::RemoveDirectoryLink => {
+                let Some(old_effect) = old_effect.as_ref() else {
+                    return Err(OperationRecordError::InvalidActionConditions { kind });
+                };
+                final_effect.is_none()
+                    && superseded_resource_id.is_none()
+                    && temporary_path.is_none()
+                    && precondition == expected(old_effect)
+                    && postcondition == missing(old_effect.target_path())
+            }
+            ActionKind::ForgetMissing => {
+                let Some(old_effect) = old_effect.as_ref() else {
+                    return Err(OperationRecordError::InvalidActionConditions { kind });
+                };
+                final_effect.is_none()
+                    && superseded_resource_id.is_none()
+                    && temporary_path.is_none()
+                    && precondition == missing(old_effect.target_path())
+                    && postcondition == missing(old_effect.target_path())
+            }
+            ActionKind::ReplaceDirectoryLink
+            | ActionKind::RelocateDirectoryLink
+            | ActionKind::ReplaceOwnership => {
+                let (Some(old_effect), Some(final_effect)) =
+                    (old_effect.as_ref(), final_effect.as_ref())
+                else {
+                    return Err(OperationRecordError::InvalidActionConditions { kind });
+                };
+                let needs_temporary = kind == ActionKind::ReplaceDirectoryLink
+                    || (kind == ActionKind::ReplaceOwnership
+                        && old_effect.link_target() != final_effect.link_target());
+                (old_effect.resource_id() == &resource_id || kind == ActionKind::ReplaceOwnership)
+                    && final_effect.resource_id() == &resource_id
+                    && precondition == expected(old_effect)
+                    && postcondition == expected(final_effect)
+                    && (!needs_temporary || temporary_path.is_some())
+                    && (needs_temporary || temporary_path.is_none())
+                    && (kind != ActionKind::ReplaceOwnership
+                        || superseded_resource_id == Some(old_effect.resource_id().clone()))
+                    && (kind == ActionKind::ReplaceOwnership || superseded_resource_id.is_none())
+                    && temporary_path.as_ref().is_none_or(|temporary| {
+                        temporary != old_effect.target_path()
+                            && temporary != final_effect.target_path()
+                            && temporary.as_ref().parent()
+                                == final_effect.target_path().as_ref().parent()
+                    })
+                    && (kind != ActionKind::RelocateDirectoryLink
+                        || old_effect.target_path() != final_effect.target_path())
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(OperationRecordError::InvalidActionConditions { kind });
+        }
+        Ok(Self {
+            facts: ActionFacts::DirectoryLink {
+                kind,
+                resource_id,
+                old_effect,
+                final_effect,
+                superseded_resource_id,
+                temporary_path,
+                precondition,
+                postcondition,
+            },
+            status,
+        })
+    }
+
     /// Builds a record for one planner-selected action supported by the current vertical slice.
     pub(crate) fn from_action(action: &PlannedAction) -> Result<Self, OperationRecordError> {
         if matches!(
@@ -899,6 +1030,7 @@ impl RecordedAction {
     /// The planned action kind represented by this persisted record.
     pub(crate) fn kind(&self) -> ActionKind {
         match &self.facts {
+            ActionFacts::DirectoryLink { kind, .. } => *kind,
             ActionFacts::CreateLink { .. } => ActionKind::CreateLink,
             ActionFacts::RemoveLink { .. } => ActionKind::RemoveLink,
             ActionFacts::ForgetMissing { .. } => ActionKind::ForgetMissing,
@@ -915,6 +1047,7 @@ impl RecordedAction {
     /// The stable resource identity affected by this action.
     pub(crate) fn resource_id(&self) -> &FullyQualifiedResourceId {
         match &self.facts {
+            ActionFacts::DirectoryLink { resource_id, .. } => resource_id,
             ActionFacts::CreateLink { resource_id, .. }
             | ActionFacts::RemoveLink { resource_id, .. }
             | ActionFacts::ForgetMissing { resource_id, .. }
@@ -933,6 +1066,15 @@ impl RecordedAction {
     /// The resolved target governed by the action's predicates.
     pub(crate) fn target_path(&self) -> &ResolvedPath {
         match &self.facts {
+            ActionFacts::DirectoryLink {
+                final_effect: Some(effect),
+                ..
+            } => effect.target_path(),
+            ActionFacts::DirectoryLink {
+                old_effect: Some(effect),
+                ..
+            } => effect.target_path(),
+            ActionFacts::DirectoryLink { precondition, .. } => precondition.target_path(),
             ActionFacts::CreateLink { target_path, .. }
             | ActionFacts::RemoveLink { target_path, .. }
             | ActionFacts::ForgetMissing { target_path, .. }
@@ -951,6 +1093,7 @@ impl RecordedAction {
     /// The exact recorded condition that held before mutation began.
     pub(crate) fn precondition(&self) -> TargetCondition {
         match &self.facts {
+            ActionFacts::DirectoryLink { precondition, .. } => precondition.clone(),
             ActionFacts::RemoveLink {
                 target_path,
                 link_target,
@@ -1006,6 +1149,7 @@ impl RecordedAction {
     /// The exact condition required before Known state may change.
     pub(crate) fn postcondition(&self) -> TargetCondition {
         match &self.facts {
+            ActionFacts::DirectoryLink { postcondition, .. } => postcondition.clone(),
             ActionFacts::CreateLink {
                 target_path,
                 link_target,
@@ -1061,6 +1205,57 @@ impl RecordedAction {
         &self,
     ) -> Result<RecordedKnownStateUpdate, OperationRecordError> {
         match &self.facts {
+            ActionFacts::DirectoryLink {
+                kind,
+                resource_id,
+                old_effect,
+                final_effect,
+                superseded_resource_id,
+                ..
+            } => match kind {
+                ActionKind::CreateDirectoryLink => {
+                    let final_effect = final_effect
+                        .clone()
+                        .expect("validated directory create has final effect");
+                    match superseded_resource_id {
+                        Some(old_resource_id) => {
+                            Ok(RecordedKnownStateUpdate::ReplaceDirectoryIdentityById {
+                                old_resource_id: old_resource_id.clone(),
+                                new_resource: final_effect,
+                            })
+                        }
+                        None => Ok(RecordedKnownStateUpdate::UpsertDirectoryLink(final_effect)),
+                    }
+                }
+                ActionKind::RemoveDirectoryLink => {
+                    Ok(RecordedKnownStateUpdate::RemoveExpectedDirectoryLink(
+                        old_effect
+                            .clone()
+                            .expect("validated directory removal has old effect"),
+                    ))
+                }
+                ActionKind::ForgetMissing => Ok(RecordedKnownStateUpdate::RemoveMissing {
+                    resource_id: resource_id.clone(),
+                }),
+                ActionKind::ReplaceDirectoryLink | ActionKind::RelocateDirectoryLink => {
+                    Ok(RecordedKnownStateUpdate::UpsertDirectoryLink(
+                        final_effect
+                            .clone()
+                            .expect("validated directory replacement has final effect"),
+                    ))
+                }
+                ActionKind::ReplaceOwnership => {
+                    Ok(RecordedKnownStateUpdate::ReplaceDirectoryIdentity {
+                        old_resource: old_effect
+                            .clone()
+                            .expect("validated directory handoff has old effect"),
+                        new_resource: final_effect
+                            .clone()
+                            .expect("validated directory handoff has final effect"),
+                    })
+                }
+                _ => Err(OperationRecordError::UnsupportedActionKind { kind: *kind }),
+            },
             ActionFacts::CreateLink {
                 resource_id,
                 target_path,
@@ -1194,6 +1389,17 @@ impl RecordedAction {
     /// Replacement-specific facts are intentionally inaccessible for other actions.
     pub(crate) fn replacement_facts(&self) -> Option<ReplacementFacts> {
         match &self.facts {
+            ActionFacts::DirectoryLink {
+                old_effect: Some(old_effect),
+                final_effect: Some(final_effect),
+                temporary_path: Some(temporary_path),
+                ..
+            } => Some(ReplacementFacts {
+                target_path: old_effect.target_path().clone(),
+                old_link_target: old_effect.link_target().clone(),
+                new_link_target: final_effect.link_target().clone(),
+                temporary_path: temporary_path.clone(),
+            }),
             ActionFacts::ReplaceLink {
                 target_path,
                 old_link_target,
@@ -1284,9 +1490,28 @@ impl RecordedAction {
         }
     }
 
+    pub(crate) fn directory_link_facts(&self) -> Option<DirectoryLinkFacts> {
+        match &self.facts {
+            ActionFacts::DirectoryLink {
+                old_effect,
+                final_effect,
+                superseded_resource_id,
+                temporary_path,
+                ..
+            } => Some(DirectoryLinkFacts {
+                old_effect: old_effect.clone(),
+                final_effect: final_effect.clone(),
+                superseded_resource_id: superseded_resource_id.clone(),
+                temporary_path: temporary_path.clone(),
+            }),
+            _ => None,
+        }
+    }
+
     /// Returns the exact action-local temporary retained for a replacement or copy materialization.
     pub(crate) fn temporary_path(&self) -> Option<&ResolvedPath> {
         match &self.facts {
+            ActionFacts::DirectoryLink { temporary_path, .. } => temporary_path.as_ref(),
             ActionFacts::ReplaceLink { temporary_path, .. }
             | ActionFacts::Copy { temporary_path, .. }
             | ActionFacts::ReplaceEffect {
@@ -1344,6 +1569,10 @@ impl RecordedAction {
 
     pub(crate) fn replaced_resource_id(&self) -> Option<&FullyQualifiedResourceId> {
         match &self.facts {
+            ActionFacts::DirectoryLink {
+                superseded_resource_id,
+                ..
+            } => superseded_resource_id.as_ref(),
             ActionFacts::ReplaceOwnership {
                 old_resource_id, ..
             } => Some(old_resource_id),
@@ -1372,6 +1601,21 @@ impl RecordedAction {
 
     fn touched_target_paths(&self) -> Vec<&ResolvedPath> {
         match &self.facts {
+            ActionFacts::DirectoryLink {
+                old_effect: Some(old),
+                final_effect: Some(final_effect),
+                kind: ActionKind::RelocateDirectoryLink,
+                ..
+            } => vec![old.target_path(), final_effect.target_path()],
+            ActionFacts::DirectoryLink {
+                final_effect: Some(effect),
+                ..
+            } => vec![effect.target_path()],
+            ActionFacts::DirectoryLink {
+                old_effect: Some(effect),
+                ..
+            } => vec![effect.target_path()],
+            ActionFacts::DirectoryLink { precondition, .. } => vec![precondition.target_path()],
             ActionFacts::RelocateLink {
                 old_target_path,
                 new_target_path,
@@ -1481,6 +1725,28 @@ impl RecordedAction {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DirectoryLinkFacts {
+    old_effect: Option<KnownDirectoryLink>,
+    final_effect: Option<KnownDirectoryLink>,
+    superseded_resource_id: Option<FullyQualifiedResourceId>,
+    temporary_path: Option<ResolvedPath>,
+}
+impl DirectoryLinkFacts {
+    pub(crate) fn old_effect(&self) -> Option<&KnownDirectoryLink> {
+        self.old_effect.as_ref()
+    }
+    pub(crate) fn final_effect(&self) -> Option<&KnownDirectoryLink> {
+        self.final_effect.as_ref()
+    }
+    pub(crate) fn superseded_resource_id(&self) -> Option<&FullyQualifiedResourceId> {
+        self.superseded_resource_id.as_ref()
+    }
+    pub(crate) fn temporary_path(&self) -> Option<&ResolvedPath> {
+        self.temporary_path.as_ref()
+    }
+}
+
 /// The facts an executor and recovery observer need for a recorded replacement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReplacementFacts {
@@ -1568,6 +1834,7 @@ fn precondition_link_target(
 ) -> Result<&LinkTarget, OperationRecordError> {
     match condition {
         TargetCondition::ExpectedLink { link_target, .. } => Ok(link_target),
+        TargetCondition::ExpectedDirectoryLink { link_target, .. } => Ok(link_target),
         TargetCondition::Missing { .. } | TargetCondition::ExpectedCopy { .. } => {
             Err(OperationRecordError::InvalidActionConditions {
                 kind: ActionKind::ReplaceLink,
@@ -1610,7 +1877,13 @@ fn condition_for_known_effect(effect: &KnownResource) -> TargetCondition {
             content_fingerprint: resource.content_fingerprint().clone(),
         },
         KnownResource::DirectoryLink(_) => {
-            unreachable!("directory-link operations are not implemented")
+            let KnownResource::DirectoryLink(resource) = effect else {
+                unreachable!()
+            };
+            TargetCondition::ExpectedDirectoryLink {
+                target_path: resource.target_path().clone(),
+                link_target: resource.link_target().clone(),
+            }
         }
     }
 }
@@ -1861,7 +2134,11 @@ impl OperationRecord {
             | RecordedKnownStateUpdate::RemoveExpected(_)
             | RecordedKnownStateUpdate::RemoveExpectedCopy(_)
             | RecordedKnownStateUpdate::RemoveMissing { .. }
-            | RecordedKnownStateUpdate::ReplaceIdentity { .. } => {
+            | RecordedKnownStateUpdate::UpsertDirectoryLink(_)
+            | RecordedKnownStateUpdate::RemoveExpectedDirectoryLink(_)
+            | RecordedKnownStateUpdate::ReplaceIdentity { .. }
+            | RecordedKnownStateUpdate::ReplaceDirectoryIdentity { .. }
+            | RecordedKnownStateUpdate::ReplaceDirectoryIdentityById { .. } => {
                 Err(OperationRecordError::UnsupportedActionKind {
                     kind: self
                         .action(action_id)
@@ -1990,6 +2267,75 @@ impl std::error::Error for OperationRecordError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn directory_known(id: &str, source: &str, target: &str) -> KnownDirectoryLink {
+        let root = std::env::temp_dir().join("loadout-directory-operation-test");
+        KnownDirectoryLink::new(
+            FullyQualifiedResourceId::parse(id).unwrap(),
+            ResolvedPath::new(root.join(source)).unwrap(),
+            ResolvedPath::new(root.join(target)).unwrap(),
+            LinkTarget::new(ResolvedPath::new(root.join(source)).unwrap()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn directory_create_records_typed_predicates_and_updates_known_only_on_success() {
+        let final_effect = directory_known("base/nvim", "store/nvim", "home/.config/nvim");
+        let mut action = RecordedAction::from_persisted_directory_link(
+            ActionKind::CreateDirectoryLink,
+            final_effect.resource_id().clone(),
+            None,
+            Some(final_effect.clone()),
+            None,
+            None,
+            TargetCondition::Missing {
+                target_path: final_effect.target_path().clone(),
+            },
+            TargetCondition::ExpectedDirectoryLink {
+                target_path: final_effect.target_path().clone(),
+                link_target: final_effect.link_target().clone(),
+            },
+            ActionStatus::Pending,
+        )
+        .unwrap();
+        action.mark_running().unwrap();
+        assert_eq!(
+            action.mark_succeeded().unwrap(),
+            RecordedKnownStateUpdate::UpsertDirectoryLink(final_effect)
+        );
+    }
+
+    #[test]
+    fn directory_missing_target_handoff_replaces_the_superseded_identity() {
+        let old = directory_known("base/old", "store/nvim", "home/.config/nvim");
+        let final_effect = directory_known("base/new", "store/nvim", "home/.config/nvim");
+        let mut action = RecordedAction::from_persisted_directory_link(
+            ActionKind::CreateDirectoryLink,
+            final_effect.resource_id().clone(),
+            None,
+            Some(final_effect.clone()),
+            Some(old.resource_id().clone()),
+            None,
+            TargetCondition::Missing {
+                target_path: final_effect.target_path().clone(),
+            },
+            TargetCondition::ExpectedDirectoryLink {
+                target_path: final_effect.target_path().clone(),
+                link_target: final_effect.link_target().clone(),
+            },
+            ActionStatus::Pending,
+        )
+        .unwrap();
+        action.mark_running().unwrap();
+        assert_eq!(
+            action.mark_succeeded().unwrap(),
+            RecordedKnownStateUpdate::ReplaceDirectoryIdentityById {
+                old_resource_id: old.resource_id().clone(),
+                new_resource: final_effect
+            }
+        );
+    }
     use crate::domain::desired::ResolvedResource;
     use crate::domain::file_copy::{ContentFingerprint, ResolvedFileCopy};
     use crate::domain::file_link::ResolvedFileLink;

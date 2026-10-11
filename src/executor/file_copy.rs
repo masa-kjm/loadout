@@ -60,7 +60,9 @@ impl FileCopyExecutor {
                 ResolvedResource::FileLink(desired) => Some((desired.source_path(), None)),
                 ResolvedResource::DirectoryLink(_) => None,
             },
-            PlannedResourceAction::FileLink(_) => return Err(CopyPreflightError::WrongAction),
+            PlannedResourceAction::FileLink(_) | PlannedResourceAction::DirectoryLink(_) => {
+                return Err(CopyPreflightError::WrongAction);
+            }
         };
         if let Some((expected_path, expected_fingerprint)) = expected_source {
             let source = source.ok_or(CopyPreflightError::MissingVerifiedSource)?;
@@ -149,7 +151,9 @@ impl FileCopyExecutor {
             }
             PlannedResourceAction::FileCopy(_) => self.ensure_copy_mutation_capability(action),
             PlannedResourceAction::ReplaceEffect(_) => self.ensure_copy_mutation_capability(action),
-            PlannedResourceAction::FileLink(_) => Err(CopyPreflightError::WrongAction),
+            PlannedResourceAction::FileLink(_) | PlannedResourceAction::DirectoryLink(_) => {
+                Err(CopyPreflightError::WrongAction)
+            }
         }
     }
 

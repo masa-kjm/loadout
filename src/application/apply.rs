@@ -17,6 +17,7 @@ use crate::executor::file_link::{
     RelocateLinkExecutionError, RemoveLinkExecutionError, ReplaceLinkExecutionError,
 };
 use crate::inspection::file_link::{FileLinkInspector, TargetInspectionError};
+#[allow(unused_imports)]
 use crate::planner::plan;
 #[cfg(test)]
 use crate::resolver::ResolvedApplyInput;
@@ -120,20 +121,21 @@ fn apply_request_with_hooks(
         stage = ApplyStage::Resolution;
         let resolved =
             super::queries::resolve_request(request).map_err(ApplyFailureCause::Input)?;
-        if let Some(resource_id) =
-            super::queries::directory_link_resource_id(resolved.desired(), locked.state().known())
-        {
-            return Err(ApplyFailureCause::Input(
-                super::queries::QueryError::DirectoryLinkPlanningNotImplemented { resource_id },
-            ));
-        }
         stage = ApplyStage::Planning;
         let inspector = FileLinkInspector::new(request.context.home_directory().as_ref())
             .map_err(|error| lifecycle(ApplyError::InitialInspection(error)))?;
         let actual = inspector
             .inspect(resolved.desired(), locked.state().known())
             .map_err(|error| lifecycle(ApplyError::InitialInspection(error)))?;
-        let fresh_plan = plan(resolved.desired(), locked.state().known(), &actual);
+        let directory_actual = inspector
+            .inspect_directory_links(resolved.desired(), locked.state().known())
+            .map_err(|error| lifecycle(ApplyError::InitialInspection(error)))?;
+        let fresh_plan = crate::planner::plan_with_directory_links(
+            resolved.desired(),
+            locked.state().known(),
+            &actual,
+            &directory_actual,
+        );
         visible_plan = Some(fresh_plan.clone());
         if !fresh_plan.is_executable() {
             return Ok(ApplyReport::Blocked { plan: fresh_plan });
@@ -143,14 +145,24 @@ fn apply_request_with_hooks(
             .map_err(|error| lifecycle(ApplyError::InitialInspection(error)))?;
         let copy_executor = FileCopyExecutor::new(request.context.home_directory().as_ref())
             .map_err(|error| lifecycle(ApplyError::InitialInspection(error)))?;
+        let directory_executor = crate::executor::directory_link::DirectoryLinkExecutor::new(
+            request.context.home_directory().as_ref(),
+        )
+        .map_err(|error| lifecycle(ApplyError::InitialInspection(error)))?;
         for action in fresh_plan.resource_actions() {
             affected_action = Some(ApplyAction {
                 action_id: None,
                 resource_id: action.resource_id().clone(),
                 kind: action.kind(),
             });
-            super::dispatch::preflight(&executor, &copy_executor, action, &resolved)
-                .map_err(lifecycle)?;
+            super::dispatch::preflight(
+                &executor,
+                &copy_executor,
+                &directory_executor,
+                action,
+                &resolved,
+            )
+            .map_err(lifecycle)?;
         }
         affected_action = None;
         locked
@@ -185,7 +197,7 @@ fn apply_request_with_hooks(
                 |action, recorded, locked, action_id| {
                     super::dispatch::execute(
                         &executor,
-                        &copy_executor,
+                        &copy_executor, &directory_executor,
                         action,
                         recorded,
                         &resolved,
@@ -959,6 +971,12 @@ fn classify_resource_execution_error(
                 .map(recovery_decision_as_execution_classification)
                 .unwrap_or(ExecutionClassification::Uncertain)
         }
+        super::dispatch::ResourceExecutionError::DirectoryLink(_) => {
+            FileLinkInspector::new(home_directory)
+                .and_then(|inspector| recovery_decision(&inspector, recorded))
+                .map(recovery_decision_as_execution_classification)
+                .unwrap_or(ExecutionClassification::Uncertain)
+        }
         super::dispatch::ResourceExecutionError::InvalidEffectHandoff => {
             ExecutionClassification::Uncertain
         }
@@ -1551,6 +1569,30 @@ fn recovery_decision(
         return Ok(RecoveryDecision::Uncertain);
     }
 
+    if action.kind() == ActionKind::ForgetMissing {
+        if let Some(facts) = action.directory_link_facts() {
+            let Some(previous) = facts.old_effect() else {
+                return Ok(RecoveryDecision::Uncertain);
+            };
+            return Ok(
+                match inspector
+                    .inspect_target_for_expected_directory_link(
+                        previous.target_path(),
+                        previous.link_target(),
+                    )?
+                    .observation()
+                {
+                    TargetObservation::Missing => RecoveryDecision::Succeeded,
+                    TargetObservation::UnsafePath { .. } => RecoveryDecision::Uncertain,
+                    TargetObservation::ExpectedLink { .. }
+                    | TargetObservation::MatchingUnmanagedLink { .. }
+                    | TargetObservation::OtherLink { .. }
+                    | TargetObservation::OtherEntry { .. } => RecoveryDecision::Failed,
+                },
+            );
+        }
+    }
+
     if action.kind() == ActionKind::RelocateLink {
         let facts = action
             .relocation_facts()
@@ -1995,6 +2037,149 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_replacement_temporary_interruption_recovers_old_known_state() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new();
+        fs::create_dir_all(workspace.path("store/old")).unwrap();
+        fs::create_dir_all(workspace.path("store/new")).unwrap();
+        fs::create_dir_all(workspace.path("home/.config")).unwrap();
+        let target = ResolvedPath::new(workspace.path("home/.config/nvim")).unwrap();
+        let temporary =
+            ResolvedPath::new(workspace.path("home/.config/.nvim.loadout-tmp")).unwrap();
+        let old = KnownDirectoryLink::new(
+            FullyQualifiedResourceId::parse("base/nvim").unwrap(),
+            ResolvedPath::new(workspace.path("store/old")).unwrap(),
+            target.clone(),
+            LinkTarget::new(ResolvedPath::new(workspace.path("store/old")).unwrap()),
+        )
+        .unwrap();
+        let final_effect = KnownDirectoryLink::new(
+            old.resource_id().clone(),
+            ResolvedPath::new(workspace.path("store/new")).unwrap(),
+            target.clone(),
+            LinkTarget::new(ResolvedPath::new(workspace.path("store/new")).unwrap()),
+        )
+        .unwrap();
+        symlink(old.link_target().as_path(), target.as_ref()).unwrap();
+        symlink(final_effect.link_target().as_path(), temporary.as_ref()).unwrap();
+        let action = RecordedAction::from_persisted_directory_link(
+            ActionKind::ReplaceDirectoryLink,
+            old.resource_id().clone(),
+            Some(old.clone()),
+            Some(final_effect),
+            None,
+            Some(temporary.clone()),
+            TargetCondition::ExpectedDirectoryLink {
+                target_path: old.target_path().clone(),
+                link_target: old.link_target().clone(),
+            },
+            TargetCondition::ExpectedDirectoryLink {
+                target_path: target,
+                link_target: LinkTarget::new(
+                    ResolvedPath::new(workspace.path("store/new")).unwrap(),
+                ),
+            },
+            ActionStatus::Running,
+        )
+        .unwrap();
+        let operation = OperationRecord::from_actions(
+            OperationId::parse("directory-temporary-interruption").unwrap(),
+            DesiredHash::parse(format!("sha256:{}", "a".repeat(64))).unwrap(),
+            [(ActionId::parse("a1").unwrap(), action)],
+        )
+        .unwrap();
+        let repository = StateRepository::new(ResolvedPath::new(workspace.path("state")).unwrap());
+        let mut locked = repository.acquire_exclusive().unwrap();
+        locked
+            .install_state_for_test(KnownState::new([old.clone()]).unwrap(), operation)
+            .unwrap();
+
+        assert!(
+            !reconcile_active_operation_with_retained_token_capability_for_test(
+                &mut locked,
+                workspace.path("home").as_path(),
+            )
+            .unwrap()
+        );
+        assert!(fs::symlink_metadata(temporary.as_ref()).is_err());
+        assert_eq!(
+            fs::read_link(old.target_path().as_ref()).unwrap(),
+            old.link_target().as_path().as_ref()
+        );
+        assert!(locked.state().active_operation().is_none());
+        assert_eq!(
+            locked.state().known().get_variant(old.resource_id()),
+            Some(&KnownResource::DirectoryLink(old))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_replacement_post_observation_failure_retains_uncertain_operation_without_known_commit()
+     {
+        use crate::test_support::{ExecutionBoundary, on_execution_boundary};
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new();
+        fs::create_dir_all(workspace.path("store/old")).unwrap();
+        fs::create_dir_all(workspace.path("store/new")).unwrap();
+        fs::create_dir_all(workspace.path("store/other")).unwrap();
+        fs::create_dir_all(workspace.path("home/.config")).unwrap();
+        workspace.write(
+            "config/environment.yaml",
+            "schema_version: 2\ndefault_profile: base\nprofile_discovery:\n  paths: [../profiles]\nstores:\n  dotfiles:\n    type: local\n    properties:\n      path: ../store\n",
+        );
+        let profile = |source| {
+            format!(
+                "schema_version: 3\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: {source}\n      target: ~/.config/nvim\n"
+            )
+        };
+        workspace.write("profiles/base.yaml", &profile("old"));
+        let request = super::super::queries::DeclarationRequest {
+            context: ResolverContext::new(
+                workspace.path("home"),
+                workspace.path("config/loadout.yaml"),
+                workspace.path("config/environment.yaml"),
+                workspace.path("state"),
+            )
+            .unwrap(),
+            root: None,
+        };
+        apply_request(&request, |_| true).unwrap();
+        workspace.write("profiles/base.yaml", &profile("new"));
+        let target = workspace.path("home/.config/nvim");
+        let other = workspace.path("store/other");
+        let _hook = on_execution_boundary(ExecutionBoundary::BeforePostObservation, move || {
+            fs::remove_file(&target)?;
+            symlink(other, target)
+        });
+
+        let failure = apply_request(&request, |_| true).unwrap_err();
+        assert_eq!(failure.stage, ApplyStage::Execution);
+        let state = workspace.repository().load().unwrap();
+        let (_, action) = state.active_operation().unwrap().actions().next().unwrap();
+        assert_eq!(action.kind(), ActionKind::ReplaceDirectoryLink);
+        assert_eq!(action.status(), ActionStatus::Uncertain);
+        assert_eq!(
+            fs::read_link(workspace.path("home/.config/nvim")).unwrap(),
+            workspace.path("store/other")
+        );
+        let expected_old = KnownDirectoryLink::new(
+            FullyQualifiedResourceId::parse("base/nvim").unwrap(),
+            ResolvedPath::new(workspace.path("store/old")).unwrap(),
+            ResolvedPath::new(workspace.path("home/.config/nvim")).unwrap(),
+            LinkTarget::new(ResolvedPath::new(workspace.path("store/old")).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            state.known().get_variant(expected_old.resource_id()),
+            Some(&KnownResource::DirectoryLink(expected_old))
+        );
     }
 
     #[cfg(unix)]
@@ -7396,5 +7581,97 @@ mod tests {
         );
         assert!(locked.state().active_operation().is_none());
         assert_eq!(locked.state().known().get_variant(&resource_id), Some(&old));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_executor_recheck_error_is_failed_when_the_recorded_precondition_remains() {
+        use crate::application::dispatch::ResourceExecutionError;
+        use crate::executor::directory_link::DirectoryLinkExecutionError;
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new();
+        fs::create_dir_all(workspace.path("store/old")).unwrap();
+        fs::create_dir_all(workspace.path("store/new")).unwrap();
+        fs::create_dir_all(workspace.path("home/.config")).unwrap();
+        let target = ResolvedPath::new(workspace.path("home/.config/nvim")).unwrap();
+        let temporary = ResolvedPath::new(workspace.path("home/.config/.nvim.tmp")).unwrap();
+        let old = KnownDirectoryLink::new(
+            FullyQualifiedResourceId::parse("base/nvim").unwrap(),
+            ResolvedPath::new(workspace.path("store/old")).unwrap(),
+            target.clone(),
+            LinkTarget::new(ResolvedPath::new(workspace.path("store/old")).unwrap()),
+        )
+        .unwrap();
+        let final_effect = KnownDirectoryLink::new(
+            old.resource_id().clone(),
+            ResolvedPath::new(workspace.path("store/new")).unwrap(),
+            target.clone(),
+            LinkTarget::new(ResolvedPath::new(workspace.path("store/new")).unwrap()),
+        )
+        .unwrap();
+        symlink(old.link_target().as_path(), target.as_ref()).unwrap();
+        let recorded = RecordedAction::from_persisted_directory_link(
+            ActionKind::ReplaceDirectoryLink,
+            old.resource_id().clone(),
+            Some(old),
+            Some(final_effect),
+            None,
+            Some(temporary),
+            TargetCondition::ExpectedDirectoryLink {
+                target_path: target.clone(),
+                link_target: LinkTarget::new(
+                    ResolvedPath::new(workspace.path("store/old")).unwrap(),
+                ),
+            },
+            TargetCondition::ExpectedDirectoryLink {
+                target_path: target.clone(),
+                link_target: LinkTarget::new(
+                    ResolvedPath::new(workspace.path("store/new")).unwrap(),
+                ),
+            },
+            ActionStatus::Running,
+        )
+        .unwrap();
+        assert_eq!(
+            classify_resource_execution_error(
+                workspace.path("home").as_path(),
+                &recorded,
+                &ResourceExecutionError::DirectoryLink(DirectoryLinkExecutionError::InvalidRecord),
+            ),
+            ExecutionClassification::Failed
+        );
+
+        let stale = KnownDirectoryLink::new(
+            FullyQualifiedResourceId::parse("base/stale-nvim").unwrap(),
+            ResolvedPath::new(workspace.path("store/old")).unwrap(),
+            target.clone(),
+            LinkTarget::new(ResolvedPath::new(workspace.path("store/old")).unwrap()),
+        )
+        .unwrap();
+        let forget = RecordedAction::from_persisted_directory_link(
+            ActionKind::ForgetMissing,
+            stale.resource_id().clone(),
+            Some(stale.clone()),
+            None,
+            None,
+            None,
+            TargetCondition::Missing {
+                target_path: target.clone(),
+            },
+            TargetCondition::Missing {
+                target_path: target.clone(),
+            },
+            ActionStatus::Running,
+        )
+        .unwrap();
+        assert_eq!(
+            recovery_decision(
+                &FileLinkInspector::new(workspace.path("home").as_path()).unwrap(),
+                &forget,
+            )
+            .unwrap(),
+            RecoveryDecision::Failed
+        );
     }
 }

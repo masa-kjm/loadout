@@ -5,6 +5,7 @@ use crate::domain::desired::ResolvedResource;
 use crate::domain::ids::FullyQualifiedResourceId;
 use crate::domain::known::KnownResource;
 use crate::domain::plan::{ActionKind, PlannedResourceAction};
+use crate::executor::directory_link::{DirectoryLinkExecutionError, DirectoryLinkExecutor};
 use crate::executor::file_copy::{
     CopyExecutionProgress, CopyPreflightError, CopyToLinkHandoffExecutionError,
     CreateCopyExecutionError, FileCopyExecutor, LinkToCopyHandoffExecutionError,
@@ -32,6 +33,7 @@ pub(crate) enum ResourceExecutionError {
     CopyStateOnly(CopyPreflightError),
     LinkToCopyHandoff(LinkToCopyHandoffExecutionError),
     CopyToLinkHandoff(CopyToLinkHandoffExecutionError),
+    DirectoryLink(DirectoryLinkExecutionError),
     InvalidEffectHandoff,
 }
 
@@ -49,6 +51,7 @@ impl std::fmt::Display for ResourceExecutionError {
             Self::CopyStateOnly(error) => error.fmt(formatter),
             Self::LinkToCopyHandoff(error) => error.fmt(formatter),
             Self::CopyToLinkHandoff(error) => error.fmt(formatter),
+            Self::DirectoryLink(error) => error.fmt(formatter),
             Self::InvalidEffectHandoff => {
                 formatter.write_str("effect handoff does not have a supported link/copy pair")
             }
@@ -70,6 +73,7 @@ impl std::error::Error for ResourceExecutionError {
             Self::CopyStateOnly(error) => Some(error),
             Self::LinkToCopyHandoff(error) => Some(error),
             Self::CopyToLinkHandoff(error) => Some(error),
+            Self::DirectoryLink(error) => Some(error),
             Self::InvalidEffectHandoff => None,
         }
     }
@@ -90,6 +94,7 @@ fn source<'a>(
 pub(super) fn preflight(
     link_executor: &FileLinkExecutor,
     copy_executor: &FileCopyExecutor,
+    directory_executor: &DirectoryLinkExecutor,
     resource_action: &PlannedResourceAction,
     resolved: &ResolvedApplyInput,
 ) -> Result<(), ApplyError> {
@@ -104,6 +109,14 @@ pub(super) fn preflight(
                 )
                 .map_err(ApplyError::CopyPreflight)
         }
+        PlannedResourceAction::DirectoryLink(action) => directory_executor
+            .preflight(
+                action,
+                resolved
+                    .verified_directory_sources()
+                    .get(action.resource_id()),
+            )
+            .map_err(|_| ApplyError::CopyPreflight(CopyPreflightError::WrongAction)),
         PlannedResourceAction::FileLink(action) => match action.kind() {
             ActionKind::CreateLink => link_executor
                 .preflight_create(action, source(resolved, action.resource_id())?)
@@ -156,12 +169,22 @@ pub(super) fn preflight(
 pub(super) fn execute(
     link_executor: &FileLinkExecutor,
     copy_executor: &FileCopyExecutor,
+    directory_executor: &DirectoryLinkExecutor,
     resource_action: &PlannedResourceAction,
     recorded: &RecordedAction,
     resolved: &ResolvedApplyInput,
     progress: &mut dyn FnMut(CopyExecutionProgress) -> io::Result<()>,
 ) -> Result<(), ResourceExecutionError> {
     match resource_action {
+        PlannedResourceAction::DirectoryLink(action) => directory_executor
+            .execute(
+                action,
+                recorded,
+                resolved
+                    .verified_directory_sources()
+                    .get(action.resource_id()),
+            )
+            .map_err(ResourceExecutionError::DirectoryLink),
         PlannedResourceAction::FileLink(action) => match action.kind() {
             ActionKind::CreateLink => link_executor
                 .execute_create(

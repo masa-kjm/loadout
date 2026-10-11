@@ -11,7 +11,8 @@ use crate::domain::known::KnownResource;
 use crate::domain::known::{KnownDirectoryLink, KnownFileLink, KnownFileLinkError};
 use crate::domain::paths::ResolvedPath;
 use crate::domain::plan::{
-    ActionKind, PlannedAction, PlannedEffectHandoff, PlannedFileCopyAction, TargetCondition,
+    ActionKind, PlannedAction, PlannedDirectoryLinkAction, PlannedEffectHandoff,
+    PlannedFileCopyAction, TargetCondition,
 };
 
 /// An opaque operation identifier stored in `active_operation`.
@@ -239,6 +240,53 @@ enum ActionFacts {
 }
 
 impl RecordedAction {
+    /// Records complete DirectoryLink facts; the repository supplies a temporary only for atomic replacement.
+    pub(crate) fn directory_link(
+        action: &PlannedDirectoryLinkAction,
+        temporary_path: Option<ResolvedPath>,
+    ) -> Result<Self, OperationRecordError> {
+        let (old_effect, final_effect, superseded_resource_id) = match action {
+            PlannedDirectoryLinkAction::Create {
+                desired,
+                superseded,
+            } => (
+                None,
+                Some(KnownDirectoryLink::from_resolved(desired)),
+                superseded.as_ref().map(|old| old.resource_id().clone()),
+            ),
+            PlannedDirectoryLinkAction::Replace { desired, previous }
+            | PlannedDirectoryLinkAction::Relocate { desired, previous }
+            | PlannedDirectoryLinkAction::ReplaceOwnership { desired, previous } => (
+                Some(previous.clone()),
+                Some(KnownDirectoryLink::from_resolved(desired)),
+                matches!(action, PlannedDirectoryLinkAction::ReplaceOwnership { .. })
+                    .then(|| previous.resource_id().clone()),
+            ),
+            PlannedDirectoryLinkAction::Remove { previous }
+            | PlannedDirectoryLinkAction::ForgetMissing { previous } => {
+                (Some(previous.clone()), None, None)
+            }
+        };
+        Self::from_persisted_directory_link(
+            action.kind(),
+            action.resource_id().clone(),
+            old_effect,
+            final_effect,
+            superseded_resource_id,
+            temporary_path,
+            action
+                .preconditions()
+                .into_iter()
+                .next()
+                .expect("directory action has precondition"),
+            action
+                .postconditions()
+                .into_iter()
+                .last()
+                .expect("directory action has postcondition"),
+            ActionStatus::Pending,
+        )
+    }
     /// Reconstructs a DirectoryLink action from complete, effect-specific durable facts.
     /// This remains separate from executor-ready plans until DirectoryLink execution is enabled.
     #[allow(clippy::too_many_arguments)] // Durable facts are deliberately explicit so decoder validation cannot omit one.

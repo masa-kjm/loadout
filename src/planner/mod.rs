@@ -8,6 +8,7 @@ pub(crate) mod ordering;
 use crate::domain::actual::ActualState;
 use crate::domain::desired::ResolvedDesired;
 use crate::domain::diagnostic::Diagnostic;
+use crate::domain::directory_link::ActualDirectoryLinkState;
 use crate::domain::known::KnownState;
 use crate::domain::plan::{Plan, PlannedResourceAction};
 use crate::planner::ordering::sort_resource_actions;
@@ -40,6 +41,31 @@ pub(crate) fn plan(desired: &ResolvedDesired, known: &KnownState, actual: &Actua
     Plan::new_with_resource_actions(
         actions,
         links.diagnostics.into_iter().chain(copies.diagnostics),
+    )
+    .expect("independent resource planners preserve globally unique desired targets")
+}
+
+/// Builds a plan with DirectoryLink observations supplied by the dedicated no-follow inspector.
+pub(crate) fn plan_with_directory_links(
+    desired: &ResolvedDesired,
+    known: &KnownState,
+    actual: &ActualState,
+    directory_actual: &ActualDirectoryLinkState,
+) -> Plan {
+    let links = file_link::contribute(desired, known, actual);
+    let copies = file_copy::contribute(desired, known, actual);
+    let directories = directory_link::contribute(desired, known, directory_actual);
+    let mut actions = links.resource_actions;
+    actions.extend(copies.resource_actions);
+    actions.extend(directories.resource_actions);
+    sort_resource_actions(&mut actions);
+    Plan::new_with_resource_actions(
+        actions,
+        links
+            .diagnostics
+            .into_iter()
+            .chain(copies.diagnostics)
+            .chain(directories.diagnostics),
     )
     .expect("independent resource planners preserve globally unique desired targets")
 }

@@ -23,7 +23,7 @@ use crate::domain::paths::{
 use crate::filesystem::is_link_or_reparse_point;
 use crate::inspection::source::{
     PhysicalStoreRoot, SourceVerificationError, VerifiedSource, resolve_store_root,
-    verify_directory_source, verify_regular_source,
+    verify_directory_source, verify_directory_source_for_execution, verify_regular_source,
 };
 
 /// Canonical Desired state and the source proofs needed to execute it safely.
@@ -33,6 +33,8 @@ use crate::inspection::source::{
 pub(crate) struct ResolvedApplyInput {
     desired: ResolvedDesired,
     verified_sources: BTreeMap<FullyQualifiedResourceId, VerifiedSource>,
+    verified_directory_sources:
+        BTreeMap<FullyQualifiedResourceId, crate::inspection::source::VerifiedDirectorySource>,
 }
 
 impl ResolvedApplyInput {
@@ -44,6 +46,12 @@ impl ResolvedApplyInput {
     /// Returns the source proofs keyed by the resource identities they support.
     pub(crate) fn verified_sources(&self) -> &BTreeMap<FullyQualifiedResourceId, VerifiedSource> {
         &self.verified_sources
+    }
+    pub(crate) fn verified_directory_sources(
+        &self,
+    ) -> &BTreeMap<FullyQualifiedResourceId, crate::inspection::source::VerifiedDirectorySource>
+    {
+        &self.verified_directory_sources
     }
 
     fn into_desired(self) -> ResolvedDesired {
@@ -58,6 +66,7 @@ impl ResolvedApplyInput {
         Self {
             desired,
             verified_sources,
+            verified_directory_sources: BTreeMap::new(),
         }
     }
 }
@@ -248,16 +257,24 @@ pub(crate) fn resolve_for_apply(
         resolve_resource_inputs(context, environment, selected_root_profile)?;
     let mut resolved_resources = Vec::new();
     let mut verified_sources = BTreeMap::new();
+    let mut verified_directory_sources = BTreeMap::new();
     for resource in resources {
         if resource.kind == FileKind::Directory {
-            let _source = verify_directory_source(&resource.store_root, &resource.source_path)
-                .map_err(|source| ResolverError::SourceVerification {
-                    resource_id: resource.resolved.resource_id().clone(),
-                    source,
-                })?;
-            return Err(ResolverError::DirectoryLinkApplyNotImplemented {
-                resource_id: resource.resolved.resource_id().clone(),
-            });
+            let source =
+                verify_directory_source_for_execution(&resource.store_root, &resource.source_path)
+                    .map_err(|source| ResolverError::SourceVerification {
+                        resource_id: resource.resolved.resource_id().clone(),
+                        source,
+                    })?;
+            let resolved = ResolvedDirectoryLink::new(
+                resource.resolved.resource_id().clone(),
+                source.path().clone(),
+                resource.resolved.target_path().clone(),
+            )
+            .map_err(ResolverError::InvalidResolvedDirectoryLink)?;
+            verified_directory_sources.insert(resolved.resource_id().clone(), source);
+            resolved_resources.push(ResolvedResource::DirectoryLink(resolved));
+            continue;
         }
         let verified_source = verify_regular_source(&resource.store_root, &resource.source_path)
             .map_err(|source| ResolverError::SourceVerification {
@@ -283,9 +300,7 @@ pub(crate) fn resolve_for_apply(
                 .map_err(ResolverError::InvalidResolvedFileCopy)?,
             ),
             (FileKind::Directory, FileOperation::Link) => {
-                return Err(ResolverError::DirectoryLinkApplyNotImplemented {
-                    resource_id: resolved.resource_id().clone(),
-                });
+                unreachable!("directory resources continue above")
             }
             (FileKind::Directory, FileOperation::Copy) => {
                 unreachable!("profile decoder rejects directory copies")
@@ -297,6 +312,7 @@ pub(crate) fn resolve_for_apply(
     Ok(ResolvedApplyInput {
         desired,
         verified_sources,
+        verified_directory_sources,
     })
 }
 

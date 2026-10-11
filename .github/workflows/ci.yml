@@ -75,6 +75,16 @@ jobs:
           LOADOUT_NATIVE_FIXTURE_ROOT: ${{ runner.temp }}
         run: cargo test --locked --test native_copy_platform
 
+      - name: Native directory-link primitive probe
+        id: native_directory_link_probe
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        env:
+          LOADOUT_NATIVE_FIXTURE_ROOT: ${{ runner.temp }}
+        run: |
+          set -o pipefail
+          cargo test --locked --test native_directory_link_platform -- --nocapture 2>&1 | tee native-directory-link-platform.log
+
       - name: Sequential copy-action compiled CLI evidence
         id: sequential_copy_cli
         env:
@@ -111,6 +121,8 @@ jobs:
             echo "test_step_outcome=${{ steps.non_macos_test.outcome }}"
             echo "native_copy_probe_command=cargo test --locked --test native_copy_platform"
             echo "native_copy_probe_outcome=${{ steps.native_copy_probe.outcome }}"
+            echo "native_directory_link_probe_command=cargo test --locked --test native_directory_link_platform"
+            echo "native_directory_link_probe_outcome=${{ steps.native_directory_link_probe.outcome }}"
             echo "sequential_copy_cli_command=cargo test --locked --test cli_read_only sequential_copy_actions_apply_and_commit_known_state"
             echo "sequential_copy_cli_outcome=${{ steps.sequential_copy_cli.outcome }}"
             echo "copy_capability_matrix_command=python .github/scripts/run-copy-capability-matrix.py"
@@ -136,6 +148,8 @@ jobs:
             echo "test_step_outcome=${{ steps.macos_test.outcome }}"
             echo "native_copy_probe_command=cargo test --locked --test native_copy_platform"
             echo "native_copy_probe_outcome=${{ steps.native_copy_probe.outcome }}"
+            echo "native_directory_link_probe_command=cargo test --locked --test native_directory_link_platform"
+            echo "native_directory_link_probe_outcome=${{ steps.native_directory_link_probe.outcome }}"
             echo "sequential_copy_cli_command=cargo test --locked --test cli_read_only sequential_copy_actions_apply_and_commit_known_state"
             echo "sequential_copy_cli_outcome=${{ steps.sequential_copy_cli.outcome }}"
             echo "copy_capability_matrix_command=python .github/scripts/run-copy-capability-matrix.py"
@@ -177,6 +191,7 @@ jobs:
           path: |
             *-platform-evidence.txt
             macos-platform-test.log
+            native-directory-link-platform.log
             docs/development/copy-platform-decision-record.md
             copy-capability-matrix.json
             copy-capability-*.log

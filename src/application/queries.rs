@@ -9,7 +9,6 @@ use crate::domain::ids::{FullyQualifiedResourceId, ProfileId};
 use crate::domain::known::KnownResource;
 use crate::domain::plan::Plan;
 use crate::inspection::file_link::{FileLinkInspector, TargetInspectionError};
-use crate::planner::plan;
 use crate::resolver::{self, ResolvedApplyInput, ResolverContext, ResolverError};
 use crate::state::operation::OperationRecord;
 use crate::state::repository::{StateRepository, StateRepositoryError};
@@ -514,17 +513,22 @@ pub(crate) fn plan_request(request: &DeclarationRequest) -> Result<PlanReport, Q
     let state = StateRepository::new(request.context.state_directory().clone())
         .load()
         .map_err(QueryError::State)?;
-    if let Some(resource_id) = directory_link_resource_id(&desired, state.known()) {
-        return Err(QueryError::DirectoryLinkPlanningNotImplemented { resource_id });
-    }
     let inspector = FileLinkInspector::new(request.context.home_directory().as_ref())
         .map_err(QueryError::Inspection)?;
     let actual = inspector
         .inspect(&desired, state.known())
         .map_err(QueryError::Inspection)?;
+    let directory_actual = inspector
+        .inspect_directory_links(&desired, state.known())
+        .map_err(QueryError::Inspection)?;
     Ok(PlanReport {
         profile: desired.root_profile().clone(),
-        plan: plan(&desired, state.known(), &actual),
+        plan: crate::planner::plan_with_directory_links(
+            &desired,
+            state.known(),
+            &actual,
+            &directory_actual,
+        ),
     })
 }
 

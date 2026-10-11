@@ -5,10 +5,11 @@ use std::fmt;
 
 use crate::domain::desired::ResolvedResource;
 use crate::domain::diagnostic::Diagnostic;
+use crate::domain::directory_link::ResolvedDirectoryLink;
 use crate::domain::file_copy::ResolvedFileCopy;
 use crate::domain::file_link::{LinkTarget, ResolvedFileLink};
 use crate::domain::ids::FullyQualifiedResourceId;
-use crate::domain::known::{KnownFileCopy, KnownFileLink, KnownResource};
+use crate::domain::known::{KnownDirectoryLink, KnownFileCopy, KnownFileLink, KnownResource};
 use crate::domain::paths::ResolvedPath;
 
 /// The file-link action chosen by the planner.
@@ -293,7 +294,162 @@ pub(crate) struct PlannedAction {
 pub(crate) enum PlannedResourceAction {
     FileLink(PlannedAction),
     FileCopy(PlannedFileCopyAction),
+    DirectoryLink(PlannedDirectoryLinkAction),
     ReplaceEffect(PlannedEffectHandoff),
+}
+
+/// A complete executor-ready DirectoryLink action.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PlannedDirectoryLinkAction {
+    Create {
+        desired: ResolvedDirectoryLink,
+        superseded: Option<KnownDirectoryLink>,
+    },
+    Replace {
+        desired: ResolvedDirectoryLink,
+        previous: KnownDirectoryLink,
+    },
+    Relocate {
+        desired: ResolvedDirectoryLink,
+        previous: KnownDirectoryLink,
+    },
+    Remove {
+        previous: KnownDirectoryLink,
+    },
+    ForgetMissing {
+        previous: KnownDirectoryLink,
+    },
+    ReplaceOwnership {
+        desired: ResolvedDirectoryLink,
+        previous: KnownDirectoryLink,
+    },
+}
+
+impl PlannedDirectoryLinkAction {
+    pub(crate) fn kind(&self) -> ActionKind {
+        match self {
+            Self::Create { .. } => ActionKind::CreateDirectoryLink,
+            Self::Replace { .. } => ActionKind::ReplaceDirectoryLink,
+            Self::Relocate { .. } => ActionKind::RelocateDirectoryLink,
+            Self::Remove { .. } => ActionKind::RemoveDirectoryLink,
+            Self::ForgetMissing { .. } => ActionKind::ForgetMissing,
+            Self::ReplaceOwnership { .. } => ActionKind::ReplaceOwnership,
+        }
+    }
+    pub(crate) fn resource_id(&self) -> &FullyQualifiedResourceId {
+        match self {
+            Self::Create { desired, .. }
+            | Self::Replace { desired, .. }
+            | Self::Relocate { desired, .. }
+            | Self::ReplaceOwnership { desired, .. } => desired.resource_id(),
+            Self::Remove { previous } | Self::ForgetMissing { previous } => previous.resource_id(),
+        }
+    }
+    pub(crate) fn reason(&self) -> ActionReason {
+        match self {
+            Self::Create { .. } => ActionReason::TargetMissing,
+            Self::Replace { .. } => ActionReason::SourceChanged,
+            Self::Relocate { .. } => ActionReason::TargetChanged,
+            Self::Remove { .. } => ActionReason::StaleResource,
+            Self::ForgetMissing { .. } => ActionReason::StaleResourceTargetMissing,
+            Self::ReplaceOwnership { .. } => ActionReason::ManagedIdentityHandoff,
+        }
+    }
+    pub(crate) fn desired(&self) -> Option<&ResolvedDirectoryLink> {
+        match self {
+            Self::Create { desired, .. }
+            | Self::Replace { desired, .. }
+            | Self::Relocate { desired, .. }
+            | Self::ReplaceOwnership { desired, .. } => Some(desired),
+            _ => None,
+        }
+    }
+    pub(crate) fn previous(&self) -> Option<&KnownDirectoryLink> {
+        match self {
+            Self::Replace { previous, .. }
+            | Self::Relocate { previous, .. }
+            | Self::Remove { previous }
+            | Self::ForgetMissing { previous }
+            | Self::ReplaceOwnership { previous, .. } => Some(previous),
+            _ => None,
+        }
+    }
+    pub(crate) fn preconditions(&self) -> Vec<TargetCondition> {
+        match self {
+            Self::Create { desired, .. } => vec![missing(desired.target_path())],
+            Self::Replace { previous, .. }
+            | Self::Remove { previous }
+            | Self::ReplaceOwnership { previous, .. } => vec![expected_directory(previous)],
+            Self::Relocate { desired, previous } => {
+                vec![expected_directory(previous), missing(desired.target_path())]
+            }
+            Self::ForgetMissing { previous } => vec![missing(previous.target_path())],
+        }
+    }
+    pub(crate) fn postconditions(&self) -> Vec<TargetCondition> {
+        match self {
+            Self::Create { desired, .. }
+            | Self::Replace { desired, .. }
+            | Self::ReplaceOwnership { desired, .. } => vec![expected_desired_directory(desired)],
+            Self::Relocate { desired, previous } => vec![
+                missing(previous.target_path()),
+                expected_desired_directory(desired),
+            ],
+            Self::Remove { previous } | Self::ForgetMissing { previous } => {
+                vec![missing(previous.target_path())]
+            }
+        }
+    }
+    pub(crate) fn known_state_update(&self) -> ResourceKnownStateUpdate {
+        match self {
+            Self::Create {
+                desired,
+                superseded: Some(old),
+            } => ResourceKnownStateUpdate::ReplaceIdentity {
+                old_resource_id: old.resource_id().clone(),
+                new_resource: KnownDirectoryLink::from_resolved(desired).into(),
+            },
+            Self::Create { desired, .. }
+            | Self::Replace { desired, .. }
+            | Self::Relocate { desired, .. } => ResourceKnownStateUpdate::Upsert {
+                resource: KnownDirectoryLink::from_resolved(desired).into(),
+            },
+            Self::ReplaceOwnership { desired, previous } => {
+                ResourceKnownStateUpdate::ReplaceIdentity {
+                    old_resource_id: previous.resource_id().clone(),
+                    new_resource: KnownDirectoryLink::from_resolved(desired).into(),
+                }
+            }
+            Self::Remove { previous } | Self::ForgetMissing { previous } => {
+                ResourceKnownStateUpdate::Remove {
+                    resource_id: previous.resource_id().clone(),
+                }
+            }
+        }
+    }
+    pub(crate) fn touched_targets(&self) -> Vec<&ResolvedPath> {
+        match self {
+            Self::Relocate { desired, previous } => {
+                vec![previous.target_path(), desired.target_path()]
+            }
+            Self::Create { desired, .. }
+            | Self::Replace { desired, .. }
+            | Self::ReplaceOwnership { desired, .. } => vec![desired.target_path()],
+            Self::Remove { previous } | Self::ForgetMissing { previous } => {
+                vec![previous.target_path()]
+            }
+        }
+    }
+    pub(crate) fn replaced_resource_id(&self) -> Option<&FullyQualifiedResourceId> {
+        match self {
+            Self::Create {
+                superseded: Some(old),
+                ..
+            } => Some(old.resource_id()),
+            Self::ReplaceOwnership { previous, .. } => Some(previous.resource_id()),
+            _ => None,
+        }
+    }
 }
 
 /// A managed same-target handoff between the two closed file effects.
@@ -361,6 +517,7 @@ impl PlannedResourceAction {
         match self {
             Self::FileLink(action) => action.kind(),
             Self::FileCopy(action) => action.kind(),
+            Self::DirectoryLink(action) => action.kind(),
             Self::ReplaceEffect(_) => ActionKind::ReplaceEffect,
         }
     }
@@ -369,6 +526,7 @@ impl PlannedResourceAction {
         match self {
             Self::FileLink(action) => action.resource_id(),
             Self::FileCopy(action) => action.resource_id(),
+            Self::DirectoryLink(action) => action.resource_id(),
             Self::ReplaceEffect(action) => action.resource_id(),
         }
     }
@@ -378,6 +536,7 @@ impl PlannedResourceAction {
         match self {
             Self::FileLink(action) => action.reason(),
             Self::FileCopy(action) => action.reason(),
+            Self::DirectoryLink(action) => action.reason(),
             Self::ReplaceEffect(action) => action.reason(),
         }
     }
@@ -386,6 +545,7 @@ impl PlannedResourceAction {
         match self {
             Self::FileLink(action) => action.touched_targets(),
             Self::FileCopy(action) => action.touched_targets(),
+            Self::DirectoryLink(action) => action.touched_targets(),
             Self::ReplaceEffect(action) => action.touched_targets(),
         }
     }
@@ -395,6 +555,7 @@ impl PlannedResourceAction {
         match self {
             Self::FileLink(action) => action.preconditions(),
             Self::FileCopy(action) => action.preconditions(),
+            Self::DirectoryLink(action) => action.preconditions(),
             Self::ReplaceEffect(action) => action.preconditions(),
         }
     }
@@ -404,6 +565,7 @@ impl PlannedResourceAction {
         match self {
             Self::FileLink(action) => action.postconditions(),
             Self::FileCopy(action) => action.postconditions(),
+            Self::DirectoryLink(action) => action.postconditions(),
             Self::ReplaceEffect(action) => action.postconditions(),
         }
     }
@@ -413,6 +575,7 @@ impl PlannedResourceAction {
         match self {
             Self::FileLink(action) => action.known_state_update().map(Into::into),
             Self::FileCopy(action) => action.known_state_update().map(Into::into),
+            Self::DirectoryLink(action) => Some(action.known_state_update()),
             Self::ReplaceEffect(action) => Some(action.known_state_update()),
         }
     }
@@ -422,6 +585,7 @@ impl PlannedResourceAction {
         match self {
             Self::FileLink(action) => action.replaced_resource_id(),
             Self::FileCopy(_) | Self::ReplaceEffect(_) => None,
+            Self::DirectoryLink(action) => action.replaced_resource_id(),
         }
     }
 }
@@ -435,6 +599,11 @@ impl From<PlannedAction> for PlannedResourceAction {
 impl From<PlannedFileCopyAction> for PlannedResourceAction {
     fn from(action: PlannedFileCopyAction) -> Self {
         Self::FileCopy(action)
+    }
+}
+impl From<PlannedDirectoryLinkAction> for PlannedResourceAction {
+    fn from(action: PlannedDirectoryLinkAction) -> Self {
+        Self::DirectoryLink(action)
     }
 }
 
@@ -701,6 +870,18 @@ fn expected_desired(desired: &ResolvedFileLink) -> TargetCondition {
         link_target: desired.link_target().clone(),
     }
 }
+fn expected_directory(known: &KnownDirectoryLink) -> TargetCondition {
+    TargetCondition::ExpectedDirectoryLink {
+        target_path: known.target_path().clone(),
+        link_target: known.link_target().clone(),
+    }
+}
+fn expected_desired_directory(desired: &ResolvedDirectoryLink) -> TargetCondition {
+    TargetCondition::ExpectedDirectoryLink {
+        target_path: desired.target_path().clone(),
+        link_target: desired.link_target().clone(),
+    }
+}
 
 fn expected_copy(known: &KnownFileCopy) -> TargetCondition {
     TargetCondition::ExpectedCopy {
@@ -720,9 +901,7 @@ fn condition_for_known_effect(effect: &KnownResource) -> TargetCondition {
     match effect {
         KnownResource::FileLink(resource) => expected(resource),
         KnownResource::FileCopy(resource) => expected_copy(resource),
-        KnownResource::DirectoryLink(_) => {
-            unreachable!("directory-link planning is not implemented")
-        }
+        KnownResource::DirectoryLink(resource) => expected_directory(resource),
     }
 }
 
@@ -730,9 +909,7 @@ fn condition_for_resolved_effect(effect: &ResolvedResource) -> TargetCondition {
     match effect {
         ResolvedResource::FileLink(resource) => expected_desired(resource),
         ResolvedResource::FileCopy(resource) => expected_desired_copy(resource),
-        ResolvedResource::DirectoryLink(_) => {
-            unreachable!("directory-link planning is not implemented")
-        }
+        ResolvedResource::DirectoryLink(resource) => expected_desired_directory(resource),
     }
 }
 
@@ -740,8 +917,8 @@ fn known_from_resolved_effect(effect: &ResolvedResource) -> KnownResource {
     match effect {
         ResolvedResource::FileLink(resource) => KnownFileLink::from_resolved(resource).into(),
         ResolvedResource::FileCopy(resource) => KnownFileCopy::from_resolved(resource).into(),
-        ResolvedResource::DirectoryLink(_) => {
-            unreachable!("directory-link planning is not implemented")
+        ResolvedResource::DirectoryLink(resource) => {
+            KnownDirectoryLink::from_resolved(resource).into()
         }
     }
 }
@@ -859,9 +1036,9 @@ impl Plan {
             .iter()
             .filter_map(|action| match action {
                 PlannedResourceAction::FileLink(action) => Some(action.clone()),
-                PlannedResourceAction::FileCopy(_) | PlannedResourceAction::ReplaceEffect(_) => {
-                    None
-                }
+                PlannedResourceAction::FileCopy(_)
+                | PlannedResourceAction::DirectoryLink(_)
+                | PlannedResourceAction::ReplaceEffect(_) => None,
             })
             .collect();
 

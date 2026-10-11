@@ -361,6 +361,12 @@ impl LockedStateRepository {
                     }
                     _ => Err(OperationRecordError::UnsupportedActionKind { kind: copy.kind() }),
                 },
+                PlannedResourceAction::DirectoryLink(directory) => {
+                    let temporary = matches!(directory.kind(), ActionKind::ReplaceDirectoryLink)
+                        || matches!(directory, crate::domain::plan::PlannedDirectoryLinkAction::ReplaceOwnership { desired, previous } if desired.link_target() != previous.link_target());
+                    let temporary = temporary.then(|| self.allocate_temporary_sibling(directory.touched_targets()[0], &reserved)).transpose()?;
+                    RecordedAction::directory_link(directory, temporary)
+                }
                 PlannedResourceAction::ReplaceEffect(handoff) => {
                     let temporary = matches!(
                         handoff.final_effect(),

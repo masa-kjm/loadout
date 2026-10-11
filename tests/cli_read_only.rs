@@ -142,6 +142,13 @@ impl Fixture {
         let content_digest = Sha256::digest(contents);
         json!({"definition_hash":format!("sha256:{definition_digest:x}"),"effect":{"kind":"file_copy","source_path":source,"target_path":target,"content_fingerprint":format!("sha256:{content_digest:x}")}})
     }
+    fn known_directory_link(&self, source: &str, target: &str) -> Value {
+        let source = self.path(source);
+        let target = self.path(&format!("home/{target}"));
+        let definition = json!({"format":"loadout.resolved-directory-link.v1","kind":"directory","operation":"link","source_path":source,"target_path":target,"type":"file"});
+        let digest = Sha256::digest(serde_json_canonicalizer::to_vec(&definition).unwrap());
+        json!({"definition_hash":format!("sha256:{digest:x}"),"effect":{"kind":"directory_link","source_path":source,"target_path":target,"link_target":source}})
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -906,6 +913,187 @@ fn copy_create_applies_exact_source_bytes_and_commits_known_state() {
         json!({"base/copied": f.known_copy(".copy-target", b"content\n")})
     );
     assert!(state["active_operation"].is_null());
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_link_create_applies_and_commits_known_only_after_verification() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.path("store/nvim")).unwrap();
+    fs::create_dir_all(f.path("home/.config")).unwrap();
+    f.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 3\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: files\n        path: nvim\n      target: ~/.config/nvim\n",
+    );
+    let target = f.path("home/.config/nvim");
+    let output = f
+        .command()
+        .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+        .output()
+        .unwrap();
+    expect(
+        output,
+        0,
+        &[
+            "create_directory_link",
+            "apply completed: 1 committed actions",
+        ],
+    );
+    assert_eq!(fs::read_link(&target).unwrap(), f.path("store/nvim"));
+    let state: Value =
+        serde_json::from_slice(&fs::read(f.path("state/loadout/state.json")).unwrap()).unwrap();
+    assert_eq!(
+        state["resources"],
+        json!({"base/nvim": f.known_directory_link("store/nvim", ".config/nvim")})
+    );
+    assert!(state["active_operation"].is_null());
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_link_replace_relocate_handoff_and_remove_commit_the_verified_effect() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.path("store/old")).unwrap();
+    fs::create_dir_all(f.path("store/new")).unwrap();
+    fs::create_dir_all(f.path("home/.config")).unwrap();
+    let profile = |resource: &str, source: &str, target: &str| {
+        format!(
+            "schema_version: 3\nid: base\nresources:\n  {resource}:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: files\n        path: {source}\n      target: ~/{target}\n"
+        )
+    };
+    f.write(
+        "portable/profiles/base.yaml",
+        &profile("nvim", "old", ".config/nvim"),
+    );
+    expect(
+        f.command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        0,
+        &["create_directory_link"],
+    );
+
+    f.write(
+        "portable/profiles/base.yaml",
+        &profile("nvim", "new", ".config/nvim"),
+    );
+    expect(
+        f.command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        0,
+        &["replace_directory_link"],
+    );
+    assert_eq!(
+        fs::read_link(f.path("home/.config/nvim")).unwrap(),
+        f.path("store/new")
+    );
+
+    f.write(
+        "portable/profiles/base.yaml",
+        &profile("nvim", "new", ".config/nvim-next"),
+    );
+    expect(
+        f.command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        0,
+        &["relocate_directory_link"],
+    );
+    assert!(fs::symlink_metadata(f.path("home/.config/nvim")).is_err());
+    assert_eq!(
+        fs::read_link(f.path("home/.config/nvim-next")).unwrap(),
+        f.path("store/new")
+    );
+
+    f.write(
+        "portable/profiles/base.yaml",
+        &profile("editor", "new", ".config/nvim-next"),
+    );
+    expect(
+        f.command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        0,
+        &["replace_ownership"],
+    );
+    let state_after_handoff = state(&f);
+    assert_eq!(
+        state_after_handoff["resources"],
+        json!({"base/editor": f.known_directory_link("store/new", ".config/nvim-next")})
+    );
+
+    f.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 3\nid: base\nresources: {}\n",
+    );
+    expect(
+        f.command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        0,
+        &["remove_directory_link"],
+    );
+    assert!(fs::symlink_metadata(f.path("home/.config/nvim-next")).is_err());
+    assert_eq!(state(&f)["resources"], json!({}));
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_link_rejections_preserve_target_store_and_state() {
+    use std::os::unix::fs::symlink;
+
+    let profile = "schema_version: 3\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: files\n        path: nvim\n      target: ~/.config/nvim\n";
+    for rejection in ["unmanaged-target", "unsafe-parent", "unsafe-source"] {
+        let f = Fixture::new();
+        fs::create_dir_all(f.path("store/nvim")).unwrap();
+        fs::create_dir_all(f.path("home/.config")).unwrap();
+        f.write("portable/profiles/base.yaml", profile);
+        match rejection {
+            "unmanaged-target" => {
+                symlink(f.path("store/nvim"), f.path("home/.config/nvim")).unwrap()
+            }
+            "unsafe-parent" => {
+                fs::remove_dir(f.path("home/.config")).unwrap();
+                symlink(f.path("store/nvim"), f.path("home/.config")).unwrap();
+            }
+            "unsafe-source" => {
+                fs::remove_dir(f.path("store/nvim")).unwrap();
+                fs::create_dir_all(f.path("store/real-nvim")).unwrap();
+                symlink(f.path("store/real-nvim"), f.path("store/nvim")).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let state_root = f.path("state");
+        let before = f
+            .snapshot()
+            .into_iter()
+            .filter(|(path, _)| !path.starts_with(&state_root))
+            .collect::<BTreeMap<_, _>>();
+        let output = f
+            .command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap();
+        assert_ne!(
+            output.status.code(),
+            Some(0),
+            "{rejection}: {}",
+            text(&output)
+        );
+        let after = f
+            .snapshot()
+            .into_iter()
+            .filter(|(path, _)| !path.starts_with(&state_root))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(after, before, "{rejection}");
+        assert!(!f.path("state/loadout/state.json").exists(), "{rejection}");
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]

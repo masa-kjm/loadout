@@ -4,11 +4,87 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::domain::actual::TargetObservation;
 use crate::domain::desired::{ResolvedDesired, ResolvedResource};
+use crate::domain::diagnostic::Diagnostic;
 use crate::domain::directory_link::{ActualDirectoryLinkState, ResolvedDirectoryLink};
 use crate::domain::ids::FullyQualifiedResourceId;
 use crate::domain::known::{KnownDirectoryLink, KnownResource, KnownState};
 use crate::domain::paths::ResolvedPath;
+use crate::domain::plan::PlannedDirectoryLinkAction;
+use crate::planner::PlanContribution;
 use crate::planner::ordering::ActionPhase;
+
+/// Converts the closed DirectoryLink transition table to executor-ready actions.
+pub(super) fn contribute(
+    desired: &ResolvedDesired,
+    known: &KnownState,
+    actual: &ActualDirectoryLinkState,
+) -> PlanContribution {
+    let planned = plan(desired, known, actual);
+    let actions = planned
+        .transitions
+        .into_iter()
+        .filter_map(|transition| match transition {
+            DirectoryLinkTransition::Create {
+                desired,
+                superseded,
+            } => Some(
+                PlannedDirectoryLinkAction::Create {
+                    desired,
+                    superseded,
+                }
+                .into(),
+            ),
+            DirectoryLinkTransition::Replace { desired, previous } => {
+                Some(PlannedDirectoryLinkAction::Replace { desired, previous }.into())
+            }
+            DirectoryLinkTransition::Relocate { desired, previous } => {
+                Some(PlannedDirectoryLinkAction::Relocate { desired, previous }.into())
+            }
+            DirectoryLinkTransition::Remove(previous) => {
+                Some(PlannedDirectoryLinkAction::Remove { previous }.into())
+            }
+            DirectoryLinkTransition::ForgetMissing(previous) => {
+                Some(PlannedDirectoryLinkAction::ForgetMissing { previous }.into())
+            }
+            DirectoryLinkTransition::Noop { .. } => None,
+            DirectoryLinkTransition::ReplaceOwnership { desired, previous } => {
+                Some(PlannedDirectoryLinkAction::ReplaceOwnership { desired, previous }.into())
+            }
+        });
+    let diagnostics = planned
+        .diagnostics
+        .into_iter()
+        .map(|diagnostic| match diagnostic {
+            DirectoryLinkDiagnostic::MissingActual(target_path) => {
+                Diagnostic::MissingActualObservation { target_path }
+            }
+            DirectoryLinkDiagnostic::UnexpectedTarget {
+                resource_id,
+                target_path,
+                observation,
+            } => Diagnostic::UnexpectedTarget {
+                resource_id,
+                target_path,
+                observation,
+            },
+            DirectoryLinkDiagnostic::TargetCollision {
+                target_path,
+                resource_ids,
+            } => Diagnostic::TargetCollision {
+                target_path,
+                resource_ids,
+            },
+            DirectoryLinkDiagnostic::MixedEffect {
+                resource_id,
+                target_path,
+            } => Diagnostic::UnsupportedResourceEffect {
+                resource_id,
+                target_path,
+                effect: "directory_link",
+            },
+        });
+    PlanContribution::new(actions, diagnostics)
+}
 
 /// A non-executor-ready DirectoryLink transition selected by the pure table.
 #[derive(Clone, Debug, Eq, PartialEq)]

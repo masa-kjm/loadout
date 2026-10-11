@@ -252,6 +252,24 @@ impl ExecutionTarget {
         Ok(CheckedCreate { target: self, link })
     }
 
+    /// Rechecks a directory source and a missing final name before creating a directory symbolic link.
+    pub(crate) fn prepare_directory_create<'a>(
+        &'a self,
+        source_root: &ResolvedPath,
+        link: &'a LinkTarget,
+    ) -> io::Result<CheckedCreate<'a>> {
+        before_recheck()?;
+        check_directory_source(source_root, link)?;
+        self.check_association()?;
+        if self.observe_name(&self.name, link)? != TargetObservation::Missing {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "create entry is not missing",
+            ));
+        }
+        Ok(CheckedCreate { target: self, link })
+    }
+
     /// Stale links and recorded temporaries may be dangling: removal needs the expected link value, not an existing source referent.
     #[allow(dead_code)] // S3/S4 connect these primitives after native action evidence.
     pub(crate) fn prepare_remove(&self, expected: &LinkTarget) -> io::Result<CheckedRemove<'_>> {
@@ -279,6 +297,26 @@ impl ExecutionTarget {
         before_recheck()?;
         let temporary_name = self.sibling_name(temporary)?;
         check_source(source_root, new)?;
+        self.check_association()?;
+        self.require_link(&self.name, old)?;
+        self.require_link(&temporary_name, new)?;
+        Ok(CheckedReplace {
+            target: self,
+            temporary_name,
+        })
+    }
+
+    /// Rechecks source, final and exact temporary for an atomic directory-link replacement.
+    pub(crate) fn prepare_directory_replace<'a>(
+        &'a self,
+        temporary: &ResolvedPath,
+        old: &LinkTarget,
+        new: &'a LinkTarget,
+        source_root: &ResolvedPath,
+    ) -> io::Result<CheckedReplace<'a>> {
+        before_recheck()?;
+        let temporary_name = self.sibling_name(temporary)?;
+        check_directory_source(source_root, new)?;
         self.check_association()?;
         self.require_link(&self.name, old)?;
         self.require_link(&temporary_name, new)?;
@@ -717,6 +755,14 @@ fn check_source(root: &ResolvedPath, link: &LinkTarget) -> io::Result<()> {
     let metadata = statat(source.parent(), &source.name, AtFlags::SYMLINK_NOFOLLOW)?;
     if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile {
         return Err(invalid("source is not a no-follow regular file"));
+    }
+    source.check_association()
+}
+fn check_directory_source(root: &ResolvedPath, link: &LinkTarget) -> io::Result<()> {
+    let source = ExecutionTarget::open(root, link.as_path())?;
+    let metadata = statat(source.parent(), &source.name, AtFlags::SYMLINK_NOFOLLOW)?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory {
+        return Err(invalid("source is not a no-follow directory"));
     }
     source.check_association()
 }

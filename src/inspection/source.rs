@@ -29,6 +29,31 @@ pub(crate) struct VerifiedSource {
     source_path: SourceRelativePath,
 }
 
+/// A source directory proven without following any component below its store root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedDirectorySource {
+    path: ResolvedPath,
+    store_root: PhysicalStoreRoot,
+    source_path: SourceRelativePath,
+}
+
+impl VerifiedDirectorySource {
+    pub(crate) fn path(&self) -> &ResolvedPath {
+        &self.path
+    }
+    pub(crate) fn physical_root(&self) -> &ResolvedPath {
+        self.store_root.as_path()
+    }
+    pub(crate) fn reverify(&self) -> Result<Self, SourceVerificationError> {
+        let path = verify_directory_source(&self.store_root, &self.source_path)?;
+        Ok(Self {
+            path,
+            store_root: self.store_root.clone(),
+            source_path: self.source_path.clone(),
+        })
+    }
+}
+
 impl VerifiedSource {
     /// The verified absolute path used as a file-link source and link target.
     pub(crate) fn path(&self) -> &ResolvedPath {
@@ -196,6 +221,18 @@ pub(crate) fn verify_directory_source(
         return Err(SourceVerificationError::SourceNotDirectory { path: current });
     }
     ResolvedPath::new(current).map_err(SourceVerificationError::InvalidResolvedPath)
+}
+
+/// Verifies and retains the facts required to recheck a directory source at mutation time.
+pub(crate) fn verify_directory_source_for_execution(
+    store_root: &PhysicalStoreRoot,
+    source_path: &SourceRelativePath,
+) -> Result<VerifiedDirectorySource, SourceVerificationError> {
+    Ok(VerifiedDirectorySource {
+        path: verify_directory_source(store_root, source_path)?,
+        store_root: store_root.clone(),
+        source_path: source_path.clone(),
+    })
 }
 
 /// The reason a local-store source cannot be treated as verified input.

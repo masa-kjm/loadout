@@ -234,6 +234,21 @@ impl FileLinkInspector {
         )
     }
 
+    /// Observes a declared DirectoryLink target without treating a matching link as owned.
+    pub(crate) fn inspect_target_for_desired_directory_link(
+        &self,
+        target_path: &ResolvedPath,
+        desired_link_target: &LinkTarget,
+    ) -> Result<ActualDirectoryLink, TargetInspectionError> {
+        self.inspect_directory_target(
+            target_path.clone(),
+            TargetExpectations {
+                desired_link_target: Some(desired_link_target.clone()),
+                known_link_target: None,
+            },
+        )
+    }
+
     /// Rechecks one target as a regular file owned by an expected byte fingerprint.
     pub(crate) fn inspect_target_for_expected_copy(
         &self,

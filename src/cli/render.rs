@@ -87,6 +87,29 @@ fn observation(actual: &ActualResource) -> String {
                 format!("unsafe_path ({parent_safety:?})")
             }
         },
+        ActualResource::DirectoryLink(actual) => directory_link_observation(actual.observation()),
+    }
+}
+
+fn directory_link_observation(observation: &TargetObservation) -> String {
+    match observation {
+        TargetObservation::Missing => "missing".into(),
+        TargetObservation::ExpectedLink { link_target } => {
+            format!("expected_directory_link -> {}", link_target.as_path())
+        }
+        TargetObservation::MatchingUnmanagedLink { link_target } => {
+            format!(
+                "matching_unmanaged_directory_link -> {}",
+                link_target.as_path()
+            )
+        }
+        TargetObservation::OtherLink { link_target } => {
+            format!("other_link -> {}", link_target.as_path())
+        }
+        TargetObservation::OtherEntry { kind } => format!("other_entry ({kind:?})"),
+        TargetObservation::UnsafePath { parent_safety } => {
+            format!("unsafe_path ({parent_safety:?})")
+        }
     }
 }
 
@@ -105,7 +128,14 @@ fn expected_category(actual: &ActualResource) -> Option<&'static str> {
         {
             Some("expected_copy")
         }
-        ActualResource::FileLink(_) | ActualResource::FileCopy(_) => None,
+        ActualResource::DirectoryLink(actual)
+            if matches!(actual.observation(), TargetObservation::ExpectedLink { .. }) =>
+        {
+            Some("expected_directory_link")
+        }
+        ActualResource::FileLink(_)
+        | ActualResource::FileCopy(_)
+        | ActualResource::DirectoryLink(_) => None,
     }
 }
 
@@ -181,9 +211,17 @@ pub(super) fn profile_show(out: &mut impl Write, report: &ProfileShowReport) -> 
         writeln!(out, "include: {include}")?;
     }
     for resource in profile.resources() {
+        let kind = match resource.kind() {
+            crate::declaration::profile::FileKind::File => "file",
+            crate::declaration::profile::FileKind::Directory => "directory",
+        };
+        let operation = match resource.operation() {
+            crate::declaration::profile::FileOperation::Link => "link",
+            crate::declaration::profile::FileOperation::Copy => "copy",
+        };
         writeln!(
             out,
-            "resource {}: file link: store {}: source {}: target {}",
+            "resource {}: {kind} {operation}: store {}: source {}: target {}",
             resource.resource_id(),
             resource.store_id(),
             resource.source_path(),
@@ -288,15 +326,6 @@ pub(super) fn status(out: &mut impl Write, report: &StatusReport) -> io::Result<
                     StatusActual::Unavailable(StatusUnavailable::Observation(error)) => {
                         let (comparison, category) = unavailable_status_category(resource);
                         writeln!(out, "  {comparison}: {category}: unavailable: {error}")?;
-                    }
-                    StatusActual::Unavailable(
-                        StatusUnavailable::DirectoryLinkInspectionNotImplemented,
-                    ) => {
-                        let (comparison, category) = unavailable_status_category(resource);
-                        writeln!(
-                            out,
-                            "  {comparison}: {category}: unavailable: directory-link inspection is not implemented"
-                        )?;
                     }
                 }
             }
@@ -514,9 +543,6 @@ pub(super) fn query_error(error: &QueryError) -> String {
         QueryError::Resolution(error) => error.to_string(),
         QueryError::State(error) => error.to_string(),
         QueryError::Inspection(error) => error.to_string(),
-        QueryError::DirectoryLinkInspectionNotImplemented { resource_id } => {
-            format!("directory-link inspection is not implemented for {resource_id}")
-        }
         QueryError::DirectoryLinkPlanningNotImplemented { resource_id } => {
             format!("directory-link planning is not implemented for {resource_id}")
         }

@@ -146,6 +146,8 @@ impl DeclaredProfile {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DeclaredFileLink {
     resource_id: ResourceId,
+    kind: FileKind,
+    operation: FileOperation,
     store_id: String,
     source_path: String,
     target_path: String,
@@ -155,6 +157,16 @@ impl DeclaredFileLink {
     /// The validated resource ID within its declaring profile.
     pub(crate) fn resource_id(&self) -> &ResourceId {
         &self.resource_id
+    }
+
+    /// The declared closed resource kind.
+    pub(crate) fn kind(&self) -> FileKind {
+        self.kind
+    }
+
+    /// The declared closed materialization operation.
+    pub(crate) fn operation(&self) -> FileOperation {
+        self.operation
     }
 
     /// The raw store ID declaration.
@@ -196,6 +208,8 @@ pub(crate) fn declared_profiles(
                     let properties = resource.properties();
                     Ok(DeclaredFileLink {
                         resource_id,
+                        kind: properties.kind(),
+                        operation: properties.operation(),
                         store_id: properties.source().store().to_owned(),
                         source_path: properties.source().path().to_owned(),
                         target_path: properties.target().to_owned(),

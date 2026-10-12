@@ -494,7 +494,6 @@ fn query_exit_code(error: &QueryError) -> u8 {
         }
         QueryError::Resolution(error) => resolver_exit_code(error),
         QueryError::Configuration(_) | QueryError::ConfigField(_) => 2,
-        QueryError::DirectoryLinkInspectionNotImplemented { .. } => 1,
         QueryError::DirectoryLinkPlanningNotImplemented { .. } => 2,
     }
 }

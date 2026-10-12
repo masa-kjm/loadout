@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.6.0
+
+- Added `directory`/`link` resources for local-store real directories, with typed DirectoryLink ownership, no-follow observation, deterministic lifecycle transitions, durable recovery, and native Unix and Windows conformance evidence.
+
 ## v0.5.0
 
 - Added content-owned `file` copy resources with exact-byte fingerprint ownership, no-replace publication, verified staged replacement, link/copy effect handoff, and durable recovery classification.

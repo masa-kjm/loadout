@@ -2,7 +2,7 @@
 
 ## Scope
 
-This specification defines the v0.5.0 read-only inspection commands: `status`, `profile list`, `profile show`, `resource list`, and `resource show`.
+This specification defines the v0.6.0 read-only inspection commands: `status`, `profile list`, `profile show`, `resource list`, `resource show`, and the v0.6 `diff` extension.
 It extends the v0.3.0 `diff` inspection contract without changing that command.
 
 Inspection reports facts from the declaration, Resolved Desired, Known, and Actual layers.
@@ -143,7 +143,7 @@ If an observation cannot be established because of an I/O failure, the report id
 
 ## Non-Goals
 
-v0.5.0 inspection does not provide configuration editing, state repair, operation recovery, migration, import, target adoption, forceful takeover, a repair form of `diff`, a saved plan, or machine-readable output.
+v0.6.0 inspection does not provide configuration editing, state repair, operation recovery, migration, import, target adoption, forceful takeover, a repair form of `diff`, a saved plan, or machine-readable output.
 
 ## Schema Gate
 

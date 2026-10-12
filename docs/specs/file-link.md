@@ -5,7 +5,7 @@
 This specification defines the only v0.3.0 resource implementation retained by v0.4.0: a regular file from a local store materialized as a file symbolic link below the current user's home directory.
 It defines declaration syntax, containment, ownership, observation, mutation preconditions, and platform requirements.
 
-Every retained link requirement in this document remains a v0.5.0 requirement under the [v0.5.0 baseline](README.md#v050-baseline), including the no-follow observations used by inspection.
+Every retained link requirement in this document remains a v0.6.0 requirement under the [v0.6.0 baseline](README.md#v060-baseline), including the no-follow observations used by inspection.
 
 Copy operations, directory resources, hard links, junctions, and remote stores are outside v0.3.0.
 

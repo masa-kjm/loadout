@@ -2,7 +2,7 @@
 
 ## Scope
 
-This document defines how an implementation demonstrates conformance with the v0.5.0 architecture and specifications.
+This document defines how an implementation demonstrates conformance with the v0.6.0 architecture and specifications.
 It does not add runtime behavior, change an error outcome, or replace a specification.
 
 Every behavior change must identify its owning specification and add evidence at the narrowest test layer that can prove the contract.
@@ -190,6 +190,21 @@ Ordinary file-link replacement and source-changing link ownership replacement te
 Windows capability evidence requires settled path/state semantics, retained-parent operation evidence, and target sharing/ACL denial aftermath separately from state-file sharing failures when the runner can establish those conditions. Symbolic-link policy or privilege denial is an action-time condition and must be classified from its post-observation; it is not a permanent preflight capability probe. Record conditions that could not be established as unverified.
 
 Platform-specific tests run only in disposable directories and must clean up only the directories they created.
+
+## DirectoryLink Release Checklist
+
+The following evidence maps the DirectoryLink contract to the release gate. The focused tests named here supplement, rather than replace, the locked suite and the native CI jobs.
+
+| Contract area | Required evidence | Current test or gate |
+| --- | --- | --- |
+| Declaration, schema boundary, hashes, and transitions | Strict decoding, typed Desired/Known/Actual values, every transition row, and blocked mixed-effect handoff | Domain, resolver, planner, and state-codec tests; `cargo test --locked` |
+| No-follow source and target safety | Real-directory source validation without descendant traversal; unmanaged, unsafe, and unsupported target preservation | `inspection::source`, `inspection::file_link`, and DirectoryLink rejection tests |
+| Execution and recovery | Create, replacement, relocation, removal, ownership handoff, durable operation facts, failure aftermath, and recovery | DirectoryLink executor, application, state-repository, and operation tests |
+| CLI and zero mutation | Typed `validate`, `plan`, `apply`, `diff`, `status`, profile/resource inspection, blocked outcomes, and dry run | `tests/cli_read_only.rs` in a disposable environment |
+| Linux/ext4 and macOS/APFS | Native no-follow inspection, symlinked-parent rejection, atomic replacement, and link-entry-only removal | `tests/native_directory_link_platform.rs` in the CI native-directory-link probe |
+| Windows/NTFS | Directory-symlink lifecycle, junction rejection, replacement-guarantee rejection, and sharing-denial aftermath | `tests/native_directory_link_windows_platform.rs` in the CI native Windows DirectoryLink probe |
+
+The CI evidence artifacts record runner OS, filesystem, Rust toolchain, exact commands, and outcomes. A platform without a required capability must record the documented preflight rejection; it is not silently skipped.
 
 ## Change Checklist
 

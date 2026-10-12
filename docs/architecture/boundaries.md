@@ -3,7 +3,7 @@
 ## Purpose
 
 These boundaries keep safety decisions in one place and prevent the command layer, resource implementations, and persistence code from making incompatible decisions.
-They apply to every v0.5 implementation, including tests, authoring commands, inspection commands, and future resource types.
+They apply to every implementation, including tests, authoring commands, inspection commands, and future resource types.
 
 ## Decision Ownership
 
@@ -39,7 +39,7 @@ For example, a planned create must not become a replacement because an unexpecte
 ## Ownership and Removal
 
 Known state alone never authorizes a destructive filesystem action.
-For each v0.5 resource effect, removal or replacement is permitted only when both conditions hold:
+For each resource effect, removal or replacement is permitted only when both conditions hold:
 
 1. Known state records Loadout's effect-specific ownership evidence for the resource.
 2. Actual inspection confirms that exact expected effect.
@@ -107,7 +107,7 @@ A command must reject an unsupported version before an inspection, planning deci
 A command need not read or validate a persisted control document that its operation does not depend on.
 It must not ignore unknown ordering, ownership, recovery, or resource-effect data in order to continue.
 
-v0.5.0 deliberately provides no schema migration or old-schema reader.
+v0.6.0 deliberately provides no schema migration or old-schema reader.
 It rejects an unsupported version rather than transforming it during validation, planning, application, recovery, or inspection.
 A future compatibility release must specify an explicit migration operation before it accepts an older schema.
 

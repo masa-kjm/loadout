@@ -2,12 +2,12 @@
 
 ## Status
 
-This is a non-binding design note for later directory-resource work.
-Regular-file copy is specified for v0.5.0 in [File Copies](../specs/file-copy.md) and is not restated here.
+This is a non-binding design note for directory-resource work beyond the current DirectoryLink operation.
+Regular-file copy is specified in [File Copies](../specs/file-copy.md), and directory symbolic links are specified in [Directory Links](../specs/directory-link.md); neither is restated here.
 
 ## Why They Are Separate
 
-Directory materialization has a larger destructive surface than either current file effect and must not be added as a small variation of file copy or file link.
+Directory copy and synchronization have a larger destructive surface than current file effects and must not be added as a small variation of file copy or DirectoryLink.
 
 ## Directory Questions
 
@@ -25,7 +25,7 @@ The future design must account for nested symlinks, junctions, reparse points, c
 
 ## Safety Baseline
 
-Any directory design must preserve the v0.5.0 safety boundaries:
+Any future directory design must preserve the v0.6.0 safety boundaries:
 
 - source and target containment must be proven physically, not lexically;
 - unexpected entries must not be followed, replaced, or removed;

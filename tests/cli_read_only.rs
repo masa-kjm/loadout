@@ -915,7 +915,7 @@ fn copy_create_applies_exact_source_bytes_and_commits_known_state() {
     assert!(state["active_operation"].is_null());
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn directory_link_create_applies_and_commits_known_only_after_verification() {
     let f = Fixture::new();
@@ -949,7 +949,7 @@ fn directory_link_create_applies_and_commits_known_only_after_verification() {
     assert!(state["active_operation"].is_null());
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn directory_link_replace_relocate_handoff_and_remove_commit_the_verified_effect() {
     let f = Fixture::new();

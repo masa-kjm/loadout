@@ -819,7 +819,89 @@ impl FileLinkExecutor {
                 aftermath: temporary_observation.observation().clone(),
             });
         }
-        self.cleanup_recorded_replacement_temporary(recorded)
+        #[cfg(unix)]
+        {
+            self.cleanup_recorded_replacement_temporary(recorded)
+        }
+
+        #[cfg(windows)]
+        {
+            use crate::filesystem::ExecutionTarget;
+
+            let target_path = self
+                .inspector
+                .physical_target_path_for_execution(old.target_path())
+                .map_err(ReplacementTemporaryCleanupError::TargetInspection)?;
+            let temporary_path = self
+                .inspector
+                .physical_target_path_for_execution(temporary)
+                .map_err(ReplacementTemporaryCleanupError::TemporaryInspection)?;
+            let target_context = ExecutionTarget::open_with_declared_root(
+                self.inspector.canonical_home(),
+                self.inspector.declared_home(),
+                &target_path,
+            )
+            .map_err(|source| {
+                ReplacementTemporaryCleanupError::TargetInspection(execution_target_inspection(
+                    old.target_path(),
+                    source,
+                ))
+            })?;
+            let temporary_context = ExecutionTarget::open_with_declared_root(
+                self.inspector.canonical_home(),
+                self.inspector.declared_home(),
+                &temporary_path,
+            )
+            .map_err(|source| {
+                ReplacementTemporaryCleanupError::TemporaryInspection(execution_target_inspection(
+                    temporary, source,
+                ))
+            })?;
+            self.inspector
+                .inspect_target_for_expected_directory_link(old.target_path(), old.link_target())
+                .and_then(|observation| {
+                    if matches!(
+                        observation.observation(),
+                        TargetObservation::ExpectedLink { .. }
+                    ) {
+                        Ok(())
+                    } else {
+                        Err(TargetInspectionError::InvalidTargetPath {
+                            target_path: old.target_path().clone(),
+                        })
+                    }
+                })
+                .map_err(ReplacementTemporaryCleanupError::TargetInspection)?;
+            target_context.check_association().map_err(|source| {
+                ReplacementTemporaryCleanupError::TargetInspection(execution_target_inspection(
+                    old.target_path(),
+                    source,
+                ))
+            })?;
+            let attempt = temporary_context
+                .prepare_directory_remove(final_effect.link_target())
+                .and_then(|checked| checked.attempt());
+            let aftermath = self
+                .inspector
+                .inspect_target_for_expected_directory_link(temporary, final_effect.link_target())
+                .map_err(ReplacementTemporaryCleanupError::TemporaryInspection)?
+                .observation()
+                .clone();
+            if matches!(aftermath, TargetObservation::Missing) {
+                return Ok(());
+            }
+            match attempt {
+                Ok(()) => Err(ReplacementTemporaryCleanupError::PostconditionNotMet {
+                    temporary_path: temporary.clone(),
+                    observation: aftermath,
+                }),
+                Err(source) => Err(ReplacementTemporaryCleanupError::RemoveAttemptFailed {
+                    temporary_path: temporary.clone(),
+                    source,
+                    aftermath,
+                }),
+            }
+        }
     }
 
     #[cfg(any(unix, windows))]

@@ -211,13 +211,13 @@ impl DirectoryLinkExecutor {
             }
             PlannedDirectoryLinkAction::Replace { desired, previous }
             | PlannedDirectoryLinkAction::ReplaceOwnership { desired, previous } => {
+                if desired.link_target() == previous.link_target() {
+                    return self.expected(previous.target_path(), previous.link_target());
+                }
                 let source = source
                     .ok_or(DirectoryLinkExecutionError::InvalidRecord)?
                     .reverify()
                     .map_err(|e| DirectoryLinkExecutionError::Io(io::Error::other(e)))?;
-                if desired.link_target() == previous.link_target() {
-                    return self.expected(previous.target_path(), previous.link_target());
-                }
                 let temporary = recorded
                     .directory_link_facts()
                     .and_then(|f| f.temporary_path().cloned())
@@ -339,9 +339,7 @@ mod tests {
             previous: known.clone(),
         };
         let handoff_record = RecordedAction::directory_link(&handoff, None).unwrap();
-        executor
-            .execute(&handoff, &handoff_record, Some(&workspace.source("old")))
-            .unwrap();
+        executor.execute(&handoff, &handoff_record, None).unwrap();
 
         let remove = PlannedDirectoryLinkAction::Remove {
             previous: KnownDirectoryLink::from_resolved(&desired),

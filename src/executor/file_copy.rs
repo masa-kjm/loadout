@@ -210,7 +210,7 @@ impl FileCopyExecutor {
             PlannedResourceAction::ReplaceEffect(action) => {
                 Some(action.final_effect().target_path())
             }
-            PlannedResourceAction::FileLink(_) => None,
+            PlannedResourceAction::FileLink(_) | PlannedResourceAction::DirectoryLink(_) => None,
         }
         .ok_or(CopyPreflightError::WrongAction)?;
         ensure_file_copy_publication_supported(

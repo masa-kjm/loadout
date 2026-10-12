@@ -2,8 +2,8 @@
 
 ## Scope
 
-This specification defines v0.5.0 profile files, identifiers, include composition, resource declarations, and static validation.
-The `file` resource supports `link` and `copy`; see [File Links](file-link.md) and [File Copies](file-copy.md) for runtime behavior.
+This specification defines v0.6.0 profile files, identifiers, include composition, resource declarations, and static validation.
+The `file` resource supports file `link`, `copy`, and directory `link`; see [File Links](file-link.md), [File Copies](file-copy.md), and [Directory Links](directory-link.md) for runtime behavior.
 
 ## Identifiers
 

@@ -6,7 +6,7 @@ This specification defines the v0.3.0 lifecycle retained by v0.4.0 for validatin
 It owns planning decisions and the Desired/Known/Actual transition table.
 The File Links and State and Recovery specifications define the filesystem and durable-state mechanics used by those decisions.
 
-Every retained lifecycle requirement in this document remains a v0.5.0 requirement under the [v0.5.0 baseline](README.md#v050-baseline).
+Every retained lifecycle requirement in this document remains a v0.6.0 requirement under the [v0.6.0 baseline](README.md#v060-baseline).
 
 ## Inputs
 

@@ -1,6 +1,6 @@
 # Windows Sandbox Runner
 
-This runner executes the current v0.2 binary inside a disposable Windows Sandbox. It copies the shared v0.2 fixture into an isolated configuration, state, home, and local-store tree before running the selected CLI scenario.
+This runner executes the current binary inside a disposable Windows Sandbox. It copies the shared fixture into an isolated configuration, state, home, and local-store tree before running the selected CLI scenario.
 
 ## Requirements
 

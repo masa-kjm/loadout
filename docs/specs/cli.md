@@ -2,8 +2,8 @@
 
 ## Scope
 
-This specification defines the complete v0.5.0 command surface.
-Commands not listed here are not part of v0.5.0.
+This specification defines the complete command surface.
+Commands not listed here are not part of current version.
 
 The CLI parses input, presents diagnostics and plans, obtains confirmation, and maps outcomes to exit status.
 It does not make ownership, planner, filesystem, or state decisions outside the lifecycle.
@@ -175,7 +175,7 @@ This explanation adds no confirmation step and does not change `--yes` semantics
 ## Output
 
 The default output is human-readable text.
-Its wording and column layout are not a machine-readable output contract in v0.4.0.
+Its wording and column layout are not a machine-readable output contract in current version.
 
 For `plan` and `apply`, output identifies:
 

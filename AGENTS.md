@@ -4,7 +4,7 @@ Follow these instructions for every change in this repository.
 
 ## Project Status
 
-v0.5.0 is released.
+v0.5.0 is released. v0.6.0 is the current release candidate.
 
 ## Sources of Truth
 
@@ -29,7 +29,7 @@ Do not require an earlier commit to implement work explicitly assigned to a late
 An intermediate commit must fail closed, must not silently report unsupported behavior as success, and must preserve every applicable safety invariant.
 The final pull-request review must verify the aggregate worktree against the full published contract; a later planned commit never excuses a remaining mismatch at that point.
 
-## v0.5.0 Architecture
+## Architecture
 
 Keep the lifecycle boundaries explicit:
 
@@ -96,7 +96,7 @@ Preserve every applicable invariant:
 - Treat an unprovable result as `uncertain`; do not retry the old action automatically.
 - Apply always creates a fresh plan after recovery. It never resumes or reinterprets an old plan.
 - Reject v0.4 and unknown profile/state schemas before target inspection, recovery, planning, or state rewrite. Do not add a migration reader or command.
-- Preserve deterministic v0.5.0 action phases and fully qualified resource-ID tie-breaking. YAML mapping order and include order are not execution-order controls.
+- Preserve deterministic v0.6.0 action phases and fully qualified resource-ID tie-breaking. YAML mapping order and include order are not execution-order controls.
 
 ## Engineering and Tests
 
@@ -106,7 +106,7 @@ Preserve every applicable invariant:
 - Add evidence at the narrowest suitable layer: pure domain, filesystem contract, state durability, executor integration, CLI acceptance, or platform conformance.
 - Test every new mutation path for success, zero-mutation rejection, ownership protection, post-mutation failure, and recovery where applicable.
 - Use disposable test directories only. Never use a real home directory, XDG/AppData directory, source store, or repository state directory in a mutation test.
-- Once the v0.5.0 Rust package exists, run the relevant formatter, linter, and tests before handoff. Report checks that could not run and why.
+- Once the v0.6.0 Rust package exists, run the relevant formatter, linter, and tests before handoff. Report checks that could not run and why.
 
 ## Project Skills
 

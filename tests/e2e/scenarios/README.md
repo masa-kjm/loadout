@@ -1,4 +1,4 @@
-# v0.2 Scenario Set
+# Scenario Set
 
 These scenarios are the initial contract for an automated CLI acceptance runner. Each scenario must create fresh temporary home, configuration, state, and local-store directories, copy the shared fixture inputs, and remove only directories it created.
 

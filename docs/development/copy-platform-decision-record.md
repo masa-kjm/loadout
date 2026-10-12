@@ -4,7 +4,7 @@
 
 This record captures the implementation and binding decisions that native CI evidence must support for the file-copy publication contract.
 It is a development evidence record, not a specification; [File Copies](../specs/file-copy.md) and [Testing Strategy](testing.md) remain authoritative.
-It is the implementation-tracking record for the v0.5 copy actions and replaces a separate resumption plan: update the relevant action row with its primitive decision, required evidence, and enablement status as work progresses.
+It is the implementation-tracking record for the current copy actions and replaces a separate resumption plan: update the relevant action row with its primitive decision, required evidence, and enablement status as work progresses.
 
 Each entry is revised only with its native CI result, including the runner OS/version, filesystem, Rust toolchain, command, and applicable test outcome.
 The platform artifact includes `copy-capability-matrix.json` and its referenced focused-test logs; every matrix record names one action, capability decision, phase, command, result, and fixture-root environment.

@@ -8,15 +8,14 @@ It converges a machine toward the desired resource set produced by one composed 
 Loadout owns profile composition, resource lifecycle planning, local state, conflict detection, and the safe mutation of supported resources.
 It does not reimplement package managers, runtime version resolution, secret management, or the side-effect guarantees of arbitrary commands.
 
-## v0.5.0 Core
+## v0.6.0 Core
 
-v0.5.0 supports two closed effects for one regular file from a local store: a link or a content-owned copy at a target path.
+v0.6.0 supports two closed effects for one regular file from a local store: a link or a content-owned copy at a target path, plus a directory symbolic link for one local-store real directory.
 It retains read-only inspection of profiles, resources, and selected Desired/Known/Actual relations.
-Task resources, remote stores, and parameters are not part of the v0.5.0 executable surface.
-The current contract adds one closed directory resource effect: a local-store real directory materialized as a directory symbolic link; it does not add directory copying or a generic plugin surface.
+Task resources, remote stores, directory copying, and parameters are not part of the v0.6.0 executable surface.
 
 The first implementation must prefer a narrow, complete file-link lifecycle over generic extension mechanisms.
-In particular, v0.5.0 does not expose an external resource-plugin API.
+In particular, v0.6.0 does not expose an external resource-plugin API.
 
 ## System Model
 
@@ -114,10 +113,10 @@ If a recheck fails, the executor aborts the action; it does not reinterpret the 
 
 ### Determinism
 
-Apply is sequential in v0.5.0.
+Apply is sequential in v0.6.0.
 Execution order must not depend on a YAML mapping iteration order or an implementation collection order.
 The lifecycle specification will define the stable phase order and the fully qualified resource-ID ordering within each phase.
-v0.5.0 does not expose resource IDs or declaration position as an ordering control.
+v0.6.0 does not expose resource IDs or declaration position as an ordering control.
 A future dependency model may constrain action order, but independent actions must retain a canonical deterministic tie-breaker.
 
 ## Responsibilities

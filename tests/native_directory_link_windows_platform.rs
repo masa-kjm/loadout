@@ -170,11 +170,17 @@ fn directory_link_lifecycle_rejects_junctions_and_preserves_old_effect_on_sharin
         assert!(fs::symlink_metadata(&capability_probe).is_err());
         fixture.profile("nvim", "old", ".config/nvim");
         let output = fixture.apply();
-        assert_ne!(output.status.code(), Some(0), "{}", output_text(&output));
+        assert_eq!(output.status.code(), Some(2), "{}", output_text(&output));
+        assert!(
+            output_text(&output).contains("Preflight"),
+            "{}",
+            output_text(&output)
+        );
         assert!(fs::symlink_metadata(fixture.path("home/.config/nvim")).is_err());
-        if fixture.path("state/loadout/state.json").exists() {
-            assert!(fixture.state()["resources"].as_object().unwrap().is_empty());
-        }
+        assert!(
+            !fixture.path("state/loadout/state.json").exists(),
+            "capability preflight rejection must not create state or an operation record"
+        );
         eprintln!("directory symbolic-link creation unavailable: {error}");
         return;
     }

@@ -2,13 +2,13 @@
 
 This directory is reserved for black-box tests that execute the compiled Loadout CLI in a disposable environment.
 
-The v0.2 test environment must provide isolated home, configuration, state, and local-store directories. It must copy version-controlled fixtures into those directories and must never use a developer's real home, XDG directories, AppData directories, or repository-owned state.
+The test environment must provide isolated home, configuration, state, and local-store directories. It must copy version-controlled fixtures into those directories and must never use a developer's real home, XDG directories, AppData directories, or repository-owned state.
 
 ## Current Scope
 
-The first scenario set is documented in [scenarios/README.md](scenarios/README.md). It covers the smallest useful v0.2 lifecycle: validate, plan, apply, repeated apply, diff, dry-run, and blocked plans.
+The first scenario set is documented in [scenarios/README.md](scenarios/README.md). It covers the smallest useful lifecycle: validate, plan, apply, repeated apply, diff, dry-run, and blocked plans.
 
-The Linux Docker and Windows Sandbox runners execute the v0.2 CLI directly. They share the same fixture and scenario contract; the platform-specific runner is responsible only for creating the disposable environment, transferring the binary and fixture, and collecting logs.
+The Linux Docker and Windows Sandbox runners execute the CLI directly. They share the same fixture and scenario contract; the platform-specific runner is responsible only for creating the disposable environment, transferring the binary and fixture, and collecting logs.
 
 ## Fixture Policy
 

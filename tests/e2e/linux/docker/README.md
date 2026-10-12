@@ -1,6 +1,6 @@
 # Linux Docker Runner
 
-This runner builds the current v0.2 binary inside Docker and executes the CLI against a disposable home, configuration, state, and local-store tree.
+This runner builds the current binary inside Docker and executes the CLI against a disposable home, configuration, state, and local-store tree.
 
 ## Requirements
 

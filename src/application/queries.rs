@@ -111,7 +111,6 @@ pub(crate) enum StatusActual {
 pub(crate) enum StatusUnavailable {
     InspectorInitialization,
     Observation(TargetInspectionError),
-    DirectoryLinkInspectionNotImplemented,
 }
 
 /// The identity and definition relation before interpreting its Actual observation.
@@ -139,6 +138,15 @@ impl StatusResource {
             (Some(ResolvedResource::FileCopy(desired)), Some(KnownResource::FileCopy(known)))
                 if desired.source_path() == known.source_path()
                     && desired.target_path() == known.target_path() =>
+            {
+                StatusRelationship::DefinitionsMatch
+            }
+            (
+                Some(ResolvedResource::DirectoryLink(desired)),
+                Some(KnownResource::DirectoryLink(known)),
+            ) if desired.source_path() == known.source_path()
+                && desired.target_path() == known.target_path()
+                && desired.link_target() == known.link_target() =>
             {
                 StatusRelationship::DefinitionsMatch
             }
@@ -177,9 +185,6 @@ pub(crate) enum QueryError {
     Resolution(ResolverError),
     State(StateRepositoryError),
     Inspection(TargetInspectionError),
-    DirectoryLinkInspectionNotImplemented {
-        resource_id: FullyQualifiedResourceId,
-    },
     DirectoryLinkPlanningNotImplemented {
         resource_id: FullyQualifiedResourceId,
     },
@@ -398,19 +403,18 @@ fn status_with_inspector(
                 (None, Some(ResolvedResource::FileCopy(desired))) => inspector
                     .inspect_target_for_desired_copy(desired.target_path())
                     .map(ActualResource::from),
-                (Some(KnownResource::DirectoryLink(_)), _)
-                | (None, Some(ResolvedResource::DirectoryLink(_))) => {
-                    has_unavailable_observation = true;
-                    resources.push(StatusResource {
-                        resource_id,
-                        desired: desired_resource,
-                        known: known_resource,
-                        actual: StatusActual::Unavailable(
-                            StatusUnavailable::DirectoryLinkInspectionNotImplemented,
-                        ),
-                    });
-                    continue;
-                }
+                (Some(KnownResource::DirectoryLink(known)), _) => inspector
+                    .inspect_target_for_expected_directory_link(
+                        known.target_path(),
+                        known.link_target(),
+                    )
+                    .map(ActualResource::from),
+                (None, Some(ResolvedResource::DirectoryLink(desired))) => inspector
+                    .inspect_target_for_desired_directory_link(
+                        desired.target_path(),
+                        desired.link_target(),
+                    )
+                    .map(ActualResource::from),
                 (None, None) => unreachable!("the union key has one source"),
             };
             match observation {
@@ -491,11 +495,12 @@ pub(crate) fn diff(
                         resource.content_fingerprint(),
                     )
                     .map(ActualResource::from),
-                KnownResource::DirectoryLink(resource) => {
-                    return Err(QueryError::DirectoryLinkInspectionNotImplemented {
-                        resource_id: resource.resource_id().clone(),
-                    });
-                }
+                KnownResource::DirectoryLink(resource) => inspector
+                    .inspect_target_for_expected_directory_link(
+                        resource.target_path(),
+                        resource.link_target(),
+                    )
+                    .map(ActualResource::from),
             }
             .map_err(QueryError::Inspection)?;
             resources.push((resource.resource_id().clone(), actual));

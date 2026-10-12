@@ -3621,6 +3621,7 @@ mod tests {
                     Some((id.as_str(), actual.observation()))
                 }
                 crate::domain::actual::ActualResource::FileCopy(_) => None,
+                crate::domain::actual::ActualResource::DirectoryLink(_) => None,
             })
             .collect::<BTreeMap<_, _>>();
         assert!(matches!(

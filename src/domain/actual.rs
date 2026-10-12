@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use crate::domain::directory_link::ActualDirectoryLink;
 use crate::domain::file_copy::ContentFingerprint;
 use crate::domain::file_link::LinkTarget;
 use crate::domain::paths::ResolvedPath;
@@ -160,6 +161,7 @@ pub(crate) struct ActualFileCopy {
 pub(crate) enum ActualResource {
     FileLink(ActualFileLink),
     FileCopy(ActualFileCopy),
+    DirectoryLink(ActualDirectoryLink),
 }
 
 impl ActualResource {
@@ -167,6 +169,7 @@ impl ActualResource {
         match self {
             Self::FileLink(value) => value.target_path(),
             Self::FileCopy(value) => value.target_path(),
+            Self::DirectoryLink(value) => value.target_path(),
         }
     }
 }
@@ -179,6 +182,12 @@ impl From<ActualFileLink> for ActualResource {
 impl From<ActualFileCopy> for ActualResource {
     fn from(value: ActualFileCopy) -> Self {
         Self::FileCopy(value)
+    }
+}
+
+impl From<ActualDirectoryLink> for ActualResource {
+    fn from(value: ActualDirectoryLink) -> Self {
+        Self::DirectoryLink(value)
     }
 }
 

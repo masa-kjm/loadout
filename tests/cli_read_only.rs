@@ -949,6 +949,76 @@ fn directory_link_create_applies_and_commits_known_only_after_verification() {
     assert!(state["active_operation"].is_null());
 }
 
+#[cfg(unix)]
+#[test]
+fn directory_link_is_reported_by_read_only_commands_without_mutation() {
+    use std::os::unix::fs::symlink;
+
+    let f = Fixture::new();
+    fs::create_dir_all(f.path("store/nvim")).unwrap();
+    fs::create_dir_all(f.path("home/.config")).unwrap();
+    symlink(f.path("store/nvim"), f.path("home/.config/nvim")).unwrap();
+    f.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 3\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: files\n        path: nvim\n      target: ~/.config/nvim\n",
+    );
+    f.state(
+        json!({"base/nvim": f.known_directory_link("store/nvim", ".config/nvim")}),
+        Value::Null,
+    );
+
+    expect(
+        f.run(&["validate", "--config", "../portable/config.yaml"]),
+        0,
+        &["valid profile: base"],
+    );
+    expect(
+        f.run(&["plan", "--config", "../portable/config.yaml"]),
+        0,
+        &["executable", "profile base"],
+    );
+    expect(
+        f.run(&["apply", "--dry-run", "--config", "../portable/config.yaml"]),
+        0,
+        &["profile base", "executable plan"],
+    );
+    expect(
+        f.run(&["diff"]),
+        0,
+        &["base/nvim", "expected_directory_link"],
+    );
+    expect(
+        f.run(&["status", "--config", "../portable/config.yaml"]),
+        0,
+        &[
+            "base/nvim: desired-to-known: definitions_match",
+            "recorded_and_expected",
+            "expected_directory_link",
+        ],
+    );
+    expect(
+        f.run(&[
+            "profile",
+            "show",
+            "--config",
+            "../portable/config.yaml",
+            "base",
+        ]),
+        0,
+        &["resource nvim: directory link"],
+    );
+    expect(
+        f.run(&["resource", "list", "--config", "../portable/config.yaml"]),
+        0,
+        &["base/nvim: directory link"],
+    );
+    expect(
+        f.run(&["resource", "show", "--known", "base/nvim"]),
+        0,
+        &["base/nvim: directory link"],
+    );
+}
+
 #[cfg(any(unix, windows))]
 #[test]
 fn directory_link_replace_relocate_handoff_and_remove_commit_the_verified_effect() {

@@ -91,6 +91,7 @@ mod execution_hooks {
         AfterMutationAttempt,
         AfterTemporaryCreation,
         BeforeReplacementRenameRecheck,
+        BeforeDirectoryRemoval,
         BeforeRelocateRemovalRecheck,
         BeforePostObservation,
         BeforeCommit,

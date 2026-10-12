@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+    GetVolumeInformationByHandleW,
 };
 
 use crate::domain::paths::ResolvedPath;
@@ -23,9 +24,11 @@ use crate::domain::{
 
 use super::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, IO_REPARSE_TAG_SYMLINK,
-    create_relative_file_no_replace, mark_file_for_deletion_on_close,
+    create_relative_directory_no_replace, create_relative_file_no_replace,
+    mark_file_for_deletion_on_close, open_relative_directory_for_delete,
     open_relative_file_for_delete, open_relative_no_follow, rename_relative_from_handle,
-    require_plain_directory, set_file_symbolic_link_reparse_point,
+    require_plain_directory, set_directory_symbolic_link_reparse_point,
+    set_file_symbolic_link_reparse_point,
 };
 
 /// A no-follow parent chain whose association with its declared paths can be rechecked.
@@ -106,6 +109,43 @@ impl ExecutionTarget {
             same_directory(&current, retained)?;
         }
         Ok(())
+    }
+
+    /// Proves that the retained target parent is on NTFS, the filesystem validated for retained-parent `FileRenameInformationEx` directory-link replacement.
+    pub(crate) fn ensure_directory_link_replacement_capability(&self) -> io::Result<()> {
+        self.check_association()?;
+        let mut filesystem_name = [0_u16; 32];
+        // SAFETY: the retained parent handle and output buffer remain valid for the synchronous query.
+        let result = unsafe {
+            GetVolumeInformationByHandleW(
+                self.parent().as_raw_handle() as _,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                filesystem_name.as_mut_ptr(),
+                filesystem_name.len() as u32,
+            )
+        };
+        if result == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let length = filesystem_name
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(filesystem_name.len());
+        if !filesystem_name[..length]
+            .iter()
+            .copied()
+            .eq("NTFS".encode_utf16())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "directory-link replacement requires an NTFS target parent",
+            ));
+        }
+        self.check_association()
     }
 
     /// Observes the final entry through the retained parent and brackets it with association checks.
@@ -221,6 +261,59 @@ impl ExecutionTarget {
         link_target: &LinkTarget,
     ) -> io::Result<()> {
         self.prepare_create(source_root, link_target)?.attempt()
+    }
+
+    /// Rechecks a real directory source and a missing final name before creating a directory symbolic link.
+    pub(crate) fn prepare_directory_create<'a>(
+        &'a self,
+        source_root: &ResolvedPath,
+        link: &'a LinkTarget,
+    ) -> io::Result<CheckedDirectoryCreate<'a>> {
+        check_directory_source(source_root, link)?;
+        self.check_association()?;
+        if self.observe_directory_name(link)? != TargetObservation::Missing {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "create entry is not missing",
+            ));
+        }
+        Ok(CheckedDirectoryCreate { target: self, link })
+    }
+
+    /// Rechecks the exact directory symbolic-link predicate and retains the final entry for deletion.
+    pub(crate) fn prepare_directory_remove(
+        &self,
+        expected: &LinkTarget,
+    ) -> io::Result<CheckedDirectoryRemove<'_>> {
+        self.check_association()?;
+        let directory = open_relative_directory_for_delete(self.parent(), &self.name)?;
+        require_expected_directory_symbolic_link(&directory, expected)?;
+        Ok(CheckedDirectoryRemove {
+            target: self,
+            directory,
+        })
+    }
+
+    /// Rechecks the exact directory-link final and temporary entries before atomic same-parent replacement.
+    pub(crate) fn prepare_directory_replace<'a>(
+        &'a self,
+        temporary: &ResolvedPath,
+        old: &LinkTarget,
+        new: &LinkTarget,
+        source_root: &ResolvedPath,
+    ) -> io::Result<CheckedDirectoryReplace<'a>> {
+        check_directory_source(source_root, new)?;
+        self.check_association()?;
+        let old_directory = open_relative_directory_for_delete(self.parent(), &self.name)?;
+        require_expected_directory_symbolic_link(&old_directory, old)?;
+        let temporary_name = self.sibling_name(temporary)?;
+        let temporary_directory =
+            open_relative_directory_for_delete(self.parent(), &temporary_name)?;
+        require_expected_directory_symbolic_link(&temporary_directory, new)?;
+        Ok(CheckedDirectoryReplace {
+            target: self,
+            temporary_directory,
+        })
     }
 
     /// Copy-to-link replacement is fail-closed until Windows-native failure-aftermath evidence exists.
@@ -352,6 +445,34 @@ impl ExecutionTarget {
             })
         }
     }
+
+    fn observe_directory_name(&self, expected: &LinkTarget) -> io::Result<TargetObservation> {
+        let directory = match open_relative_directory_for_delete(self.parent(), &self.name) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(TargetObservation::Missing);
+            }
+            Err(error) => return Err(error),
+        };
+        let metadata = directory.metadata()?;
+        let attributes = metadata.file_attributes();
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+            || attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+            || reparse_buffer(&directory)?[..4] != IO_REPARSE_TAG_SYMLINK.to_le_bytes()
+        {
+            return Ok(TargetObservation::OtherEntry {
+                kind: OtherEntryKind::ReparsePoint,
+            });
+        }
+        let link_target = LinkTarget::new(parse_file_symbolic_link_target(&reparse_buffer(
+            &directory,
+        )?)?);
+        Ok(if &link_target == expected {
+            TargetObservation::ExpectedLink { link_target }
+        } else {
+            TargetObservation::OtherLink { link_target }
+        })
+    }
 }
 
 /// A short-lived proof of no-replace creation predicates.
@@ -422,6 +543,72 @@ impl CheckedRemove<'_> {
         let Self { target, file } = self;
         mark_file_for_deletion_on_close(&file)?;
         drop(file);
+        target.check_association()
+    }
+}
+
+/// A short-lived proof of no-replace directory-link creation predicates.
+#[must_use]
+pub(crate) struct CheckedDirectoryCreate<'a> {
+    target: &'a ExecutionTarget,
+    link: &'a LinkTarget,
+}
+
+impl CheckedDirectoryCreate<'_> {
+    pub(crate) fn attempt_temporary(self) -> io::Result<()> {
+        self.attempt()
+    }
+
+    pub(crate) fn attempt(self) -> io::Result<()> {
+        let Self { target, link } = self;
+        #[cfg(test)]
+        crate::test_support::execution_boundary(
+            crate::test_support::ExecutionBoundary::AfterFinalRecheck,
+        )?;
+        let directory = create_relative_directory_no_replace(target.parent(), &target.name)?;
+        if let Err(error) =
+            set_directory_symbolic_link_reparse_point(&directory, link.as_path().as_ref())
+        {
+            let cleanup = mark_file_for_deletion_on_close(&directory);
+            drop(directory);
+            return cleanup.and(Err(error));
+        }
+        drop(directory);
+        target.check_association()
+    }
+}
+
+/// A short-lived proof of atomic directory-link replacement predicates.
+#[must_use]
+pub(crate) struct CheckedDirectoryReplace<'a> {
+    target: &'a ExecutionTarget,
+    temporary_directory: File,
+}
+
+impl CheckedDirectoryReplace<'_> {
+    pub(crate) fn attempt(self) -> io::Result<()> {
+        let Self {
+            target,
+            temporary_directory,
+        } = self;
+        rename_relative_from_handle(&temporary_directory, target.parent(), &target.name, true)?;
+        drop(temporary_directory);
+        target.check_association()
+    }
+}
+
+/// A short-lived proof of directory-link removal predicates.
+#[must_use]
+pub(crate) struct CheckedDirectoryRemove<'a> {
+    target: &'a ExecutionTarget,
+    directory: File,
+}
+
+impl CheckedDirectoryRemove<'_> {
+    pub(crate) fn attempt(self) -> io::Result<()> {
+        let Self { target, directory } = self;
+        mark_file_for_deletion_on_close(&directory)?;
+        drop(directory);
         target.check_association()
     }
 }
@@ -558,6 +745,26 @@ fn require_expected_file_symbolic_link(file: &File, expected: &LinkTarget) -> io
     Ok(())
 }
 
+fn require_expected_directory_symbolic_link(file: &File, expected: &LinkTarget) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    let attributes = metadata.file_attributes();
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 || attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+    {
+        return Err(invalid("entry is not a directory symbolic link"));
+    }
+    let buffer = reparse_buffer(file)?;
+    if buffer[..4] != IO_REPARSE_TAG_SYMLINK.to_le_bytes() {
+        return Err(invalid("entry is not a directory symbolic link"));
+    }
+    let observed = LinkTarget::new(parse_file_symbolic_link_target(&buffer)?);
+    if &observed != expected {
+        return Err(invalid(
+            "entry no longer has the expected symbolic-link value",
+        ));
+    }
+    Ok(())
+}
+
 fn check_source(root: &ResolvedPath, link: &LinkTarget) -> io::Result<()> {
     let source = ExecutionTarget::open(root, link.as_path())?;
     let file = open_relative_no_follow(source.parent(), &source.name, false)?;
@@ -566,6 +773,13 @@ fn check_source(root: &ResolvedPath, link: &LinkTarget) -> io::Result<()> {
     if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_file() {
         return Err(invalid("source is not a no-follow regular file"));
     }
+    source.check_association()
+}
+
+fn check_directory_source(root: &ResolvedPath, link: &LinkTarget) -> io::Result<()> {
+    let source = ExecutionTarget::open(root, link.as_path())?;
+    let directory = open_relative_no_follow(source.parent(), &source.name, true)?;
+    require_plain_directory(&directory)?;
     source.check_association()
 }
 
@@ -658,11 +872,11 @@ fn copy_unsupported() -> io::Error {
 mod tests {
     use std::fs;
     use std::io;
-    use std::os::windows::fs::{symlink_dir, symlink_file};
+    use std::os::windows::fs::{MetadataExt, symlink_dir, symlink_file};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::ExecutionTarget;
+    use super::{ExecutionTarget, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT};
     use crate::domain::actual::TargetObservation;
     use crate::domain::file_link::LinkTarget;
     use crate::domain::paths::ResolvedPath;
@@ -947,6 +1161,104 @@ mod tests {
         assert_eq!(fs::read_link(&target_path).unwrap(), old_source);
         assert_eq!(fs::read_link(&temporary_path).unwrap(), other_source);
         drop(context);
+        fs::remove_dir_all(root.as_ref()).unwrap();
+    }
+
+    #[test]
+    fn checked_directory_create_and_remove_materialize_only_a_directory_link_entry() {
+        let root = fixture_root();
+        let source_path = root.join("source");
+        let target_path = root.join("target");
+        fs::create_dir(&source_path).unwrap();
+        fs::write(source_path.join("sentinel"), "directory referent").unwrap();
+        let root = ResolvedPath::new(root).unwrap();
+        let target = ResolvedPath::new(target_path.clone()).unwrap();
+        let source = LinkTarget::new(ResolvedPath::new(source_path.clone()).unwrap());
+        let context = ExecutionTarget::open(&root, &target).unwrap();
+
+        match context.prepare_directory_create(&root, &source) {
+            Ok(create) => create.attempt().unwrap(),
+            Err(error) => {
+                assert_eq!(error.raw_os_error(), Some(1314));
+                assert!(fs::symlink_metadata(&target_path).is_err());
+                drop(context);
+                fs::remove_dir_all(root.as_ref()).unwrap();
+                return;
+            }
+        }
+
+        let metadata = fs::symlink_metadata(&target_path).unwrap();
+        assert!(metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0);
+        assert!(metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0);
+        assert_eq!(fs::read_link(&target_path).unwrap(), source_path);
+        context
+            .prepare_directory_remove(&source)
+            .unwrap()
+            .attempt()
+            .unwrap();
+        assert!(fs::symlink_metadata(&target_path).is_err());
+        assert_eq!(
+            fs::read_to_string(source.as_path().as_ref().join("sentinel")).unwrap(),
+            "directory referent"
+        );
+        drop(context);
+        fs::remove_dir_all(root.as_ref()).unwrap();
+    }
+
+    #[test]
+    fn directory_link_rename_info_ex_replaces_the_old_link_without_touching_either_referent() {
+        let root = fixture_root();
+        let old_source_path = root.join("old-source");
+        let new_source_path = root.join("new-source");
+        let target_path = root.join("target");
+        let temporary_path = root.join("temporary");
+        fs::create_dir(&old_source_path).unwrap();
+        fs::create_dir(&new_source_path).unwrap();
+        fs::write(old_source_path.join("sentinel"), "old").unwrap();
+        fs::write(new_source_path.join("sentinel"), "new").unwrap();
+        let root = ResolvedPath::new(root).unwrap();
+        let target = ResolvedPath::new(target_path.clone()).unwrap();
+        let temporary = ResolvedPath::new(temporary_path.clone()).unwrap();
+        let old = LinkTarget::new(ResolvedPath::new(old_source_path.clone()).unwrap());
+        let new = LinkTarget::new(ResolvedPath::new(new_source_path.clone()).unwrap());
+        let target_context = ExecutionTarget::open(&root, &target).unwrap();
+        let temporary_context = ExecutionTarget::open(&root, &temporary).unwrap();
+
+        for result in [
+            target_context
+                .prepare_directory_create(&root, &old)
+                .and_then(|checked| checked.attempt()),
+            temporary_context
+                .prepare_directory_create(&root, &new)
+                .and_then(|checked| checked.attempt()),
+        ] {
+            if let Err(error) = result {
+                assert_eq!(error.raw_os_error(), Some(1314));
+                drop(temporary_context);
+                drop(target_context);
+                fs::remove_dir_all(root.as_ref()).unwrap();
+                return;
+            }
+        }
+
+        target_context
+            .prepare_directory_replace(&temporary, &old, &new, &root)
+            .unwrap()
+            .attempt()
+            .unwrap();
+
+        assert_eq!(fs::read_link(&target_path).unwrap(), new_source_path);
+        assert!(fs::symlink_metadata(&temporary_path).is_err());
+        assert_eq!(
+            fs::read_to_string(old_source_path.join("sentinel")).unwrap(),
+            "old"
+        );
+        assert_eq!(
+            fs::read_to_string(new_source_path.join("sentinel")).unwrap(),
+            "new"
+        );
+        drop(temporary_context);
+        drop(target_context);
         fs::remove_dir_all(root.as_ref()).unwrap();
     }
 

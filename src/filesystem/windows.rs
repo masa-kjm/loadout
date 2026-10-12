@@ -254,6 +254,23 @@ fn create_relative_file_no_replace(parent: &fs::File, component: &OsStr) -> io::
     )
 }
 
+/// Creates one missing final directory entry relative to its retained parent without following a reparse point.
+fn create_relative_directory_no_replace(
+    parent: &fs::File,
+    component: &OsStr,
+) -> io::Result<fs::File> {
+    use windows_sys::Wdk::Storage::FileSystem::FILE_CREATE;
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_READ, FILE_GENERIC_WRITE};
+
+    open_relative_no_follow_with_disposition(
+        parent,
+        component,
+        true,
+        FILE_CREATE,
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
+    )
+}
+
 /// Opens a final non-directory entry relative to its retained parent with delete access.
 /// The caller must verify the exact no-follow link predicate before consuming this handle.
 fn open_relative_file_for_delete(parent: &fs::File, component: &OsStr) -> io::Result<fs::File> {
@@ -264,6 +281,23 @@ fn open_relative_file_for_delete(parent: &fs::File, component: &OsStr) -> io::Re
         parent,
         component,
         false,
+        FILE_OPEN,
+        FILE_GENERIC_READ | DELETE,
+    )
+}
+
+/// Opens a final directory entry relative to its retained parent with delete access without requiring it to be a plain directory.
+fn open_relative_directory_for_delete(
+    parent: &fs::File,
+    component: &OsStr,
+) -> io::Result<fs::File> {
+    use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_READ};
+
+    open_relative_no_follow_with_disposition(
+        parent,
+        component,
+        true,
         FILE_OPEN,
         FILE_GENERIC_READ | DELETE,
     )
@@ -320,6 +354,16 @@ fn set_file_symbolic_link_reparse_point(
     Ok(())
 }
 
+/// Sets a symbolic-link reparse value on a newly created directory handle.
+///
+/// The directory handle is created with `FILE_DIRECTORY_FILE`, so this cannot create a file symbolic link or a junction.
+fn set_directory_symbolic_link_reparse_point(
+    directory: &fs::File,
+    target: &std::path::Path,
+) -> io::Result<()> {
+    set_file_symbolic_link_reparse_point(directory, target)
+}
+
 #[cfg(test)]
 fn invalid_reparse_setup_error_for_prototype(file: &fs::File) -> io::Result<()> {
     use windows_sys::Win32::System::IO::DeviceIoControl;
@@ -356,7 +400,8 @@ fn rename_relative_from_handle(
     replace_if_exists: bool,
 ) -> io::Result<()> {
     use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
+        FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS,
+        FileRenameInformation, FileRenameInformationEx, NtSetInformationFile,
     };
     use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
@@ -377,7 +422,13 @@ fn rename_relative_from_handle(
     let length_offset = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileNameLength);
     let name_offset = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
     let mut buffer = vec![0_u8; name_offset + name_length];
-    buffer[0] = u8::from(replace_if_exists);
+    if replace_if_exists {
+        buffer[..std::mem::size_of::<u32>()].copy_from_slice(
+            &(FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS).to_ne_bytes(),
+        );
+    } else {
+        buffer[0] = 0;
+    }
     buffer[root_offset..root_offset + std::mem::size_of::<usize>()]
         .copy_from_slice(&(parent.as_raw_handle() as usize).to_ne_bytes());
     buffer[length_offset..length_offset + std::mem::size_of::<u32>()]
@@ -394,7 +445,11 @@ fn rename_relative_from_handle(
             &mut status,
             buffer.as_ptr().cast(),
             buffer.len() as u32,
-            FileRenameInformation,
+            if replace_if_exists {
+                FileRenameInformationEx
+            } else {
+                FileRenameInformation
+            },
         )
     };
     if result < 0 {

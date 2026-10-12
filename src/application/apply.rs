@@ -1899,11 +1899,17 @@ fn condition_holds(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::fs;
     #[cfg(windows)]
     use std::fs::File;
     use std::path::PathBuf;
+    #[cfg(windows)]
+    use std::process::Command;
+    #[cfg(windows)]
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicU64, Ordering};
     #[cfg(windows)]
     use std::sync::mpsc;
@@ -1914,16 +1920,20 @@ mod tests {
     use crate::domain::desired::{ResolvedDesired, ResolvedResource};
     use crate::domain::file_copy::{ContentFingerprint, ResolvedFileCopy};
     use crate::domain::file_link::ResolvedFileLink;
-    use crate::domain::hashes::{DesiredHash, desired_hash};
+    #[cfg(unix)]
+    use crate::domain::hashes::DesiredHash;
+    use crate::domain::hashes::desired_hash;
     use crate::domain::ids::ProfileId;
-    use crate::domain::known::{KnownDirectoryLink, KnownFileCopy, KnownResource, KnownState};
+    #[cfg(unix)]
+    use crate::domain::known::{KnownDirectoryLink, KnownState};
+    use crate::domain::known::{KnownFileCopy, KnownResource};
     use crate::domain::paths::SourceRelativePath;
     use crate::domain::plan::{PlannedEffectHandoff, PlannedFileCopyAction};
     use crate::inspection::source::{VerifiedSource, resolve_store_root, verify_regular_source};
     use crate::resolver::{ResolverContext, resolve_for_apply};
-    use crate::state::operation::{
-        ActionId, ActionStatus, OperationId, OperationRecord, RecordedAction,
-    };
+    use crate::state::operation::{ActionId, ActionStatus, RecordedAction};
+    #[cfg(unix)]
+    use crate::state::operation::{OperationId, OperationRecord};
     use crate::state::repository::{CommitError, CommitStage, StateRepository};
     use sha2::{Digest, Sha256};
 
@@ -2707,8 +2717,8 @@ mod tests {
         use std::os::windows::io::FromRawHandle;
         use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::Storage::FileSystem::{
-            CreateFileW, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            OPEN_EXISTING,
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, OPEN_EXISTING,
         };
 
         let mut name = path.as_os_str().encode_wide().collect::<Vec<_>>();
@@ -2721,7 +2731,7 @@ mod tests {
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 std::ptr::null(),
                 OPEN_EXISTING,
-                FILE_FLAG_OPEN_REPARSE_POINT,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
                 std::ptr::null_mut(),
             )
         };
@@ -5172,6 +5182,245 @@ mod tests {
                 .as_ref(),
             workspace.path("store/git/config").as_path()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_link_replacement_sharing_denial_preserves_old_effect_and_known_state() {
+        use crate::test_support::{ExecutionBoundary, on_execution_boundary};
+
+        let workspace = TestWorkspace::new();
+        fs::create_dir_all(workspace.path("store/old")).unwrap();
+        fs::create_dir_all(workspace.path("store/new")).unwrap();
+        fs::create_dir_all(workspace.path("home/.config")).unwrap();
+        workspace.write(
+            "config/environment.yaml",
+            "schema_version: 2\ndefault_profile: base\nprofile_discovery:\n  paths: [../profiles]\nstores:\n  dotfiles:\n    type: local\n    properties:\n      path: ../store\n",
+        );
+        let profile = |source: &str| {
+            format!(
+                "schema_version: 3\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: {source}\n      target: ~/.config/nvim\n"
+            )
+        };
+        workspace.write("profiles/base.yaml", &profile("old"));
+        let request = super::super::queries::DeclarationRequest {
+            context: ResolverContext::new(
+                workspace.path("home"),
+                workspace.path("config/loadout.yaml"),
+                workspace.path("config/environment.yaml"),
+                workspace.path("state"),
+            )
+            .unwrap(),
+            root: None,
+        };
+        apply_request(&request, |_| true).unwrap();
+        workspace.write("profiles/base.yaml", &profile("new"));
+
+        let target = workspace.path("home/.config/nvim");
+        let held = Rc::new(RefCell::new(None));
+        let held_by_hook = Rc::clone(&held);
+        let target_by_hook = target.clone();
+        let _hook = on_execution_boundary(
+            ExecutionBoundary::BeforeReplacementRenameRecheck,
+            move || {
+                *held_by_hook.borrow_mut() =
+                    Some(hold_link_without_delete_sharing(target_by_hook.clone())?);
+                Ok(())
+            },
+        );
+        let failure = apply_request(&request, |_| true).unwrap_err();
+        assert_eq!(failure.stage, ApplyStage::Execution);
+        assert_eq!(fs::read_link(&target).unwrap(), workspace.path("store/old"));
+
+        let state = workspace.repository().load().unwrap();
+        let (_, action) = state.active_operation().unwrap().actions().next().unwrap();
+        assert_eq!(action.kind(), ActionKind::ReplaceDirectoryLink);
+        assert_eq!(action.status(), ActionStatus::Uncertain);
+        let temporary = action
+            .directory_link_facts()
+            .unwrap()
+            .temporary_path()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            fs::read_link(temporary.as_ref()).unwrap(),
+            workspace.path("store/new")
+        );
+        let resource_id = FullyQualifiedResourceId::parse("base/nvim").unwrap();
+        assert_eq!(
+            directory_link_source(state.known().get_variant(&resource_id).unwrap()).as_ref(),
+            workspace.path("store/old").as_path()
+        );
+        drop(state);
+
+        held.borrow_mut().take();
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        assert!(
+            !reconcile_active_operation(&mut locked, workspace.path("home").as_path()).unwrap()
+        );
+        assert!(locked.state().active_operation().is_none());
+        assert!(fs::symlink_metadata(temporary.as_ref()).is_err());
+        assert_eq!(
+            directory_link_source(locked.state().known().get_variant(&resource_id).unwrap(),)
+                .as_ref(),
+            workspace.path("store/old").as_path()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_link_removal_sharing_denial_preserves_the_link_and_known_state() {
+        use crate::test_support::{ExecutionBoundary, on_execution_boundary};
+
+        let workspace = TestWorkspace::new();
+        fs::create_dir_all(workspace.path("store/nvim")).unwrap();
+        fs::create_dir_all(workspace.path("home/.config")).unwrap();
+        workspace.write(
+            "config/environment.yaml",
+            "schema_version: 2\ndefault_profile: base\nprofile_discovery:\n  paths: [../profiles]\nstores:\n  dotfiles:\n    type: local\n    properties:\n      path: ../store\n",
+        );
+        workspace.write(
+            "profiles/base.yaml",
+            "schema_version: 3\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: nvim\n      target: ~/.config/nvim\n",
+        );
+        let request = super::super::queries::DeclarationRequest {
+            context: ResolverContext::new(
+                workspace.path("home"),
+                workspace.path("config/loadout.yaml"),
+                workspace.path("config/environment.yaml"),
+                workspace.path("state"),
+            )
+            .unwrap(),
+            root: None,
+        };
+        apply_request(&request, |_| true).unwrap();
+        workspace.write(
+            "profiles/base.yaml",
+            "schema_version: 3\nid: base\nresources: {}\n",
+        );
+
+        let target = workspace.path("home/.config/nvim");
+        let held = Rc::new(RefCell::new(None));
+        let held_by_hook = Rc::clone(&held);
+        let target_by_hook = target.clone();
+        let _hook = on_execution_boundary(ExecutionBoundary::BeforeDirectoryRemoval, move || {
+            *held_by_hook.borrow_mut() =
+                Some(hold_link_without_delete_sharing(target_by_hook.clone())?);
+            Ok(())
+        });
+        let failure = apply_request(&request, |_| true).unwrap_err();
+        assert_eq!(failure.stage, ApplyStage::Execution);
+        assert_eq!(
+            fs::read_link(&target).unwrap(),
+            workspace.path("store/nvim")
+        );
+
+        let state = workspace.repository().load().unwrap();
+        assert!(state.active_operation().is_none());
+        assert!(
+            state
+                .known()
+                .get_variant(&FullyQualifiedResourceId::parse("base/nvim").unwrap())
+                .is_some()
+        );
+        held.borrow_mut().take();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_link_create_acl_denial_after_running_leaves_known_empty() {
+        use crate::test_support::{ExecutionBoundary, on_execution_boundary};
+
+        let workspace = TestWorkspace::new();
+        fs::create_dir_all(workspace.path("store/nvim")).unwrap();
+        fs::create_dir_all(workspace.path("home/.config")).unwrap();
+        workspace.write(
+            "config/environment.yaml",
+            "schema_version: 2\ndefault_profile: base\nprofile_discovery:\n  paths: [../profiles]\nstores:\n  dotfiles:\n    type: local\n    properties:\n      path: ../store\n",
+        );
+        workspace.write(
+            "profiles/base.yaml",
+            "schema_version: 3\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: nvim\n      target: ~/.config/nvim\n",
+        );
+        let request = super::super::queries::DeclarationRequest {
+            context: ResolverContext::new(
+                workspace.path("home"),
+                workspace.path("config/loadout.yaml"),
+                workspace.path("config/environment.yaml"),
+                workspace.path("state"),
+            )
+            .unwrap(),
+            root: None,
+        };
+        let parent = workspace.path("home/.config");
+        let identity = current_windows_identity().unwrap();
+        let parent_by_hook = parent.clone();
+        let identity_by_hook = identity.clone();
+        let _hook = on_execution_boundary(ExecutionBoundary::AfterFinalRecheck, move || {
+            deny_directory_creation(&parent_by_hook, &identity_by_hook)
+        });
+        let failure = apply_request(&request, |_| true).unwrap_err();
+        remove_directory_creation_denial(&parent, &identity).unwrap();
+
+        assert_eq!(failure.stage, ApplyStage::Execution);
+        assert!(fs::symlink_metadata(workspace.path("home/.config/nvim")).is_err());
+        let state = workspace.repository().load().unwrap();
+        assert!(state.active_operation().is_none());
+        assert!(state.known().resources().next().is_none());
+    }
+
+    #[cfg(windows)]
+    fn directory_link_source(resource: &KnownResource) -> &ResolvedPath {
+        match resource {
+            KnownResource::DirectoryLink(resource) => resource.source_path(),
+            KnownResource::FileLink(_) | KnownResource::FileCopy(_) => {
+                panic!("expected a directory-link Known resource")
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn current_windows_identity() -> std::io::Result<String> {
+        let output = Command::new("whoami").output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other("whoami failed"));
+        }
+        String::from_utf8(output.stdout)
+            .map(|identity| identity.trim().to_owned())
+            .map_err(std::io::Error::other)
+    }
+
+    #[cfg(windows)]
+    fn deny_directory_creation(parent: &std::path::Path, identity: &str) -> std::io::Result<()> {
+        run_icacls(parent, ["/deny", &format!("{identity}:(WD,AD)")])
+    }
+
+    #[cfg(windows)]
+    fn remove_directory_creation_denial(
+        parent: &std::path::Path,
+        identity: &str,
+    ) -> std::io::Result<()> {
+        run_icacls(parent, ["/remove:d", identity])
+    }
+
+    #[cfg(windows)]
+    fn run_icacls<'a>(
+        parent: &std::path::Path,
+        arguments: impl IntoIterator<Item = &'a str>,
+    ) -> std::io::Result<()> {
+        let output = Command::new("icacls")
+            .arg(parent)
+            .args(arguments)
+            .output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "icacls failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )))
+        }
     }
 
     // Requires the supported Unix create path; Windows proves preflight rejection separately.

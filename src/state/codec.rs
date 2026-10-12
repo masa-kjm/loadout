@@ -1475,9 +1475,9 @@ mod tests {
     fn directory_replacement_round_trips_its_temporary_and_exact_predicates() {
         let root = std::env::temp_dir().join("loadout-directory-replacement-codec");
         let old_source = root.join("store/old");
-        let new_source = root.join("store/new");
+        let new_source = ResolvedPath::new(root.join("store/new")).unwrap();
         let target = root.join("home/.config/nvim");
-        let temporary = root.join("home/.config/.nvim.loadout-tmp");
+        let temporary = ResolvedPath::new(root.join("home/.config/.nvim.loadout-tmp")).unwrap();
         let old = ResolvedDirectoryLink::new(
             FullyQualifiedResourceId::parse("base/nvim").unwrap(),
             ResolvedPath::new(old_source.clone()).unwrap(),
@@ -1486,17 +1486,17 @@ mod tests {
         .unwrap();
         let document = json!({
             "schema_version": 3,
-            "resources": { "base/nvim": { "definition_hash": directory_link_definition_hash(&old).unwrap().as_str(), "effect": { "kind": "directory_link", "source_path": old_source, "target_path": target, "link_target": old.source_path().as_ref() } } },
+            "resources": { "base/nvim": { "definition_hash": directory_link_definition_hash(&old).unwrap().as_str(), "effect": { "kind": "directory_link", "source_path": old.source_path().as_ref(), "target_path": old.target_path().as_ref(), "link_target": old.source_path().as_ref() } } },
             "active_operation": { "id": "op-directory", "desired_hash": format!("sha256:{}", "a".repeat(64)), "actions": { "a1": {
                 "kind": "replace_directory_link", "resource_id": "base/nvim",
                 "old_effect": { "kind": "directory_link", "source_path": old.source_path().as_ref(), "target_path": old.target_path().as_ref(), "link_target": old.source_path().as_ref() },
-                "final_effect": { "kind": "directory_link", "source_path": new_source, "target_path": old.target_path().as_ref(), "link_target": root.join("store/new") },
+                "final_effect": { "kind": "directory_link", "source_path": new_source.as_ref(), "target_path": old.target_path().as_ref(), "link_target": new_source.as_ref() },
                 "precondition": { "kind": "expected_directory_link", "target_path": old.target_path().as_ref(), "link_target": old.source_path().as_ref() },
                 "postcondition": {
-                    "target": { "kind": "expected_directory_link", "target_path": old.target_path().as_ref(), "link_target": root.join("store/new") },
-                    "temporary": { "kind": "missing", "target_path": temporary }
+                    "target": { "kind": "expected_directory_link", "target_path": old.target_path().as_ref(), "link_target": new_source.as_ref() },
+                    "temporary": { "kind": "missing", "target_path": temporary.as_ref() }
                 },
-                "temporary": { "path": root.join("home/.config/.nvim.loadout-tmp"), "predicate": { "kind": "expected_directory_link", "target_path": root.join("home/.config/.nvim.loadout-tmp"), "link_target": root.join("store/new") } },
+                "temporary": { "path": temporary.as_ref(), "predicate": { "kind": "expected_directory_link", "target_path": temporary.as_ref(), "link_target": new_source.as_ref() } },
                 "status": "running"
             } } }
         });
@@ -1505,9 +1505,7 @@ mod tests {
         let mut encoded = serde_json::to_value(StateDocument::from_state(&state).unwrap()).unwrap();
         assert_eq!(
             encoded["active_operation"]["actions"]["a1"]["temporary"]["path"],
-            root.join("home/.config/.nvim.loadout-tmp")
-                .to_string_lossy()
-                .as_ref()
+            temporary.as_ref().to_string_lossy().as_ref()
         );
         assert_eq!(
             encoded["active_operation"]["actions"]["a1"]["precondition"]["kind"],

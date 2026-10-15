@@ -95,6 +95,25 @@ fn apply_request_with_hooks(
     confirm: impl FnOnce(&Plan) -> bool,
     after_running: impl FnMut(usize, &mut LockedStateRepository),
 ) -> Result<ApplyReport, Box<ApplyFailure>> {
+    apply_request_with_hooks_and_after_planning(request, confirm, |_| {}, after_running)
+}
+
+#[cfg(test)]
+fn apply_request_with_after_planning_hook(
+    request: &super::queries::DeclarationRequest,
+    confirm: impl FnOnce(&Plan) -> bool,
+    after_planning: impl FnOnce(&Plan),
+) -> Result<ApplyReport, Box<ApplyFailure>> {
+    apply_request_with_hooks_and_after_planning(request, confirm, after_planning, |_, _| {})
+}
+
+#[allow(clippy::result_large_err)] // The closure error is immediately converted into the public boxed ApplyFailure.
+fn apply_request_with_hooks_and_after_planning(
+    request: &super::queries::DeclarationRequest,
+    confirm: impl FnOnce(&Plan) -> bool,
+    after_planning: impl FnOnce(&Plan),
+    after_running: impl FnMut(usize, &mut LockedStateRepository),
+) -> Result<ApplyReport, Box<ApplyFailure>> {
     let mut stage = ApplyStage::LockAndState;
     let mut visible_plan = None;
     let mut committed = Vec::new();
@@ -137,6 +156,7 @@ fn apply_request_with_hooks(
             &directory_actual,
         );
         visible_plan = Some(fresh_plan.clone());
+        after_planning(&fresh_plan);
         if !fresh_plan.is_executable() {
             return Ok(ApplyReport::Blocked { plan: fresh_plan });
         }
@@ -1986,6 +2006,69 @@ mod tests {
         assert_eq!(
             recovery_decision(&inspector, &action).unwrap(),
             RecoveryDecision::Uncertain
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_link_noop_revalidates_source_before_confirmation_or_operation_creation() {
+        let workspace = TestWorkspace::new();
+        let source = workspace.path("store/nvim");
+        let target = workspace.path("home/.config/nvim");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        workspace.write(
+            "config/environment.yaml",
+            "schema_version: 2\ndefault_profile: base\nprofile_discovery:\n  paths: [../profiles]\nstores:\n  dotfiles:\n    type: local\n    properties:\n      path: ../store\n",
+        );
+        workspace.write(
+            "profiles/base.yaml",
+            "schema_version: 3\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: nvim\n      target: ~/.config/nvim\n",
+        );
+        let request = super::super::queries::DeclarationRequest {
+            context: ResolverContext::new(
+                workspace.path("home"),
+                workspace.path("config/loadout.yaml"),
+                workspace.path("config/environment.yaml"),
+                workspace.path("state"),
+            )
+            .unwrap(),
+            root: None,
+        };
+
+        apply_request(&request, |_| true).unwrap();
+        assert_eq!(fs::read_link(&target).unwrap(), source);
+        let before_state = fs::read(workspace.path("state/state.json")).unwrap();
+        let known_before = workspace.repository().load().unwrap().known().clone();
+
+        let failure = apply_request_with_after_planning_hook(
+            &request,
+            |_| panic!("preflight must reject the changed source before confirmation"),
+            |plan| {
+                assert_eq!(plan.resource_actions().len(), 1);
+                assert_eq!(plan.resource_actions()[0].kind(), ActionKind::Noop);
+                fs::remove_dir(&source).unwrap();
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(failure.stage, ApplyStage::Preflight);
+        assert_eq!(
+            failure.affected_action,
+            Some(ApplyAction {
+                action_id: None,
+                resource_id: FullyQualifiedResourceId::parse("base/nvim").unwrap(),
+                kind: ActionKind::Noop,
+            })
+        );
+        assert_eq!(failure.operation, Some(OperationOutcome::Absent));
+        assert_eq!(fs::read_link(&target).unwrap(), source);
+        let state = workspace.repository().load().unwrap();
+        assert!(state.active_operation().is_none());
+        assert_eq!(state.known(), &known_before);
+        assert_eq!(
+            fs::read(workspace.path("state/state.json")).unwrap(),
+            before_state
         );
     }
 

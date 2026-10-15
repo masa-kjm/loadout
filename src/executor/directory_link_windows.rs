@@ -132,6 +132,13 @@ impl DirectoryLinkExecutor {
             PlannedDirectoryLinkAction::ForgetMissing { previous } => {
                 self.missing(previous.target_path(), previous.link_target())
             }
+            PlannedDirectoryLinkAction::Noop { previous, .. } => {
+                source
+                    .ok_or(DirectoryLinkExecutionError::InvalidRecord)?
+                    .reverify()
+                    .map_err(|error| DirectoryLinkExecutionError::Io(io::Error::other(error)))?;
+                self.expected(previous.target_path(), previous.link_target())
+            }
         }
     }
 
@@ -219,6 +226,9 @@ impl DirectoryLinkExecutor {
                 self.expected(desired.target_path(), desired.link_target())?;
                 self.missing(&temporary, desired.link_target())
             }
+            PlannedDirectoryLinkAction::Noop { .. } => {
+                unreachable!("report-only action cannot be recorded for execution")
+            }
         }
     }
 }
@@ -232,7 +242,8 @@ fn requires_replacement_capability(action: &PlannedDirectoryLinkAction) -> bool 
         PlannedDirectoryLinkAction::Create { .. }
         | PlannedDirectoryLinkAction::Relocate { .. }
         | PlannedDirectoryLinkAction::Remove { .. }
-        | PlannedDirectoryLinkAction::ForgetMissing { .. } => false,
+        | PlannedDirectoryLinkAction::ForgetMissing { .. }
+        | PlannedDirectoryLinkAction::Noop { .. } => false,
     }
 }
 

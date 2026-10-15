@@ -266,6 +266,11 @@ impl RecordedAction {
             | PlannedDirectoryLinkAction::ForgetMissing { previous } => {
                 (Some(previous.clone()), None, None)
             }
+            PlannedDirectoryLinkAction::Noop { .. } => {
+                return Err(OperationRecordError::UnsupportedActionKind {
+                    kind: action.kind(),
+                });
+            }
         };
         Self::from_persisted_directory_link(
             action.kind(),

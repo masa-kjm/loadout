@@ -319,6 +319,10 @@ pub(crate) enum PlannedDirectoryLinkAction {
     ForgetMissing {
         previous: KnownDirectoryLink,
     },
+    Noop {
+        desired: ResolvedDirectoryLink,
+        previous: KnownDirectoryLink,
+    },
     ReplaceOwnership {
         desired: ResolvedDirectoryLink,
         previous: KnownDirectoryLink,
@@ -333,6 +337,7 @@ impl PlannedDirectoryLinkAction {
             Self::Relocate { .. } => ActionKind::RelocateDirectoryLink,
             Self::Remove { .. } => ActionKind::RemoveDirectoryLink,
             Self::ForgetMissing { .. } => ActionKind::ForgetMissing,
+            Self::Noop { .. } => ActionKind::Noop,
             Self::ReplaceOwnership { .. } => ActionKind::ReplaceOwnership,
         }
     }
@@ -341,6 +346,7 @@ impl PlannedDirectoryLinkAction {
             Self::Create { desired, .. }
             | Self::Replace { desired, .. }
             | Self::Relocate { desired, .. }
+            | Self::Noop { desired, .. }
             | Self::ReplaceOwnership { desired, .. } => desired.resource_id(),
             Self::Remove { previous } | Self::ForgetMissing { previous } => previous.resource_id(),
         }
@@ -352,6 +358,7 @@ impl PlannedDirectoryLinkAction {
             Self::Relocate { .. } => ActionReason::TargetChanged,
             Self::Remove { .. } => ActionReason::StaleResource,
             Self::ForgetMissing { .. } => ActionReason::StaleResourceTargetMissing,
+            Self::Noop { .. } => ActionReason::AlreadySatisfied,
             Self::ReplaceOwnership { .. } => ActionReason::ManagedIdentityHandoff,
         }
     }
@@ -360,6 +367,7 @@ impl PlannedDirectoryLinkAction {
             Self::Create { desired, .. }
             | Self::Replace { desired, .. }
             | Self::Relocate { desired, .. }
+            | Self::Noop { desired, .. }
             | Self::ReplaceOwnership { desired, .. } => Some(desired),
             _ => None,
         }
@@ -370,6 +378,7 @@ impl PlannedDirectoryLinkAction {
             | Self::Relocate { previous, .. }
             | Self::Remove { previous }
             | Self::ForgetMissing { previous }
+            | Self::Noop { previous, .. }
             | Self::ReplaceOwnership { previous, .. } => Some(previous),
             _ => None,
         }
@@ -379,6 +388,7 @@ impl PlannedDirectoryLinkAction {
             Self::Create { desired, .. } => vec![missing(desired.target_path())],
             Self::Replace { previous, .. }
             | Self::Remove { previous }
+            | Self::Noop { previous, .. }
             | Self::ReplaceOwnership { previous, .. } => vec![expected_directory(previous)],
             Self::Relocate { desired, previous } => {
                 vec![expected_directory(previous), missing(desired.target_path())]
@@ -390,6 +400,7 @@ impl PlannedDirectoryLinkAction {
         match self {
             Self::Create { desired, .. }
             | Self::Replace { desired, .. }
+            | Self::Noop { desired, .. }
             | Self::ReplaceOwnership { desired, .. } => vec![expected_desired_directory(desired)],
             Self::Relocate { desired, previous } => vec![
                 missing(previous.target_path()),
@@ -400,31 +411,32 @@ impl PlannedDirectoryLinkAction {
             }
         }
     }
-    pub(crate) fn known_state_update(&self) -> ResourceKnownStateUpdate {
+    pub(crate) fn known_state_update(&self) -> Option<ResourceKnownStateUpdate> {
         match self {
             Self::Create {
                 desired,
                 superseded: Some(old),
-            } => ResourceKnownStateUpdate::ReplaceIdentity {
+            } => Some(ResourceKnownStateUpdate::ReplaceIdentity {
                 old_resource_id: old.resource_id().clone(),
                 new_resource: KnownDirectoryLink::from_resolved(desired).into(),
-            },
+            }),
             Self::Create { desired, .. }
             | Self::Replace { desired, .. }
-            | Self::Relocate { desired, .. } => ResourceKnownStateUpdate::Upsert {
+            | Self::Relocate { desired, .. } => Some(ResourceKnownStateUpdate::Upsert {
                 resource: KnownDirectoryLink::from_resolved(desired).into(),
-            },
+            }),
             Self::ReplaceOwnership { desired, previous } => {
-                ResourceKnownStateUpdate::ReplaceIdentity {
+                Some(ResourceKnownStateUpdate::ReplaceIdentity {
                     old_resource_id: previous.resource_id().clone(),
                     new_resource: KnownDirectoryLink::from_resolved(desired).into(),
-                }
+                })
             }
             Self::Remove { previous } | Self::ForgetMissing { previous } => {
-                ResourceKnownStateUpdate::Remove {
+                Some(ResourceKnownStateUpdate::Remove {
                     resource_id: previous.resource_id().clone(),
-                }
+                })
             }
+            Self::Noop { .. } => None,
         }
     }
     pub(crate) fn touched_targets(&self) -> Vec<&ResolvedPath> {
@@ -434,6 +446,7 @@ impl PlannedDirectoryLinkAction {
             }
             Self::Create { desired, .. }
             | Self::Replace { desired, .. }
+            | Self::Noop { desired, .. }
             | Self::ReplaceOwnership { desired, .. } => vec![desired.target_path()],
             Self::Remove { previous } | Self::ForgetMissing { previous } => {
                 vec![previous.target_path()]
@@ -575,7 +588,7 @@ impl PlannedResourceAction {
         match self {
             Self::FileLink(action) => action.known_state_update().map(Into::into),
             Self::FileCopy(action) => action.known_state_update().map(Into::into),
-            Self::DirectoryLink(action) => Some(action.known_state_update()),
+            Self::DirectoryLink(action) => action.known_state_update(),
             Self::ReplaceEffect(action) => Some(action.known_state_update()),
         }
     }

@@ -23,32 +23,32 @@ pub(super) fn contribute(
     let actions = planned
         .transitions
         .into_iter()
-        .filter_map(|transition| match transition {
+        .map(|transition| match transition {
             DirectoryLinkTransition::Create {
                 desired,
                 superseded,
-            } => Some(
-                PlannedDirectoryLinkAction::Create {
-                    desired,
-                    superseded,
-                }
-                .into(),
-            ),
+            } => PlannedDirectoryLinkAction::Create {
+                desired,
+                superseded,
+            }
+            .into(),
             DirectoryLinkTransition::Replace { desired, previous } => {
-                Some(PlannedDirectoryLinkAction::Replace { desired, previous }.into())
+                PlannedDirectoryLinkAction::Replace { desired, previous }.into()
             }
             DirectoryLinkTransition::Relocate { desired, previous } => {
-                Some(PlannedDirectoryLinkAction::Relocate { desired, previous }.into())
+                PlannedDirectoryLinkAction::Relocate { desired, previous }.into()
             }
             DirectoryLinkTransition::Remove(previous) => {
-                Some(PlannedDirectoryLinkAction::Remove { previous }.into())
+                PlannedDirectoryLinkAction::Remove { previous }.into()
             }
             DirectoryLinkTransition::ForgetMissing(previous) => {
-                Some(PlannedDirectoryLinkAction::ForgetMissing { previous }.into())
+                PlannedDirectoryLinkAction::ForgetMissing { previous }.into()
             }
-            DirectoryLinkTransition::Noop { .. } => None,
+            DirectoryLinkTransition::Noop { desired, previous } => {
+                PlannedDirectoryLinkAction::Noop { desired, previous }.into()
+            }
             DirectoryLinkTransition::ReplaceOwnership { desired, previous } => {
-                Some(PlannedDirectoryLinkAction::ReplaceOwnership { desired, previous }.into())
+                PlannedDirectoryLinkAction::ReplaceOwnership { desired, previous }.into()
             }
         });
     let diagnostics = planned
@@ -475,6 +475,7 @@ fn transition_order(value: &DirectoryLinkTransition) -> (ActionPhase, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::actual::ActualState;
     use crate::domain::actual::ParentSafety;
     use crate::domain::directory_link::{
         ActualDirectoryLink as DirectoryLinkActual,
@@ -484,6 +485,7 @@ mod tests {
     };
     use crate::domain::file_link::LinkTarget;
     use crate::domain::ids::ProfileId;
+    use crate::domain::plan::{ActionKind, ActionReason, PlannedResourceAction, TargetCondition};
 
     fn path(value: &str) -> ResolvedPath {
         ResolvedPath::new(
@@ -708,6 +710,46 @@ mod tests {
             transition_order(&noop.transitions()[0]).0,
             ActionPhase::Noop
         );
+    }
+
+    #[test]
+    fn satisfied_directory_link_contributes_a_typed_noop_to_the_aggregate_plan() {
+        let value = desired("base/nvim", "store/nvim", "home/.config/nvim");
+        let previous = KnownDirectoryLink::from_resolved(&value);
+        let known = KnownState::new([previous.clone()]).unwrap();
+        let aggregate = crate::planner::plan_with_directory_links(
+            &desired_set(vec![value.clone()]),
+            &known,
+            &ActualState::default(),
+            &actual(vec![(value.target_path(), expected(&value))]),
+        );
+
+        assert!(aggregate.is_executable());
+        let [PlannedResourceAction::DirectoryLink(action)] = aggregate.resource_actions() else {
+            panic!("expected one directory-link noop action: {aggregate:?}");
+        };
+        assert!(
+            matches!(action, PlannedDirectoryLinkAction::Noop { desired, previous: recorded } if desired == &value && recorded == &previous)
+        );
+        assert_eq!(action.kind(), ActionKind::Noop);
+        assert_eq!(action.resource_id(), value.resource_id());
+        assert_eq!(action.reason(), ActionReason::AlreadySatisfied);
+        assert_eq!(action.touched_targets(), vec![value.target_path()]);
+        assert_eq!(
+            action.preconditions(),
+            vec![TargetCondition::ExpectedDirectoryLink {
+                target_path: previous.target_path().clone(),
+                link_target: previous.link_target().clone(),
+            }]
+        );
+        assert_eq!(
+            action.postconditions(),
+            vec![TargetCondition::ExpectedDirectoryLink {
+                target_path: value.target_path().clone(),
+                link_target: value.link_target().clone(),
+            }]
+        );
+        assert_eq!(action.known_state_update(), None);
     }
 
     #[test]

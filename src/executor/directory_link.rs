@@ -137,6 +137,13 @@ impl DirectoryLinkExecutor {
                     Err(DirectoryLinkExecutionError::InvalidRecord)
                 }
             }
+            PlannedDirectoryLinkAction::Noop { previous, .. } => {
+                source
+                    .ok_or(DirectoryLinkExecutionError::InvalidRecord)?
+                    .reverify()
+                    .map_err(|e| DirectoryLinkExecutionError::Io(io::Error::other(e)))?;
+                self.expected(previous.target_path(), previous.link_target())
+            }
         }
     }
     pub(crate) fn execute(
@@ -249,6 +256,9 @@ impl DirectoryLinkExecutor {
                 .map_err(DirectoryLinkExecutionError::Io)?;
                 self.expected(desired.target_path(), desired.link_target())?;
                 self.missing(&temporary, desired.link_target())
+            }
+            PlannedDirectoryLinkAction::Noop { .. } => {
+                unreachable!("report-only action cannot be recorded for execution")
             }
         }
     }

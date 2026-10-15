@@ -975,12 +975,26 @@ fn directory_link_is_reported_by_read_only_commands_without_mutation() {
     expect(
         f.run(&["plan", "--config", "../portable/config.yaml"]),
         0,
-        &["executable", "profile base"],
+        &[
+            "executable",
+            "profile base",
+            "noop",
+            "base/nvim",
+            ".config/nvim",
+            "already satisfied",
+        ],
     );
     expect(
         f.run(&["apply", "--dry-run", "--config", "../portable/config.yaml"]),
         0,
-        &["profile base", "executable plan"],
+        &[
+            "profile base",
+            "executable plan",
+            "noop",
+            "base/nvim",
+            ".config/nvim",
+            "already satisfied",
+        ],
     );
     expect(
         f.run(&["diff"]),

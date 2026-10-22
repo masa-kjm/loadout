@@ -6,7 +6,7 @@ This specification defines the v0.3.0 lifecycle retained by v0.4.0 for validatin
 It owns planning decisions and the Desired/Known/Actual transition table.
 The File Links and State and Recovery specifications define the filesystem and durable-state mechanics used by those decisions.
 
-Every retained lifecycle requirement in this document remains a v0.6.0 requirement under the [v0.6.0 baseline](README.md#v060-baseline).
+Every retained lifecycle requirement in this document remains a v0.7.0 requirement under the [v0.7.0 baseline](README.md#v070-baseline).
 
 ## Inputs
 
@@ -233,11 +233,12 @@ FileLink/FileCopy to DirectoryLink handoff, and the reverse, are blocked conflic
 
 ## Schema Gate
 
-Before a lifecycle command observes a target, reconciles an active operation, produces a plan, rewrites state, or mutates a target, it validates every profile and state document in that command's read set against the [Current Profile Schema](profiles.md#current-profile-schema) and [Current State Schema](state-and-recovery.md#current-state-schema).
+Before a normal lifecycle command observes a target, reconciles an active operation, produces a plan, rewrites state, or mutates a target, it validates every profile and state document in that command's read set against the [Current Profile Schema](profiles.md#current-profile-schema) and [Current State Schema](state-and-recovery.md#current-state-schema).
 For non-dry-run apply, acquiring the exclusive lock may precede this gate, but the gate precedes recovery and every other mutable state-repository operation.
 
 If any required document has an unsupported schema version or invalid schema shape, the command reports invalid input and performs none of those actions.
-In particular, it does not recover a version-2 active operation, inspect a target that matches a version-2 Known effect, or create a replacement state document.
+In particular, it does not recover a schema-3 active operation, inspect a target that matches a schema-3 Known effect, or create a replacement state document.
+The explicit [Migration](migration.md) authoring operation is outside this lifecycle and is the only schema-3 conversion path.
 An absent state file is the only state input that the current contract treats as an empty Known state.
 
 Inspection commands apply the same gate only to documents their read-only contract names.

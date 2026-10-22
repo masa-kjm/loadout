@@ -2,7 +2,7 @@
 
 ## Scope
 
-This specification defines the v0.6.0 read-only inspection commands: `status`, `profile list`, `profile show`, `resource list`, `resource show`, and the v0.6 `diff` extension.
+This specification defines the v0.7.0 read-only inspection commands: `status`, `profile list`, `profile show`, `resource list`, `resource show`, and the `diff` extension.
 It extends the v0.3.0 `diff` inspection contract without changing that command.
 
 Inspection reports facts from the declaration, Resolved Desired, Known, and Actual layers.
@@ -143,11 +143,11 @@ If an observation cannot be established because of an I/O failure, the report id
 
 ## Non-Goals
 
-v0.6.0 inspection does not provide configuration editing, state repair, operation recovery, migration, import, target adoption, forceful takeover, a repair form of `diff`, a saved plan, or machine-readable output.
+v0.7.0 inspection does not provide configuration editing, state repair, operation recovery, migration, import, target adoption, forceful takeover, a repair form of `diff`, a saved plan, or machine-readable output.
 
 ## Schema Gate
 
 Before an inspection command observes a target, it validates every profile or state document in that command's read set against the [Current Profile Schema](profiles.md#current-profile-schema) and [Current State Schema](state-and-recovery.md#current-state-schema).
-An unsupported version-2 or unknown profile/state document returns status `2` and prevents target observation; malformed state contents return status `1` and likewise prevent target observation.
+A schema-3, earlier, or unknown profile/state document returns status `2` and prevents target observation; malformed state contents return status `1` and likewise prevent target observation.
 Both outcomes preserve the target tree, state file, and active operation.
-In particular, `status` and Known-resource inspection do not inspect or adopt a target recorded by a version-2 state file, and they do not recover its active operation.
+In particular, `status` and Known-resource inspection do not inspect or adopt a target recorded by a schema-3 state file, and they do not recover its active operation.

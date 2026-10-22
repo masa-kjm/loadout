@@ -8,14 +8,15 @@ It converges a machine toward the desired resource set produced by one composed 
 Loadout owns profile composition, resource lifecycle planning, local state, conflict detection, and the safe mutation of supported resources.
 It does not reimplement package managers, runtime version resolution, secret management, or the side-effect guarantees of arbitrary commands.
 
-## v0.6.0 Core
+## v0.7.0 Core
 
-v0.6.0 supports two closed effects for one regular file from a local store: a link or a content-owned copy at a target path, plus a directory symbolic link for one local-store real directory.
+v0.7.0 supports two closed effects for one regular file from a local store: a link or a content-owned copy at a target path, plus a directory symbolic link for one local-store real directory.
 It retains read-only inspection of profiles, resources, and selected Desired/Known/Actual relations.
-Task resources, remote stores, directory copying, and parameters are not part of the v0.6.0 executable surface.
+Profiles may declare closed typed parameters and compose explicitly named instances; resolution substitutes those values before it produces Desired state for the unchanged lifecycle.
+Task resources, remote stores, and directory copying are not part of the v0.7.0 executable surface.
 
 The first implementation must prefer a narrow, complete file-link lifecycle over generic extension mechanisms.
-In particular, v0.6.0 does not expose an external resource-plugin API.
+In particular, v0.7.0 does not expose an external resource-plugin API.
 
 ## System Model
 
@@ -59,13 +60,13 @@ Neither command family invokes the planner, executor, preflight, recovery, or a 
 ### Declared Configuration
 
 Declared configuration is the user-authored configuration and profile input.
-It includes profile IDs, includes, resource declarations, store references, and user-facing path syntax.
+It includes profile IDs, explicit instance includes and typed bindings, resource declarations, store references, and user-facing path syntax.
 It is not an input to the planner.
 
 ### Resolved Desired
 
 Resolved Desired is the canonical desired resource set for a selected root profile.
-It has resolved includes, stable fully qualified resource IDs, bound stores, and normalized paths.
+It has resolved instances, stable fully qualified resource IDs, bound stores, and normalized paths.
 It contains no YAML syntax, store ID, home-directory shorthand, relative path, or profile-include traversal for downstream layers to interpret.
 
 ### Known
@@ -113,10 +114,10 @@ If a recheck fails, the executor aborts the action; it does not reinterpret the 
 
 ### Determinism
 
-Apply is sequential in v0.6.0.
+Apply is sequential in v0.7.0.
 Execution order must not depend on a YAML mapping iteration order or an implementation collection order.
 The lifecycle specification will define the stable phase order and the fully qualified resource-ID ordering within each phase.
-v0.6.0 does not expose resource IDs or declaration position as an ordering control.
+v0.7.0 does not expose resource IDs or declaration position as an ordering control.
 A future dependency model may constrain action order, but independent actions must retain a canonical deterministic tie-breaker.
 
 ## Responsibilities
@@ -130,6 +131,7 @@ A future dependency model may constrain action order, but independent actions mu
 | Planner | Classify Resolved Desired, Known, and Actual state into a deterministic Plan. |
 | Executor | Perform planned actions, recheck immediate mutation safety, and verify post-conditions. |
 | State repository | Own the state lock, operation records, durable Known state, and atomic commits. |
+| Migration facade | Select an explicitly registered private version-pair route and own schema-3 inventory discovery, conversion eligibility, state-first interlocks, conversion, and publication decisions; expose only request, presentation, and outcome data to the command adapter. |
 | Filesystem implementation | Perform platform-specific filesystem observation and mutation behind the executor's contract. |
 | Inspection query | Assemble typed read-only reports from declarations, Resolved Desired, Known state, and Actual observations without making a lifecycle decision. |
 

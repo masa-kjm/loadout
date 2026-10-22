@@ -1,258 +1,363 @@
-//! Strict raw DTO for one discovered profile declaration.
+//! Strict raw DTO for one discovered schema-4 profile declaration.
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer};
+use serde_yaml::Value;
 
-use crate::declaration::schema::ProfileSchemaVersionV3;
+use crate::declaration::schema::ProfileSchemaVersionV4;
 
-/// One profile file before identifier validation, include composition, and path binding.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProfileDeclaration {
     #[allow(dead_code)]
-    schema_version: ProfileSchemaVersionV3,
+    schema_version: ProfileSchemaVersionV4,
     id: String,
+    #[serde(default)]
+    parameters: BTreeMap<String, ParameterType>,
     #[serde(default)]
     includes: Vec<IncludeDeclaration>,
     resources: BTreeMap<String, FileResourceDeclaration>,
 }
 
 impl ProfileDeclaration {
-    /// Parses only the strict version-2 profile declaration schema.
     pub(crate) fn parse(yaml: &str) -> Result<Self, serde_yaml::Error> {
         serde_yaml::from_str(yaml)
     }
-
-    /// The raw profile ID before identifier validation.
     pub(crate) fn id(&self) -> &str {
         &self.id
     }
-
-    /// Includes in their declaration order.
+    pub(crate) fn parameters(&self) -> &BTreeMap<String, ParameterType> {
+        &self.parameters
+    }
     pub(crate) fn includes(&self) -> &[IncludeDeclaration] {
         &self.includes
     }
-
-    /// Resources keyed by their raw declaration ID.
     pub(crate) fn resources(
         &self,
     ) -> impl ExactSizeIterator<Item = (&str, &FileResourceDeclaration)> {
         self.resources
             .iter()
-            .map(|(resource_id, resource)| (resource_id.as_str(), resource))
+            .map(|(id, resource)| (id.as_str(), resource))
     }
 }
 
-/// One profile include before identifier validation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+pub(crate) enum ParameterType {
+    #[serde(rename = "string")]
+    String,
+    #[serde(rename = "integer")]
+    Integer,
+    #[serde(rename = "boolean")]
+    Boolean,
+    #[serde(rename = "list")]
+    List,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ParameterValue {
+    String(String),
+    Integer(i64),
+    Boolean(bool),
+    List(Vec<ParameterScalar>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ParameterScalar {
+    String(String),
+    Integer(i64),
+    Boolean(bool),
+}
+
+impl ParameterValue {
+    pub(crate) fn parse(value: Value) -> Result<Self, String> {
+        match value {
+            Value::String(value) => Ok(Self::String(value)),
+            Value::Number(value) => value
+                .as_i64()
+                .map(Self::Integer)
+                .ok_or_else(|| "must be an integer".to_owned()),
+            Value::Bool(value) => Ok(Self::Boolean(value)),
+            Value::Sequence(values) => values
+                .into_iter()
+                .map(ParameterScalar::parse)
+                .collect::<Result<Vec<_>, _>>()
+                .map(Self::List),
+            Value::Tagged(_) => Err("must not use a YAML tag".to_owned()),
+            Value::Null => Err("must not be null".to_owned()),
+            Value::Mapping(_) => Err("must be a scalar, list, or whole-value reference".to_owned()),
+        }
+    }
+    pub(crate) fn matches(&self, parameter_type: ParameterType) -> bool {
+        matches!(
+            (self, parameter_type),
+            (Self::String(_), ParameterType::String)
+                | (Self::Integer(_), ParameterType::Integer)
+                | (Self::Boolean(_), ParameterType::Boolean)
+                | (Self::List(_), ParameterType::List)
+        )
+    }
+    pub(crate) fn as_string(&self) -> Option<&str> {
+        match self {
+            Self::String(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+impl ParameterScalar {
+    fn parse(value: Value) -> Result<Self, String> {
+        match value {
+            Value::String(value) => Ok(Self::String(value)),
+            Value::Number(value) => value
+                .as_i64()
+                .map(Self::Integer)
+                .ok_or_else(|| "list elements must be integers, not floats".to_owned()),
+            Value::Bool(value) => Ok(Self::Boolean(value)),
+            Value::Tagged(_) => Err("list elements must not use YAML tags".to_owned()),
+            _ => Err(
+                "list elements must be non-recursive string, integer, or boolean scalars"
+                    .to_owned(),
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ValueOrReference {
+    Value(ParameterValue),
+    Reference(String),
+}
+
+impl<'de> Deserialize<'de> for ValueOrReference {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        if let Value::String(value) = &value {
+            if value.contains("{ parameter:") {
+                return Err(D::Error::custom(
+                    "parameter references must occupy the complete YAML value",
+                ));
+            }
+        }
+        if let Value::Mapping(mapping) = &value {
+            if mapping.len() == 1 {
+                let key = Value::String("parameter".to_owned());
+                if let Some(Value::String(name)) = mapping.get(&key) {
+                    return Ok(Self::Reference(name.clone()));
+                }
+            }
+            return Err(D::Error::custom(
+                "reference must be exactly { parameter: name }",
+            ));
+        }
+        ParameterValue::parse(value)
+            .map(Self::Value)
+            .map_err(D::Error::custom)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct IncludeDeclaration {
     id: String,
+    #[serde(default, rename = "as")]
+    as_name: Option<String>,
+    #[serde(default, rename = "with")]
+    bindings: BTreeMap<String, ValueOrReference>,
 }
-
 impl IncludeDeclaration {
-    /// The raw included profile ID.
     pub(crate) fn id(&self) -> &str {
         &self.id
     }
+    pub(crate) fn as_name(&self) -> Option<&str> {
+        self.as_name.as_deref()
+    }
+    pub(crate) fn bindings(&self) -> &BTreeMap<String, ValueOrReference> {
+        &self.bindings
+    }
 }
 
-/// The only v0.2.0 resource declaration shape.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FileResourceDeclaration {
     #[serde(rename = "type")]
-    #[allow(dead_code)]
     resource_type: FileResourceType,
     properties: FileLinkProperties,
 }
-
 impl FileResourceDeclaration {
-    /// File-link properties before source and target resolution.
     pub(crate) fn properties(&self) -> &FileLinkProperties {
         &self.properties
     }
 }
-
-/// The only supported profile resource type in v0.2.0.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 enum FileResourceType {
     #[serde(rename = "file")]
     File,
 }
 
-/// Raw properties of the only v0.2.0 file-link resource.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct FileLinkProperties {
-    #[allow(dead_code)]
-    kind: FileKind,
+    kind: ValueOrReference,
     source: SourceDeclaration,
-    target: String,
-    operation: FileOperation,
+    target: ValueOrReference,
+    operation: ValueOrReference,
 }
-
-impl<'de> Deserialize<'de> for FileLinkProperties {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Raw {
-            kind: FileKind,
-            source: SourceDeclaration,
-            target: String,
-            operation: FileOperation,
-        }
-        let raw = Raw::deserialize(deserializer)?;
-        if raw.kind == FileKind::Directory && raw.operation == FileOperation::Copy {
-            return Err(serde::de::Error::custom(
-                "directory resources support only operation: link",
-            ));
-        }
-        Ok(Self {
-            kind: raw.kind,
-            source: raw.source,
-            target: raw.target,
-            operation: raw.operation,
-        })
-    }
-}
-
 impl FileLinkProperties {
-    /// The raw source declaration before store lookup and path verification.
     pub(crate) fn source(&self) -> &SourceDeclaration {
         &self.source
     }
-
-    /// The raw target declaration before home binding.
-    pub(crate) fn target(&self) -> &str {
+    pub(crate) fn target(&self) -> &ValueOrReference {
         &self.target
     }
-
-    /// The declared closed file materialization effect.
-    pub(crate) fn operation(&self) -> FileOperation {
-        self.operation
+    pub(crate) fn operation(&self) -> &ValueOrReference {
+        &self.operation
     }
-
-    pub(crate) fn kind(&self) -> FileKind {
-        self.kind
+    pub(crate) fn kind(&self) -> &ValueOrReference {
+        &self.kind
     }
 }
 
-/// Raw local-store source syntax before resolver validation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SourceDeclaration {
     store: String,
     path: String,
 }
-
 impl SourceDeclaration {
-    /// The raw store ID.
     pub(crate) fn store(&self) -> &str {
         &self.store
     }
-
-    /// The raw slash-separated source path.
     pub(crate) fn path(&self) -> &str {
         &self.path
     }
 }
 
-/// The only permitted file-link kind.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FileKind {
-    #[serde(rename = "file")]
     File,
-    #[serde(rename = "directory")]
     Directory,
 }
-
-/// The only permitted file-link operation.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FileOperation {
-    #[serde(rename = "link")]
     Link,
-    #[serde(rename = "copy")]
     Copy,
+}
+pub(crate) fn parse_kind(value: &str) -> Option<FileKind> {
+    match value {
+        "file" => Some(FileKind::File),
+        "directory" => Some(FileKind::Directory),
+        _ => None,
+    }
+}
+pub(crate) fn parse_operation(value: &str) -> Option<FileOperation> {
+    match value {
+        "link" => Some(FileOperation::Link),
+        "copy" => Some(FileOperation::Copy),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const VALID_PROFILE: &str = "schema_version: 3\nid: workstation\nincludes:\n  - id: base\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/.gitconfig\n      operation: link\n";
-
     #[test]
-    fn profile_declaration_preserves_raw_profile_resource_and_path_syntax() {
-        let profile = ProfileDeclaration::parse(VALID_PROFILE).unwrap();
-
-        assert_eq!(profile.id(), "workstation");
-        assert_eq!(profile.includes()[0].id(), "base");
-        let (resource_id, resource) = profile.resources().next().unwrap();
-        assert_eq!(resource_id, "git-config");
-        assert_eq!(resource.properties().source().store(), "dotfiles");
-        assert_eq!(resource.properties().source().path(), "git/config");
-        assert_eq!(resource.properties().target(), "~/.gitconfig");
+    fn strict_schema_four_parameters_and_references_parse() {
+        let profile = ProfileDeclaration::parse("schema_version: 4\nid: base\nparameters: { name: string, count: integer, enabled: boolean, values: list }\nincludes: [{ id: child, as: child, with: { name: { parameter: name } } }]\nresources: {}\n").unwrap();
+        assert_eq!(profile.parameters().len(), 4);
+        assert!(matches!(
+            profile.includes()[0].bindings()["name"],
+            ValueOrReference::Reference(_)
+        ));
+    }
+    #[test]
+    fn rejects_invalid_reference_and_recursive_list() {
+        for yaml in [
+            "schema_version: 4\nid: base\nresources: { x: { type: file, properties: { kind: { parameter: x, extra: y }, source: { store: s, path: p }, target: /x, operation: link } } }\n",
+            "schema_version: 4\nid: base\nresources: {}\nincludes: [{ id: x, with: { p: [a, [b]] } }]\n",
+        ] {
+            assert!(ProfileDeclaration::parse(yaml).is_err());
+        }
     }
 
     #[test]
-    fn profile_declaration_rejects_schema_errors_at_every_object_level() {
-        for (fixture, yaml) in [
-            ("missing schema version", "id: workstation\nresources: {}\n"),
+    fn parameter_values_accept_each_closed_type_and_preserve_list_order() {
+        let values = [
             (
-                "unsupported schema version",
-                "schema_version: 2\nid: workstation\nresources: {}\n",
+                "string",
+                "plain",
+                ParameterValue::String("plain".to_owned()),
             ),
+            ("integer", "42", ParameterValue::Integer(42)),
+            ("boolean", "true", ParameterValue::Boolean(true)),
+            ("empty list", "[]", ParameterValue::List(Vec::new())),
             (
-                "unknown top-level field",
-                "schema_version: 3\nid: workstation\nresources: {}\nname: workstation\n",
+                "ordered scalar list",
+                "[first, 2, false]",
+                ParameterValue::List(vec![
+                    ParameterScalar::String("first".to_owned()),
+                    ParameterScalar::Integer(2),
+                    ParameterScalar::Boolean(false),
+                ]),
             ),
+        ];
+
+        for (name, yaml, expected) in values {
+            let value = serde_yaml::from_str(yaml).unwrap();
+            assert_eq!(ParameterValue::parse(value).unwrap(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn parameter_value_and_reference_grammar_reject_invalid_yaml_forms() {
+        for (name, yaml) in [
+            ("null", "null"),
+            ("float", "1.5"),
+            ("tagged scalar", "!custom value"),
+            ("mapping lookalike", "{ value: plain }"),
+            ("nested list", "[plain, [nested]]"),
+            ("tagged list element", "[!custom value]"),
+        ] {
+            let value = serde_yaml::from_str(yaml).unwrap();
+            assert!(ParameterValue::parse(value).is_err(), "{name} must reject");
+        }
+
+        for (name, yaml) in [
+            ("partial string reference", "'prefix { parameter: name }'"),
             (
-                "unknown include field",
-                "schema_version: 3\nid: workstation\nincludes:\n  - id: base\n    path: profiles/base.yaml\nresources: {}\n",
+                "reference with extra field",
+                "{ parameter: name, extra: value }",
             ),
-            (
-                "unsupported resource type",
-                "schema_version: 3\nid: workstation\nresources:\n  install:\n    type: task\n    properties: {}\n",
-            ),
-            (
-                "unknown resource field",
-                "schema_version: 3\nid: workstation\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/.gitconfig\n      operation: link\n    optional: true\n",
-            ),
-            (
-                "unknown properties field",
-                "schema_version: 3\nid: workstation\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/.gitconfig\n      operation: link\n      mode: 0600\n",
-            ),
-            (
-                "unknown source field",
-                "schema_version: 3\nid: workstation\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n        revision: main\n      target: ~/.gitconfig\n      operation: link\n",
-            ),
+            ("reference with non-string name", "{ parameter: 1 }"),
+            ("reference in list element", "[{ parameter: name }]"),
         ] {
             assert!(
-                ProfileDeclaration::parse(yaml).is_err(),
-                "{fixture} must reject"
+                serde_yaml::from_str::<ValueOrReference>(yaml).is_err(),
+                "{name} must reject"
             );
         }
     }
 
     #[test]
-    fn profile_declaration_defaults_includes_to_empty() {
-        let profile =
-            ProfileDeclaration::parse("schema_version: 3\nid: workstation\nresources: {}\n")
-                .unwrap();
-
-        assert!(profile.includes().is_empty());
-    }
-
-    #[test]
-    fn profile_declaration_accepts_directory_link_and_rejects_directory_copy() {
-        let directory_link = "schema_version: 3\nid: workstation\nresources:\n  config:\n    type: file\n    properties:\n      kind: directory\n      source: { store: dotfiles, path: nvim }\n      target: ~/.config/nvim\n      operation: link\n";
-        assert!(ProfileDeclaration::parse(directory_link).is_ok());
-
-        let directory_copy = directory_link.replace("operation: link", "operation: copy");
-        assert!(ProfileDeclaration::parse(&directory_copy).is_err());
+    fn profile_declaration_rejects_unknown_types_and_null_property_values() {
+        for (name, yaml) in [
+            (
+                "unknown parameter type",
+                "schema_version: 4\nid: base\nparameters: { value: path }\nresources: {}\n",
+            ),
+            (
+                "null property",
+                "schema_version: 4\nid: base\nresources: { x: { type: file, properties: { kind: null, source: { store: s, path: p }, target: /x, operation: link } } }\n",
+            ),
+        ] {
+            assert!(
+                ProfileDeclaration::parse(yaml).is_err(),
+                "{name} must reject"
+            );
+        }
     }
 }

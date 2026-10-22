@@ -15,6 +15,37 @@ use std::{
     path::Path,
 };
 
+pub(super) fn migration_presentation(
+    out: &mut impl Write,
+    operation: &str,
+    documents: &[(String, u32, u32)],
+    source_schema_version: u32,
+    target_schema_version: u32,
+    required_next_step: &str,
+    ownership_invariant: &str,
+) -> io::Result<()> {
+    writeln!(out, "migration: {operation}")?;
+    writeln!(out, "affected documents: {}", documents.len())?;
+    for (path, source_schema_version, target_schema_version) in documents {
+        writeln!(
+            out,
+            "document: {} (schema {} -> {})",
+            path, source_schema_version, target_schema_version
+        )?;
+    }
+    writeln!(
+        out,
+        "schema versions: {} -> {}",
+        source_schema_version, target_schema_version
+    )?;
+    writeln!(out, "required next step: {required_next_step}")?;
+    writeln!(out, "ownership guarantee: {ownership_invariant}")
+}
+
+pub(super) fn migration_outcome(out: &mut impl Write, operation: &str) -> io::Result<()> {
+    writeln!(out, "migration completed: {operation}")
+}
+
 pub(super) fn action_name(kind: ActionKind) -> &'static str {
     match kind {
         ActionKind::CreateLink => "create_link",

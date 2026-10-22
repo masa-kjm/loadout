@@ -122,7 +122,21 @@ fn apply_request_with_hooks_and_after_planning(
     let result = (|| -> Result<ApplyReport, ApplyFailureCause> {
         let lifecycle = ApplyFailureCause::Lifecycle;
         let state_error = |error| lifecycle(ApplyError::State(error));
+        // This is deliberately narrower than full resolution: it reads only the profile inventory and rejects non-current declarations before state creation, locking, recovery, or resource access.
+        if let Err(error) = super::queries::validate_current_profile_schemas(request) {
+            if matches!(
+                error,
+                super::queries::QueryError::Resolution(
+                    crate::resolver::ResolverError::InvalidProfileSchema { .. }
+                )
+            ) {
+                return Err(ApplyFailureCause::Input(error));
+            }
+        }
         let repository = StateRepository::new(request.context.state_directory().clone());
+        // A normal lifecycle path must reject an incompatible state before it can create or contend on the exclusive lock.
+        // The locked acquisition revalidates the snapshot after locking.
+        repository.load().map_err(state_error)?;
         locked_session = Some(repository.acquire_exclusive().map_err(state_error)?);
         let locked = locked_session
             .as_mut()
@@ -2023,7 +2037,7 @@ mod tests {
         );
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 3\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: nvim\n      target: ~/.config/nvim\n",
+            "schema_version: 4\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: nvim\n      target: ~/.config/nvim\n",
         );
         let request = super::super::queries::DeclarationRequest {
             context: ResolverContext::new(
@@ -2229,7 +2243,7 @@ mod tests {
         );
         let profile = |source| {
             format!(
-                "schema_version: 3\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: {source}\n      target: ~/.config/nvim\n"
+                "schema_version: 4\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: {source}\n      target: ~/.config/nvim\n"
             )
         };
         workspace.write("profiles/base.yaml", &profile("old"));
@@ -2462,7 +2476,7 @@ mod tests {
 
         fn request(&self, resources: &[(&str, &str)]) -> super::super::queries::DeclarationRequest {
             self.write("config/environment.yaml", "schema_version: 2\ndefault_profile: base\nprofile_discovery:\n  paths: [../profiles]\nstores:\n  dotfiles:\n    type: local\n    properties:\n      path: ../store\n");
-            let mut profile = String::from("schema_version: 3\nid: base\nresources:");
+            let mut profile = String::from("schema_version: 4\nid: base\nresources:");
             if resources.is_empty() {
                 profile.push_str(" {}\n");
             } else {
@@ -2589,7 +2603,7 @@ mod tests {
             self.write("config/environment.yaml", "schema_version: 1\n");
             self.write(
                 "profiles/workstation.yaml",
-                "schema_version: 3\nid: workstation\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/.gitconfig\n      operation: link\n",
+                "schema_version: 4\nid: workstation\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/.gitconfig\n      operation: link\n",
             );
             let context = ResolverContext::new(
                 self.path("home"),
@@ -3651,6 +3665,33 @@ mod tests {
     }
 
     #[test]
+    fn noncurrent_profile_schemas_fail_before_state_creation_lock_or_source_resolution() {
+        for schema_version in [3, 99] {
+            let workspace = TestWorkspace::new();
+            let request = workspace.request(&[("item", "target")]);
+            workspace.write(
+                "profiles/base.yaml",
+                &format!("schema_version: {schema_version}\nid: base\nresources: {{}}\n"),
+            );
+            fs::remove_dir_all(workspace.path("store")).unwrap();
+            let before = workspace.snapshot();
+            let _no_mutation = crate::test_support::forbid_mutation();
+
+            let failure = apply_request(&request, |_| panic!("no confirmation")).unwrap_err();
+
+            assert_eq!(failure.stage, ApplyStage::LockAndState);
+            assert!(matches!(
+                failure.cause,
+                ApplyFailureCause::Input(super::super::queries::QueryError::Resolution(
+                    crate::resolver::ResolverError::InvalidProfileSchema { .. }
+                ))
+            ));
+            assert_eq!(workspace.snapshot(), before);
+            assert!(!workspace.path("state").exists());
+        }
+    }
+
+    #[test]
     fn dry_run_with_absent_state_has_no_write_or_lock_boundary_calls() {
         let workspace = TestWorkspace::new();
         workspace.write("store/git/config", "source\n");
@@ -3769,7 +3810,7 @@ mod tests {
         let request = workspace.request(&[("a", "a")]);
         workspace.write(
             "profiles/other.yaml",
-            "schema_version: 3\nid: other\nincludes: [{id: missing}]\nresources: {}\n",
+            "schema_version: 4\nid: other\nincludes: [{id: missing}]\nresources: {}\n",
         );
         let before = workspace.snapshot();
         let _read_only = crate::test_support::forbid_mutation();
@@ -5283,7 +5324,7 @@ mod tests {
         );
         let profile = |source: &str| {
             format!(
-                "schema_version: 3\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: {source}\n      target: ~/.config/nvim\n"
+                "schema_version: 4\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: {source}\n      target: ~/.config/nvim\n"
             )
         };
         workspace.write("profiles/base.yaml", &profile("old"));
@@ -5366,7 +5407,7 @@ mod tests {
         );
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 3\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: nvim\n      target: ~/.config/nvim\n",
+            "schema_version: 4\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: nvim\n      target: ~/.config/nvim\n",
         );
         let request = super::super::queries::DeclarationRequest {
             context: ResolverContext::new(
@@ -5381,7 +5422,7 @@ mod tests {
         apply_request(&request, |_| true).unwrap();
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 3\nid: base\nresources: {}\n",
+            "schema_version: 4\nid: base\nresources: {}\n",
         );
 
         let target = workspace.path("home/.config/nvim");
@@ -5425,7 +5466,7 @@ mod tests {
         );
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 3\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: nvim\n      target: ~/.config/nvim\n",
+            "schema_version: 4\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: nvim\n      target: ~/.config/nvim\n",
         );
         let request = super::super::queries::DeclarationRequest {
             context: ResolverContext::new(

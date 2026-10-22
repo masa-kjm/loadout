@@ -28,7 +28,7 @@ use crate::state::operation::{
 };
 use crate::state::repository::{CommitError, PersistedState};
 
-const STATE_SCHEMA_VERSION: u32 = 3;
+const STATE_SCHEMA_VERSION: u32 = 4;
 
 /// A strict on-disk representation of `state.json`.
 #[derive(Debug, Deserialize, Serialize)]
@@ -80,6 +80,13 @@ impl StateDocument {
             .transpose()?;
         PersistedState::from_parts(known, active_operation)
     }
+}
+
+/// Validates bytes as the current state schema without performing I/O or changing state.
+pub(crate) fn validate_current_state_bytes(bytes: &[u8]) -> Result<(), StateDecodeError> {
+    let document = serde_json::from_slice::<StateDocument>(bytes)
+        .map_err(|_| StateDecodeError::InvalidTargetCondition)?;
+    document.into_state().map(|_| ())
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1485,7 +1492,7 @@ mod tests {
         )
         .unwrap();
         let document = json!({
-            "schema_version": 3,
+            "schema_version": 4,
             "resources": { "base/nvim": { "definition_hash": directory_link_definition_hash(&old).unwrap().as_str(), "effect": { "kind": "directory_link", "source_path": old.source_path().as_ref(), "target_path": old.target_path().as_ref(), "link_target": old.source_path().as_ref() } } },
             "active_operation": { "id": "op-directory", "desired_hash": format!("sha256:{}", "a".repeat(64)), "actions": { "a1": {
                 "kind": "replace_directory_link", "resource_id": "base/nvim",
@@ -1704,7 +1711,7 @@ mod tests {
             });
         }
         json!({
-            "schema_version": 3,
+            "schema_version": 4,
             "resources": resources,
             "active_operation": {
                 "id": "op-fixture",
@@ -1737,7 +1744,7 @@ mod tests {
 
         let document = StateDocument::from_state(&state).unwrap();
         let encoded = serde_json::to_value(&document).unwrap();
-        assert_eq!(encoded["schema_version"], 3);
+        assert_eq!(encoded["schema_version"], 4);
         assert_eq!(
             encoded["resources"]["base/nvim"]["effect"]["kind"],
             "directory_link"
@@ -1766,7 +1773,7 @@ mod tests {
         .unwrap();
         let definition_hash = definition_hash_for_copy_known(&old_copy).unwrap();
         let document = json!({
-            "schema_version": 3,
+            "schema_version": 4,
             "resources": {"base/config": {
                 "definition_hash": definition_hash.as_str(),
                 "effect": {
@@ -1856,7 +1863,7 @@ mod tests {
         let target = root.join("home").join(".config");
         let fingerprint = format!("sha256:{}", "b".repeat(64));
         let document = json!({
-            "schema_version": 3,
+            "schema_version": 4,
             "resources": {},
             "active_operation": {
                 "id": "op-copy",
@@ -1913,7 +1920,7 @@ mod tests {
     fn active_copy_without_its_recorded_temporary_is_rejected() {
         let root = std::env::temp_dir().join("loadout-codec-copy-operation-missing-temp");
         let document = json!({
-            "schema_version": 3,
+            "schema_version": 4,
             "resources": {},
             "active_operation": {
                 "id": "op-copy",
@@ -1980,7 +1987,7 @@ mod tests {
         .unwrap();
         let definition = definition_hash_for_copy_known(&copy).unwrap();
         let fixture = json!({
-            "schema_version": 3,
+            "schema_version": 4,
             "resources": {"base/config": {
                 "definition_hash": definition.as_str(),
                 "effect": {"kind": "file_copy", "source_path": source.as_ref(), "target_path": target.as_ref(), "content_fingerprint": fingerprint.as_str()}

@@ -26,6 +26,7 @@ pub(super) enum Command {
         dry_run: bool,
     },
     Config(ConfigCommand),
+    Migrate(MigrationCommand),
     Diff,
     Status {
         config: Option<OsString>,
@@ -61,6 +62,11 @@ enum ParsedCommand {
     Config {
         #[command(subcommand)]
         command: ParsedConfigCommand,
+    },
+    #[command(about = "Explicitly migrate supported profile and state schemas.")]
+    Migrate {
+        #[command(subcommand)]
+        command: ParsedMigrationCommand,
     },
     #[command(about = "Report drift between recorded state and managed targets.")]
     Diff,
@@ -144,6 +150,27 @@ struct ApplyArgs {
         help = "Run the apply lifecycle without changing persistent state."
     )]
     dry_run: bool,
+}
+
+#[derive(Args)]
+struct MigrationArgs {
+    #[arg(
+        long,
+        required = true,
+        value_name = "PATH",
+        help = "Select the portable environment configuration file to migrate."
+    )]
+    config: OsString,
+    #[arg(long, help = "Proceed without an interactive confirmation prompt.")]
+    yes: bool,
+}
+
+#[derive(Subcommand)]
+enum ParsedMigrationCommand {
+    #[command(about = "Migrate schema-3 state before profile documents.")]
+    State(MigrationArgs),
+    #[command(about = "Migrate remaining schema-3 profile documents after state.")]
+    Profiles(MigrationArgs),
 }
 
 #[derive(Subcommand)]
@@ -239,6 +266,12 @@ pub(super) enum ConfigCommand {
 }
 
 #[derive(Debug, PartialEq)]
+pub(super) enum MigrationCommand {
+    State { config: OsString, yes: bool },
+    Profiles { config: OsString, yes: bool },
+}
+
+#[derive(Debug, PartialEq)]
 pub(super) enum ProfileCommand {
     List {
         config: Option<OsString>,
@@ -310,6 +343,16 @@ pub(super) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
                 field,
                 value,
                 yes,
+            },
+        }),
+        ParsedCommand::Migrate { command } => Command::Migrate(match command {
+            ParsedMigrationCommand::State(args) => MigrationCommand::State {
+                config: args.config,
+                yes: args.yes,
+            },
+            ParsedMigrationCommand::Profiles(args) => MigrationCommand::Profiles {
+                config: args.config,
+                yes: args.yes,
             },
         }),
         ParsedCommand::Diff => Command::Diff,
@@ -397,6 +440,8 @@ impl Command {
             | Self::Apply { config, .. }
             | Self::Status { config, .. } => config.as_ref(),
             Self::Config(command) => command.config(),
+            Self::Migrate(MigrationCommand::State { config, .. })
+            | Self::Migrate(MigrationCommand::Profiles { config, .. }) => Some(config),
             Self::Profile(ProfileCommand::List { config })
             | Self::Profile(ProfileCommand::Show { config, .. }) => config.as_ref(),
             Self::Resource(ResourceCommand::DesiredList { config, .. })

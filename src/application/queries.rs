@@ -284,6 +284,15 @@ pub(super) fn resolve_request(
         .map_err(QueryError::Resolution)
 }
 
+/// Proves that every discovered profile is a current-schema declaration before lifecycle state access.
+pub(super) fn validate_current_profile_schemas(
+    request: &DeclarationRequest,
+) -> Result<(), QueryError> {
+    let environment = load_environment(&request.context)?;
+    resolver::validate_current_profile_schemas(&request.context, &environment)
+        .map_err(QueryError::Resolution)
+}
+
 fn resolve_desired(request: &DeclarationRequest) -> Result<ResolvedDesired, QueryError> {
     let environment = load_environment(&request.context)?;
     resolver::resolve(&request.context, &environment, request.root.as_deref())
@@ -592,7 +601,7 @@ mod tests {
             .unwrap();
             fs::write(
                 root.join("portable/profiles/base.yaml"),
-                "schema_version: 3\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.item\n",
+                "schema_version: 4\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.item\n",
             )
             .unwrap();
             let root = crate::domain::paths::ResolvedPath::from_platform_canonicalized(
@@ -825,7 +834,7 @@ mod tests {
         fs::write(
             workspace.root.join("state/state.json"),
             serde_json::json!({
-                "schema_version":3,
+                "schema_version":4,
                 "resources": {},
                 "active_operation": {
                     "id": "interrupted-operation",
@@ -874,7 +883,7 @@ mod tests {
         let workspace = Workspace::new();
         fs::write(
             workspace.root.join("portable/profiles/base.yaml"),
-            "schema_version: 3\nid: base\nresources:\n  changed:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.changed\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.item\n",
+            "schema_version: 4\nid: base\nresources:\n  changed:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.changed\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.item\n",
         )
         .unwrap();
         let desired_item = desired_resources(&DeclarationRequest {
@@ -925,7 +934,7 @@ mod tests {
         fs::write(
             workspace.root.join("state/state.json"),
             serde_json::json!({
-                "schema_version":3,
+                "schema_version":4,
                 "resources": resources,
                 "active_operation": null,
             })
@@ -990,7 +999,7 @@ mod tests {
         fs::write(
             workspace.root.join("state/state.json"),
             serde_json::json!({
-                "schema_version":3,
+                "schema_version":4,
                 "resources": {
                     "base/item": persisted_known_file_link(&desired),
                 },
@@ -1091,7 +1100,7 @@ mod tests {
         let workspace = Workspace::new();
         fs::write(
             workspace.root.join("portable/profiles/base.yaml"),
-            "schema_version: 3\nid: base\nresources:\n  another:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.another\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.blocked/item\n",
+            "schema_version: 4\nid: base\nresources:\n  another:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.another\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.blocked/item\n",
         )
         .unwrap();
         let blocked = workspace.root.join("home/.blocked");

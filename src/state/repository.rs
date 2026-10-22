@@ -102,6 +102,16 @@ impl StateRepository {
         read_state_file(&self.state_file_path())
     }
 
+    /// Reads opaque bytes for the explicit migration preflight without creating a lock or state directory.
+    ///
+    /// Only the migration facade may interpret these bytes as a legacy document.
+    pub(crate) fn read_source_for_migration(&self) -> Result<Vec<u8>, StateRepositoryError> {
+        fs::read(self.state_file_path()).map_err(|source| StateRepositoryError::StateRead {
+            path: self.state_file_path(),
+            source,
+        })
+    }
+
     /// Creates the state directory and holds the exclusive operating-system lock.
     pub(crate) fn acquire_exclusive(&self) -> Result<LockedStateRepository, StateRepositoryError> {
         #[cfg(test)]
@@ -138,6 +148,38 @@ impl StateRepository {
             commits_before_fault: 0,
             #[cfg(test)]
             fail_state_write_preflight: self.fail_state_write_preflight,
+        })
+    }
+
+    /// Acquires only the state lock for an explicit migration operation.
+    ///
+    /// Unlike normal acquisition, this deliberately does not decode the state file.
+    /// The migration module supplies the sole schema-3 reader and must validate a schema-4 candidate before this session publishes it.
+    pub(crate) fn acquire_exclusive_for_migration(
+        &self,
+    ) -> Result<MigrationLockedStateRepository, StateRepositoryError> {
+        #[cfg(test)]
+        crate::test_support::assert_mutation_allowed();
+        fs::create_dir_all(self.state_directory.as_ref()).map_err(|source| {
+            StateRepositoryError::StateDirectoryIo {
+                path: self.state_directory.as_ref().to_path_buf(),
+                source,
+            }
+        })?;
+        let metadata = fs::metadata(self.state_directory.as_ref()).map_err(|source| {
+            StateRepositoryError::StateDirectoryIo {
+                path: self.state_directory.as_ref().to_path_buf(),
+                source,
+            }
+        })?;
+        if !metadata.is_dir() {
+            return Err(StateRepositoryError::StateDirectoryNotDirectory {
+                path: self.state_directory.as_ref().to_path_buf(),
+            });
+        }
+        Ok(MigrationLockedStateRepository {
+            repository: self.clone(),
+            _lock: ExclusiveStateLock::acquire(&self.lock_file_path())?,
         })
     }
 
@@ -182,6 +224,92 @@ pub(crate) struct LockedStateRepository {
     commits_before_fault: usize,
     #[cfg(test)]
     fail_state_write_preflight: bool,
+}
+
+/// A lock session reserved for the explicit schema migration boundary.
+pub(crate) struct MigrationLockedStateRepository {
+    repository: StateRepository,
+    _lock: ExclusiveStateLock,
+}
+
+impl MigrationLockedStateRepository {
+    /// Reads opaque legacy bytes while holding the exclusive state lock.
+    pub(crate) fn read_source(&self) -> Result<Vec<u8>, StateRepositoryError> {
+        self.repository.read_source_for_migration()
+    }
+
+    /// Validates and atomically publishes a current-schema migration candidate.
+    pub(crate) fn publish_current(&self, candidate: &[u8]) -> Result<(), StateRepositoryError> {
+        crate::state::validate_current_state_bytes(candidate).map_err(|source| {
+            StateRepositoryError::InvalidState {
+                path: self.repository.state_file_path(),
+                source,
+            }
+        })?;
+        let temporary_path = migration_temporary_path(&self.repository)?;
+        let result = (|| {
+            let mut temporary = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary_path)
+                .map_err(|source| CommitError::TemporaryCreate {
+                    path: temporary_path.clone(),
+                    source,
+                })?;
+            temporary
+                .write_all(candidate)
+                .map_err(|source| CommitError::TemporaryWrite {
+                    path: temporary_path.clone(),
+                    source,
+                })?;
+            temporary
+                .sync_all()
+                .map_err(|source| CommitError::TemporaryFlush {
+                    path: temporary_path.clone(),
+                    source,
+                })?;
+            drop(temporary);
+            read_state_file(&temporary_path).map_err(|source| {
+                CommitError::TemporaryValidation {
+                    path: temporary_path.clone(),
+                    source: Box::new(source),
+                }
+            })?;
+            fs::rename(&temporary_path, self.repository.state_file_path()).map_err(|source| {
+                CommitError::StateReplacement {
+                    temporary_path: temporary_path.clone(),
+                    state_path: self.repository.state_file_path(),
+                    source,
+                }
+            })?;
+            flush_state_directory(self.repository.state_directory.as_ref()).map_err(|source| {
+                CommitError::DirectoryFlushAfterReplacement {
+                    state_directory: self.repository.state_directory.as_ref().to_path_buf(),
+                    source,
+                }
+            })
+        })();
+        result.map_err(StateRepositoryError::Commit)
+    }
+}
+
+fn migration_temporary_path(repository: &StateRepository) -> Result<PathBuf, StateRepositoryError> {
+    let pid = std::process::id();
+    for _ in 0..MAX_TEMPORARY_NAME_ATTEMPTS {
+        let nonce = NEXT_TEMPORARY_NONCE.fetch_add(1, Ordering::Relaxed);
+        let path = repository
+            .state_directory
+            .as_ref()
+            .join(format!(".loadout-state-migrate-{pid}-{nonce}.tmp"));
+        if !path.exists() {
+            return Ok(path);
+        }
+    }
+    Err(StateRepositoryError::Commit(
+        CommitError::TemporaryNameExhausted {
+            state_directory: repository.state_directory.as_ref().to_path_buf(),
+        },
+    ))
 }
 
 impl LockedStateRepository {
@@ -2240,7 +2368,7 @@ mod tests {
 
         let json: serde_json::Value =
             serde_json::from_slice(&fs::read(directory.state_file()).unwrap()).unwrap();
-        assert_eq!(json["schema_version"], 3);
+        assert_eq!(json["schema_version"], 4);
         assert!(
             json["resources"]["base/git"]["definition_hash"]
                 .as_str()

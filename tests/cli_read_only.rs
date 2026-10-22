@@ -190,13 +190,9 @@ struct StateLockWitness {
 #[cfg(unix)]
 impl StateLockWitness {
     fn hold(path: &Path) -> Self {
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg(
-                "exec 9>\"$1\"; printf 'ready\\n'; flock -n 9 || exit 1; printf 'held\\n'; IFS= read -r command; test \"$command\" = release; flock -u 9; printf 'released\\n'",
-            )
-            .arg("state-lock-witness")
-            .arg(path)
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "state_lock_witness_helper", "--nocapture"])
+            .env("LOADOUT_STATE_LOCK_WITNESS", path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -214,9 +210,14 @@ impl StateLockWitness {
     }
 
     fn next_event(&mut self) -> String {
-        let mut event = String::new();
-        self.output.read_line(&mut event).unwrap();
-        event.trim_end().to_owned()
+        loop {
+            let mut event = String::new();
+            assert_ne!(self.output.read_line(&mut event).unwrap(), 0);
+            let event = event.trim_end();
+            if matches!(event, "ready" | "held" | "released") {
+                return event.to_owned();
+            }
+        }
     }
 
     fn release(&mut self) {
@@ -225,6 +226,37 @@ impl StateLockWitness {
         assert_eq!(self.next_event(), "released");
         assert!(self.child.wait().unwrap().success());
     }
+}
+
+/// The helper runs in a separate test process so its operating-system lock contends with the CLI process.
+#[cfg(unix)]
+#[test]
+fn state_lock_witness_helper() {
+    use std::{io::BufRead, os::fd::AsRawFd};
+
+    let Some(path) = std::env::var_os("LOADOUT_STATE_LOCK_WITNESS") else {
+        return;
+    };
+    let path = PathBuf::from(path);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .unwrap();
+    println!("ready");
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    println!("held");
+    let mut command = String::new();
+    std::io::stdin().lock().read_line(&mut command).unwrap();
+    assert_eq!(command.trim_end(), "release");
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    println!("released");
 }
 
 #[cfg(unix)]

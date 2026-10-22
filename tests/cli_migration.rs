@@ -8,6 +8,22 @@ use std::{
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(windows)]
+fn normal_existing_path(path: PathBuf) -> PathBuf {
+    let canonical = fs::canonicalize(path).unwrap();
+    let raw = canonical.to_str().unwrap();
+    if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{unc}"))
+    } else {
+        PathBuf::from(raw.strip_prefix(r"\\?\").unwrap_or(raw))
+    }
+}
+
+#[cfg(not(windows))]
+fn normal_existing_path(path: PathBuf) -> PathBuf {
+    fs::canonicalize(path).unwrap()
+}
+
 struct Fixture {
     root: PathBuf,
 }
@@ -20,6 +36,7 @@ impl Fixture {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&root).unwrap();
+        let root = normal_existing_path(root);
         for directory in ["cwd", "home", "portable/profiles", "state/loadout"] {
             fs::create_dir_all(root.join(directory)).unwrap();
         }
@@ -102,10 +119,16 @@ fn state_migration_without_yes_presents_the_boundary_and_leaves_everything_uncha
     assert_eq!(output.status.code(), Some(2), "{text}");
     assert!(text.contains("migration: state"), "{text}");
     assert!(text.contains("affected documents: 1"), "{text}");
-    assert!(text.contains(&format!(
+    let document = format!(
         "document: {} (schema 3 -> 4)",
-        fixture.root.join("state/loadout/state.json").display()
-    )));
+        fixture
+            .root
+            .join("state")
+            .join("loadout")
+            .join("state.json")
+            .display()
+    );
+    assert!(text.contains(&document), "expected {document:?} in {text}");
     assert!(text.contains("schema versions: 3 -> 4"), "{text}");
     assert!(text.contains("resource IDs, effects, and Known ownership do not change"));
     assert!(text.contains("requires --yes"), "{text}");
@@ -133,10 +156,16 @@ fn profile_migration_confirmation_lists_each_exact_schema_three_document() {
     assert!(text.contains("migration: profiles"), "{text}");
     assert!(text.contains("affected documents: 2"), "{text}");
     for profile in ["base.yaml", "extra.yaml"] {
-        assert!(text.contains(&format!(
+        let document = format!(
             "document: {} (schema 3 -> 4)",
-            fixture.root.join("portable/profiles").join(profile).display()
-        )));
+            fixture
+                .root
+                .join("portable")
+                .join("profiles")
+                .join(profile)
+                .display()
+        );
+        assert!(text.contains(&document), "expected {document:?} in {text}");
     }
     assert!(text.contains("required next step:"), "{text}");
     assert!(text.contains("resource IDs, effects, and Known ownership do not change"));

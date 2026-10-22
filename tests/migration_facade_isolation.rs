@@ -312,6 +312,27 @@ fn cargo_selected_production_roots() -> Result<Vec<PathBuf>, String> {
     )
 }
 
+#[cfg(windows)]
+fn normal_existing_path(path: &Path) -> Result<PathBuf, String> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("path must be readable: {error}"))?;
+    let raw = canonical
+        .to_str()
+        .ok_or_else(|| "path must be valid Unicode".to_owned())?;
+    if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        Ok(PathBuf::from(format!(r"\\{unc}")))
+    } else {
+        Ok(PathBuf::from(raw.strip_prefix(r"\\?\").unwrap_or(raw)))
+    }
+}
+
+#[cfg(not(windows))]
+fn normal_existing_path(path: &Path) -> Result<PathBuf, String> {
+    path.canonicalize()
+        .map_err(|error| format!("path must be readable: {error}"))
+}
+
 fn cargo_selected_production_roots_for(manifest_path: &Path) -> Result<Vec<PathBuf>, String> {
     let output = Command::new(env!("CARGO"))
         .args([
@@ -331,15 +352,18 @@ fn cargo_selected_production_roots_for(manifest_path: &Path) -> Result<Vec<PathB
     }
     let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("Cargo metadata must be JSON: {error}"))?;
-    let manifest_path = manifest_path
-        .canonicalize()
+    let manifest_path = normal_existing_path(manifest_path)
         .map_err(|error| format!("Cargo manifest path must be readable: {error}"))?;
     let package = metadata["packages"]
         .as_array()
         .unwrap()
         .iter()
         .find(|package| {
-            package["manifest_path"].as_str() == Some(manifest_path.to_string_lossy().as_ref())
+            package["manifest_path"]
+                .as_str()
+                .and_then(|path| normal_existing_path(Path::new(path)).ok())
+                .as_ref()
+                == Some(&manifest_path)
         })
         .ok_or_else(|| "Cargo metadata root package must be present".to_owned())?;
     if package["name"].as_str() != Some("loadout") {
@@ -2463,6 +2487,8 @@ fn ends_with(path: &[String], suffix: &[&str]) -> bool {
 fn display(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
-        .to_string_lossy()
-        .into_owned()
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
 }

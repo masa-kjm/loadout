@@ -65,7 +65,7 @@ impl Fixture {
         self.write(
             "portable/profiles/base.yaml",
             &format!(
-                "schema_version: 3\nid: base\nresources:\n  {resource}:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: files\n        path: {source}\n      target: ~/{target}\n"
+                "schema_version: 4\nid: base\nresources:\n  {resource}:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: files\n        path: {source}\n      target: ~/{target}\n"
             ),
         );
     }
@@ -253,7 +253,7 @@ fn directory_link_lifecycle_rejects_junctions_and_preserves_old_effect_on_sharin
 
     fixture.write(
         "portable/profiles/base.yaml",
-        "schema_version: 3\nid: base\nresources: {}\n",
+        "schema_version: 4\nid: base\nresources: {}\n",
     );
     expect_success(fixture.apply());
     assert!(fs::symlink_metadata(&target).is_err());

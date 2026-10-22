@@ -15,7 +15,7 @@ const SHA256_PREFIX: &str = "sha256:";
 const RESOLVED_FILE_LINK_FORMAT: &str = "loadout.resolved-file-link.v1";
 const RESOLVED_FILE_COPY_FORMAT: &str = "loadout.resolved-file-copy.v1";
 const RESOLVED_DIRECTORY_LINK_FORMAT: &str = "loadout.resolved-directory-link.v1";
-const RESOLVED_DESIRED_FORMAT: &str = "loadout.resolved-desired.v3";
+const RESOLVED_DESIRED_FORMAT: &str = "loadout.resolved-desired.v4";
 
 /// A SHA-256 hash of one canonical resolved file-link definition.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -371,7 +371,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             desired_hash(&desired).unwrap().as_str(),
-            "sha256:943faeabbd3d23bd2feaaa9cd9eb89f0ffa9a962ddf6c48bc9b7d85f83ccb422"
+            "sha256:0b97e6f75331bbedfe0e6f0ecadb3bb33320a3a8f6284b2ecbadcff9b26e36c1"
         );
     }
 
@@ -436,7 +436,7 @@ mod tests {
 
         assert_eq!(
             desired_hash(&desired).unwrap().as_str(),
-            "sha256:1730c7d062b4dc0ae58cb54265dbd00d05fc04d47f3abd32f2b0660a76747b5f"
+            "sha256:9dce85d5ea1484b13b3c2b0df841c213a3af939ed86448bde4bf5416faeba562"
         );
     }
 

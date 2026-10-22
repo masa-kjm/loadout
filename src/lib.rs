@@ -34,6 +34,9 @@ mod authoring;
 mod cli;
 mod loader;
 
+// Schema-3 parsing and conversion are deliberately unreachable from normal lifecycle modules.
+mod migration;
+
 /// Entry point for the Loadout executable; core domain types remain internal.
 /// This is not a supported embeddable Rust API.
 #[doc(hidden)]

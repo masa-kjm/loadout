@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::declaration::environment_config::EnvironmentConfig;
-use crate::declaration::profile::{FileKind, FileOperation, ProfileDeclaration};
+use crate::declaration::profile::{
+    FileKind, FileOperation, ParameterValue, ProfileDeclaration, ValueOrReference, parse_kind,
+    parse_operation,
+};
 use crate::domain::desired::{ResolvedDesired, ResolvedDesiredError, ResolvedResource};
 use crate::domain::directory_link::ResolvedDirectoryLink;
 use crate::domain::file_copy::{ContentFingerprint, ResolvedFileCopy};
@@ -114,7 +117,10 @@ pub(crate) fn discovered_roots(
 ) -> Result<Vec<ProfileId>, ResolverError> {
     let profiles = discover_profiles(context, environment)?;
     resolve_stores(context, environment)?;
-    Ok(profiles.into_keys().collect())
+    Ok(profiles
+        .into_iter()
+        .filter_map(|(id, profile)| profile.declaration.parameters().is_empty().then_some(id))
+        .collect())
 }
 
 /// One strictly parsed portable profile declaration for read-only inspection.
@@ -151,6 +157,37 @@ pub(crate) struct DeclaredFileLink {
     store_id: String,
     source_path: String,
     target_path: String,
+    kind_value: DeclaredPropertyValue,
+    operation_value: DeclaredPropertyValue,
+    target_value: DeclaredPropertyValue,
+}
+
+/// One resource property as written in a declaration-only inspection result.
+///
+/// References remain unbound here because profile inspection does not select an instance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DeclaredPropertyValue {
+    Literal(String),
+    Reference { parameter: String },
+}
+
+impl DeclaredPropertyValue {
+    fn from_value_or_reference(value: &ValueOrReference) -> Self {
+        match value {
+            ValueOrReference::Value(ParameterValue::String(value)) => Self::Literal(value.clone()),
+            ValueOrReference::Value(_) => Self::Literal("<non-string>".to_owned()),
+            ValueOrReference::Reference(parameter) => Self::Reference {
+                parameter: parameter.clone(),
+            },
+        }
+    }
+
+    fn presentation(&self) -> String {
+        match self {
+            Self::Literal(value) => value.clone(),
+            Self::Reference { parameter } => format!("{{ parameter: {parameter} }}"),
+        }
+    }
 }
 
 impl DeclaredFileLink {
@@ -183,6 +220,21 @@ impl DeclaredFileLink {
     pub(crate) fn target_path(&self) -> &str {
         &self.target_path
     }
+
+    /// The declared kind before instance-scoped reference binding and semantic validation.
+    pub(crate) fn kind_value(&self) -> &DeclaredPropertyValue {
+        &self.kind_value
+    }
+
+    /// The declared operation before instance-scoped reference binding and semantic validation.
+    pub(crate) fn operation_value(&self) -> &DeclaredPropertyValue {
+        &self.operation_value
+    }
+
+    /// The declared target before instance-scoped reference binding and path validation.
+    pub(crate) fn target_value(&self) -> &DeclaredPropertyValue {
+        &self.target_value
+    }
 }
 
 /// Discovers and strictly parses profile declarations without resolving includes, stores, sources, or targets.
@@ -206,13 +258,34 @@ pub(crate) fn declared_profiles(
                             }
                         })?;
                     let properties = resource.properties();
+                    let kind_value =
+                        DeclaredPropertyValue::from_value_or_reference(properties.kind());
+                    let operation_value =
+                        DeclaredPropertyValue::from_value_or_reference(properties.operation());
+                    let target_value =
+                        DeclaredPropertyValue::from_value_or_reference(properties.target());
                     Ok(DeclaredFileLink {
                         resource_id,
-                        kind: properties.kind(),
-                        operation: properties.operation(),
+                        // Rendering currently has a closed literal presentation.
+                        // The raw values below retain references, while resolution owns their type and closed-enum validation.
+                        kind: match &kind_value {
+                            DeclaredPropertyValue::Literal(value) => {
+                                parse_kind(value).unwrap_or(FileKind::File)
+                            }
+                            DeclaredPropertyValue::Reference { .. } => FileKind::File,
+                        },
+                        operation: match &operation_value {
+                            DeclaredPropertyValue::Literal(value) => {
+                                parse_operation(value).unwrap_or(FileOperation::Link)
+                            }
+                            DeclaredPropertyValue::Reference { .. } => FileOperation::Link,
+                        },
                         store_id: properties.source().store().to_owned(),
                         source_path: properties.source().path().to_owned(),
-                        target_path: properties.target().to_owned(),
+                        target_path: target_value.presentation(),
+                        kind_value,
+                        operation_value,
+                        target_value,
                     })
                 })
                 .collect::<Result<Vec<_>, ResolverError>>()?;
@@ -229,6 +302,15 @@ pub(crate) fn declared_profiles(
             })
         })
         .collect()
+}
+
+/// Strictly discovers the complete profile inventory without resolving stores, sources, or targets.
+/// Normal lifecycle callers use this as their schema barrier before any state or resource access.
+pub(crate) fn validate_current_profile_schemas(
+    context: &ResolverContext,
+    environment: &EnvironmentConfig,
+) -> Result<(), ResolverError> {
+    discover_profiles(context, environment).map(|_| ())
 }
 
 /// Resolves every declared local-store root for a read-only configuration view.
@@ -396,7 +478,7 @@ fn resolve_resource_inputs(
 ) -> Result<(ProfileId, Vec<ResolvedResourceInput>), ResolverError> {
     let profiles = discover_profiles(context, environment)?;
     let root_profile = select_root_profile(environment, selected_root_profile, &profiles)?;
-    let composed_profiles = compose_profiles(&root_profile, &profiles)?;
+    let composed_profiles = compose_instances(&root_profile, &profiles)?;
     let stores = resolve_stores(context, environment)?;
     let profile_paths = profiles
         .values()
@@ -405,9 +487,9 @@ fn resolve_resource_inputs(
     let protected_paths = ProtectedPaths::new(context, profile_paths)?;
 
     let mut resources = Vec::new();
-    for profile_id in composed_profiles {
+    for instance in composed_profiles {
         let profile = profiles
-            .get(&profile_id)
+            .get(&instance.definition)
             .expect("composed profiles must have been discovered");
         for (raw_resource_id, resource) in profile.declaration.resources() {
             let resource_id = ResourceId::parse(raw_resource_id.to_owned()).map_err(|source| {
@@ -417,8 +499,40 @@ fn resolve_resource_inputs(
                     source,
                 }
             })?;
-            let resource_id = FullyQualifiedResourceId::new(&profile_id, &resource_id);
+            let resource_id = FullyQualifiedResourceId::new(&instance.name, &resource_id);
             let properties = resource.properties();
+            let kind = parse_kind(&resolve_string(
+                properties.kind(),
+                &instance,
+                profile.declaration.id(),
+                "kind",
+            )?)
+            .ok_or_else(|| ResolverError::InvalidPropertyValue {
+                defining_profile: profile.declaration.id().to_owned(),
+                instance: instance.name.to_string(),
+                property: "kind",
+                reason: "must be file or directory",
+            })?;
+            let operation = parse_operation(&resolve_string(
+                properties.operation(),
+                &instance,
+                profile.declaration.id(),
+                "operation",
+            )?)
+            .ok_or_else(|| ResolverError::InvalidPropertyValue {
+                defining_profile: profile.declaration.id().to_owned(),
+                instance: instance.name.to_string(),
+                property: "operation",
+                reason: "must be link or copy",
+            })?;
+            if kind == FileKind::Directory && operation == FileOperation::Copy {
+                return Err(ResolverError::InvalidPropertyValue {
+                    defining_profile: profile.declaration.id().to_owned(),
+                    instance: instance.name.to_string(),
+                    property: "operation",
+                    reason: "directory resources support only operation: link",
+                });
+            }
             let raw_store_id = properties.source().store();
             let store_id = StoreId::parse(raw_store_id.to_owned()).map_err(|source| {
                 ResolverError::InvalidIdentifier {
@@ -434,15 +548,23 @@ fn resolve_resource_inputs(
                     store_id,
                 })?;
             let source_components = parse_source_path(properties.source().path())?;
-            let target_path = bind_target_path(properties.target(), context)?;
+            let target_path = bind_target_path(
+                &resolve_string(
+                    properties.target(),
+                    &instance,
+                    profile.declaration.id(),
+                    "target",
+                )?,
+                context,
+            )?;
             protected_paths.ensure_target_allowed(&target_path, &stores)?;
             let source_path = bind_source_path(&store.root, &source_components)?;
             let resolved = ResolvedFileLink::new(resource_id, source_path, target_path)
                 .map_err(ResolverError::InvalidResolvedFileLink)?;
             resources.push(ResolvedResourceInput {
                 resolved,
-                operation: properties.operation(),
-                kind: properties.kind(),
+                operation,
+                kind,
                 store_root: store.root.clone(),
                 source_path: source_components,
             });
@@ -540,6 +662,15 @@ fn discover_profiles(
                     source,
                 }
             })?;
+            for parameter in declaration.parameters().keys() {
+                ProfileId::parse(parameter.to_owned()).map_err(|source| {
+                    ResolverError::InvalidIdentifier {
+                        role: "parameter name",
+                        value: parameter.clone(),
+                        source,
+                    }
+                })?;
+            }
             let file_path = ResolvedPath::from_platform_canonicalized(profile_path)
                 .map_err(ResolverError::InvalidPath)?;
             candidates.entry(id).or_default().push(DiscoveredProfile {
@@ -596,6 +727,210 @@ fn select_root_profile(
     }
 
     Ok(root_profile)
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedInstance {
+    definition: ProfileId,
+    name: ProfileId,
+    bindings: BTreeMap<String, ParameterValue>,
+}
+
+fn literal_string(
+    value: &ValueOrReference,
+    defining_profile: &str,
+    instance: &str,
+    property: &'static str,
+) -> Result<String, ResolverError> {
+    match value {
+        ValueOrReference::Value(value) => {
+            value.as_string().map(ToOwned::to_owned).ok_or_else(|| {
+                ResolverError::InvalidPropertyValue {
+                    defining_profile: defining_profile.to_owned(),
+                    instance: instance.to_owned(),
+                    property,
+                    reason: "must be a string",
+                }
+            })
+        }
+        ValueOrReference::Reference(_) => Err(ResolverError::InvalidPropertyValue {
+            defining_profile: defining_profile.to_owned(),
+            instance: instance.to_owned(),
+            property,
+            reason: "reference has no instance scope",
+        }),
+    }
+}
+
+fn resolve_string(
+    value: &ValueOrReference,
+    instance: &ResolvedInstance,
+    defining_profile: &str,
+    property: &'static str,
+) -> Result<String, ResolverError> {
+    match value {
+        ValueOrReference::Value(value) => {
+            value.as_string().map(ToOwned::to_owned).ok_or_else(|| {
+                ResolverError::InvalidPropertyValue {
+                    defining_profile: defining_profile.to_owned(),
+                    instance: instance.name.to_string(),
+                    property,
+                    reason: "must be a string",
+                }
+            })
+        }
+        ValueOrReference::Reference(name) => instance
+            .bindings
+            .get(name)
+            .ok_or_else(|| ResolverError::UndeclaredParameterReference {
+                defining_profile: defining_profile.to_owned(),
+                instance: instance.name.to_string(),
+                property,
+                parameter: name.clone(),
+            })?
+            .as_string()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| ResolverError::InvalidPropertyValue {
+                defining_profile: defining_profile.to_owned(),
+                instance: instance.name.to_string(),
+                property,
+                reason: "resolved parameter must be a string",
+            }),
+    }
+}
+
+fn compose_instances(
+    root: &ProfileId,
+    profiles: &BTreeMap<ProfileId, DiscoveredProfile>,
+) -> Result<Vec<ResolvedInstance>, ResolverError> {
+    if !profiles[root].declaration.parameters().is_empty() {
+        return Err(ResolverError::ParameterizedRoot {
+            root_profile: root.clone(),
+        });
+    }
+    fn visit(
+        definition: &ProfileId,
+        name: ProfileId,
+        bindings: BTreeMap<String, ParameterValue>,
+        profiles: &BTreeMap<ProfileId, DiscoveredProfile>,
+        visiting: &mut Vec<ProfileId>,
+        instances: &mut BTreeMap<ProfileId, ResolvedInstance>,
+    ) -> Result<(), ResolverError> {
+        if let Some(start) = visiting.iter().position(|current| current == definition) {
+            let mut cycle = visiting[start..].to_vec();
+            cycle.push(definition.clone());
+            return Err(ResolverError::IncludeCycle { cycle });
+        }
+        if let Some(existing) = instances.get(&name) {
+            if existing.definition == *definition && existing.bindings == bindings {
+                return Ok(());
+            }
+            return Err(ResolverError::ConflictingInstance { instance: name });
+        }
+        instances.insert(
+            name.clone(),
+            ResolvedInstance {
+                definition: definition.clone(),
+                name: name.clone(),
+                bindings: bindings.clone(),
+            },
+        );
+        visiting.push(definition.clone());
+        let profile = &profiles[definition].declaration;
+        for include in profile.includes() {
+            let child_definition = ProfileId::parse(include.id().to_owned()).map_err(|source| {
+                ResolverError::InvalidIdentifier {
+                    role: "included profile ID",
+                    value: include.id().to_owned(),
+                    source,
+                }
+            })?;
+            let child = profiles.get(&child_definition).ok_or_else(|| {
+                ResolverError::MissingIncludedProfile {
+                    including_profile: definition.clone(),
+                    included_profile: child_definition.clone(),
+                }
+            })?;
+            let child_name = match include.as_name() {
+                Some(value) => ProfileId::parse(value.to_owned()).map_err(|source| {
+                    ResolverError::InvalidIdentifier {
+                        role: "instance ID",
+                        value: value.to_owned(),
+                        source,
+                    }
+                })?,
+                None if child.declaration.parameters().is_empty() => child_definition.clone(),
+                None => {
+                    return Err(ResolverError::MissingParameterizedIncludeAlias {
+                        including_profile: definition.clone(),
+                        included_profile: child_definition,
+                    });
+                }
+            };
+            let mut child_bindings = BTreeMap::new();
+            for (parameter, parameter_type) in child.declaration.parameters() {
+                let value = include.bindings().get(parameter).ok_or_else(|| {
+                    ResolverError::MissingParameterBinding {
+                        defining_profile: child.declaration.id().to_owned(),
+                        instance: child_name.to_string(),
+                        parameter: parameter.clone(),
+                    }
+                })?;
+                let value = match value {
+                    ValueOrReference::Value(value) => value.clone(),
+                    ValueOrReference::Reference(reference) => bindings
+                        .get(reference)
+                        .cloned()
+                        .ok_or_else(|| ResolverError::UndeclaredParameterReference {
+                            defining_profile: definition.to_string(),
+                            instance: name.to_string(),
+                            property: "include binding",
+                            parameter: reference.clone(),
+                        })?,
+                };
+                if !value.matches(*parameter_type) {
+                    return Err(ResolverError::InvalidParameterBinding {
+                        defining_profile: child.declaration.id().to_owned(),
+                        instance: child_name.to_string(),
+                        parameter: parameter.clone(),
+                        reason: "does not match declared type",
+                    });
+                }
+                child_bindings.insert(parameter.clone(), value);
+            }
+            if let Some(unknown) = include
+                .bindings()
+                .keys()
+                .find(|key| !child.declaration.parameters().contains_key(*key))
+            {
+                return Err(ResolverError::UnknownParameterBinding {
+                    defining_profile: child.declaration.id().to_owned(),
+                    instance: child_name.to_string(),
+                    parameter: unknown.clone(),
+                });
+            }
+            visit(
+                &child_definition,
+                child_name,
+                child_bindings,
+                profiles,
+                visiting,
+                instances,
+            )?;
+        }
+        visiting.pop();
+        Ok(())
+    }
+    let mut instances = BTreeMap::new();
+    visit(
+        root,
+        root.clone(),
+        BTreeMap::new(),
+        profiles,
+        &mut Vec::new(),
+        &mut instances,
+    )?;
+    Ok(instances.into_values().collect())
 }
 
 fn compose_profiles(
@@ -981,6 +1316,44 @@ pub(crate) enum ResolverError {
     RootProfileNotDiscovered {
         root_profile: ProfileId,
     },
+    ParameterizedRoot {
+        root_profile: ProfileId,
+    },
+    MissingParameterizedIncludeAlias {
+        including_profile: ProfileId,
+        included_profile: ProfileId,
+    },
+    ConflictingInstance {
+        instance: ProfileId,
+    },
+    MissingParameterBinding {
+        defining_profile: String,
+        instance: String,
+        parameter: String,
+    },
+    UnknownParameterBinding {
+        defining_profile: String,
+        instance: String,
+        parameter: String,
+    },
+    InvalidParameterBinding {
+        defining_profile: String,
+        instance: String,
+        parameter: String,
+        reason: &'static str,
+    },
+    UndeclaredParameterReference {
+        defining_profile: String,
+        instance: String,
+        property: &'static str,
+        parameter: String,
+    },
+    InvalidPropertyValue {
+        defining_profile: String,
+        instance: String,
+        property: &'static str,
+        reason: &'static str,
+    },
     MissingIncludedProfile {
         including_profile: ProfileId,
         included_profile: ProfileId,
@@ -1111,6 +1484,64 @@ impl fmt::Display for ResolverError {
                     "selected root profile was not discovered: {root_profile}"
                 )
             }
+            Self::ParameterizedRoot { root_profile } => write!(
+                formatter,
+                "selected root profile {root_profile} must not declare parameters"
+            ),
+            Self::MissingParameterizedIncludeAlias {
+                including_profile,
+                included_profile,
+            } => write!(
+                formatter,
+                "profile {including_profile} must name parameterized include {included_profile} with as"
+            ),
+            Self::ConflictingInstance { instance } => write!(
+                formatter,
+                "instance {instance} is reached with conflicting definition or bindings"
+            ),
+            Self::MissingParameterBinding {
+                defining_profile,
+                instance,
+                parameter,
+            } => write!(
+                formatter,
+                "profile {defining_profile} instance {instance} is missing binding {parameter}"
+            ),
+            Self::UnknownParameterBinding {
+                defining_profile,
+                instance,
+                parameter,
+            } => write!(
+                formatter,
+                "profile {defining_profile} instance {instance} has unknown binding {parameter}"
+            ),
+            Self::InvalidParameterBinding {
+                defining_profile,
+                instance,
+                parameter,
+                reason,
+            } => write!(
+                formatter,
+                "profile {defining_profile} instance {instance} binding {parameter} {reason}"
+            ),
+            Self::UndeclaredParameterReference {
+                defining_profile,
+                instance,
+                property,
+                parameter,
+            } => write!(
+                formatter,
+                "profile {defining_profile} instance {instance} property {property} references undeclared parameter {parameter}"
+            ),
+            Self::InvalidPropertyValue {
+                defining_profile,
+                instance,
+                property,
+                reason,
+            } => write!(
+                formatter,
+                "profile {defining_profile} instance {instance} property {property} {reason}"
+            ),
             Self::MissingIncludedProfile {
                 including_profile,
                 included_profile,
@@ -1203,6 +1634,14 @@ impl std::error::Error for ResolverError {
             | Self::DuplicateProfileId { .. }
             | Self::MissingRootProfile
             | Self::RootProfileNotDiscovered { .. }
+            | Self::ParameterizedRoot { .. }
+            | Self::MissingParameterizedIncludeAlias { .. }
+            | Self::ConflictingInstance { .. }
+            | Self::MissingParameterBinding { .. }
+            | Self::UnknownParameterBinding { .. }
+            | Self::InvalidParameterBinding { .. }
+            | Self::UndeclaredParameterReference { .. }
+            | Self::InvalidPropertyValue { .. }
             | Self::MissingIncludedProfile { .. }
             | Self::IncludeCycle { .. }
             | Self::MissingStore { .. }
@@ -1324,7 +1763,7 @@ mod tests {
                 .collect::<String>();
             format!("includes:\n{entries}")
         };
-        format!("schema_version: 3\nid: {id}\n{includes}resources:\n{resources}")
+        format!("schema_version: 4\nid: {id}\n{includes}resources:\n{resources}")
     }
 
     fn file_resource(resource_id: &str, source: &str, target: &str) -> String {
@@ -1398,6 +1837,307 @@ mod tests {
         assert!(
             !uncreated_target_parent.exists(),
             "resolver must not inspect or create target parents"
+        );
+    }
+
+    #[test]
+    fn resolver_substitutes_a_nested_include_binding_into_its_named_instance() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "content");
+        workspace.write(
+            "profiles/base.yaml",
+            "schema_version: 4\nid: base\nparameters: { target: string }\nresources:\n  git:\n    type: file\n    properties:\n      kind: file\n      source: { store: dotfiles, path: git/config }\n      target: { parameter: target }\n      operation: link\n",
+        );
+        workspace.write(
+            "profiles/parent.yaml",
+            "schema_version: 4\nid: parent\nparameters: { target: string }\nincludes:\n  - id: base\n    as: named-base\n    with: { target: { parameter: target } }\nresources: {}\n",
+        );
+        workspace.write(
+            "profiles/workstation.yaml",
+            "schema_version: 4\nid: workstation\nincludes:\n  - id: parent\n    as: named-parent\n    with: { target: ~/.gitconfig }\nresources: {}\n",
+        );
+        let resolved = resolve(
+            &workspace.context(),
+            &environment(Some("workstation"), &["../profiles"], "../store"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.resources()[0].resource_id().as_str(),
+            "named-base/git"
+        );
+        assert_eq!(
+            resolved.resources()[0].target_path().as_ref(),
+            workspace.path("home/.gitconfig")
+        );
+    }
+
+    #[test]
+    fn declaration_inspection_preserves_unbound_property_references() {
+        let workspace = TestWorkspace::new();
+        workspace.write(
+            "profiles/base.yaml",
+            "schema_version: 4\nid: base\nparameters: { kind: string, operation: string, target: string }\nresources:\n  config:\n    type: file\n    properties:\n      kind: { parameter: kind }\n      source: { store: dotfiles, path: config }\n      target: { parameter: target }\n      operation: { parameter: operation }\n",
+        );
+
+        let profiles = declared_profiles(
+            &workspace.context(),
+            &environment_without_stores("base", &["../profiles"]),
+        )
+        .unwrap();
+
+        let resource = &profiles[0].resources()[0];
+        assert_eq!(
+            resource.kind_value(),
+            &DeclaredPropertyValue::Reference {
+                parameter: "kind".to_owned(),
+            }
+        );
+        assert_eq!(
+            resource.operation_value(),
+            &DeclaredPropertyValue::Reference {
+                parameter: "operation".to_owned(),
+            }
+        );
+        assert_eq!(
+            resource.target_value(),
+            &DeclaredPropertyValue::Reference {
+                parameter: "target".to_owned(),
+            }
+        );
+        assert_eq!(resource.target_path(), "{ parameter: target }");
+    }
+
+    #[test]
+    fn resolver_rejects_parameterized_root_and_conflicting_instance_bindings() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "content");
+        workspace.write(
+            "profiles/base.yaml",
+            "schema_version: 4\nid: base\nparameters: { target: string }\nresources: {}\n",
+        );
+        let base_environment = environment(Some("base"), &["../profiles"], "../store");
+        assert!(matches!(
+            resolve(&workspace.context(), &base_environment, None),
+            Err(ResolverError::ParameterizedRoot { .. })
+        ));
+
+        workspace.write(
+            "profiles/workstation.yaml",
+            "schema_version: 4\nid: workstation\nincludes:\n  - id: base\n    as: shared\n    with: { target: ~/.one }\n  - id: base\n    as: shared\n    with: { target: ~/.two }\nresources: {}\n",
+        );
+        let environment = environment(Some("workstation"), &["../profiles"], "../store");
+        assert!(matches!(
+            resolve(&workspace.context(), &environment, None),
+            Err(ResolverError::ConflictingInstance { .. })
+        ));
+    }
+
+    #[test]
+    fn discovered_roots_excludes_parameterized_profiles_but_validates_their_declarations() {
+        let workspace = TestWorkspace::new();
+        workspace.write(
+            "profiles/reusable.yaml",
+            "schema_version: 4\nid: reusable\nparameters: { target: string }\nresources: {}\n",
+        );
+        workspace.write(
+            "profiles/root.yaml",
+            "schema_version: 4\nid: root\nresources: {}\n",
+        );
+        let roots = discovered_roots(
+            &workspace.context(),
+            &environment_without_stores("root", &["../profiles"]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            roots.iter().map(ProfileId::as_str).collect::<Vec<_>>(),
+            ["root"]
+        );
+    }
+
+    #[test]
+    fn normal_resolution_rejects_unsupported_profile_schemas_before_store_or_target_access() {
+        let workspace = TestWorkspace::new();
+        let context = workspace.context();
+        let environment = environment_without_stores("root", &["../profiles"]);
+
+        for schema_version in [3, 2, 99] {
+            workspace.write(
+                "profiles/root.yaml",
+                &format!(
+                    "schema_version: {schema_version}\nid: root\nresources:\n  config:\n    type: file\n    properties:\n      kind: file\n      source: {{ store: missing, path: config }}\n      target: ~/.must-not-be-observed\n      operation: link\n"
+                ),
+            );
+
+            let _no_targets = crate::test_support::forbid_target_inspection();
+            let _no_mutation = crate::test_support::forbid_mutation();
+            let error = resolve(&context, &environment, None).unwrap_err();
+
+            assert!(
+                matches!(error, ResolverError::InvalidProfileSchema { .. }),
+                "schema {schema_version} must stop normal resolution at the schema gate: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolver_validates_parameter_binding_type_and_name_matrix_before_store_or_target_access() {
+        let workspace = TestWorkspace::new();
+        let context = workspace.context();
+        let environment = environment_without_stores("root", &["../profiles"]);
+        workspace.write(
+            "profiles/child.yaml",
+            "schema_version: 4\nid: child\nparameters: { text: string, count: integer, enabled: boolean, values: list }\nresources: {}\n",
+        );
+
+        for (name, include, expected) in [
+            (
+                "missing binding",
+                "id: child\n    as: child\n    with: { text: value, count: 1, enabled: true }",
+                "missing binding values",
+            ),
+            (
+                "unknown binding",
+                "id: child\n    as: child\n    with: { text: value, count: 1, enabled: true, values: [], extra: value }",
+                "unknown binding extra",
+            ),
+            (
+                "wrong scalar type",
+                "id: child\n    as: child\n    with: { text: 1, count: 1, enabled: true, values: [] }",
+                "invalid binding text",
+            ),
+            (
+                "wrong list type",
+                "id: child\n    as: child\n    with: { text: value, count: 1, enabled: true, values: value }",
+                "invalid binding values",
+            ),
+        ] {
+            workspace.write(
+                "profiles/root.yaml",
+                &format!(
+                    "schema_version: 4\nid: root\nincludes:\n  - {include}\nresources: {{}}\n"
+                ),
+            );
+            let _no_targets = crate::test_support::forbid_target_inspection();
+            let _no_mutation = crate::test_support::forbid_mutation();
+            let error = resolve(&context, &environment, None).unwrap_err();
+            assert!(
+                match (expected, error) {
+                    (
+                        "missing binding values",
+                        ResolverError::MissingParameterBinding {
+                            defining_profile,
+                            instance,
+                            parameter,
+                        },
+                    ) =>
+                        defining_profile == "child" && instance == "child" && parameter == "values",
+                    (
+                        "unknown binding extra",
+                        ResolverError::UnknownParameterBinding {
+                            defining_profile,
+                            instance,
+                            parameter,
+                        },
+                    ) => defining_profile == "child" && instance == "child" && parameter == "extra",
+                    (
+                        "invalid binding text",
+                        ResolverError::InvalidParameterBinding {
+                            defining_profile,
+                            instance,
+                            parameter,
+                            ..
+                        },
+                    ) => defining_profile == "child" && instance == "child" && parameter == "text",
+                    (
+                        "invalid binding values",
+                        ResolverError::InvalidParameterBinding {
+                            defining_profile,
+                            instance,
+                            parameter,
+                            ..
+                        },
+                    ) =>
+                        defining_profile == "child" && instance == "child" && parameter == "values",
+                    _ => false,
+                },
+                "{name} must report its defining profile, instance, and binding: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolver_validates_reference_scope_and_post_binding_property_types_without_target_access() {
+        let workspace = TestWorkspace::new();
+        let context = workspace.context();
+        let environment = environment_without_stores("root", &["../profiles"]);
+        workspace.write(
+            "profiles/child.yaml",
+            "schema_version: 4\nid: child\nparameters: { value: string }\nresources:\n  config:\n    type: file\n    properties:\n      kind: { parameter: missing }\n      source: { store: dotfiles, path: config }\n      target: { parameter: value }\n      operation: link\n",
+        );
+        workspace.write(
+            "profiles/root.yaml",
+            "schema_version: 4\nid: root\nincludes:\n  - id: child\n    as: child\n    with: { value: ~/.config }\nresources: {}\n",
+        );
+        let _no_targets = crate::test_support::forbid_target_inspection();
+        let _no_mutation = crate::test_support::forbid_mutation();
+        let error = resolve(&context, &environment, None).unwrap_err();
+        assert!(matches!(
+            error,
+            ResolverError::UndeclaredParameterReference { defining_profile, instance, property, parameter }
+                if defining_profile == "child" && instance == "child" && property == "kind" && parameter == "missing"
+        ));
+
+        workspace.write(
+            "profiles/child.yaml",
+            "schema_version: 4\nid: child\nparameters: { value: string }\nresources:\n  config:\n    type: file\n    properties:\n      kind: { parameter: value }\n      source: { store: dotfiles, path: config }\n      target: ~/.config\n      operation: link\n",
+        );
+        let error = resolve(&context, &environment, None).unwrap_err();
+        assert!(matches!(
+            error,
+            ResolverError::InvalidPropertyValue { defining_profile, instance, property, reason }
+                if defining_profile == "child" && instance == "child" && property == "kind" && reason == "must be file or directory"
+        ));
+
+        workspace.write(
+            "profiles/child.yaml",
+            "schema_version: 4\nid: child\nparameters: { value: string }\nresources:\n  config:\n    type: file\n    properties:\n      kind: [file]\n      source: { store: dotfiles, path: config }\n      target: ~/.config\n      operation: link\n",
+        );
+        let error = resolve(&context, &environment, None).unwrap_err();
+        assert!(matches!(
+            error,
+            ResolverError::InvalidPropertyValue { defining_profile, instance, property, reason }
+                if defining_profile == "child" && instance == "child" && property == "kind" && reason == "must be a string"
+        ));
+    }
+
+    #[test]
+    fn resolver_deduplicates_equal_order_independent_bindings_but_preserves_alias_identity() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/config", "content");
+        workspace.write(
+            "profiles/child.yaml",
+            "schema_version: 4\nid: child\nparameters: { target: string, values: list }\nresources:\n  config:\n    type: file\n    properties:\n      kind: file\n      source: { store: dotfiles, path: config }\n      target: { parameter: target }\n      operation: link\n",
+        );
+        workspace.write(
+            "profiles/root.yaml",
+            "schema_version: 4\nid: root\nincludes:\n  - id: child\n    as: first\n    with: { target: ~/.first, values: [one, 2, true] }\n  - id: child\n    as: first\n    with: { values: [one, 2, true], target: ~/.first }\n  - id: child\n    as: second\n    with: { target: ~/.second, values: [one, 2, true] }\nresources: {}\n",
+        );
+
+        let resolved = resolve(
+            &workspace.context(),
+            &environment(Some("root"), &["../profiles"], "../store"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved
+                .resources()
+                .iter()
+                .map(|resource| resource.resource_id().as_str())
+                .collect::<Vec<_>>(),
+            ["first/config", "second/config"]
         );
     }
 

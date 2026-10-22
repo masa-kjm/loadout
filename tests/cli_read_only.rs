@@ -9,6 +9,12 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(unix)]
+use std::{
+    io::{BufRead, BufReader, Write},
+    process::{Child, ChildStdin, ChildStdout, Stdio},
+};
+
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(windows)]
@@ -70,7 +76,7 @@ impl Fixture {
         self.write("portable/config.yaml", &format!("schema_version: 2\n{default}profile_discovery:\n  paths: [profiles]\nstores:\n  files:\n    type: local\n    properties:\n      path: ../store\n"));
     }
     fn profile(&self, id: &str, resource: &str, target: &str) {
-        self.write(&format!("portable/profiles/{id}.yaml"), &format!("schema_version: 3\nid: {id}\nresources:\n  {resource}:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: {target}\n"));
+        self.write(&format!("portable/profiles/{id}.yaml"), &format!("schema_version: 4\nid: {id}\nresources:\n  {resource}:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: {target}\n"));
     }
     fn command(&self) -> Command {
         self.command_with_home(&self.path("home"))
@@ -122,7 +128,7 @@ impl Fixture {
     fn state(&self, resources: Value, active: Value) {
         self.write(
             "state/loadout/state.json",
-            &json!({"schema_version": 3,"resources":resources,"active_operation":active})
+            &json!({"schema_version": 4,"resources":resources,"active_operation":active})
                 .to_string(),
         );
     }
@@ -170,6 +176,65 @@ fn expect(output: Output, code: i32, needles: &[&str]) {
     let text = text(&output);
     for needle in needles {
         assert!(text.contains(needle), "missing {needle:?} in {text}");
+    }
+}
+
+/// A separate process that owns the same operating-system lock used by the state repository.
+#[cfg(unix)]
+struct StateLockWitness {
+    child: Child,
+    input: ChildStdin,
+    output: BufReader<ChildStdout>,
+}
+
+#[cfg(unix)]
+impl StateLockWitness {
+    fn hold(path: &Path) -> Self {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(
+                "exec 9>\"$1\"; printf 'ready\\n'; flock -n 9 || exit 1; printf 'held\\n'; IFS= read -r command; test \"$command\" = release; flock -u 9; printf 'released\\n'",
+            )
+            .arg("state-lock-witness")
+            .arg(path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take().unwrap();
+        let output = BufReader::new(child.stdout.take().unwrap());
+        let mut witness = Self {
+            child,
+            input,
+            output,
+        };
+        assert_eq!(witness.next_event(), "ready");
+        assert_eq!(witness.next_event(), "held");
+        witness
+    }
+
+    fn next_event(&mut self) -> String {
+        let mut event = String::new();
+        self.output.read_line(&mut event).unwrap();
+        event.trim_end().to_owned()
+    }
+
+    fn release(&mut self) {
+        self.input.write_all(b"release\n").unwrap();
+        self.input.flush().unwrap();
+        assert_eq!(self.next_event(), "released");
+        assert!(self.child.wait().unwrap().success());
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StateLockWitness {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.input.write_all(b"release\n");
+            let _ = self.input.flush();
+            let _ = self.child.wait();
+        }
     }
 }
 
@@ -255,7 +320,7 @@ fn defaults_all_roots_and_argument_rejections() {
     );
     f.write(
         "portable/profiles/work.yaml",
-        "schema_version: 3\nid: work\nincludes: [{id: missing}]\nresources: {}\n",
+        "schema_version: 4\nid: work\nincludes: [{id: missing}]\nresources: {}\n",
     );
     expect(
         f.run(&["validate", "--config", "../portable/config.yaml", "--all"]),
@@ -427,6 +492,104 @@ fn read_only_processes_do_not_acquire_the_exclusive_state_lock() {
 
 #[cfg(unix)]
 #[test]
+fn noncurrent_profile_apply_rejects_before_lock_or_recovery_with_active_operation() {
+    for schema_version in [3, 99] {
+        let f = Fixture::new();
+        f.state(
+            json!({}),
+            json!({
+                "id":"interrupted-operation",
+                "desired_hash":format!("sha256:{}", "a".repeat(64)),
+                "actions": {
+                    "a1": {
+                        "kind":"create_link",
+                        "resource_id":"base/pending",
+                        "target_path":f.path("home/pending"),
+                        "precondition":{"target":"missing"},
+                        "postcondition":{"target":"expected_link","link_target":f.path("store/source")},
+                        "status":"pending"
+                    }
+                }
+            }),
+        );
+        f.write(
+            "portable/profiles/base.yaml",
+            &format!("schema_version: {schema_version}\nid: base\nresources: {{}}\n"),
+        );
+        let mut witness = StateLockWitness::hold(&f.path("state/loadout/state.lock"));
+        let before = f.snapshot();
+
+        let output = f
+            .command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap();
+
+        expect(
+            output,
+            2,
+            &[&format!(
+                "unsupported schema_version {schema_version}; expected 4"
+            )],
+        );
+        assert_eq!(
+            f.snapshot(),
+            before,
+            "schema {schema_version} must not acquire the held lock, dispatch recovery, or access a resource route"
+        );
+        assert_eq!(
+            state(&f)["active_operation"]["id"],
+            "interrupted-operation",
+            "schema {schema_version} must leave the recovery-visible operation intact"
+        );
+        assert!(
+            fs::symlink_metadata(f.path("home/pending")).is_err(),
+            "schema {schema_version} must not probe or change the recorded target"
+        );
+        witness.release();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_lock_witness_reports_contention_then_a_post_release_acquisition() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.path("state/loadout")).unwrap();
+    let mut witness = StateLockWitness::hold(&f.path("state/loadout/state.lock"));
+    let before = f.snapshot();
+
+    expect(
+        f.command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        1,
+        &["state lock is already held"],
+    );
+    assert_eq!(
+        f.snapshot(),
+        before,
+        "a contended apply must not recover or mutate"
+    );
+
+    witness.release();
+    expect(
+        f.command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap(),
+        0,
+        &["apply completed: 1 committed actions"],
+    );
+    assert!(
+        fs::symlink_metadata(f.path("home/target"))
+            .unwrap()
+            .is_symlink()
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn status_reports_a_symlinked_parent_as_unsafe_without_changing_any_fixture_entry() {
     use std::os::unix::fs::symlink;
 
@@ -455,7 +618,7 @@ fn status_returns_partial_report_after_an_unavailable_desired_target_observation
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 3\nid: base\nresources:\n  available:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.available\n  unavailable:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.blocked/target\n",
+        "schema_version: 4\nid: base\nresources:\n  available:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.available\n  unavailable:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.blocked/target\n",
     );
     let blocked = f.path("home/.blocked");
     fs::create_dir(&blocked).unwrap();
@@ -816,7 +979,7 @@ fn copy_inspection_reports_typed_known_and_desired_only_facts_without_side_effec
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 3\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 4\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
     f.write("home/.copy-target", "content\n");
     f.state(
@@ -841,7 +1004,7 @@ fn copy_inspection_reports_typed_known_and_desired_only_facts_without_side_effec
 
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 3\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 4\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
     expect(
         f.run(&["status", "--config", "../portable/config.yaml"]),
@@ -856,7 +1019,7 @@ fn copy_inspection_reports_typed_known_and_desired_only_facts_without_side_effec
     let desired_only = Fixture::new();
     desired_only.write(
         "portable/profiles/base.yaml",
-        "schema_version: 3\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 4\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
     desired_only.write("home/.copy-target", "content\n");
     expect(
@@ -871,7 +1034,7 @@ fn copy_inspection_reports_typed_known_and_desired_only_facts_without_side_effec
 
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 3\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 4\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
     f.write("home/.copy-target", "drifted\n");
     expect(f.run(&["diff"]), 0, &["base/copied", "other_regular_file"]);
@@ -888,7 +1051,7 @@ fn copy_create_applies_exact_source_bytes_and_commits_known_state() {
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 3\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 4\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
     let target = f.path("home/.copy-target");
     assert!(fs::symlink_metadata(&target).is_err());
@@ -923,7 +1086,7 @@ fn directory_link_create_applies_and_commits_known_only_after_verification() {
     fs::create_dir_all(f.path("home/.config")).unwrap();
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 3\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: files\n        path: nvim\n      target: ~/.config/nvim\n",
+        "schema_version: 4\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: files\n        path: nvim\n      target: ~/.config/nvim\n",
     );
     let target = f.path("home/.config/nvim");
     let output = f
@@ -960,7 +1123,7 @@ fn directory_link_is_reported_by_read_only_commands_without_mutation() {
     symlink(f.path("store/nvim"), f.path("home/.config/nvim")).unwrap();
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 3\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: files\n        path: nvim\n      target: ~/.config/nvim\n",
+        "schema_version: 4\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: files\n        path: nvim\n      target: ~/.config/nvim\n",
     );
     f.state(
         json!({"base/nvim": f.known_directory_link("store/nvim", ".config/nvim")}),
@@ -1042,7 +1205,7 @@ fn directory_link_replace_relocate_handoff_and_remove_commit_the_verified_effect
     fs::create_dir_all(f.path("home/.config")).unwrap();
     let profile = |resource: &str, source: &str, target: &str| {
         format!(
-            "schema_version: 3\nid: base\nresources:\n  {resource}:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: files\n        path: {source}\n      target: ~/{target}\n"
+            "schema_version: 4\nid: base\nresources:\n  {resource}:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: files\n        path: {source}\n      target: ~/{target}\n"
         )
     };
     f.write(
@@ -1113,7 +1276,7 @@ fn directory_link_replace_relocate_handoff_and_remove_commit_the_verified_effect
 
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 3\nid: base\nresources: {}\n",
+        "schema_version: 4\nid: base\nresources: {}\n",
     );
     expect(
         f.command()
@@ -1132,7 +1295,7 @@ fn directory_link_replace_relocate_handoff_and_remove_commit_the_verified_effect
 fn directory_link_rejections_preserve_target_store_and_state() {
     use std::os::unix::fs::symlink;
 
-    let profile = "schema_version: 3\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: files\n        path: nvim\n      target: ~/.config/nvim\n";
+    let profile = "schema_version: 4\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: files\n        path: nvim\n      target: ~/.config/nvim\n";
     for rejection in ["unmanaged-target", "unsafe-parent", "unsafe-source"] {
         let f = Fixture::new();
         fs::create_dir_all(f.path("store/nvim")).unwrap();
@@ -1186,7 +1349,7 @@ fn copy_capability_preflight_rejection_creates_no_operation_or_target() {
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 3\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 4\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
 
     expect(
@@ -1210,7 +1373,7 @@ fn copy_replace_relocate_and_remove_fail_preflight_without_mutating_target_or_st
     let replace = Fixture::new();
     replace.write(
         "portable/profiles/base.yaml",
-        "schema_version: 3\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 4\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
     replace.write("store/source", "new\n");
     replace.write("home/.copy-target", "old\n");
@@ -1244,7 +1407,7 @@ fn copy_replace_relocate_and_remove_fail_preflight_without_mutating_target_or_st
     let relocate = Fixture::new();
     relocate.write(
         "portable/profiles/base.yaml",
-        "schema_version: 3\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.new-target\n",
+        "schema_version: 4\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.new-target\n",
     );
     relocate.write("home/.old-target", "content\n");
     relocate.state(
@@ -1278,7 +1441,7 @@ fn copy_replace_relocate_and_remove_fail_preflight_without_mutating_target_or_st
     let remove = Fixture::new();
     remove.write(
         "portable/profiles/base.yaml",
-        "schema_version: 3\nid: base\nresources: {}\n",
+        "schema_version: 4\nid: base\nresources: {}\n",
     );
     remove.write("home/.copy-target", "content\n");
     remove.state(
@@ -1322,7 +1485,7 @@ fn copy_handoffs_fail_preflight_without_mutating_target_or_state() {
         json!({"base/item": link_to_copy.known(".handoff")}),
         Value::Null,
     );
-    link_to_copy.write("portable/profiles/base.yaml", "schema_version: 3\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.handoff\n");
+    link_to_copy.write("portable/profiles/base.yaml", "schema_version: 4\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.handoff\n");
     let before_target = fs::read_link(&target).unwrap();
     let before_state = fs::read(link_to_copy.path("state/loadout/state.json")).unwrap();
     expect(
@@ -1376,7 +1539,7 @@ fn copy_handoffs_fail_preflight_without_mutating_target_or_state() {
 #[test]
 fn sequential_copy_actions_apply_and_commit_known_state() {
     let create = Fixture::new();
-    create.write("portable/profiles/base.yaml", "schema_version: 3\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n");
+    create.write("portable/profiles/base.yaml", "schema_version: 4\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n");
     expect(
         create
             .command()
@@ -1402,7 +1565,7 @@ fn sequential_copy_actions_apply_and_commit_known_state() {
         json!({"base/item": replace.known_copy(".copy-target", b"old\n")}),
         Value::Null,
     );
-    replace.write("portable/profiles/base.yaml", "schema_version: 3\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n");
+    replace.write("portable/profiles/base.yaml", "schema_version: 4\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n");
     expect(
         replace
             .command()
@@ -1427,7 +1590,7 @@ fn sequential_copy_actions_apply_and_commit_known_state() {
         json!({"base/item": relocate.known_copy(".old-target", b"content\n")}),
         Value::Null,
     );
-    relocate.write("portable/profiles/base.yaml", "schema_version: 3\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.new-target\n");
+    relocate.write("portable/profiles/base.yaml", "schema_version: 4\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.new-target\n");
     expect(
         relocate
             .command()
@@ -1446,7 +1609,7 @@ fn sequential_copy_actions_apply_and_commit_known_state() {
     let remove = Fixture::new();
     remove.write(
         "portable/profiles/base.yaml",
-        "schema_version: 3\nid: base\nresources: {}\n",
+        "schema_version: 4\nid: base\nresources: {}\n",
     );
     remove.write("home/.copy-target", "content\n");
     remove.state(
@@ -1475,7 +1638,7 @@ fn sequential_copy_actions_apply_and_commit_known_state() {
         json!({"base/item": link_to_copy.known(".handoff")}),
         Value::Null,
     );
-    link_to_copy.write("portable/profiles/base.yaml", "schema_version: 3\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.handoff\n");
+    link_to_copy.write("portable/profiles/base.yaml", "schema_version: 4\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.handoff\n");
     expect(
         link_to_copy
             .command()
@@ -1524,7 +1687,7 @@ fn copy_recovery_closes_a_retained_create_before_applying_a_fresh_copy_on_apfs()
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 3\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 4\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
     let fingerprint = format!("sha256:{:x}", Sha256::digest(b"content\n"));
     f.state(
@@ -1582,7 +1745,7 @@ fn copy_recovery_keeps_matching_create_uncertain_and_blocks_a_fresh_plan() {
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 3\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 4\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
     let fingerprint = format!("sha256:{:x}", Sha256::digest(b"content\n"));
     f.state(
@@ -1637,7 +1800,7 @@ fn copy_replacement_recovery_closes_a_different_final_as_conflict() {
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 3\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 4\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
     let old_fingerprint = format!("sha256:{:x}", Sha256::digest(b"old\n"));
     let new_fingerprint = format!("sha256:{:x}", Sha256::digest(b"content\n"));
@@ -1698,7 +1861,7 @@ fn copy_lifecycle_commands_render_typed_actions_and_apply_on_apfs() {
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 3\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 4\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
 
     expect(
@@ -1743,7 +1906,7 @@ fn copy_lifecycle_commands_render_typed_actions_and_apply_on_apfs() {
     let conflict = Fixture::new();
     conflict.write(
         "portable/profiles/base.yaml",
-        "schema_version: 3\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/target\n",
+        "schema_version: 4\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/target\n",
     );
     conflict.write("home/target", "unmanaged");
     expect(
@@ -1775,7 +1938,7 @@ fn copy_schema_rejection_precedes_target_observation_or_lifecycle_mutation() {
     let state_fixture = Fixture::new();
     state_fixture.write(
         "portable/profiles/base.yaml",
-        "schema_version: 3\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 4\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
     state_fixture.write(
         "state/loadout/state.json",
@@ -1795,7 +1958,7 @@ fn copy_declarations_render_in_read_only_queries() {
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 3\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 4\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
 
     expect(

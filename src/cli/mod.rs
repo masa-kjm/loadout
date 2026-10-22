@@ -9,6 +9,7 @@ use crate::application::queries::{
 use crate::authoring::{config_set, config_use, init};
 use crate::domain::ids::{FullyQualifiedResourceId, ProfileId};
 use crate::loader::{LoadError, MachinePaths, StatePaths};
+use crate::migration::{MigrationFacade, MigrationOperation, MigrationRequest};
 use crate::state::repository::StateRepository;
 use args::Command;
 use clap::error::ErrorKind;
@@ -97,6 +98,7 @@ fn run_command(
 ) -> io::Result<u8> {
     let result = match command {
         Command::Init { .. } => unreachable!("init returns before machine path selection"),
+        Command::Migrate(command) => return run_migration(command, machine, out, err),
         Command::Diff => queries::diff(
             &machine.home,
             &StateRepository::new(machine.state_directory.clone()),
@@ -162,6 +164,88 @@ fn run_command(
         Command::Config(command) => return run_config(command, machine, out, err),
     };
     render_result(result, err)
+}
+
+fn run_migration(
+    command: args::MigrationCommand,
+    machine: &MachinePaths,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> io::Result<u8> {
+    let (operation, config, yes) = match command {
+        args::MigrationCommand::State { config, yes } => (MigrationOperation::State, config, yes),
+        args::MigrationCommand::Profiles { config, yes } => {
+            (MigrationOperation::Profiles, config, yes)
+        }
+    };
+    let context = match machine.select(Some(&config)) {
+        Ok(context) => context,
+        Err(error) => return load_error(err, error),
+    };
+    let request = MigrationRequest::new(operation, context);
+    let presentation = match MigrationFacade::present(&request) {
+        Ok(presentation) => presentation,
+        Err(error) => {
+            writeln!(err, "migration failed: {error}")?;
+            return Ok(1);
+        }
+    };
+    let operation_name = migration_operation_name(operation);
+    let documents = presentation
+        .documents
+        .iter()
+        .map(|document| {
+            (
+                document.path.clone(),
+                document.source_schema_version,
+                document.target_schema_version,
+            )
+        })
+        .collect::<Vec<_>>();
+    render::migration_presentation(
+        out,
+        operation_name,
+        &documents,
+        presentation.source_schema_version,
+        presentation.target_schema_version,
+        presentation.required_next_step,
+        presentation.ownership_invariant,
+    )?;
+    out.flush()?;
+    if !yes {
+        if !(io::stdin().is_terminal() && io::stderr().is_terminal()) {
+            writeln!(
+                err,
+                "confirmation unavailable: non-interactive migration requires --yes"
+            )?;
+            return Ok(2);
+        }
+        write!(err, "Migrate the listed documents? [y/N] ")?;
+        err.flush()?;
+        let mut response = String::new();
+        io::stdin().lock().read_line(&mut response)?;
+        if !matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            writeln!(err, "migration cancelled: confirmation not granted")?;
+            return Ok(2);
+        }
+    }
+    match MigrationFacade::execute(request) {
+        Ok(_) => {
+            render::migration_outcome(out, operation_name)?;
+            Ok(0)
+        }
+        Err(error) => {
+            writeln!(err, "migration failed: {error}")?;
+            Ok(1)
+        }
+    }
+}
+
+fn migration_operation_name(operation: MigrationOperation) -> &'static str {
+    match operation {
+        MigrationOperation::State => "state",
+        MigrationOperation::Profiles => "profiles",
+    }
 }
 
 fn run_profile(
@@ -514,7 +598,11 @@ fn resolver_exit_code(error: &crate::resolver::ResolverError) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{domain::paths::ResolvedPath, test_support};
+    use crate::{
+        domain::paths::ResolvedPath,
+        migration::{ProfilePublicationFaultPoint, fail_profile_publication_at_for_test},
+        test_support,
+    };
     use std::{
         fs,
         path::PathBuf,
@@ -537,7 +625,7 @@ mod tests {
             }
             fs::write(root.join("store/source"), "source").unwrap();
             fs::write(root.join("config.yaml"), "schema_version: 2\ndefault_profile: base\nprofile_discovery:\n  paths: [profiles]\nstores:\n  files:\n    type: local\n    properties:\n      path: store\n").unwrap();
-            fs::write(root.join("profiles/base.yaml"), "schema_version: 3\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/absent-parent/target\n").unwrap();
+            fs::write(root.join("profiles/base.yaml"), "schema_version: 4\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/absent-parent/target\n").unwrap();
             Self { root }
         }
         fn machine(&self) -> MachinePaths {
@@ -546,6 +634,34 @@ mod tests {
                 runtime_directory: ResolvedPath::new(self.root.join("runtime")).unwrap(),
                 state_directory: ResolvedPath::new(self.root.join("state")).unwrap(),
             }
+        }
+
+        fn prepare_profile_migration(&self) {
+            fs::write(
+                self.root.join("profiles/base.yaml"),
+                "schema_version: 3\nid: base\nresources: {}\n",
+            )
+            .unwrap();
+            fs::write(
+                self.root.join("profiles/extra.yaml"),
+                "schema_version: 3\nid: extra\nresources: {}\n",
+            )
+            .unwrap();
+            fs::create_dir_all(self.root.join("state")).unwrap();
+            fs::write(
+                self.root.join("state/state.json"),
+                "{\"schema_version\":4,\"resources\":{},\"active_operation\":null}",
+            )
+            .unwrap();
+            fs::write(self.root.join("home/managed-target"), "target").unwrap();
+            fs::write(self.root.join("home/materialization"), "materialization").unwrap();
+        }
+
+        fn migration_command(&self) -> Command {
+            Command::Migrate(args::MigrationCommand::Profiles {
+                config: self.root.join("config.yaml").into_os_string(),
+                yes: true,
+            })
         }
     }
     impl Drop for Fixture {
@@ -755,6 +871,156 @@ mod tests {
                     1
                 );
             }
+        }
+    }
+
+    #[test]
+    fn profile_publication_faults_leave_a_resumable_mixed_inventory_until_an_explicit_retry() {
+        for point in [
+            ProfilePublicationFaultPoint::CreateTemporary,
+            ProfilePublicationFaultPoint::WriteTemporary,
+            ProfilePublicationFaultPoint::FlushTemporary,
+            ProfilePublicationFaultPoint::ReopenValidation,
+            ProfilePublicationFaultPoint::Replace,
+        ] {
+            let fixture = Fixture::new();
+            fixture.prepare_profile_migration();
+            let base = fixture.root.join("profiles/base.yaml");
+            let extra = fixture.root.join("profiles/extra.yaml");
+            let state = fixture.root.join("state/state.json");
+            let state_before = fs::read(&state).unwrap();
+            let target_before = fs::read(fixture.root.join("home/managed-target")).unwrap();
+            let materialization_before =
+                fs::read(fixture.root.join("home/materialization")).unwrap();
+            let store_before = fs::read(fixture.root.join("store/source")).unwrap();
+
+            let _fault = fail_profile_publication_at_for_test(point, 2);
+            let mut output = Vec::new();
+            let mut errors = Vec::new();
+            assert_eq!(
+                run_command(
+                    fixture.migration_command(),
+                    &fixture.machine(),
+                    &mut output,
+                    &mut errors,
+                )
+                .unwrap(),
+                1,
+                "{point:?}"
+            );
+            assert!(
+                String::from_utf8(errors)
+                    .unwrap()
+                    .contains("migration failed:"),
+                "{point:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(&base).unwrap(),
+                "schema_version: 4\nid: base\nresources: {}\n",
+                "{point:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(&extra).unwrap(),
+                "schema_version: 3\nid: extra\nresources: {}\n",
+                "{point:?}"
+            );
+            assert_eq!(fs::read(&state).unwrap(), state_before, "{point:?}");
+            assert_eq!(
+                fs::read(fixture.root.join("home/managed-target")).unwrap(),
+                target_before,
+                "{point:?}"
+            );
+            assert_eq!(
+                fs::read(fixture.root.join("home/materialization")).unwrap(),
+                materialization_before,
+                "{point:?}"
+            );
+            assert_eq!(
+                fs::read(fixture.root.join("store/source")).unwrap(),
+                store_before,
+                "{point:?}"
+            );
+            let temporary_count = fs::read_dir(fixture.root.join("profiles"))
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".loadout-profile-migrate-")
+                })
+                .count();
+            assert_eq!(
+                temporary_count,
+                usize::from(point == ProfilePublicationFaultPoint::WriteTemporary),
+                "{point:?} retained an unexpected temporary profile publication file"
+            );
+
+            let published_before_retry = fs::read(&base).unwrap();
+            assert_eq!(
+                run_command(
+                    Command::Validate {
+                        config: Some(fixture.root.join("config.yaml").into_os_string()),
+                        root: None,
+                        all: true,
+                    },
+                    &fixture.machine(),
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                )
+                .unwrap(),
+                2,
+                "normal validation must fail closed on the mixed inventory after {point:?}"
+            );
+            assert_eq!(
+                fs::read(&base).unwrap(),
+                published_before_retry,
+                "{point:?}"
+            );
+            assert_eq!(
+                fs::read(&extra).unwrap(),
+                b"schema_version: 3\nid: extra\nresources: {}\n"
+            );
+            assert_eq!(fs::read(&state).unwrap(), state_before, "{point:?}");
+
+            assert_eq!(
+                run_command(
+                    fixture.migration_command(),
+                    &fixture.machine(),
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                )
+                .unwrap(),
+                0,
+                "only an explicit profile migration retry may resume after {point:?}"
+            );
+            assert_eq!(
+                fs::read(&base).unwrap(),
+                published_before_retry,
+                "{point:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(&extra).unwrap(),
+                "schema_version: 4\nid: extra\nresources: {}\n",
+                "{point:?}"
+            );
+            assert_eq!(fs::read(&state).unwrap(), state_before, "{point:?}");
+            assert_eq!(
+                fs::read(fixture.root.join("home/managed-target")).unwrap(),
+                target_before,
+                "{point:?}"
+            );
+            assert_eq!(
+                fs::read(fixture.root.join("home/materialization")).unwrap(),
+                materialization_before,
+                "{point:?}"
+            );
+            assert_eq!(
+                fs::read(fixture.root.join("store/source")).unwrap(),
+                store_before,
+                "{point:?}"
+            );
         }
     }
 

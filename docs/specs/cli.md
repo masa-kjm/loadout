@@ -67,6 +67,18 @@ loadout config set [--config <path>] <field> <value> [--yes]
 These are configuration inspection and authoring commands, not lifecycle commands.
 Their selection rules, typed field model, confirmation, publication, failure aftermath, and non-goals are defined by [Configuration Authoring](config-authoring.md).
 
+### `loadout migrate`
+
+```text
+loadout migrate state --config <path> [--yes]
+loadout migrate profiles --config <path> [--yes]
+```
+
+These are explicit schema-migration authoring commands, not lifecycle or inspection commands.
+They present the document inventory, source and target versions, required next step, and the no-ID/effect/ownership-change guarantee before any write.
+`--yes` is required non-interactively and does not bypass source validation, locking, publication validation, or the mandatory state-first ordering.
+Their complete state-first protocol, partial-completion boundary, and failure aftermath are defined by [Migration](migration.md).
+
 ### `loadout validate`
 
 ```text
@@ -75,7 +87,9 @@ loadout validate [--config <path>] [--all | <profile-id>]
 
 With a positional profile ID, this command validates that root profile and its include closure.
 Without a profile ID or `--all`, it validates the environment configuration's `default_profile` and its include closure.
-`--all` validates every discovered profile as a possible root profile and MUST NOT be combined with a positional profile ID.
+`--all` validates every discovered profile declaration and resolves every root-eligible profile as a possible root profile; it MUST NOT be combined with a positional profile ID.
+Profiles that declare parameters are not root-eligible, so `--all` does not select or reject them as roots solely for declaring parameters.
+They remain subject to discovery and declaration validation and are fully resolved when reached by a root-eligible profile through an include with bindings.
 
 When neither a profile ID nor `--all` is supplied, `default_profile` is REQUIRED.
 
@@ -194,6 +208,8 @@ Observed drift is reportable state, not a `diff` runtime failure.
 
 For `config`, output identifies the inspected or changed configuration file and the selected field or path when applicable.
 
+For `migrate`, output identifies every affected document, source and target schema versions, the required next step, and that migration changes no resource ID, effect, or ownership evidence.
+
 ## Exit Status
 
 | Status | Meaning |
@@ -209,12 +225,13 @@ When recovery retains an active operation containing `uncertain`, `apply` report
 
 ## Excluded Commands
 
-The current contract does not provide configuration reset, generic YAML editing, resource import, partial apply, task execution, directory copy or tree synchronization, remote store management, forceful takeover, rollback, parallel execution, state repair, migration, operation recovery on inspection, or machine-readable inspection output.
+The current contract does not provide configuration reset, generic YAML editing, resource import, partial apply, task execution, directory copy or tree synchronization, remote store management, forceful takeover, rollback, parallel execution, state repair, operation recovery on inspection, or machine-readable inspection output.
 
 ## Schema Boundary
 
 Every lifecycle command and every inspection command that reads a profile or state document uses the version-specific decoding rules in [Profiles](profiles.md#current-profile-schema) and [State and Recovery](state-and-recovery.md#current-state-schema).
 An unsupported profile or state schema version exits with the documented invalid-input category before target inspection, planning, recovery, state rewrite, or target mutation.
 
-The current contract provides no `migrate` command, old-schema reader, implicit conversion, compatibility alias, or schema-repair path.
-In particular, a v0.5 state file does not authorize observing or adopting a matching target and its active operation is not recovered.
+Normal commands provide no old-schema reader, implicit conversion, compatibility alias, or schema-repair path.
+Only the explicit `migrate` commands may read a complete valid schema-3 document, and only for the lossless conversion defined by [Migration](migration.md).
+An unsupported state file does not authorize observing or adopting a matching target, and its active operation is not recovered.

@@ -2,7 +2,7 @@
 
 ## Scope
 
-This specification defines v0.6.0 durable state, operation records, exclusive locking, atomic commits, and recovery after interruption for file-link, file-copy, and DirectoryLink resource effects.
+This specification defines v0.7.0 durable state, operation records, exclusive locking, atomic commits, and recovery after interruption for file-link, file-copy, and DirectoryLink resource effects.
 
 The v0.5.0 State Schema section supersedes the retained v0.3.0 state schema, hash formats, and operation representation. Retained state and recovery requirements continue to apply unless that section states otherwise, including the requirement that inspection validates state before relying on its facts.
 
@@ -503,20 +503,21 @@ Recovery observes only recorded predicates and may perform only this exact tempo
 
 ## Current State Schema
 
-This section supersedes the v0.5.0 State Schema for every lifecycle or inspection command that reads state.
-`state.json` has `schema_version: 3`; schema version `2`, every earlier version, and every unknown future version are invalid.
+This section supersedes the v0.6.0 State Schema for every normal lifecycle or inspection command that reads state.
+`state.json` has `schema_version: 4`; schema version `3`, every earlier version, and every unknown future version are invalid.
 The state repository rejects an invalid state version before target inspection, operation recovery, planning, state rewrite, or any target mutation.
 It does not decode the older document for conversion, recalculate its hashes, reinterpret an active operation, or write a replacement state file.
+Only the explicit migration operation in [Migration](migration.md) may parse a supported schema-3 state document.
 
 An absent state file is an empty Known state.
-An existing version-2 state file is not an empty state: it is an error that preserves the file and prevents a new plan.
+An existing schema-3 state file is not an empty state: it is an error that preserves the file and prevents a new plan.
 Its recorded effects and active operation are not ownership evidence and MUST NOT be observed, adopted, recovered, removed, replaced, or otherwise acted upon.
 
 The current logical Known-state structure is:
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "resources": {
     "base/nvim-config": {
       "definition_hash": "sha256:...",
@@ -553,7 +554,7 @@ The current desired hash is exactly the hash of this JCS value:
 
 ```json
 {
-  "format": "loadout.resolved-desired.v3",
+  "format": "loadout.resolved-desired.v4",
   "resources": [
     {
       "definition": {
@@ -573,4 +574,4 @@ The current desired hash is exactly the hash of this JCS value:
 `resources` sorts lexicographically by fully qualified `resource_id`.
 The resource ID is an input only to `desired_hash`; it is not an input to `definition_hash`.
 Schema versions, YAML mapping order, profile discovery/include order, raw declaration syntax, store IDs, source file content, source-directory contents, and metadata are not hash inputs.
-Version-2 hashes are not aliases for version-3 hashes and MUST NOT be accepted, recalculated, or compared to establish ownership.
+Schema-3 hashes are not aliases for schema-4 hashes and MUST NOT be accepted, recalculated, or compared to establish ownership by a normal command.

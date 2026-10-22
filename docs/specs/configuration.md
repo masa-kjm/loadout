@@ -5,7 +5,7 @@
 This specification defines the machine-local runtime configuration, the portable environment configuration, local stores, and path syntax for the v0.3.0 core retained by v0.4.0.
 It does not define profile files or resource behavior; see [Profiles](profiles.md), [File Links](file-link.md), and [File Copies](file-copy.md).
 
-Every retained configuration requirement in this document remains a v0.6.0 requirement under the [v0.6.0 baseline](README.md#v060-baseline).
+Every retained configuration requirement in this document remains a v0.7.0 requirement under the [v0.7.0 baseline](README.md#v070-baseline).
 
 ## Runtime Locations
 

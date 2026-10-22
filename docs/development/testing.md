@@ -2,7 +2,7 @@
 
 ## Scope
 
-This document defines how an implementation demonstrates conformance with the v0.6.0 architecture and specifications.
+This document defines how an implementation demonstrates conformance with the v0.7.0 architecture and specifications.
 It does not add runtime behavior, change an error outcome, or replace a specification.
 
 Every behavior change must identify its owning specification and add evidence at the narrowest test layer that can prove the contract.
@@ -30,7 +30,7 @@ The following matrix is the minimum evidence required before the version that ow
 | [File Links](../specs/file-link.md) | Create, no-op, replace, relocate, remove, forget-missing, and managed identity-handoff outcomes; observed unmanaged-target rejection and the external-concurrency limits; wrong-link and regular-file conflicts; parent-escape rejection; source and target containment; no parent removal. |
 | [File Copies](../specs/file-copy.md) | Create, no-op, replace, relocate, remove, forget-missing, link/copy handoff, source and target content drift, no-follow regular-file and exact-byte-fingerprint ownership, `create-no-replace` collision preservation, staged and direct-create failure aftermath, sequential copy replacement and handoff classification, and recovery without adoption of unmanaged final targets. |
 | [Directory Links](../specs/directory-link.md) | Directory-source validation without descendant traversal; typed directory-link hash, Known ownership, and no-follow Actual classification; every DirectoryLink transition; unmanaged matching directory-link, file-link, junction/reparse point, regular directory/file, and unsafe-parent conflicts; mixed-effect handoff rejection; creation, replacement, relocation, removal, post-mutation failure, and recovery evidence on Unix and Windows. |
-| [Current Profile and State Schemas](../specs/profiles.md#current-profile-schema) | Profile schema-3 and state schema-3 strict decoding; unknown-field and invalid `(kind, operation)` rejection; exact DirectoryLink and desired-set canonical hashes; rejection of every v0.5/unknown profile/state version before target observation, recovery, planning, state rewrite, or implicit conversion; and preservation without adoption of old Known effects. |
+| [Current Profile Schema](../specs/profiles.md#current-profile-schema), [Current State Schema](../specs/state-and-recovery.md#current-state-schema), and [Migration](../specs/migration.md) | Normal profile and state readers strictly decode schema 4; unknown-field and invalid `(kind, operation)` rejection; exact DirectoryLink and desired-set canonical hashes; normal-command rejection of schema 3, earlier, and unknown profile/state versions before target observation, recovery, planning, state rewrite, or implicit conversion; migration-only schema-3 source decoding and lossless conversion; and preservation without adoption of old Known effects. |
 | [Lifecycle](../specs/lifecycle.md) | Every Desired/Known/Actual table row; blocked Plans and preflight failures perform no new planned target mutation; preflight failure creates no new operation record; permitted prior-operation recovery cleanup and state commits are asserted separately; executor recheck rejects observable changes since planning; phase ordering; contiguous relocation; and stop-after-failure behavior. |
 | [State and Recovery](../specs/state-and-recovery.md) | Corrupt-state rejection; canonical-hash fixtures; exclusive-lock contention; atomic-commit failure; every operation-status transition; same-source identity-handoff recovery; recovery to succeeded, failed, skipped, and uncertain; no rollback of verified earlier actions. |
 | [CLI](../specs/cli.md) | Positional root-profile selection; `validate` default-profile and `--all` behavior; `diff` Known-to-Actual reporting and zero mutation; `plan` and `apply` default-profile behavior; confirmation after successful preflight and before an operation record; non-interactive `--yes` requirement; dry-run zero mutation; all documented exit-status classes. |
@@ -38,7 +38,7 @@ The following matrix is the minimum evidence required before the version that ow
 | [Configuration Authoring](../specs/config-authoring.md) | Read-only config commands leave configuration, state, store, and targets unchanged; typed-path and value rejection; complete-document validation; confirmation; runtime-selection creation and replacement; portable-configuration presentation preservation or rejection; publication failure and external-substitution aftermath; and Unix/Windows behavior. |
 | [Inspection](../specs/inspection.md) | Every `status`, profile, and resource grammar and selection conflict; declaration/Desired/Known/Actual read-set boundaries; deterministic ordering; active-operation display for `status` and existing `diff` only; Desired-only, Known-only, definition-changed, expected, drifted, unsafe, and unavailable status rows; invalid declaration/state behavior; partial status report behavior; and snapshots proving no target, store, configuration, state, lock, operation, or directory mutation. |
 
-Version-boundary tests reject profile version 1, state version 1, and unknown future versions before target observation, state rewrite, or implicit conversion.
+Version-boundary tests reject schema-3, earlier, and unknown profile/state versions before target observation, recovery, state rewrite, or implicit conversion.
 Copy tests snapshot the target tree, state directory, store, and control files for every rejection and dry-run case and use only disposable locations.
 
 ## Pure Domain Tests
@@ -58,9 +58,9 @@ DirectoryLink domain tests cover every row in [its transition table](../specs/di
 They assert typed `directory_link` definition and desired hashes, the complete old and final typed effects where applicable, deterministic phase/order selection, and no executable action for every conflict.
 
 Version-boundary tests use disposable profile, state, target, and store paths.
-They prove that version-2 profiles and state files, unknown future versions, unknown fields, invalid effect shapes, and `directory/copy` stop before target observation or state rewrite.
-They prove that a version-2 state file with a matching target or active operation remains unchanged, is neither recovered nor adopted, and prevents a fresh plan.
-State-decoder tests additionally prove exact schema-3 `directory_link` and canonical-hash decoding, while rejecting every non-v3 state before it can enter recovery.
+They prove that schema-3 profiles and state files, unknown future versions, unknown fields, invalid effect shapes, and `directory/copy` stop before target observation, recovery, or state rewrite.
+They prove that a schema-3 state file with a matching target or active operation remains unchanged, is neither recovered nor adopted, and prevents a fresh plan.
+State-decoder tests additionally prove exact schema-4 `directory_link` and canonical-hash decoding, while rejecting every non-v4 state before it can enter recovery.
 They table-drive every DirectoryLink operation-record shape, including ordinary and superseding create, remove, forget, relocate, state-only handoff, source-changing handoff, and replacement, and reject every missing, extra, or forbidden field before recovery.
 Replacement fixtures prove the nested temporary predicate and compound postcondition have the exact recorded target paths and link targets, including the required equality between the temporary record and its missing postcondition and between the temporary link target and final effect link target.
 
@@ -190,6 +190,42 @@ Ordinary file-link replacement and source-changing link ownership replacement te
 Windows capability evidence requires settled path/state semantics, retained-parent operation evidence, and target sharing/ACL denial aftermath separately from state-file sharing failures when the runner can establish those conditions. Symbolic-link policy or privilege denial is an action-time condition and must be classified from its post-observation; it is not a permanent preflight capability probe. Record conditions that could not be established as unverified.
 
 Platform-specific tests run only in disposable directories and must clean up only the directories they created.
+
+## Profile Parameters and Migration Evidence
+
+Schema-4 declaration and resolver tests cover every closed parameter type, empty and non-empty scalar lists, whole-value references, root-parameter rejection, typed binding mismatch, unknown/missing/duplicate bindings, scope, invalid YAML lookalikes, nested-list rejection, and post-substitution resource validation.
+They cover instance aliases, repeated equal-binding deduplication, conflicting repeated aliases, definition-reachability cycles, target collisions, and mapping/list-order and scalar-type canonicalization.
+Hash fixtures prove schema-4 fully qualified IDs are lexicographically ordered in `loadout.resolved-desired.v4`, definition hashes exclude instance identity and raw parameter syntax, and alias changes identity while binding/effect changes do not.
+
+Migration tests use a disposable configuration, state, store, target, and temporary-publication tree and snapshot every target, store, profile, and state byte sequence.
+They prove normal lifecycle, validation, dry run, and inspection reject schema 3 or unknown documents before observation, recovery, planning, rewrite, or target mutation, and prove an executable retained v0.6 binary rejects schema-4 state before recovery or target mutation.
+They also prove the migration-module boundary with a falsifiable static isolation oracle in `tests/migration_facade_isolation.rs`.
+Before structural analysis, the oracle uses Cargo metadata to select the package and production crate roots, then constructs exactly three finite configuration records from the corresponding `rustc --target <triple> --print cfg` output: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc`.
+It records each exact target triple, compiler configuration, target/root identity, active `cfg` or `cfg_attr` decision, and conventional external module edge, and rejects an unmodelled target/root, host or ambient cfg fact, unsupported predicate/source-loading form, inactive or orphan reachable source, missing or ambiguous child, duplicate/cyclic edge, `#[path]` redirection, generated source, or metadata disagreement before structural analysis.
+The Linux and macOS records must select `src/executor/mod.rs` `directory_link` to `src/executor/directory_link.rs`.
+The Windows record must select `directory_link_windows` to `src/executor/directory_link_windows.rs` and its cfg-gated crate-internal `directory_link_windows as directory_link` re-export, while leaving the Unix declaration inactive and unreachable.
+Named inventory controls prove missing, extra, inactive, and path-redirected Unix and Windows declarations or re-exports fail in the applicable configuration before Stage 2.
+Only after all three inventories succeed does Stage 2 parse the recorded active production items with `syn`, excluding `src/migration/**` from the non-migration structural scan.
+Outside the migration module, the only permitted migration names are `MigrationFacade`, `MigrationRequest`, `MigrationPresentation`, and `MigrationOutcome` from the crate-root migration facade; aliases, globs, re-exports, wrappers, and every other migration item are rejected.
+It rejects a legacy DTO/parser/converter import or call, including aliases, globs, re-exports, qualified descendants, and aliased YAML or JSON parsing.
+For the dispatch paths reachable from `migrate state` and `migrate profiles`, it rejects filesystem or inventory access, migration eligibility decisions, state-lock access, and temporary, flush, reopen, rename, replacement, or other publication capability before the sole direct facade invocation.
+The oracle follows local crate calls to that invocation and fails for zero or multiple invocations, an unresolved or indirect pre-facade dispatch, or an unexpanded/generated/macro body unless the exact body and its finite callees are available for the same scan.
+It names the source file, AST path or call, resolved import origin, and violated rule on failure.
+Oracle fixtures include direct and aliased legacy parsing/conversion, inventory/preflight helpers, state-first and active-operation checks, state locks, publication operations, widened migration imports, function-pointer or closure dispatch, trait/generic or table dispatch, and included, generated, or macro-produced dispatch.
+Each negative fixture must fail with its named rule or the indirect-dispatch rule; one positive fixture contains only request construction, confirmation, presentation/outcome rendering, and one facade call.
+Separate route-boundary and facade-registration tests prove that only private `schema_3_to_4` is registered, that it is selectable only through the facade, and that an unregistered candidate pair fails without reaching route parsing or publication.
+The route-boundary oracle rejects a route-private import, re-export, or facade bypass outside `src/migration/`.
+Add and retirement fixtures prove that adding a route requires a distinct unit plus explicit registration, while retiring one removes both and leaves normal readers schema-4-only.
+This static oracle complements rather than replaces migration integration and CLI acceptance evidence.
+
+State-migration tests cover presentation and no-confirmation writes, complete inventory validation, exclusive-lock contention, null-only active operation, a changed/missing/malformed/mixed/schema-2/unknown inventory at either validation, publication fault injection, and byte-for-byte unchanged state on every rejection.
+Success tests prove the locked final rediscovery, validated same-directory temporary publication, retained ID/effect/ownership facts, and the schema-4 old-binary barrier.
+Profile-migration tests cover absent/schema-4 state permission, profile-first rejection, whole-inventory preflight before any publication, schema-version-only conversion, observable schema-4 resume eligibility, unsafe control-file-path rejection, temporary validation and replacement failure, interruption after partial publication, and explicit resumption of remaining schema-3 profiles.
+Every migration rejection and success test proves zero target, store, materialization, and ownership mutation.
+
+Native Unix and Windows migration conformance exercises same-directory replacement and state-lock contention in disposable directories.
+It records operating-system version, filesystem, Rust toolchain, exact command, and whether the evidence ran natively; cross-compilation is not Windows-native evidence.
+An unavailable required capability must demonstrate the documented fail-closed preflight rather than being skipped.
 
 ## DirectoryLink Release Checklist
 

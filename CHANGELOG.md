@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.7.0
+
+- Added composable schema-4 profiles with typed parameter bindings and stable resource identities for profile instances.
+- Added explicit state-first schema-3-to-4 migration for profiles and durable Known state, including complete inventory preflight and safe publication.
+
 ## v0.6.0
 
 - Added `directory`/`link` resources for local-store real directories, with typed DirectoryLink ownership, no-follow observation, deterministic lifecycle transitions, durable recovery, and native Unix and Windows conformance evidence.

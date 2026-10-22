@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -365,17 +367,27 @@ fn publish_profile_candidate(
         })?;
         verify_profile_parent(parent)?;
         verify_profile_temporary(path, candidate)?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|source| MigrationError::ProfilePublication {
-                path: parent.to_path_buf(),
-                source,
-            })
+        sync_profile_parent(parent)
     })();
     if result.is_err() {
         let _ = remove_profile_temporary_if_expected(&temporary_path, candidate);
     }
     result
+}
+
+#[cfg(unix)]
+fn sync_profile_parent(parent: &Path) -> Result<(), MigrationError> {
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| MigrationError::ProfilePublication {
+            path: parent.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(windows)]
+fn sync_profile_parent(_parent: &Path) -> Result<(), MigrationError> {
+    Ok(())
 }
 
 fn verify_profile_parent(parent: &Path) -> Result<(), MigrationError> {
@@ -1290,7 +1302,10 @@ mod tests {
     use crate::domain::paths::ResolvedPath;
 
     const PROFILE: &str = "schema_version: 3\nid: base\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source: { store: dotfiles, path: git/config }\n      target: /home/example/.gitconfig\n      operation: link\n";
+    #[cfg(unix)]
     const STATE: &str = r#"{"schema_version":3,"resources":{"base/git-config":{"definition_hash":"sha256:1250e6bf4abdb529664c1444709aeae2ce814e8b97c3984e32d46d9c971b3a5e","effect":{"kind":"file_link","source_path":"/home/example/dotfiles/git/config","target_path":"/home/example/.gitconfig","link_target":"/home/example/dotfiles/git/config"}}},"active_operation":null}"#;
+    #[cfg(windows)]
+    const STATE: &str = r#"{"schema_version":3,"resources":{"base/git-config":{"definition_hash":"sha256:553a59aab51ec70ffcec1e6c4dd3ebb4059bb3a257cd2cc3ccd5ef5908849348","effect":{"kind":"file_link","source_path":"C:\\loadout\\dotfiles\\git\\config","target_path":"C:\\loadout\\.gitconfig","link_target":"C:\\loadout\\dotfiles\\git\\config"}}},"active_operation":null}"#;
 
     #[test]
     fn profile_conversion_only_admits_complete_schema_three_documents() {
@@ -1383,7 +1398,7 @@ mod tests {
 
     #[test]
     fn state_conversion_preserves_resource_facts_and_rejects_active_operations() {
-        let source = r#"{"schema_version":3,"resources":{"base/git-config":{"definition_hash":"sha256:1250e6bf4abdb529664c1444709aeae2ce814e8b97c3984e32d46d9c971b3a5e","effect":{"kind":"file_link","source_path":"/home/example/dotfiles/git/config","target_path":"/home/example/.gitconfig","link_target":"/home/example/dotfiles/git/config"}}},"active_operation":null}"#.to_owned();
+        let source = STATE.to_owned();
         let converted = convert_state(source.as_bytes()).unwrap();
         let value: JsonValue = serde_json::from_slice(&converted).unwrap();
         let original: JsonValue = serde_json::from_str(&source).unwrap();
@@ -1391,7 +1406,7 @@ mod tests {
         assert_eq!(value["resources"], original["resources"]);
         assert_eq!(
             value["resources"]["base/git-config"]["definition_hash"],
-            "sha256:1250e6bf4abdb529664c1444709aeae2ce814e8b97c3984e32d46d9c971b3a5e"
+            original["resources"]["base/git-config"]["definition_hash"]
         );
         assert!(matches!(
             convert_state(source.replace("null", "{}").as_bytes()),

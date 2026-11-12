@@ -6,7 +6,7 @@ This specification defines the v0.3.0 lifecycle retained by v0.4.0 for validatin
 It owns planning decisions and the Desired/Known/Actual transition table.
 The File Links and State and Recovery specifications define the filesystem and durable-state mechanics used by those decisions.
 
-Every retained lifecycle requirement in this document remains a v0.7.0 requirement under the [v0.7.0 baseline](README.md#v070-baseline).
+Every retained lifecycle requirement in this document remains a v0.8.0 requirement under the [v0.8.0 baseline](README.md#v080-baseline).
 
 ## Inputs
 
@@ -65,7 +65,7 @@ The v0.3.0 planner may produce these actions:
 
 Each action identifies its fully qualified resource ID, resolved target or targets, expected precondition, required post-condition, and reason.
 The executor completes every step required by one action's post-condition before it begins another action.
-An action is never divided across execution phases.
+An action is indivisible for scheduling and execution.
 
 ### Transition Table
 
@@ -145,25 +145,15 @@ A failed recheck prevents the next mutation step and records failure or uncertai
 
 ## Execution Order
 
-Apply is sequential in v0.3.0.
-Within every phase, actions are ordered lexicographically by their fully qualified resource ID.
-For `replace_ownership`, the sort key is `<old-resource-id>\u0000<new-resource-id>`.
+Apply is sequential in v0.8.0. The planner first classifies normal lifecycle actions, then constructs and validates one combined DAG. The relation contains only typed legal lifecycle/replacement relations, canonical direct `depends_on` prerequisites, compact stage barriers, and permissible historical stale-removal topology. The planner rejects every combined cycle before operation creation or target mutation. An unsupported action-role pair is a blocking diagnostic with no fallback.
 
-v0.3.0 has no user-configurable per-resource execution order.
-Fully qualified resource ID ordering is a deterministic tie-breaker, not an ordering interface; resource IDs express identity and users MUST NOT choose or rename them to control execution order.
-Future ordering constraints require a separate dependency contract and must not change the meaning of the v0.3.0 profile declaration order.
+The only action roles are `current_create`, `current_change`, `current_handoff`, `stale_remove`, and `forget_missing`. Current-to-current direct and forward-stage relations are legal. `stale_remove` and `forget_missing` are stale actions and may relate only by reversing a selected applied-topology edge whose endpoints are stale. Current-to-stale, stale-to-current, and every unspecified pair are illegal. Resource-specific replacement or handoff predicates remain additional required safety predicates and never override this closed legality table.
 
-The phases are:
+The Plan stores unique actions, sorted direct action edges with `origin: "depends_on"`, compact barrier units, and a schedule that is a permutation of the action IDs. A barrier has stable ID `stage/<fully-qualified-stage-id>`, sorted `after` barrier IDs, sorted input/output action-ID sets, and provenance containing only canonical resolved IDs. Barrier stages MUST NOT be serialized as an n-by-m cross-product of action edges. Direct edges, barrier incidences, action IDs, and schedule members are unique and canonical. A graph with an unknown reference, duplicate or noncanonical collection, invalid status/reason relation, invalid role relation, missing scheduled action, or cycle is invalid before recovery or target observation.
 
-1. `create_link`;
-2. `replace_link`, `replace_ownership`, and `relocate_link`;
-3. `remove_link` and `forget_missing`.
+The schedule is a deterministic sequential topological order. Independent ready actions use fully qualified resource ID only as a tie-breaker. YAML mapping order, include order, declaration order, collection order, source order, and lexical renaming are not ordering APIs. An ordering-only declaration change creates no resource action, active operation, applied-topology update, or state rewrite. An unstaged resource creates no barrier membership. A satisfied prerequisite creates no synthetic action.
 
-A `relocate_link` action creates and verifies the new target, then removes and verifies the old target, as one contiguous phase-2 action.
-No other action begins between those steps.
-
-An action in a later phase is not attempted after an earlier action fails.
-Verified actions from earlier phases remain committed; v0.3.0 does not roll them back.
+A failed or uncertain action stops every later planned mutation. Every unstarted action reachable from an unsatisfied or non-success terminal predecessor records a dependency skip naming that blocking action. Every other unstarted action records a global-abort skip naming the first failed or uncertain action that stopped execution. Verified earlier effects are not rolled back.
 
 ## Dry Run
 
@@ -214,19 +204,16 @@ Target relocation creates and verifies the new effect before removing the old ex
 For `relocate_copy`, the new target uses `create-no-replace`; after it is verified, removal still requires a fresh owned-old-copy proof.
 If either target cannot be proven by the action's recorded precondition or postcondition, the relocation is `uncertain` and is not rolled back.
 
-Within a phase, actions sort lexicographically by fully qualified resource ID; a managed identity handoff sorts by `<old-resource-id>\u0000<new-resource-id>`.
-The phases are: (1) creates, (2) replacements, effect handoffs, identity handoffs, and relocations, then (3) removals and forgets.
+The preceding action inventory does not assign an execution order.
+Every action type is scheduled only through the schema-5 combined DAG in [Execution Order](#execution-order).
 No later action begins after an earlier action fails, and verified earlier actions are not rolled back.
 
 ## Directory-Link Effect
 
-DirectoryLink adds the typed `directory_link` effect without changing the planner boundary or the deterministic phase rule.
+DirectoryLink adds the typed `directory_link` effect without changing the planner boundary or the schema-5 combined-DAG scheduling contract.
 Its complete Desired/Known/Actual transition table, including create, replace, relocate, remove, forget-missing, same-effect identity handoff, unmanaged matching-link rejection, and mixed-effect conflict, is owned by [Directory Links](directory-link.md#planning-transitions).
 
-`create_directory_link` belongs to the create phase.
-`replace_directory_link`, DirectoryLink `replace_ownership`, and `relocate_directory_link` belong to phase 2.
-`remove_directory_link` and `forget_missing` belong to phase 3.
-A DirectoryLink action retains the existing fully qualified resource-ID tie-break and its relocate steps are contiguous.
+A DirectoryLink relocate action remains contiguous.
 
 A DirectoryLink may hand off identity only to another DirectoryLink with the same normalized target and typed old-effect proof.
 FileLink/FileCopy to DirectoryLink handoff, and the reverse, are blocked conflicts with no executable target action.
@@ -237,8 +224,7 @@ Before a normal lifecycle command observes a target, reconciles an active operat
 For non-dry-run apply, acquiring the exclusive lock may precede this gate, but the gate precedes recovery and every other mutable state-repository operation.
 
 If any required document has an unsupported schema version or invalid schema shape, the command reports invalid input and performs none of those actions.
-In particular, it does not recover a schema-3 active operation, inspect a target that matches a schema-3 Known effect, or create a replacement state document.
-The explicit [Migration](migration.md) authoring operation is outside this lifecycle and is the only schema-3 conversion path.
+In particular, it does not recover a schema-4 active operation, inspect a target that matches a schema-4 Known effect, or create a replacement state document. The explicit [Migration](migration.md) authoring operation is outside this lifecycle and is the only schema-4 conversion path.
 An absent state file is the only state input that the current contract treats as an empty Known state.
 
 Inspection commands apply the same gate only to documents their read-only contract names.

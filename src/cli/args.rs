@@ -167,9 +167,9 @@ struct MigrationArgs {
 
 #[derive(Subcommand)]
 enum ParsedMigrationCommand {
-    #[command(about = "Migrate schema-3 state before profile documents.")]
+    #[command(about = "Migrate schema-4 state before profile documents.")]
     State(MigrationArgs),
-    #[command(about = "Migrate remaining schema-3 profile documents after state.")]
+    #[command(about = "Migrate remaining schema-4 profile documents after state.")]
     Profiles(MigrationArgs),
 }
 

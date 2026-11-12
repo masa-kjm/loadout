@@ -1,4 +1,4 @@
-//! Strict raw DTO for one discovered schema-4 profile declaration.
+//! Strict raw DTO for one discovered schema-5 profile declaration.
 
 use std::collections::BTreeMap;
 
@@ -6,18 +6,20 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer};
 use serde_yaml::Value;
 
-use crate::declaration::schema::ProfileSchemaVersionV4;
+use crate::declaration::schema::{ProfileSchemaVersionV5, deserialize_optional_string};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProfileDeclaration {
     #[allow(dead_code)]
-    schema_version: ProfileSchemaVersionV4,
+    schema_version: ProfileSchemaVersionV5,
     id: String,
     #[serde(default)]
     parameters: BTreeMap<String, ParameterType>,
     #[serde(default)]
     includes: Vec<IncludeDeclaration>,
+    #[serde(default)]
+    stages: BTreeMap<String, StageDeclaration>,
     resources: BTreeMap<String, FileResourceDeclaration>,
 }
 
@@ -40,6 +42,9 @@ impl ProfileDeclaration {
         self.resources
             .iter()
             .map(|(id, resource)| (id.as_str(), resource))
+    }
+    pub(crate) fn stages(&self) -> impl ExactSizeIterator<Item = (&str, &StageDeclaration)> {
+        self.stages.iter().map(|(id, stage)| (id.as_str(), stage))
     }
 }
 
@@ -187,10 +192,32 @@ pub(crate) struct FileResourceDeclaration {
     #[serde(rename = "type")]
     resource_type: FileResourceType,
     properties: FileLinkProperties,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    stage: Option<String>,
+    #[serde(default)]
+    depends_on: Vec<String>,
 }
 impl FileResourceDeclaration {
     pub(crate) fn properties(&self) -> &FileLinkProperties {
         &self.properties
+    }
+    pub(crate) fn stage(&self) -> Option<&str> {
+        self.stage.as_deref()
+    }
+    pub(crate) fn depends_on(&self) -> &[String] {
+        &self.depends_on
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StageDeclaration {
+    after: Vec<String>,
+}
+
+impl StageDeclaration {
+    pub(crate) fn after(&self) -> &[String] {
+        &self.after
     }
 }
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -267,7 +294,7 @@ mod tests {
     use super::*;
     #[test]
     fn strict_schema_four_parameters_and_references_parse() {
-        let profile = ProfileDeclaration::parse("schema_version: 4\nid: base\nparameters: { name: string, count: integer, enabled: boolean, values: list }\nincludes: [{ id: child, as: child, with: { name: { parameter: name } } }]\nresources: {}\n").unwrap();
+        let profile = ProfileDeclaration::parse("schema_version: 5\nid: base\nparameters: { name: string, count: integer, enabled: boolean, values: list }\nincludes: [{ id: child, as: child, with: { name: { parameter: name } } }]\nresources: {}\n").unwrap();
         assert_eq!(profile.parameters().len(), 4);
         assert!(matches!(
             profile.includes()[0].bindings()["name"],
@@ -277,8 +304,8 @@ mod tests {
     #[test]
     fn rejects_invalid_reference_and_recursive_list() {
         for yaml in [
-            "schema_version: 4\nid: base\nresources: { x: { type: file, properties: { kind: { parameter: x, extra: y }, source: { store: s, path: p }, target: /x, operation: link } } }\n",
-            "schema_version: 4\nid: base\nresources: {}\nincludes: [{ id: x, with: { p: [a, [b]] } }]\n",
+            "schema_version: 5\nid: base\nresources: { x: { type: file, properties: { kind: { parameter: x, extra: y }, source: { store: s, path: p }, target: /x, operation: link } } }\n",
+            "schema_version: 5\nid: base\nresources: {}\nincludes: [{ id: x, with: { p: [a, [b]] } }]\n",
         ] {
             assert!(ProfileDeclaration::parse(yaml).is_err());
         }
@@ -347,11 +374,11 @@ mod tests {
         for (name, yaml) in [
             (
                 "unknown parameter type",
-                "schema_version: 4\nid: base\nparameters: { value: path }\nresources: {}\n",
+                "schema_version: 5\nid: base\nparameters: { value: path }\nresources: {}\n",
             ),
             (
                 "null property",
-                "schema_version: 4\nid: base\nresources: { x: { type: file, properties: { kind: null, source: { store: s, path: p }, target: /x, operation: link } } }\n",
+                "schema_version: 5\nid: base\nresources: { x: { type: file, properties: { kind: null, source: { store: s, path: p }, target: /x, operation: link } } }\n",
             ),
         ] {
             assert!(

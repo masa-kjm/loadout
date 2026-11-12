@@ -216,9 +216,15 @@ fn apply_request_with_hooks_and_after_planning(
             .collect::<Vec<_>>();
         if !resource_actions.is_empty() {
             stage = ApplyStage::OperationCreation;
-            let ids = locked
-                .begin_resource_actions(hash, &resource_actions)
-                .map_err(state_error)?;
+            let ids = if let Some(graph) = fresh_plan.graph() {
+                locked
+                    .begin_resource_actions_with_graph(hash, &resource_actions, graph.clone())
+                    .map_err(state_error)?
+            } else {
+                locked
+                    .begin_resource_actions(hash, &resource_actions)
+                    .map_err(state_error)?
+            };
             stage = ApplyStage::Execution;
             execute_resource_actions(
                 locked,
@@ -301,7 +307,23 @@ fn execute_resource_actions(
         &crate::state::operation::ActionId,
     ) -> Result<(), super::dispatch::ResourceExecutionError>,
 ) -> Result<(), ApplyError> {
-    for (index, (action, id)) in actions.iter().zip(ids).enumerate() {
+    let schedule = locked
+        .state()
+        .active_operation()
+        .expect("complete operation was persisted before execution")
+        .schedule()
+        .to_vec();
+    let scheduled_indexes = schedule
+        .iter()
+        .map(|scheduled| {
+            ids.iter()
+                .position(|id| id == scheduled)
+                .expect("operation schedule is a validated action-ID permutation")
+        })
+        .collect::<Vec<_>>();
+    for (index, action_index) in scheduled_indexes.into_iter().enumerate() {
+        let action = &actions[action_index];
+        let id = &ids[action_index];
         *affected_action = Some(ApplyAction {
             action_id: Some(id.clone()),
             resource_id: action.resource_id().clone(),
@@ -336,14 +358,28 @@ fn execute_resource_actions(
                     .mark_without_known(id, status)
                     .map_err(ApplyError::State)?;
                 let failed_action = affected_action.clone();
-                for (pending, action) in ids[index + 1..].iter().zip(&actions[index + 1..]) {
+                for pending_index in schedule[index + 1..].iter().map(|scheduled| {
+                    ids.iter()
+                        .position(|id| id == scheduled)
+                        .expect("validated schedule")
+                }) {
+                    let pending = &ids[pending_index];
+                    let action = &actions[pending_index];
                     *affected_action = Some(ApplyAction {
                         action_id: Some(pending.clone()),
                         resource_id: action.resource_id().clone(),
                         kind: action.kind(),
                     });
+                    let reason = locked
+                        .state()
+                        .active_operation()
+                        .expect("complete operation was persisted before execution")
+                        .abort_skip_reason(id, pending)
+                        .map_err(|error| {
+                            ApplyError::State(StateRepositoryError::Operation(error))
+                        })?;
                     locked
-                        .mark_without_known(pending, ActionStatus::Skipped)
+                        .mark_skipped(pending, reason)
                         .map_err(ApplyError::State)?;
                 }
                 *affected_action = failed_action;
@@ -1463,9 +1499,36 @@ where
             });
         }
         match action.status() {
-            ActionStatus::Pending => locked
-                .mark_without_known(&action_id, ActionStatus::Skipped)
-                .map_err(ApplyError::State)?,
+            ActionStatus::Pending => {
+                let aborting_action = locked.state().active_operation().and_then(|operation| {
+                    operation.schedule().iter().find(|candidate| {
+                        operation.action(candidate).is_some_and(|candidate| {
+                            matches!(
+                                candidate.status(),
+                                ActionStatus::Failed | ActionStatus::Uncertain
+                            )
+                        })
+                    })
+                });
+                if let Some(initiator) = aborting_action {
+                    let reason = locked
+                        .state()
+                        .active_operation()
+                        .expect("active operation remains present during recovery")
+                        .abort_skip_reason(initiator, &action_id)
+                        .map_err(|error| {
+                            ApplyError::State(StateRepositoryError::Operation(error))
+                        })?;
+                    locked
+                        .mark_skipped(&action_id, reason)
+                        .map_err(ApplyError::State)?;
+                } else {
+                    // A crash before any action result has no prior abort cause; close the unstarted action as failed rather than manufacture a skip cause.
+                    locked
+                        .mark_without_known(&action_id, ActionStatus::Failed)
+                        .map_err(ApplyError::State)?;
+                }
+            }
             ActionStatus::Running | ActionStatus::Uncertain => {
                 let mut decision = inspector
                     .as_ref()
@@ -2037,7 +2100,7 @@ mod tests {
         );
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 4\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: nvim\n      target: ~/.config/nvim\n",
+            "schema_version: 5\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: nvim\n      target: ~/.config/nvim\n",
         );
         let request = super::super::queries::DeclarationRequest {
             context: ResolverContext::new(
@@ -2243,7 +2306,7 @@ mod tests {
         );
         let profile = |source| {
             format!(
-                "schema_version: 4\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: {source}\n      target: ~/.config/nvim\n"
+                "schema_version: 5\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: {source}\n      target: ~/.config/nvim\n"
             )
         };
         workspace.write("profiles/base.yaml", &profile("old"));
@@ -2474,9 +2537,18 @@ mod tests {
             snapshot
         }
 
+        fn target_and_state_snapshot(&self) -> BTreeMap<PathBuf, Vec<u8>> {
+            let home = self.path("home");
+            let state = self.path("state");
+            self.snapshot()
+                .into_iter()
+                .filter(|(path, _)| path.starts_with(&home) || path.starts_with(&state))
+                .collect()
+        }
+
         fn request(&self, resources: &[(&str, &str)]) -> super::super::queries::DeclarationRequest {
             self.write("config/environment.yaml", "schema_version: 2\ndefault_profile: base\nprofile_discovery:\n  paths: [../profiles]\nstores:\n  dotfiles:\n    type: local\n    properties:\n      path: ../store\n");
-            let mut profile = String::from("schema_version: 4\nid: base\nresources:");
+            let mut profile = String::from("schema_version: 5\nid: base\nresources:");
             if resources.is_empty() {
                 profile.push_str(" {}\n");
             } else {
@@ -2603,7 +2675,7 @@ mod tests {
             self.write("config/environment.yaml", "schema_version: 1\n");
             self.write(
                 "profiles/workstation.yaml",
-                "schema_version: 4\nid: workstation\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/.gitconfig\n      operation: link\n",
+                "schema_version: 5\nid: workstation\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/.gitconfig\n      operation: link\n",
             );
             let context = ResolverContext::new(
                 self.path("home"),
@@ -2975,6 +3047,142 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn ordering_only_orchestration_edit_leaves_target_and_state_bytes_unchanged() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let request = workspace.request(&[]);
+        workspace.write(
+            "profiles/base.yaml",
+            "schema_version: 5\nid: base\nstages:\n  first: { after: [] }\n  second: { after: [first] }\nresources:\n  first:\n    type: file\n    stage: first\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.first\n  second:\n    type: file\n    stage: second\n    depends_on: [first]\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.second\n",
+        );
+        apply_request(&request, |_| true).unwrap();
+        let before = workspace.target_and_state_snapshot();
+
+        workspace.write(
+            "profiles/base.yaml",
+            "schema_version: 5\nid: base\nstages:\n  first: { after: [] }\n  second: { after: [] }\nresources:\n  first:\n    type: file\n    stage: first\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.first\n  second:\n    type: file\n    stage: second\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.second\n",
+        );
+        let report = apply_request(&request, |_| true).unwrap();
+
+        assert!(matches!(report, ApplyReport::Applied { committed, .. } if committed.is_empty()));
+        assert_eq!(workspace.target_and_state_snapshot(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_graph_schedule_and_topology_delta_commit_are_executor_atomic() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let request = workspace.request(&[]);
+        workspace.write(
+            "profiles/base.yaml",
+            "schema_version: 5\nid: base\nstages:\n  first: { after: [] }\n  second: { after: [first] }\nresources:\n  first:\n    type: file\n    stage: first\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.first\n  second:\n    type: file\n    stage: second\n    depends_on: [first]\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.second\n",
+        );
+        let mut observed = Vec::new();
+        let failure = apply_request_with_hooks(
+            &request,
+            |_| true,
+            |index, locked| {
+                let operation = locked.state().active_operation().unwrap();
+                let running = operation
+                    .actions()
+                    .find(|(_, action)| action.status() == ActionStatus::Running)
+                    .unwrap();
+                observed.push(running.1.resource_id().to_string());
+                if index == 1 {
+                    locked.fail_next_commit_at(CommitStage::ReplaceState);
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(observed, ["base/first", "base/second"]);
+        assert_eq!(failure.stage, ApplyStage::Execution);
+        let state = workspace.repository().load().unwrap();
+        let operation = state.active_operation().unwrap();
+        assert_eq!(
+            operation
+                .schedule()
+                .iter()
+                .map(|id| operation.action(id).unwrap().resource_id().as_str())
+                .collect::<Vec<_>>(),
+            observed
+        );
+        assert_eq!(state.known().resources().count(), 1);
+        assert_eq!(state.known().topology().current_direct().len(), 0);
+        assert!(
+            state
+                .known()
+                .topology()
+                .current_barriers()
+                .iter()
+                .all(|barrier| barrier.id != "stage/base/second")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unstaged_action_is_not_published_as_a_barrier_member() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let request = workspace.request(&[]);
+        workspace.write(
+            "profiles/base.yaml",
+            "schema_version: 5\nid: base\nstages:\n  staged: { after: [] }\nresources:\n  staged:\n    type: file\n    stage: staged\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.staged\n  unstaged:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.unstaged\n",
+        );
+        apply_request(&request, |_| true).unwrap();
+
+        let state = workspace.repository().load().unwrap();
+        assert_eq!(state.known().topology().current_barriers().len(), 1);
+        assert_eq!(
+            state.known().topology().current_barriers()[0].members,
+            [FullyQualifiedResourceId::parse("base/staged").unwrap()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn satisfied_predecessor_runs_only_its_successor_without_a_synthetic_action() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let request = workspace.request(&[]);
+        workspace.write(
+            "profiles/base.yaml",
+            "schema_version: 5\nid: base\nresources:\n  predecessor:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.predecessor\n",
+        );
+        apply_request(&request, |_| true).unwrap();
+        workspace.write(
+            "profiles/base.yaml",
+            "schema_version: 5\nid: base\nresources:\n  predecessor:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.predecessor\n  successor:\n    type: file\n    depends_on: [predecessor]\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.successor\n",
+        );
+        let mut action_count = None;
+        let report = apply_request_with_hooks(
+            &request,
+            |_| true,
+            |_, locked| {
+                let operation = locked.state().active_operation().unwrap();
+                action_count = Some(operation.actions().count());
+                assert_eq!(operation.schedule().len(), 1);
+            },
+        )
+        .unwrap();
+
+        assert!(
+            matches!(report, ApplyReport::Applied { committed, .. } if committed == [FullyQualifiedResourceId::parse("base/successor").unwrap()])
+        );
+        assert_eq!(action_count, Some(1));
+        assert!(
+            workspace
+                .repository()
+                .load()
+                .unwrap()
+                .active_operation()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn later_recheck_failure_retains_earlier_success_and_skips_every_remaining_action() {
         let workspace = TestWorkspace::new();
         workspace.write("store/git/config", "source\n");
@@ -3171,7 +3379,7 @@ mod tests {
                 [
                     ActionStatus::Succeeded,
                     ActionStatus::Succeeded,
-                    ActionStatus::Skipped
+                    ActionStatus::Failed
                 ]
             );
             let recovered = workspace.repository().load().unwrap();
@@ -3394,9 +3602,9 @@ mod tests {
         assert_eq!(
             sequence,
             [
-                ActionKind::CreateLink,
                 ActionKind::ReplaceOwnership,
-                ActionKind::ForgetMissing
+                ActionKind::ForgetMissing,
+                ActionKind::CreateLink,
             ]
         );
         let state = workspace.repository().load().unwrap();
@@ -3430,7 +3638,7 @@ mod tests {
             |_| true,
             |index, locked| {
                 started.push(index);
-                if index == 2 {
+                if index == 1 {
                     workspace.write("home/a", "unmanaged");
                 }
                 assert!(locked.state().active_operation().is_some());
@@ -3458,19 +3666,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 ActionStatus::Succeeded,
-                ActionStatus::Succeeded,
                 ActionStatus::Failed,
+                ActionStatus::Skipped,
                 ActionStatus::Skipped
             ]
         );
-        assert_eq!(started, [0, 1, 2]);
+        assert_eq!(started, [0, 1]);
         assert_eq!(
             failure
                 .committed
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
-            ["base/z", "base/new"]
+            ["base/new"]
         );
         let state = workspace.repository().load().unwrap();
         assert!(state.active_operation().is_none());
@@ -3480,7 +3688,7 @@ mod tests {
                 .resources()
                 .map(|r| r.resource_id().as_str())
                 .collect::<Vec<_>>(),
-            ["base/new", "base/stale-a", "base/stale-b", "base/z"]
+            ["base/new", "base/stale-a", "base/stale-b"]
         );
         assert_eq!(
             fs::read_to_string(workspace.path("home/a")).unwrap(),
@@ -3810,7 +4018,7 @@ mod tests {
         let request = workspace.request(&[("a", "a")]);
         workspace.write(
             "profiles/other.yaml",
-            "schema_version: 4\nid: other\nincludes: [{id: missing}]\nresources: {}\n",
+            "schema_version: 5\nid: other\nincludes: [{id: missing}]\nresources: {}\n",
         );
         let before = workspace.snapshot();
         let _read_only = crate::test_support::forbid_mutation();
@@ -5324,7 +5532,7 @@ mod tests {
         );
         let profile = |source: &str| {
             format!(
-                "schema_version: 4\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: {source}\n      target: ~/.config/nvim\n"
+                "schema_version: 5\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: {source}\n      target: ~/.config/nvim\n"
             )
         };
         workspace.write("profiles/base.yaml", &profile("old"));
@@ -5407,7 +5615,7 @@ mod tests {
         );
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 4\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: nvim\n      target: ~/.config/nvim\n",
+            "schema_version: 5\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: nvim\n      target: ~/.config/nvim\n",
         );
         let request = super::super::queries::DeclarationRequest {
             context: ResolverContext::new(
@@ -5422,7 +5630,7 @@ mod tests {
         apply_request(&request, |_| true).unwrap();
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 4\nid: base\nresources: {}\n",
+            "schema_version: 5\nid: base\nresources: {}\n",
         );
 
         let target = workspace.path("home/.config/nvim");
@@ -5466,7 +5674,7 @@ mod tests {
         );
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 4\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: nvim\n      target: ~/.config/nvim\n",
+            "schema_version: 5\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: nvim\n      target: ~/.config/nvim\n",
         );
         let request = super::super::queries::DeclarationRequest {
             context: ResolverContext::new(

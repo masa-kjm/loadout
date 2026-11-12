@@ -15,6 +15,79 @@ pub(crate) struct ResolvedDesired {
     root_profile: ProfileId,
     resources: Vec<ResolvedFileLink>,
     variants: Vec<ResolvedResource>,
+    orchestration: ResolvedOrchestration,
+}
+
+/// Canonical, declaration-derived ordering facts for the pure planning boundary.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ResolvedOrchestration {
+    stages: Vec<ResolvedStage>,
+    resources: Vec<ResolvedResourceOrchestration>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResolvedStage {
+    id: String,
+    after: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResolvedResourceOrchestration {
+    resource_id: FullyQualifiedResourceId,
+    stage: Option<String>,
+    depends_on: Vec<FullyQualifiedResourceId>,
+}
+
+impl ResolvedStage {
+    pub(crate) fn new(id: String, after: Vec<String>) -> Self {
+        Self { id, after }
+    }
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+    pub(crate) fn after(&self) -> &[String] {
+        &self.after
+    }
+}
+
+impl ResolvedResourceOrchestration {
+    pub(crate) fn new(
+        resource_id: FullyQualifiedResourceId,
+        stage: Option<String>,
+        depends_on: Vec<FullyQualifiedResourceId>,
+    ) -> Self {
+        Self {
+            resource_id,
+            stage,
+            depends_on,
+        }
+    }
+    pub(crate) fn resource_id(&self) -> &FullyQualifiedResourceId {
+        &self.resource_id
+    }
+    pub(crate) fn stage(&self) -> Option<&str> {
+        self.stage.as_deref()
+    }
+    pub(crate) fn depends_on(&self) -> &[FullyQualifiedResourceId] {
+        &self.depends_on
+    }
+}
+
+impl ResolvedOrchestration {
+    pub(crate) fn new(
+        mut stages: Vec<ResolvedStage>,
+        mut resources: Vec<ResolvedResourceOrchestration>,
+    ) -> Self {
+        stages.sort_by(|left, right| left.id.cmp(&right.id));
+        resources.sort_by(|left, right| left.resource_id.cmp(&right.resource_id));
+        Self { stages, resources }
+    }
+    pub(crate) fn stages(&self) -> &[ResolvedStage] {
+        &self.stages
+    }
+    pub(crate) fn resources(&self) -> &[ResolvedResourceOrchestration] {
+        &self.resources
+    }
 }
 
 /// A closed resolved resource effect.
@@ -105,7 +178,14 @@ impl ResolvedDesired {
             root_profile,
             resources,
             variants: ordered_variants,
+            orchestration: ResolvedOrchestration::default(),
         })
+    }
+
+    /// Adds already canonicalized ordering facts without changing effect identity.
+    pub(crate) fn with_orchestration(mut self, orchestration: ResolvedOrchestration) -> Self {
+        self.orchestration = orchestration;
+        self
     }
 
     /// The profile whose include composition produced this Desired set.
@@ -121,6 +201,11 @@ impl ResolvedDesired {
     /// Every effect variant, sorted by fully qualified resource ID.
     pub(crate) fn variants(&self) -> &[ResolvedResource] {
         &self.variants
+    }
+
+    /// Typed stage and direct-dependency facts, sorted independently of declaration order.
+    pub(crate) fn orchestration(&self) -> &ResolvedOrchestration {
+        &self.orchestration
     }
 
     /// Finds one resource by its stable identity.
@@ -145,6 +230,7 @@ impl ResolvedDesired {
             root_profile,
             variants: resources.iter().cloned().map(Into::into).collect(),
             resources,
+            orchestration: ResolvedOrchestration::default(),
         }
     }
 }

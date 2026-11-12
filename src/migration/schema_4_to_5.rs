@@ -20,8 +20,8 @@ use crate::resolver::ResolverContext;
 use crate::state::repository::{StateDecodeError, StateRepository, StateRepositoryError};
 use crate::state::validate_current_state_bytes;
 
-const LEGACY_SCHEMA_VERSION: u64 = 3;
-const CURRENT_SCHEMA_VERSION: u64 = 4;
+const LEGACY_SCHEMA_VERSION: u64 = 4;
+const CURRENT_SCHEMA_VERSION: u64 = 5;
 const MAX_TEMPORARY_NAME_ATTEMPTS: u64 = 128;
 
 static NEXT_PROFILE_TEMPORARY_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -94,7 +94,7 @@ fn profile_publication_boundary(point: ProfilePublicationFaultPoint) -> io::Resu
     })
 }
 
-/// Converts one complete schema-3 profile without inventing parameters or instances.
+/// Converts one complete schema-4 profile without inventing parameters or instances.
 pub(super) fn convert_profile(source: &str) -> Result<String, MigrationError> {
     validate_legacy_profile_source(source)?;
     let candidate = replace_root_schema_version(source)?;
@@ -102,7 +102,7 @@ pub(super) fn convert_profile(source: &str) -> Result<String, MigrationError> {
     Ok(candidate)
 }
 
-/// Converts a complete inactive schema-3 state document after preserving its facts byte-for-byte.
+/// Converts a complete inactive schema-4 state document after preserving its facts byte-for-byte.
 pub(super) fn convert_state(source: &[u8]) -> Result<Vec<u8>, MigrationError> {
     let legacy: LegacyStateDocument =
         serde_json::from_slice(source).map_err(MigrationError::State)?;
@@ -119,6 +119,10 @@ pub(super) fn convert_state(source: &[u8]) -> Result<Vec<u8>, MigrationError> {
     let candidate = serde_json::to_vec(&serde_json::json!({
         "schema_version": CURRENT_SCHEMA_VERSION,
         "resources": legacy.resources,
+        "applied_lifecycle_topology": {
+            "current": [],
+            "historical": [],
+        },
         "active_operation": null,
     }))
     .map_err(MigrationError::State)?;
@@ -136,10 +140,10 @@ pub(super) fn migrate_state(
     migrate_state_after_initial_inventory(repository, context, || {})
 }
 
-/// Converts each remaining schema-3 profile only after the state barrier is absent or current.
+/// Converts each remaining schema-4 profile only after the state barrier is absent or current.
 ///
 /// The state repository's ordinary current-schema reader is intentionally used here: a
-/// schema-3 state must fail before any profile temporary is created or profile is replaced.
+/// schema-4 state must fail before any profile temporary is created or profile is replaced.
 pub(super) fn migrate_profiles(
     repository: &StateRepository,
     context: &ResolverContext,
@@ -966,7 +970,7 @@ fn replace_root_schema_version(source: &str) -> Result<String, MigrationError> {
                 .or_else(|| flow_root_schema_version_value_start(line))
             {
                 let value = &line[value_start..];
-                if let Some(suffix) = value.strip_prefix('3') {
+                if let Some(suffix) = value.strip_prefix('4') {
                     if suffix.is_empty()
                         || suffix.chars().next().is_some_and(char::is_whitespace)
                         || suffix.starts_with('#')
@@ -974,7 +978,7 @@ fn replace_root_schema_version(source: &str) -> Result<String, MigrationError> {
                         || suffix.starts_with('}')
                     {
                         result.push_str(&line[..value_start]);
-                        result.push('4');
+                        result.push('5');
                         result.push_str(suffix);
                         replaced = true;
                         continue;
@@ -1301,23 +1305,23 @@ mod tests {
 
     use crate::domain::paths::ResolvedPath;
 
-    const PROFILE: &str = "schema_version: 3\nid: base\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source: { store: dotfiles, path: git/config }\n      target: /home/example/.gitconfig\n      operation: link\n";
+    const PROFILE: &str = "schema_version: 4\nid: base\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source: { store: dotfiles, path: git/config }\n      target: /home/example/.gitconfig\n      operation: link\n";
     #[cfg(unix)]
-    const STATE: &str = r#"{"schema_version":3,"resources":{"base/git-config":{"definition_hash":"sha256:1250e6bf4abdb529664c1444709aeae2ce814e8b97c3984e32d46d9c971b3a5e","effect":{"kind":"file_link","source_path":"/home/example/dotfiles/git/config","target_path":"/home/example/.gitconfig","link_target":"/home/example/dotfiles/git/config"}}},"active_operation":null}"#;
+    const STATE: &str = r#"{"schema_version":4,"resources":{"base/git-config":{"definition_hash":"sha256:1250e6bf4abdb529664c1444709aeae2ce814e8b97c3984e32d46d9c971b3a5e","effect":{"kind":"file_link","source_path":"/home/example/dotfiles/git/config","target_path":"/home/example/.gitconfig","link_target":"/home/example/dotfiles/git/config"}}},"active_operation":null}"#;
     #[cfg(windows)]
-    const STATE: &str = r#"{"schema_version":3,"resources":{"base/git-config":{"definition_hash":"sha256:553a59aab51ec70ffcec1e6c4dd3ebb4059bb3a257cd2cc3ccd5ef5908849348","effect":{"kind":"file_link","source_path":"C:\\loadout\\dotfiles\\git\\config","target_path":"C:\\loadout\\.gitconfig","link_target":"C:\\loadout\\dotfiles\\git\\config"}}},"active_operation":null}"#;
+    const STATE: &str = r#"{"schema_version":4,"resources":{"base/git-config":{"definition_hash":"sha256:553a59aab51ec70ffcec1e6c4dd3ebb4059bb3a257cd2cc3ccd5ef5908849348","effect":{"kind":"file_link","source_path":"C:\\loadout\\dotfiles\\git\\config","target_path":"C:\\loadout\\.gitconfig","link_target":"C:\\loadout\\dotfiles\\git\\config"}}},"active_operation":null}"#;
 
     #[test]
     fn profile_conversion_only_admits_complete_schema_three_documents() {
         let converted = convert_profile(PROFILE).unwrap();
-        assert!(converted.contains("schema_version: 4"));
+        assert!(converted.contains("schema_version: 5"));
         assert_eq!(
             converted,
-            PROFILE.replacen("schema_version: 3", "schema_version: 4", 1)
+            PROFILE.replacen("schema_version: 4", "schema_version: 5", 1)
         );
         assert!(ProfileDeclaration::parse(&converted).is_ok());
         assert!(
-            convert_profile(&PROFILE.replace("schema_version: 3", "schema_version: 2")).is_err()
+            convert_profile(&PROFILE.replace("schema_version: 4", "schema_version: 2")).is_err()
         );
         assert!(convert_profile(&PROFILE.replace("id: base", "parameters: {}\nid: base")).is_err());
     }
@@ -1347,39 +1351,39 @@ mod tests {
     #[test]
     fn profile_conversion_preserves_comments_and_mapping_order() {
         let source =
-            "# kept\nid: base\nresources: {}\nschema_version: 3 # only this value changes\n";
+            "# kept\nid: base\nresources: {}\nschema_version: 4 # only this value changes\n";
 
         assert_eq!(
             convert_profile(source).unwrap(),
-            "# kept\nid: base\nresources: {}\nschema_version: 4 # only this value changes\n"
+            "# kept\nid: base\nresources: {}\nschema_version: 5 # only this value changes\n"
         );
     }
 
     #[test]
     fn profile_conversion_preserves_quoted_key_and_pre_colon_whitespace() {
         for source in [
-            PROFILE.replacen("schema_version: 3", "\"schema_version\": 3", 1),
-            PROFILE.replacen("schema_version: 3", "schema_version \t: 3", 1),
-            PROFILE.replacen("schema_version: 3", "'schema_version' : 3 # kept", 1),
+            PROFILE.replacen("schema_version: 4", "\"schema_version\": 4", 1),
+            PROFILE.replacen("schema_version: 4", "schema_version \t: 4", 1),
+            PROFILE.replacen("schema_version: 4", "'schema_version' : 4 # kept", 1),
         ] {
             let converted = convert_profile(&source).unwrap();
-            assert_eq!(converted.replace('4', "3"), source);
+            assert_eq!(converted.replace('5', "4"), source);
             assert!(ProfileDeclaration::parse(&converted).is_ok());
         }
     }
 
     #[test]
     fn profile_conversion_supports_a_valid_flow_style_root_mapping() {
-        let source = "{ schema_version: 3, id: base, resources: {} }\n";
+        let source = "{ schema_version: 4, id: base, resources: {} }\n";
         assert_eq!(
             convert_profile(source).unwrap(),
-            "{ schema_version: 4, id: base, resources: {} }\n"
+            "{ schema_version: 5, id: base, resources: {} }\n"
         );
     }
 
     #[test]
     fn schema_four_resume_requires_observable_legacy_equivalence() {
-        let resumable = PROFILE.replace("schema_version: 3", "schema_version: 4");
+        let resumable = PROFILE.replace("schema_version: 4", "schema_version: 5");
         assert!(validate_resumable_schema_four_profile_source(&resumable).is_ok());
         assert!(
             validate_resumable_schema_four_profile_source(
@@ -1442,8 +1446,8 @@ mod tests {
 
     #[test]
     fn state_migration_facade_owns_inventory_rejection_without_writing_state() {
-        let invalid = "schema_version: 3\nid: base\nresources: []\n";
-        let mixed = PROFILE.replace("schema_version: 3", "schema_version: 4");
+        let invalid = "schema_version: 4\nid: base\nresources: []\n";
+        let mixed = PROFILE.replace("schema_version: 4", "schema_version: 5");
         for (label, profile) in [("invalid", invalid), ("mixed", mixed.as_str())] {
             let fixture_root = migration_fixture(label, profile, true);
             let before = fs::read(fixture_root.root.join("state/state.json")).unwrap();
@@ -1471,12 +1475,12 @@ mod tests {
         let fixture = migration_fixture("cycle", PROFILE, true);
         fs::write(
             fixture.root.join("profiles/base.yaml"),
-            "schema_version: 3\nid: base\nincludes: [{ id: extra }]\nresources: {}\n",
+            "schema_version: 4\nid: base\nincludes: [{ id: extra }]\nresources: {}\n",
         )
         .unwrap();
         fs::write(
             fixture.root.join("profiles/extra.yaml"),
-            "schema_version: 3\nid: extra\nincludes: [{ id: base }]\nresources: {}\n",
+            "schema_version: 4\nid: extra\nincludes: [{ id: base }]\nresources: {}\n",
         )
         .unwrap();
         let state_path = fixture.root.join("state/state.json");
@@ -1591,7 +1595,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(fixture.root.join("profiles/base.yaml")).unwrap(),
-            PROFILE.replacen("schema_version: 3", "schema_version: 4", 1)
+            PROFILE.replacen("schema_version: 4", "schema_version: 5", 1)
         );
         fixture.remove();
     }
@@ -1650,7 +1654,7 @@ mod tests {
         migrate_profiles(&fixture.repository, &fixture.context).unwrap();
         assert_eq!(
             fs::read_to_string(&profile_path).unwrap(),
-            before.replacen("schema_version: 3", "schema_version: 4", 1)
+            before.replacen("schema_version: 4", "schema_version: 5", 1)
         );
         assert!(!state_path.exists());
         fixture.remove();
@@ -1671,7 +1675,7 @@ mod tests {
         let before = fs::read(&base_path).unwrap();
         fs::write(
             fixture.root.join("profiles/invalid.yaml"),
-            "schema_version: 3\nid: invalid\nresources: []\n",
+            "schema_version: 4\nid: invalid\nresources: []\n",
         )
         .unwrap();
 
@@ -1688,13 +1692,13 @@ mod tests {
         let before = fs::read(&base_path).unwrap();
         fs::write(
             &base_path,
-            "schema_version: 3\nid: base\nincludes: [{ id: extra }]\nresources: {}\n",
+            "schema_version: 4\nid: base\nincludes: [{ id: extra }]\nresources: {}\n",
         )
         .unwrap();
         let expected = fs::read(&base_path).unwrap();
         fs::write(
             fixture.root.join("profiles/extra.yaml"),
-            "schema_version: 3\nid: extra\nincludes: [{ id: base }]\nresources: {}\n",
+            "schema_version: 4\nid: extra\nincludes: [{ id: base }]\nresources: {}\n",
         )
         .unwrap();
 

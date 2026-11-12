@@ -15,7 +15,7 @@ const SHA256_PREFIX: &str = "sha256:";
 const RESOLVED_FILE_LINK_FORMAT: &str = "loadout.resolved-file-link.v1";
 const RESOLVED_FILE_COPY_FORMAT: &str = "loadout.resolved-file-copy.v1";
 const RESOLVED_DIRECTORY_LINK_FORMAT: &str = "loadout.resolved-directory-link.v1";
-const RESOLVED_DESIRED_FORMAT: &str = "loadout.resolved-desired.v4";
+const RESOLVED_DESIRED_FORMAT: &str = "loadout.resolved-desired.v5";
 
 /// A SHA-256 hash of one canonical resolved file-link definition.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -305,7 +305,9 @@ impl std::error::Error for HashParseError {}
 mod tests {
     use super::*;
     #[cfg(unix)]
-    use crate::domain::desired::ResolvedDesired;
+    use crate::domain::desired::{
+        ResolvedDesired, ResolvedOrchestration, ResolvedResourceOrchestration, ResolvedStage,
+    };
     #[cfg(windows)]
     use crate::domain::ids::FullyQualifiedResourceId;
     #[cfg(unix)]
@@ -371,7 +373,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             desired_hash(&desired).unwrap().as_str(),
-            "sha256:0b97e6f75331bbedfe0e6f0ecadb3bb33320a3a8f6284b2ecbadcff9b26e36c1"
+            "sha256:f6d27d6bd966506ca3ec084f594325fc10e28c4ce96ee1b0a016b7960ca779eb"
         );
     }
 
@@ -436,7 +438,7 @@ mod tests {
 
         assert_eq!(
             desired_hash(&desired).unwrap().as_str(),
-            "sha256:9dce85d5ea1484b13b3c2b0df841c213a3af939ed86448bde4bf5416faeba562"
+            "sha256:7002f3e20641065d944bb96653706783473e46e3cc6cbc8e7fe371437f7327c4"
         );
     }
 
@@ -491,6 +493,30 @@ mod tests {
         assert_eq!(
             desired_hash(&ordered).unwrap(),
             desired_hash(&reversed).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desired_hash_excludes_resolved_orchestration_facts() {
+        let resource = file_link("base/git-config");
+        let plain =
+            ResolvedDesired::new(ProfileId::parse("workstation").unwrap(), [resource.clone()])
+                .unwrap();
+        let ordered = ResolvedDesired::new(ProfileId::parse("workstation").unwrap(), [resource])
+            .unwrap()
+            .with_orchestration(ResolvedOrchestration::new(
+                vec![ResolvedStage::new("base/prepare".to_owned(), Vec::new())],
+                vec![ResolvedResourceOrchestration::new(
+                    FullyQualifiedResourceId::parse("base/git-config").unwrap(),
+                    Some("base/prepare".to_owned()),
+                    Vec::new(),
+                )],
+            ));
+
+        assert_eq!(
+            desired_hash(&plain).unwrap(),
+            desired_hash(&ordered).unwrap()
         );
     }
 

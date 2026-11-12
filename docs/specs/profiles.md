@@ -2,7 +2,7 @@
 
 ## Scope
 
-This specification defines v0.7.0 profile files, typed parameters, named-instance composition, resource declarations, and static validation.
+This specification defines v0.8.0 profile files, typed parameters, named-instance composition, resource declarations, orchestration declarations, and static validation.
 The `file` resource supports file `link`, `copy`, and directory `link`; see [File Links](file-link.md), [File Copies](file-copy.md), and [Directory Links](directory-link.md) for runtime behavior.
 
 ## Identifiers
@@ -29,7 +29,7 @@ Migration preserves the default instance name equal to the profile ID, so an unp
 One profile file defines one profile.
 
 ```yaml
-schema_version: 4
+schema_version: 5
 id: workstation
 includes:
   - id: base
@@ -53,9 +53,9 @@ Unknown fields are errors at every object level.
 The resource value MUST contain `type` and `properties`.
 The only current type is `file`.
 Its accepted `kind` and `operation` pairs are defined in [Current Profile Schema](#current-profile-schema) and its effect-specific properties are defined by [File Links](file-link.md), [File Copies](file-copy.md), and [Directory Links](directory-link.md).
-Every normal profile reader rejects a schema version other than `4` before it resolves a source, observes a target, creates a plan, recovers an operation, or writes state.
+Every normal profile reader rejects a schema version other than `5` before it resolves a source, observes a target, creates a plan, recovers an operation, or writes state.
 
-## Schema-4 Parameters and References
+## Schema-5 Parameters and References
 
 The current profile schema permits an optional `parameters` mapping from a parameter name to exactly one closed type: `string`, `integer`, `boolean`, or `list`.
 Omission means that the profile declares no parameters.
@@ -150,8 +150,8 @@ The lifecycle specification determines whether that change creates, replaces, re
 
 ## Current Profile Schema
 
-This section supersedes the v0.6.0 profile schema for every normal lifecycle, validation, dry-run, and inspection command that reads a profile.
-A current profile has `schema_version: 4`; schema version `3`, every earlier version, and every unknown future version are invalid.
+This section supersedes the v0.7.0 profile schema for every normal lifecycle, validation, dry-run, and inspection command that reads a profile.
+A current profile has `schema_version: 5`; schema version `4`, every earlier version, and every unknown future version are invalid.
 Loadout rejects that version mismatch before it resolves a store source, normalizes a target, observes a target, creates a plan, recovers an operation, or writes state.
 
 The profile object, include objects, resource envelope, and resource `properties` objects reject unknown fields at every level.
@@ -167,6 +167,16 @@ The accepted `(properties.kind, properties.operation)` pairs are exactly:
 `directory` with `copy`, and every other pair, are invalid.
 The `directory_link` declaration and resolution rules are defined by [Directory Links](directory-link.md).
 
-Normal commands do not decode a version-3 profile for conversion, reinterpret it as version 4, or provide an implicit migration path.
-The explicit schema-3-to-4 authoring operation is defined by [Migration](migration.md).
+Normal commands do not decode a version-4 profile for conversion, reinterpret it as version 5, or provide an implicit migration path.
+The explicit schema-4-to-5 authoring operation is defined by [Migration](migration.md).
 An invalid version is a validation diagnostic, not an input from which a target or existing effect may be inspected or adopted.
+
+## Schema-5 Orchestration
+
+The top-level profile object has optional `stages` and existing `resources` members. `stages` is a mapping from a local stage name to an object with exactly one required member, `after`. `after` is an array of stage-reference strings and may be empty for an explicit root stage. A resource envelope has optional `stage`, a scalar local-stage name, and optional `depends_on`, an array of resource-reference strings. Omitting `depends_on` and declaring `depends_on: []` are absence-equivalent: both produce no prerequisite facts, no graph edges, and no ordering effect. Unknown fields, duplicate references, duplicate resource IDs, self references, a resource naming an undeclared local stage, or a malformed reference are invalid.
+
+A local resource or stage reference is its local identifier and MUST name a member declared in the same resolved profile instance. A qualified reference contains `/` and is an exact fully qualified resolved ID: a slash-joined nonempty sequence of instance aliases followed by the local resource or stage key. A qualified reference is never reinterpreted as a local identifier. Local resource IDs and local stage names use the profile identifier grammar and MUST NOT contain `/`.
+
+Resolution canonicalizes every valid reference to a fully qualified resource or stage ID before planner input. Profile IDs, stack names, includes, generic groups, YAML names, and include positions are never dependency targets. Reused and parameterized instances therefore have distinct stage namespaces and cannot capture sibling local names. Resolution rejects a missing, ambiguous, invalid, or self reference before target observation or mutation. Orchestration facts are not effect or ownership hash inputs.
+
+`depends_on` constrains a legal current-Desired successor action behind its predecessor's planned action. If the predecessor's required post-condition already holds, it satisfies the prerequisite without a synthetic `NOOP` action. A stage relation constrains applicable legal actions in its later stage behind applicable legal actions in its earlier stage through the compact barrier representation in [Lifecycle](lifecycle.md). Unstaged resources are members of no barrier. Declaration, mapping, include, discovery, and lexical resource-name order are not execution-order controls.

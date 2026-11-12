@@ -8,15 +8,15 @@ It converges a machine toward the desired resource set produced by one composed 
 Loadout owns profile composition, resource lifecycle planning, local state, conflict detection, and the safe mutation of supported resources.
 It does not reimplement package managers, runtime version resolution, secret management, or the side-effect guarantees of arbitrary commands.
 
-## v0.7.0 Core
+## v0.8.0 Core
 
-v0.7.0 supports two closed effects for one regular file from a local store: a link or a content-owned copy at a target path, plus a directory symbolic link for one local-store real directory.
+v0.8.0 supports two closed effects for one regular file from a local store: a link or a content-owned copy at a target path, plus a directory symbolic link for one local-store real directory.
 It retains read-only inspection of profiles, resources, and selected Desired/Known/Actual relations.
 Profiles may declare closed typed parameters and compose explicitly named instances; resolution substitutes those values before it produces Desired state for the unchanged lifecycle.
-Task resources, remote stores, and directory copying are not part of the v0.7.0 executable surface.
+Profiles may additionally declare stable stages and direct prerequisites between canonical resolved resource instances. Task resources, remote stores, directory copying, parallel execution, numeric priorities, generic before/after relations, and declaration or include ordering controls are not part of the v0.8.0 executable surface.
 
 The first implementation must prefer a narrow, complete file-link lifecycle over generic extension mechanisms.
-In particular, v0.7.0 does not expose an external resource-plugin API.
+In particular, v0.8.0 does not expose an external resource-plugin API.
 
 ## System Model
 
@@ -67,12 +67,12 @@ It is not an input to the planner.
 
 Resolved Desired is the canonical desired resource set for a selected root profile.
 It has resolved instances, stable fully qualified resource IDs, bound stores, and normalized paths.
-It contains no YAML syntax, store ID, home-directory shorthand, relative path, or profile-include traversal for downstream layers to interpret.
+It contains no YAML syntax, store ID, home-directory shorthand, relative path, profile-include traversal, or unresolved orchestration reference for downstream layers to interpret. Its orchestration facts use only canonical fully qualified resource and stage IDs.
 
 ### Known
 
 Known state is the durable record of resource effects that Loadout has successfully verified and committed.
-It records enough applied facts to prove ownership before a later destructive operation.
+It records enough applied facts to prove ownership before a later destructive operation and the Applied Lifecycle Topology actually committed by verified actions.
 Known state is evidence of a past operation, not proof that the current filesystem still has the expected entry.
 
 ### Actual
@@ -84,13 +84,13 @@ Actual state is not persisted as an assertion of ownership.
 ### Plan
 
 A Plan is an immutable, deterministic decision derived from Resolved Desired, Known, and Actual state.
-It contains executable resource actions, their reasons, and blocking diagnostics.
+It contains executable resource actions, compact barrier units, direct action edges, a fixed deterministic schedule, planner-selected topology authority/deltas, their reasons, and blocking diagnostics.
 Conflicts are diagnostics that make a plan non-executable; they are not executable actions.
 
 ### Resource Execution Plan
 
 A Resource Execution Plan is the executor-ready payload for one planned action.
-It identifies the resolved target, the expected precondition, the required post-condition, and the state update that becomes eligible only after successful verification.
+It identifies the resolved target, the expected precondition, the required post-condition, and the state update and topology delta that become eligible only after successful verification.
 
 ## Lifecycle Flow
 
@@ -114,11 +114,7 @@ If a recheck fails, the executor aborts the action; it does not reinterpret the 
 
 ### Determinism
 
-Apply is sequential in v0.7.0.
-Execution order must not depend on a YAML mapping iteration order or an implementation collection order.
-The lifecycle specification will define the stable phase order and the fully qualified resource-ID ordering within each phase.
-v0.7.0 does not expose resource IDs or declaration position as an ordering control.
-A future dependency model may constrain action order, but independent actions must retain a canonical deterministic tie-breaker.
+Apply is sequential in v0.8.0. The planner first classifies lifecycle actions, then validates one combined DAG of typed legal lifecycle relations, canonical direct prerequisites, compact stage barriers, and permitted stale topology relations. Execution order is its recorded topological schedule. Independent ready actions use fully qualified resource ID only as a tie-breaker. YAML mapping order, include order, declaration position, source order, and lexical renaming are not ordering controls.
 
 ## Responsibilities
 
@@ -131,7 +127,7 @@ A future dependency model may constrain action order, but independent actions mu
 | Planner | Classify Resolved Desired, Known, and Actual state into a deterministic Plan. |
 | Executor | Perform planned actions, recheck immediate mutation safety, and verify post-conditions. |
 | State repository | Own the state lock, operation records, durable Known state, and atomic commits. |
-| Migration facade | Select an explicitly registered private version-pair route and own schema-3 inventory discovery, conversion eligibility, state-first interlocks, conversion, and publication decisions; expose only request, presentation, and outcome data to the command adapter. |
+| Migration facade | Select an explicitly registered private version-pair route and own schema-4 inventory discovery, conversion eligibility, state-first interlocks, conversion, and publication decisions; expose only request, presentation, and outcome data to the command adapter. |
 | Filesystem implementation | Perform platform-specific filesystem observation and mutation behind the executor's contract. |
 | Inspection query | Assemble typed read-only reports from declarations, Resolved Desired, Known state, and Actual observations without making a lifecycle decision. |
 

@@ -1,18 +1,17 @@
 ---
 name: prepare-loadout-release
-description: Prepare or validate a Loadout v0.4 release candidate and matching vX.Y.Z tag. Use for release metadata, candidate readiness, tag readiness, or release-workflow follow-up; not for ordinary feature work.
+description: Prepare or validate a Loadout release candidate and matching vX.Y.Z tag. Use for release metadata, tag readiness, or release workflow follow-up.
 ---
 
 # Prepare Loadout Release
 
-Prepare a focused, reviewable v0.4 release candidate. Do not infer a target version or perform a merge, tag, push, publication, workflow dispatch, or other external action unless the user explicitly requests it.
+Prepare a focused, reviewable release candidate for the requested version. Do not infer a target version or perform a merge, tag, push, publication, or workflow dispatch without an explicit request for that operation.
 
 ## Establish the release stage
 
-1. Determine whether the request is candidate preparation, local candidate validation, post-merge tag readiness, or post-tag workflow follow-up.
-2. Read `CONTRIBUTING.md`, the root `Cargo.toml`, the top of `CHANGELOG.md`, and `.github/workflows/release.yml` before changing release metadata.
-3. Require an exact stable tag in `vX.Y.Z` form. The release branch convention is `release/vX.Y.Z`.
-4. Inspect the worktree and preserve unrelated changes. Keep implementation changes out of a release-only pull request unless they are separately reviewed in scope.
+1. Identify the requested release stage and exact `vX.Y.Z` version.
+2. Read `CONTRIBUTING.md`, `Cargo.toml`, `CHANGELOG.md`, and `.github/workflows/release.yml`; inspect the worktree before changing metadata.
+3. Keep the candidate focused on release metadata and supporting documentation.
 
 ## Prepare and review
 
@@ -20,11 +19,11 @@ Read [the release contract](references/release-contract.md) before deciding whic
 
 Use the adjacent metadata checker for the intended tag. Read [release validation](references/release-validation.md) before running it or interpreting its result.
 
-Use `review-loadout-v0-2` when the candidate changes v0.4 behavior, platform claims, or release automation. A metadata-only candidate is reviewed against the release contract and its complete diff.
+Review the complete diff against the release contract. For behavior or platform changes, also use `review-loadout-v0-2`.
 
 ## Complete only with explicit authority
 
-After the release pull request is reviewed and required checks pass, merging, tagging, pushing, and dispatching a workflow each require explicit user authorization. Do not publish a crate manually: release automation distributes archives only.
+Merging, tagging, pushing, and dispatching a workflow each require an explicit request. The release workflow distributes archives only.
 
 After an authorized tag push, inspect the Release workflow before reporting the release as available.
 

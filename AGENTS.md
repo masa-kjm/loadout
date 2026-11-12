@@ -1,123 +1,28 @@
 # Loadout Agent Instructions
 
-Follow these instructions for every change in this repository.
+Follow these instructions for changes in this repository.
 
-## Project Status
+## Authority and scope
 
-v0.5.0 is released. v0.6.0 is the current release candidate.
+Read [documentation authority](docs/README.md), then the documents that own the changed behavior: [architecture](docs/architecture/README.md) for responsibilities and safety boundaries, [specifications](docs/specs/README.md) for observable contracts, and [testing strategy](docs/development/testing.md) for required evidence.
+Architecture and specifications are authoritative; `docs/future/`, `local/`, and other drafts are not.
+Do not derive current behavior from a historical schema or release section when a current section supersedes it.
+If the authoritative documents conflict or leave a safety-, ownership-, persistence-, platform-, or schema-sensitive choice unclear, report the ambiguity before deciding it.
 
-## Sources of Truth
+## Changes and validation
 
-Before changing v0.6.0 behavior, read the documents that own it:
+- Keep parsing, resolution, observation, planning, execution, and state persistence within their [architecture boundaries](docs/architecture/boundaries.md).
+- Keep public CLI, schema, state, and diagnostic contracts narrow; change them only through their owning specification.
+- For target mutations, preserve the ownership, immediate recheck, post-condition, operation-record, and recovery contracts in the relevant [resource](docs/specs/README.md), [lifecycle](docs/specs/lifecycle.md), and [state](docs/specs/state-and-recovery.md) specifications. Do not infer a stronger external-filesystem concurrency guarantee than [specified](docs/specs/file-link.md#external-filesystem-concurrency).
+- Keep observable behavior, its owning specification, and test evidence aligned. Use the narrowest suitable test layer and cover success, zero-mutation rejection, ownership protection, post-mutation failure, and recovery for each new mutation path where applicable.
+- Use disposable directories for mutation tests; never use a real home, XDG/AppData, source store, or repository state directory.
+- Write code, comments, user-facing documentation, commit messages, and pull-request text in English. Keep each sentence in a comment or doc comment on one line.
+- Run relevant formatter, linter, and tests before handoff; report checks that could not run and why.
 
-- [`docs/README.md`](docs/README.md) explains document authority.
-- [`docs/architecture/`](docs/architecture/README.md) owns responsibility and safety boundaries.
-- [`docs/specs/`](docs/specs/README.md) owns observable behavior, schemas, state transitions, CLI contracts, and failure aftermath.
-- [`docs/development/testing.md`](docs/development/testing.md) owns required test evidence.
+For a staged pull-request review, assess a named intermediate commit against its declared scope and the final pull-request contract. It must fail closed and preserve applicable safety invariants; assess the aggregate worktree against the full contract at final review.
 
-Architecture and specifications are authoritative.
-`docs/future/` is non-binding and may identify constraints for later work.
-`local/` and any other draft material are exploratory only and must never override published documentation.
+## Project workflow
 
-If requirements conflict or leave a safety-, ownership-, persistence-, platform-, or schema-sensitive choice unclear, report the ambiguity before making that choice.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before work involving issues, branches, commits, pull requests, tags, releases, or other GitHub state. Do not mutate GitHub state, create or change Git branches or tags, push, publish, delete user data, or make other external or irreversible changes without an explicit request for that operation.
 
-## Staged Pull-Request Reviews
-
-An explicitly ordered implementation plan may establish the final public contract before every implementation commit in the same pull request has landed.
-When reviewing a named intermediate commit in that plan, assess it against both its declared commit scope and the final pull-request contract.
-Do not require an earlier commit to implement work explicitly assigned to a later commit in the same pull request.
-An intermediate commit must fail closed, must not silently report unsupported behavior as success, and must preserve every applicable safety invariant.
-The final pull-request review must verify the aggregate worktree against the full published contract; a later planned commit never excuses a remaining mismatch at that point.
-
-## Architecture
-
-Keep the lifecycle boundaries explicit:
-
-```text
-Declared Configuration
-  -> Resolve and Validate
-  -> Resolved Desired + Known + Actual
-  -> Planner
-  -> Plan
-  -> Executor
-  -> Verify and Commit State
-```
-
-- The planner is pure: `Resolved Desired + Known + Actual -> Plan`.
-- The resolver and validator do not inspect managed targets, mutate the filesystem, or write state.
-- The planner does not perform I/O, acquire locks, mutate state, or render terminal output.
-- The executor performs only actions already selected by the Plan. It may reject an action after an immediate safety recheck, but it must not replan or choose a different action.
-- The state repository exclusively owns locks, operation records, Known state, and atomic commits.
-- Resource implementations must not write state, format CLI output, or accept unresolved YAML, store IDs, home shorthand, or relative paths.
-
-## Design Principles
-
-### Keep public contracts narrow
-
-Public contracts are expensive to change.
-Treat CLI syntax and behavior, configuration and schema fields, serialized state formats, diagnostics intended for automation, and other user-observable behavior as compatibility boundaries.
-Do not expose new concepts publicly unless necessary.
-Prefer changing internal implementations over expanding or changing public contracts.
-
-### Preserve architectural boundaries
-
-Define domain models and interfaces so that each layer has a clear responsibility and cannot rely on implementation details from other layers.
-Prefer explicit types and narrow interfaces over shared mutable state or cross-layer shortcuts.
-
-- Keep parsing and loading, resolution, validation, inspection, planning, execution, and persistence separate.
-- The planner operates only on resolved domain models. It must not access the filesystem or parse configuration.
-- The executor executes an already-decided Plan. It must not reimplement planning decisions.
-- Keep filesystem- and platform-specific behavior behind the filesystem and resource-execution boundary.
-- Do not put domain decisions in the CLI or rendering layer.
-- Do not leak persistence representations into domain logic unless a domain boundary requires them.
-
-### Make invalid architecture difficult to express
-
-Prefer types, module visibility, constructors, and interfaces that enforce invariants structurally rather than relying on comments or caller discipline.
-Keep APIs minimal; do not make a type or function public unless another boundary requires it.
-
-### Optimize for changeability
-
-Before introducing an abstraction, identify the boundary or expected axis of change it protects.
-Avoid speculative abstractions, but do not couple independent responsibilities merely because the current implementation is small.
-
-## Safety Invariants
-
-Preserve every applicable invariant:
-
-- Reject observed unmanaged or unexpected entries before mutation; never plan adoption or takeover. Apply the [external filesystem concurrency contract](docs/specs/file-link.md#external-filesystem-concurrency): substitutions after the last recheck can be deleted or replaced and may be indistinguishable from successful removal. Do not claim atomic entry identity or uninterrupted containment.
-- Remove or replace a link or copy only when both Known state and current Actual observation prove the expected owned effect.
-- A copy owns its recorded byte-content fingerprint, not matching unmanaged content or unsynchronized metadata.
-- A blocked Plan, validation failure or failed preflight permits no new planned target mutation; dry run performs no mutation at all. A failed execution recheck prevents the next step, not earlier effects. Classify those effects and distinguish permitted prior recovery from new-plan execution.
-- Recheck containment, parent safety, target kind, source safety, and action-specific ownership immediately before each filesystem mutation step, including target and temporary checks after temporary creation and before rename. Verify required declared-path association; a retained parent handle alone does not prove it.
-- Write `running` before a mutation. Update Known state only after the exact post-condition has been verified and commit it atomically with `succeeded`.
-- For staged copy cleanup or old-effect removal, and for sequential copy/effect-handoff recovery, follow the action record's durable `temporary_staged` and `publication_attempted` facts in [State and Recovery](docs/specs/state-and-recovery.md); do not reconstruct them from a pathname or an operating-system return value.
-- After an attempted mutation, classify the result from recorded preconditions and post-conditions, not from an operating-system return value alone.
-- Treat an unprovable result as `uncertain`; do not retry the old action automatically.
-- Apply always creates a fresh plan after recovery. It never resumes or reinterprets an old plan.
-- Reject v0.4 and unknown profile/state schemas before target inspection, recovery, planning, or state rewrite. Do not add a migration reader or command.
-- Preserve deterministic v0.6.0 action phases and fully qualified resource-ID tie-breaking. YAML mapping order and include order are not execution-order controls.
-
-## Engineering and Tests
-
-- Write code, comments, user-facing documentation, commit messages, and pull-request text in English.
-- In comments and doc comments you write or touch, do not manually wrap a single sentence across multiple lines; keep one sentence per line instead.
-- Keep user-visible behavior, its owning specification, and its tests aligned in the same change.
-- Add evidence at the narrowest suitable layer: pure domain, filesystem contract, state durability, executor integration, CLI acceptance, or platform conformance.
-- Test every new mutation path for success, zero-mutation rejection, ownership protection, post-mutation failure, and recovery where applicable.
-- Use disposable test directories only. Never use a real home directory, XDG/AppData directory, source store, or repository state directory in a mutation test.
-- Once the v0.6.0 Rust package exists, run the relevant formatter, linter, and tests before handoff. Report checks that could not run and why.
-
-## Project Skills
-
-Source skills live in `.claude/skills/` and are synchronized for Codex discovery by `scripts/sync-codex-skills.sh`.
-
-- `review-loadout-v0-2`: reviews v0.5 contracts, architecture boundaries, ownership and mutation safety, state consistency, compatibility, and required test evidence.
-- `propose-loadout-change`: drafts evidence-based issue, commit, and pull-request text without mutating Git or GitHub state.
-- `test-design-loadout-v0-2`: designs state-transition, crash-recovery, path-safety, durability, and Unix/Windows conformance evidence from v0.5 contracts.
-- `maintain-loadout-context`: maintains v0.5 documentation, project-skill sources, and generated skill discovery copies without changing authority boundaries.
-
-## Repository and External State
-
-Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before work involving issues, branches, commits, pull requests, tags, releases, or other GitHub state.
-Do not push, publish, create or modify GitHub releases, alter tags, delete user data, or make other external or irreversible changes unless the user explicitly requests the exact operation.
+Project skill sources live in `.claude/skills/`; `scripts/sync-codex-skills.sh` generates the Codex discovery copies in `.agents/skills/`. Keep skill guidance derived from the authoritative documents.

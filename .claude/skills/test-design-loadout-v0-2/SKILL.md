@@ -1,18 +1,17 @@
 ---
 name: test-design-loadout-v0-2
-description: Design Loadout v0.5 test evidence from authoritative contracts. Use when planning tests for lifecycle behavior, filesystem safety, state durability, recovery, CLI acceptance, or Unix and Windows conformance.
+description: Design Loadout test evidence from current contracts. Use for lifecycle, filesystem, state, recovery, CLI, or platform test planning.
 ---
 
-# Design Loadout v0.5 Tests
+# Design Loadout Tests
 
 Design evidence from contracts, not from the current implementation shape. Do not change code or tests unless the task explicitly requests implementation.
 
 ## Establish the contract
 
-1. Read `docs/README.md`, then the architecture, specification, and testing documents that own the requested behavior. Architecture and specifications are authoritative; `future/` and draft material do not define v0.5 behavior.
-2. Identify the observable outcome, owner, preconditions, post-condition, zero-mutation requirements, durable-state effect, failure aftermath, recovery behavior, and platform assumptions that apply.
-3. Select the narrowest test layer that proves the contract. Add executor integration or CLI acceptance evidence when behavior is observable through the lifecycle or command interface.
-4. Treat legacy tests and fixtures as historical material. Do not derive v0.4 expectations from them.
+1. Read `docs/README.md`, the owning architecture and specifications, and `docs/development/testing.md`. Use the current contract rather than historical sections or legacy fixtures.
+2. Identify the outcome, preconditions, post-condition, failure aftermath, recovery, and platform facts that apply.
+3. Select the narrowest test layer that proves the contract, adding integration or CLI evidence for observable behavior.
 
 ## Read the relevant design lenses
 
@@ -24,37 +23,4 @@ The references help choose evidence. They do not replace the authoritative docum
 
 ## Produce a test design
 
-For each proposed test group, state:
-
-- the owning contract and the precise behavior being proved;
-- the test layer and, when non-obvious, why a narrower layer cannot prove the required fact;
-- the controlled setup, including only disposable home, store, configuration, and state directories;
-- the stimulus and, when applicable, the semantic failure boundary or platform condition to inject, without prescribing a mock, trait, method, or module seam unless that seam is itself part of the authoritative contract;
-- assertions on Plan, diagnostics category, filesystem observation, Known state, operation record, process status, or output category as applicable; and
-- the relevant negative, zero-mutation, recovery, and platform cases.
-
-Prefer assertions on structured outcomes and filesystem or state snapshots over incidental diagnostic wording.
-Prefer assertions that remain valid across internal refactors that preserve the authoritative contract; do not couple evidence to private modules, traits, helper calls, or orchestration shape unless that structure is itself part of the contract under test.
-Do not expose a new public API merely to make a test compile.
-
-Use this response shape unless the user requests another format:
-
-```markdown
-## Contract coverage
-
-| Contract | Test layer | Evidence |
-| --- | --- | --- |
-| ... | ... | ... |
-
-## Cases
-
-### <behavior group>
-
-- Setup:
-- Stimulus or injected failure:
-- Assertions:
-
-## Boundaries and limitations
-
-- <Platform or testability limitation, if any.>
-```
+For each test group, give its owning contract, layer, disposable setup, stimulus or failure boundary, observable assertions, and applicable negative, zero-mutation, recovery, and platform cases. Prefer structured outcomes and filesystem or state snapshots over incidental wording or private implementation seams. Do not add a public API solely for a test. Report platform or testability limitations.

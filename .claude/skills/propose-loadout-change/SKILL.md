@@ -1,21 +1,18 @@
 ---
 name: propose-loadout-change
-description: Draft evidence-based Loadout v0.5 issue, commit, and pull-request text. Use when proposing an issue or its acceptance criteria, naming a commit or branch, or preparing a pull-request title and body.
+description: Draft evidence-based Loadout issue, commit, branch, or pull-request text. Use when preparing change proposals without mutating Git or GitHub state.
 ---
 
 # Propose Loadout Changes
 
-Propose text only. Do not create issues, commits, branches, pull requests, or other GitHub or Git state.
-Follow `CONTRIBUTING.md` as the source of truth.
-Git is required when the requested text describes an existing change. GitHub lookup is optional and read-only.
+Propose text only; do not change Git or GitHub state. Use `CONTRIBUTING.md` for workflow and the owning architecture or specification for behavior.
 
 ## Gather evidence
 
-1. Read `CONTRIBUTING.md` and the documents that own the proposed behavior. For v0.5 behavior, architecture, and test evidence, start from `docs/README.md`.
-2. For a commit, branch, or pull-request proposal, read the current branch name, supplied title, and diff against the proposed base. Inspect changed paths and relevant diff; do not infer intent from a branch name alone.
-3. For an issue proposal, establish the problem, affected contract, intended user-visible outcome, safety or compatibility implications, and testable non-goals. Do not invent an implementation, test result, or issue number.
-4. When an actual linked issue is supplied, inspect it read-only before claiming that a change addresses it. Invoke `gh` through `bash -lic` as required by `AGENTS.md`. If it is unavailable, unauthenticated, or the issue cannot be read, state that limitation and continue from the available local evidence.
-5. Read the reference that matches the requested output:
+1. Read `CONTRIBUTING.md`, `docs/README.md`, and the documents that own the proposed behavior.
+2. For an existing change, inspect the branch and diff against its proposed base; inspect a supplied linked issue read-only before claiming it is addressed. Use `bash -lic` for `gh` as required by the repository instructions.
+3. For a new issue, establish the problem, affected contract, expected outcome, safety or compatibility implications, and testable non-goals. Do not invent results or identifiers.
+4. Read the reference that matches the requested output:
 
    - For an issue title or body, read [issue.md](references/issue.md).
    - For a commit subject or body, read [commit-message.md](references/commit-message.md).
@@ -24,6 +21,4 @@ Git is required when the requested text describes an existing change. GitHub loo
 
 ## Respond
 
-State the proposed text first, then list the branch, changed behavior, specifications, and inspected issue criteria that support it.
-Only offer an alternative when the type, scope, or pull-request framing is genuinely ambiguous, and explain the distinction in one sentence.
-If the diff contains unrelated changes, identify that as a PR-scoping concern instead of hiding it behind a broad message.
+State the proposed text first, then cite the evidence that supports it. Identify unrelated changes or unavailable evidence explicitly.

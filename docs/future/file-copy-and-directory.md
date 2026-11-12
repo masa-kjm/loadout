@@ -11,9 +11,8 @@ Directory copy and synchronization have a larger destructive surface than curren
 
 ## Directory Questions
 
-Directory resources require an explicit choice among incompatible models:
+Future tree materialization requires an explicit choice among incompatible models:
 
-- a directory symbolic link;
 - a one-way copy that never removes destination entries;
 - a synchronized tree with defined deletion semantics; or
 - a managed manifest of individual files.
@@ -25,14 +24,7 @@ The future design must account for nested symlinks, junctions, reparse points, c
 
 ## Safety Baseline
 
-Any future directory design must preserve the v0.6.0 safety boundaries:
-
-- source and target containment must be proven physically, not lexically;
-- unexpected entries must not be followed, replaced, or removed;
-- a target is removed only with both Known ownership evidence and matching Actual state;
-- dry run, validation, conflicts, and failed preflight make no filesystem mutation;
-- Known state changes only after post-condition verification; and
-- recovery never deletes user-visible artifacts to clean up an uncertain operation.
+Any future directory design must preserve the current [architecture boundaries](../architecture/boundaries.md), [lifecycle safety rules](../specs/lifecycle.md), and [external filesystem concurrency contract](../specs/file-link.md#external-filesystem-concurrency).
 
 ## Remaining Directory Promotion Work
 

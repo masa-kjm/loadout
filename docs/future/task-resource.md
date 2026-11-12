@@ -3,7 +3,7 @@
 ## Status
 
 This is a non-binding design note.
-Task resources are not part of v0.2.0 and this document defines no task schema or command behavior.
+Task resources are outside the current v0.8.0 contract; this note defines no task schema or command behavior.
 
 ## Problem
 

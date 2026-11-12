@@ -3,7 +3,7 @@
 ## Status
 
 This is a non-binding design note.
-Remote stores are not part of v0.2.0 and this document defines no network behavior, authentication mechanism, or store schema.
+Remote stores are outside the current v0.8.0 contract; this note defines no network behavior, authentication mechanism, or store schema.
 
 ## Problem
 
@@ -25,7 +25,7 @@ The lock or state data would need to record that resolved revision and the verif
 ## Link and Cache Lifetime
 
 A file link to a remote-store cache becomes broken when the cache is pruned or replaced.
-For that reason, a future remote-store design should not treat a cache-backed source as a valid target for the v0.2.0 file-link operation.
+The future design must establish cache lifetime and source safety before allowing a link to a cache-backed source.
 One possible later constraint is to allow remote stores only with a copy resource whose applied content is independently recorded.
 
 This is a design direction, not a promise that remote stores will support copy or any other materialization mode.

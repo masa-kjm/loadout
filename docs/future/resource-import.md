@@ -3,7 +3,7 @@
 ## Status
 
 This is a non-binding design note.
-Resource import is not part of v0.2.0 and this document defines no command syntax or mutation protocol.
+Resource import is outside the current v0.8.0 contract; this note defines no command syntax or mutation protocol.
 
 ## Problem
 
@@ -34,7 +34,7 @@ An import must not overwrite an existing store asset, profile file, or configura
 
 ## Separation from Normal Lifecycle
 
-Normal v0.2.0 planning observes local stores as read-only and never adopts unmanaged targets.
+Current planning observes local stores as read-only and never adopts unmanaged targets.
 That remains true after import exists.
 Import must use a distinct authoring workflow and must not add a planner action such as `adopt`, `force_replace`, or `import_target` to the normal convergence lifecycle.
 

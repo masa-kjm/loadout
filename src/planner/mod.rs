@@ -1,5 +1,6 @@
 //! Pure Desired/Known/Actual classification and deterministic plan construction.
 
+pub(crate) mod action_graph;
 pub(crate) mod directory_link;
 pub(crate) mod file_copy;
 pub(crate) mod file_link;
@@ -11,7 +12,7 @@ use crate::domain::diagnostic::Diagnostic;
 use crate::domain::directory_link::ActualDirectoryLinkState;
 use crate::domain::known::KnownState;
 use crate::domain::plan::{Plan, PlannedResourceAction};
-use crate::planner::ordering::sort_resource_actions;
+use crate::planner::action_graph::schedule;
 
 /// One resource planner's private contribution to the aggregate plan.
 pub(super) struct PlanContribution {
@@ -37,10 +38,18 @@ pub(crate) fn plan(desired: &ResolvedDesired, known: &KnownState, actual: &Actua
     let copies = file_copy::contribute(desired, known, actual);
     let mut actions = links.resource_actions;
     actions.extend(copies.resource_actions);
-    sort_resource_actions(&mut actions);
-    Plan::new_with_resource_actions(
+    let graph = schedule(desired, known, &actions);
+    let graph_diagnostics = graph.diagnostics().to_vec();
+    let graph_plan = graph.plan_graph();
+    actions = graph.into_actions(actions);
+    Plan::new_with_graph(
         actions,
-        links.diagnostics.into_iter().chain(copies.diagnostics),
+        links
+            .diagnostics
+            .into_iter()
+            .chain(copies.diagnostics)
+            .chain(graph_diagnostics),
+        graph_plan,
     )
     .expect("independent resource planners preserve globally unique desired targets")
 }
@@ -58,14 +67,19 @@ pub(crate) fn plan_with_directory_links(
     let mut actions = links.resource_actions;
     actions.extend(copies.resource_actions);
     actions.extend(directories.resource_actions);
-    sort_resource_actions(&mut actions);
-    Plan::new_with_resource_actions(
+    let graph = schedule(desired, known, &actions);
+    let graph_diagnostics = graph.diagnostics().to_vec();
+    let graph_plan = graph.plan_graph();
+    actions = graph.into_actions(actions);
+    Plan::new_with_graph(
         actions,
         links
             .diagnostics
             .into_iter()
             .chain(copies.diagnostics)
-            .chain(directories.diagnostics),
+            .chain(directories.diagnostics)
+            .chain(graph_diagnostics),
+        graph_plan,
     )
     .expect("independent resource planners preserve globally unique desired targets")
 }

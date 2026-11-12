@@ -11,8 +11,8 @@ use crate::domain::known::KnownResource;
 use crate::domain::known::{KnownDirectoryLink, KnownFileLink, KnownFileLinkError};
 use crate::domain::paths::ResolvedPath;
 use crate::domain::plan::{
-    ActionKind, PlannedAction, PlannedDirectoryLinkAction, PlannedEffectHandoff,
-    PlannedFileCopyAction, TargetCondition,
+    ActionKind, ActionRole, GraphAction, PlannedAction, PlannedActionGraph,
+    PlannedDirectoryLinkAction, PlannedEffectHandoff, PlannedFileCopyAction, TargetCondition,
 };
 
 /// An opaque operation identifier stored in `active_operation`.
@@ -64,6 +64,17 @@ pub(crate) enum ActionStatus {
     Failed,
     Skipped,
     Uncertain,
+}
+
+/// The durable cause for an action that never started after an operation abort.
+///
+/// This is deliberately recorded rather than recomputed during recovery: the
+/// graph that selected the cause belongs to the operation, not to later
+/// declarations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SkipReason {
+    Dependency { blocking_action_id: ActionId },
+    GlobalAbort { initiating_action_id: ActionId },
 }
 
 impl ActionStatus {
@@ -1749,7 +1760,11 @@ impl RecordedAction {
 
     fn mark_without_known(&mut self, status: ActionStatus) -> Result<(), OperationRecordError> {
         let permitted = match status {
-            ActionStatus::Failed | ActionStatus::Uncertain => {
+            ActionStatus::Failed => matches!(
+                self.status,
+                ActionStatus::Pending | ActionStatus::Running | ActionStatus::Uncertain
+            ),
+            ActionStatus::Uncertain => {
                 matches!(self.status, ActionStatus::Running | ActionStatus::Uncertain)
             }
             ActionStatus::Skipped => self.status == ActionStatus::Pending,
@@ -2009,6 +2024,9 @@ pub(crate) struct OperationRecord {
     id: OperationId,
     desired_hash: DesiredHash,
     actions: BTreeMap<ActionId, RecordedAction>,
+    schedule: Vec<ActionId>,
+    skip_reasons: BTreeMap<ActionId, SkipReason>,
+    graph: Option<PlannedActionGraph>,
 }
 
 impl OperationRecord {
@@ -2108,11 +2126,321 @@ impl OperationRecord {
             }
         }
 
+        let schedule = actions.keys().cloned().collect::<Vec<_>>();
+        let graph = PlannedActionGraph {
+            actions: actions
+                .iter()
+                .map(|(id, action)| GraphAction {
+                    id: id.as_str().to_owned(),
+                    resource_id: action.resource_id().clone(),
+                    role: role_for_kind(action.kind()).expect("recorded actions have a graph role"),
+                    topology_authority: Default::default(),
+                    topology_delta: Default::default(),
+                })
+                .collect(),
+            direct_edges: Vec::new(),
+            barriers: Vec::new(),
+            schedule: schedule.iter().map(|id| id.as_str().to_owned()).collect(),
+            stale_topology_snapshot: Default::default(),
+        };
         Ok(Self {
             id,
             desired_hash,
             actions,
+            schedule,
+            skip_reasons: BTreeMap::new(),
+            graph: Some(graph),
         })
+    }
+
+    /// Reconstructs an operation with the exact already-selected execution schedule.
+    pub(crate) fn from_actions_with_schedule(
+        id: OperationId,
+        desired_hash: DesiredHash,
+        actions: impl IntoIterator<Item = (ActionId, RecordedAction)>,
+        schedule: Vec<ActionId>,
+    ) -> Result<Self, OperationRecordError> {
+        let mut record = Self::from_actions(id, desired_hash, actions)?;
+        if schedule.len() != record.actions.len()
+            || schedule.iter().collect::<BTreeSet<_>>().len() != schedule.len()
+            || schedule.iter().any(|id| !record.actions.contains_key(id))
+        {
+            return Err(OperationRecordError::InvalidSchedule);
+        }
+        record.schedule = schedule;
+        record
+            .graph
+            .as_mut()
+            .expect("schema-5 operations retain their graph")
+            .schedule = record
+            .schedule
+            .iter()
+            .map(|id| id.as_str().to_owned())
+            .collect();
+        Ok(record)
+    }
+
+    /// Attaches the immutable graph selected before the first target mutation.
+    pub(crate) fn with_graph(
+        mut self,
+        graph: PlannedActionGraph,
+    ) -> Result<Self, OperationRecordError> {
+        if !self.valid_graph(&graph) {
+            return Err(OperationRecordError::InvalidGraph);
+        }
+        self.graph = Some(graph);
+        Ok(self)
+    }
+
+    /// Checks the complete persisted graph before it can become recovery input.
+    fn valid_graph(&self, graph: &PlannedActionGraph) -> bool {
+        let nodes = graph
+            .actions
+            .iter()
+            .map(|node| (node.id.as_str(), node))
+            .collect::<BTreeMap<_, _>>();
+        if nodes.len() != graph.actions.len()
+            || nodes.len() != self.actions.len()
+            || graph.schedule.len() != nodes.len()
+            || graph.schedule.iter().collect::<BTreeSet<_>>().len() != graph.schedule.len()
+            || graph.schedule
+                != self
+                    .schedule
+                    .iter()
+                    .map(|id| id.as_str().to_owned())
+                    .collect::<Vec<_>>()
+        {
+            return false;
+        }
+        for (action_id, action) in &self.actions {
+            let Some(node) = nodes.get(action_id.as_str()) else {
+                return false;
+            };
+            if node.resource_id != *action.resource_id()
+                || !role_matches(node.role, action.kind())
+                || node.topology_authority.validate().is_err()
+                || node
+                    .topology_delta
+                    .validate(&node.topology_authority)
+                    .is_err()
+            {
+                return false;
+            }
+            if !topology_belongs_to_node(node, &graph.stale_topology_snapshot) {
+                return false;
+            }
+        }
+        if graph
+            .schedule
+            .iter()
+            .any(|id| !nodes.contains_key(id.as_str()))
+        {
+            return false;
+        }
+        if graph.direct_edges.windows(2).any(|pair| {
+            (&pair[0].from, &pair[0].to, pair[0].origin)
+                >= (&pair[1].from, &pair[1].to, pair[1].origin)
+        }) || graph
+            .barriers
+            .windows(2)
+            .any(|pair| pair[0].id >= pair[1].id)
+        {
+            return false;
+        }
+        let mut edges = BTreeSet::new();
+        for edge in &graph.direct_edges {
+            let (Some(from), Some(to)) =
+                (nodes.get(edge.from.as_str()), nodes.get(edge.to.as_str()))
+            else {
+                return false;
+            };
+            if edge.origin != "depends_on"
+                || !is_current_role(from.role)
+                || !is_current_role(to.role)
+                || !edges.insert((&edge.from, &edge.to, edge.origin))
+            {
+                return false;
+            }
+        }
+        let mut barriers = BTreeSet::new();
+        for barrier in &graph.barriers {
+            if !(stage_id_is_canonical(&barrier.id) || barrier.id.starts_with("stale/"))
+                || !is_sorted_unique(&barrier.after)
+                || !is_sorted_unique(&barrier.input)
+                || !is_sorted_unique(&barrier.output)
+                || !is_sorted_unique(&barrier.provenance)
+                || barrier.output.is_empty()
+                || (barrier.input.is_empty() && !barrier.after.is_empty())
+                || !barriers.insert(&barrier.id)
+                || barrier
+                    .after
+                    .iter()
+                    .any(|id| !(stage_id_is_canonical(id) || id.starts_with("stale/")))
+                || barrier
+                    .provenance
+                    .iter()
+                    .any(|id| FullyQualifiedResourceId::parse(id).is_err())
+            {
+                return false;
+            }
+            let stale_constraint = barrier.id.starts_with("stale/");
+            for id in barrier.input.iter().chain(&barrier.output) {
+                let Some(node) = nodes.get(id.as_str()) else {
+                    return false;
+                };
+                if !(if stale_constraint {
+                    matches!(
+                        node.role,
+                        ActionRole::StaleRemove | ActionRole::ForgetMissing
+                    )
+                } else {
+                    is_current_role(node.role)
+                }) {
+                    return false;
+                }
+            }
+        }
+        if graph
+            .barriers
+            .iter()
+            .any(|barrier| barrier.after.iter().any(|id| !barriers.contains(id)))
+        {
+            return false;
+        }
+        let positions = graph
+            .schedule
+            .iter()
+            .enumerate()
+            .map(|(position, id)| (id.as_str(), position))
+            .collect::<BTreeMap<_, _>>();
+        // The persisted schedule must retain every graph ordering decision, not merely be a permutation.
+        if graph
+            .direct_edges
+            .iter()
+            .any(|edge| positions[edge.from.as_str()] >= positions[edge.to.as_str()])
+            || graph.barriers.iter().any(|barrier| {
+                barrier.input.iter().any(|input| {
+                    barrier
+                        .output
+                        .iter()
+                        .any(|output| positions[input.as_str()] >= positions[output.as_str()])
+                })
+            })
+            || graph.barriers.iter().any(|barrier| {
+                barrier.after.iter().any(|predecessor_id| {
+                    let predecessor = graph
+                        .barriers
+                        .iter()
+                        .find(|candidate| candidate.id == *predecessor_id)
+                        .expect("validated barrier reference exists");
+                    predecessor.output.iter().any(|output| {
+                        barrier
+                            .output
+                            .iter()
+                            .any(|input| positions[output.as_str()] >= positions[input.as_str()])
+                    })
+                })
+            })
+        {
+            return false;
+        }
+        // The graph may not make recovery depend on a cyclic ordering relation.
+        let mut outgoing = BTreeMap::<&str, Vec<&str>>::new();
+        for edge in &graph.direct_edges {
+            outgoing.entry(&edge.from).or_default().push(&edge.to);
+        }
+        for barrier in &graph.barriers {
+            for input in &barrier.input {
+                for output in &barrier.output {
+                    outgoing.entry(input).or_default().push(output);
+                }
+            }
+        }
+        for barrier in &graph.barriers {
+            for predecessor_id in &barrier.after {
+                let predecessor = graph
+                    .barriers
+                    .iter()
+                    .find(|candidate| candidate.id == *predecessor_id)
+                    .expect("validated barrier reference exists");
+                for output in &predecessor.output {
+                    for input in &barrier.input {
+                        outgoing.entry(output).or_default().push(input);
+                    }
+                }
+            }
+        }
+        !nodes.keys().any(|start| graph_cycle(start, &outgoing))
+    }
+
+    /// Attaches already-decoded skip causes after validating status/reason consistency.
+    pub(crate) fn with_skip_reasons(
+        mut self,
+        skip_reasons: BTreeMap<ActionId, SkipReason>,
+    ) -> Result<Self, OperationRecordError> {
+        let first_abort = self.schedule.iter().find(|action_id| {
+            self.actions.get(*action_id).is_some_and(|action| {
+                matches!(
+                    action.status(),
+                    ActionStatus::Failed | ActionStatus::Uncertain
+                )
+            })
+        });
+        for (action_id, reason) in &skip_reasons {
+            let action = self.actions.get(action_id).ok_or_else(|| {
+                OperationRecordError::UnknownActionId {
+                    action_id: action_id.clone(),
+                }
+            })?;
+            if action.status() != ActionStatus::Skipped {
+                return Err(OperationRecordError::InvalidSkipReason);
+            }
+            let referenced = match reason {
+                SkipReason::Dependency { blocking_action_id }
+                | SkipReason::GlobalAbort {
+                    initiating_action_id: blocking_action_id,
+                } => blocking_action_id,
+            };
+            let referenced_action = self.actions.get(referenced).ok_or_else(|| {
+                OperationRecordError::UnknownActionId {
+                    action_id: referenced.clone(),
+                }
+            })?;
+            if !matches!(
+                referenced_action.status(),
+                ActionStatus::Failed | ActionStatus::Uncertain
+            ) {
+                return Err(OperationRecordError::InvalidSkipReason);
+            }
+            match reason {
+                SkipReason::Dependency { blocking_action_id } => {
+                    if self.abort_skip_reason(blocking_action_id, action_id)?
+                        != (SkipReason::Dependency {
+                            blocking_action_id: blocking_action_id.clone(),
+                        })
+                    {
+                        return Err(OperationRecordError::InvalidSkipReason);
+                    }
+                }
+                SkipReason::GlobalAbort {
+                    initiating_action_id,
+                } => {
+                    if first_abort != Some(initiating_action_id) {
+                        return Err(OperationRecordError::InvalidSkipReason);
+                    }
+                }
+            }
+        }
+        let skipped = self
+            .actions
+            .values()
+            .filter(|action| action.status() == ActionStatus::Skipped)
+            .count();
+        if skipped != skip_reasons.len() {
+            return Err(OperationRecordError::InvalidSkipReason);
+        }
+        self.skip_reasons = skip_reasons;
+        Ok(self)
     }
 
     /// The opaque operation identifier.
@@ -2128,6 +2456,129 @@ impl OperationRecord {
     /// Actions in stable opaque-ID order.
     pub(crate) fn actions(&self) -> impl ExactSizeIterator<Item = (&ActionId, &RecordedAction)> {
         self.actions.iter()
+    }
+
+    /// The immutable action order selected before the first mutation.
+    pub(crate) fn schedule(&self) -> &[ActionId] {
+        &self.schedule
+    }
+
+    pub(crate) fn graph(&self) -> Option<&PlannedActionGraph> {
+        self.graph.as_ref()
+    }
+
+    /// Classifies a later skip only from the immutable persisted graph.
+    pub(crate) fn abort_skip_reason(
+        &self,
+        initiator: &ActionId,
+        candidate: &ActionId,
+    ) -> Result<SkipReason, OperationRecordError> {
+        let Some(graph) = &self.graph else {
+            return Ok(SkipReason::GlobalAbort {
+                initiating_action_id: initiator.clone(),
+            });
+        };
+        let from = self
+            .action(initiator)
+            .ok_or_else(|| OperationRecordError::UnknownActionId {
+                action_id: initiator.clone(),
+            })?
+            .resource_id();
+        let to = self
+            .action(candidate)
+            .ok_or_else(|| OperationRecordError::UnknownActionId {
+                action_id: candidate.clone(),
+            })?
+            .resource_id();
+        let mut edges =
+            BTreeMap::<&FullyQualifiedResourceId, BTreeSet<&FullyQualifiedResourceId>>::new();
+        for edge in &graph.direct_edges {
+            let source = graph
+                .actions
+                .iter()
+                .find(|action| action.id == edge.from)
+                .ok_or(OperationRecordError::InvalidGraph)?;
+            let destination = graph
+                .actions
+                .iter()
+                .find(|action| action.id == edge.to)
+                .ok_or(OperationRecordError::InvalidGraph)?;
+            edges
+                .entry(&source.resource_id)
+                .or_default()
+                .insert(&destination.resource_id);
+        }
+        for barrier in &graph.barriers {
+            for input in &barrier.input {
+                let source = graph
+                    .actions
+                    .iter()
+                    .find(|action| action.id == *input)
+                    .ok_or(OperationRecordError::InvalidGraph)?;
+                for output in &barrier.output {
+                    let destination = graph
+                        .actions
+                        .iter()
+                        .find(|action| action.id == *output)
+                        .ok_or(OperationRecordError::InvalidGraph)?;
+                    edges
+                        .entry(&source.resource_id)
+                        .or_default()
+                        .insert(&destination.resource_id);
+                }
+            }
+        }
+        let mut pending = vec![from];
+        let mut visited = BTreeSet::new();
+        while let Some(resource) = pending.pop() {
+            if !visited.insert(resource) {
+                continue;
+            }
+            if resource == to && resource != from {
+                return Ok(SkipReason::Dependency {
+                    blocking_action_id: initiator.clone(),
+                });
+            }
+            if let Some(next) = edges.get(resource) {
+                pending.extend(next.iter().copied());
+            }
+        }
+        Ok(SkipReason::GlobalAbort {
+            initiating_action_id: initiator.clone(),
+        })
+    }
+
+    pub(crate) fn topology_for_action(
+        &self,
+        action_id: &ActionId,
+    ) -> Result<
+        (
+            &crate::domain::known::TopologyAuthority,
+            &crate::domain::known::TopologyDelta,
+        ),
+        OperationRecordError,
+    > {
+        let graph = self
+            .graph
+            .as_ref()
+            .ok_or(OperationRecordError::InvalidGraph)?;
+        let resource = self
+            .action(action_id)
+            .ok_or_else(|| OperationRecordError::UnknownActionId {
+                action_id: action_id.clone(),
+            })?
+            .resource_id();
+        let node = graph
+            .actions
+            .iter()
+            .find(|node| node.resource_id == *resource)
+            .ok_or(OperationRecordError::InvalidGraph)?;
+        Ok((&node.topology_authority, &node.topology_delta))
+    }
+
+    /// The recorded skip cause, if this action was skipped after an abort.
+    pub(crate) fn skip_reason(&self, action_id: &ActionId) -> Option<&SkipReason> {
+        self.skip_reasons.get(action_id)
     }
 
     /// Looks up one recorded action.
@@ -2166,6 +2617,18 @@ impl OperationRecord {
         status: ActionStatus,
     ) -> Result<(), OperationRecordError> {
         self.action_mut(action_id)?.mark_without_known(status)
+    }
+
+    /// Records a skipped action together with its graph-derived abort cause.
+    pub(crate) fn mark_skipped(
+        &mut self,
+        action_id: &ActionId,
+        reason: SkipReason,
+    ) -> Result<(), OperationRecordError> {
+        self.action_mut(action_id)?
+            .mark_without_known(ActionStatus::Skipped)?;
+        self.skip_reasons.insert(action_id.clone(), reason);
+        Ok(())
     }
 
     /// Marks a verified action successful and returns its atomic Known-state update.
@@ -2221,6 +2684,206 @@ impl OperationRecord {
     }
 }
 
+fn topology_belongs_to_node(
+    node: &GraphAction,
+    stale: &crate::domain::known::StaleTopologySnapshot,
+) -> bool {
+    let owns_direct = |fact: &crate::domain::known::AppliedDirectEdge| {
+        fact.from == node.resource_id || fact.to == node.resource_id
+    };
+    let authority = &node.topology_authority;
+    // A current action may publish a predecessor-only stage fact when that fact is
+    // required by a stage barrier containing the action. Follow that compact
+    // `after` chain, rather than requiring synthetic executable barrier nodes.
+    let barrier_facts = authority
+        .current_barriers
+        .iter()
+        .chain(&authority.historical_barriers)
+        .collect::<Vec<_>>();
+    let owns_barrier = |fact: &crate::domain::known::AppliedBarrier| {
+        let mut reachable = barrier_facts
+            .iter()
+            .filter(|candidate| candidate.members.contains(&node.resource_id))
+            .map(|candidate| candidate.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for candidate in &barrier_facts {
+                if reachable.contains(candidate.id.as_str()) {
+                    for predecessor in &candidate.after {
+                        changed |= reachable.insert(predecessor);
+                    }
+                }
+            }
+        }
+        reachable.contains(fact.id.as_str())
+    };
+    if authority
+        .current_direct
+        .iter()
+        .chain(&authority.historical_direct)
+        .any(|fact| !owns_direct(fact))
+        || authority
+            .current_barriers
+            .iter()
+            .chain(&authority.historical_barriers)
+            .any(|fact| !owns_barrier(fact))
+    {
+        return false;
+    }
+    let delta = &node.topology_delta;
+    if delta
+        .add_current_direct
+        .iter()
+        .any(|fact| fact.to != node.resource_id)
+        || delta
+            .add_historical_direct
+            .iter()
+            .any(|fact| fact.to != node.resource_id)
+        || delta
+            .remove_current_direct
+            .iter()
+            .chain(&delta.remove_historical_direct)
+            .any(|fact| !owns_direct(fact))
+        || delta.add_current_barriers.iter().any(|fact| {
+            !owns_barrier(fact)
+                && !delta.add_current_barriers.iter().any(|successor| {
+                    owns_barrier(successor) && successor.after.iter().any(|after| after == &fact.id)
+                })
+        })
+        || delta
+            .add_historical_barriers
+            .iter()
+            .any(|fact| !owns_barrier(fact))
+        || delta
+            .remove_current_barriers
+            .iter()
+            .chain(&delta.remove_historical_barriers)
+            .any(|fact| !owns_barrier(fact))
+        || delta
+            .replace_current_barriers
+            .iter()
+            .chain(&delta.replace_historical_barriers)
+            .any(|replacement| {
+                !owns_barrier(&replacement.before) || !owns_barrier(&replacement.after)
+            })
+    {
+        return false;
+    }
+    // Deletions and shrinking projections can only be justified by the immutable stale snapshot.
+    let stale_direct = stale
+        .current_direct
+        .iter()
+        .chain(&stale.historical_direct)
+        .collect::<Vec<_>>();
+    let stale_barriers = stale
+        .current_barriers
+        .iter()
+        .chain(&stale.historical_barriers)
+        .collect::<Vec<_>>();
+    delta
+        .remove_current_direct
+        .iter()
+        .chain(&delta.remove_historical_direct)
+        .all(|fact| stale_direct.contains(&fact))
+        && delta
+            .remove_current_barriers
+            .iter()
+            .chain(&delta.remove_historical_barriers)
+            .all(|fact| stale_barriers.contains(&fact))
+        && delta
+            .replace_current_barriers
+            .iter()
+            .chain(&delta.replace_historical_barriers)
+            .all(|replacement| stale_barriers.contains(&&replacement.before))
+}
+
+fn is_current_role(role: ActionRole) -> bool {
+    matches!(
+        role,
+        ActionRole::CurrentCreate | ActionRole::CurrentChange | ActionRole::CurrentHandoff
+    )
+}
+
+fn role_matches(role: ActionRole, kind: ActionKind) -> bool {
+    matches!(
+        (role, kind),
+        (
+            ActionRole::CurrentCreate,
+            ActionKind::CreateLink | ActionKind::CreateCopy | ActionKind::CreateDirectoryLink
+        ) | (
+            ActionRole::CurrentChange,
+            ActionKind::ReplaceLink
+                | ActionKind::RelocateLink
+                | ActionKind::ReplaceCopy
+                | ActionKind::RelocateCopy
+                | ActionKind::ReplaceDirectoryLink
+                | ActionKind::RelocateDirectoryLink
+        ) | (
+            ActionRole::CurrentHandoff,
+            ActionKind::ReplaceOwnership | ActionKind::ReplaceEffect
+        ) | (
+            ActionRole::StaleRemove,
+            ActionKind::RemoveLink | ActionKind::RemoveCopy | ActionKind::RemoveDirectoryLink
+        ) | (ActionRole::ForgetMissing, ActionKind::ForgetMissing)
+    )
+}
+
+fn role_for_kind(kind: ActionKind) -> Option<ActionRole> {
+    Some(match kind {
+        ActionKind::CreateLink | ActionKind::CreateCopy | ActionKind::CreateDirectoryLink => {
+            ActionRole::CurrentCreate
+        }
+        ActionKind::ReplaceLink
+        | ActionKind::RelocateLink
+        | ActionKind::ReplaceCopy
+        | ActionKind::RelocateCopy
+        | ActionKind::ReplaceDirectoryLink
+        | ActionKind::RelocateDirectoryLink => ActionRole::CurrentChange,
+        ActionKind::ReplaceOwnership | ActionKind::ReplaceEffect => ActionRole::CurrentHandoff,
+        ActionKind::RemoveLink | ActionKind::RemoveCopy | ActionKind::RemoveDirectoryLink => {
+            ActionRole::StaleRemove
+        }
+        ActionKind::ForgetMissing => ActionRole::ForgetMissing,
+        ActionKind::Noop => return None,
+    })
+}
+
+fn is_sorted_unique(values: &[String]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn stage_id_is_canonical(id: &str) -> bool {
+    id.strip_prefix("stage/")
+        .is_some_and(|suffix| FullyQualifiedResourceId::parse(suffix).is_ok())
+}
+
+fn graph_cycle<'a>(start: &'a str, outgoing: &BTreeMap<&'a str, Vec<&'a str>>) -> bool {
+    fn visit<'a>(
+        node: &'a str,
+        outgoing: &BTreeMap<&'a str, Vec<&'a str>>,
+        visiting: &mut BTreeSet<&'a str>,
+        visited: &mut BTreeSet<&'a str>,
+    ) -> bool {
+        if !visiting.insert(node) {
+            return true;
+        }
+        if visited.contains(node) {
+            visiting.remove(node);
+            return false;
+        }
+        let cyclic = outgoing.get(node).is_some_and(|next| {
+            next.iter()
+                .any(|next| visit(next, outgoing, visiting, visited))
+        });
+        visiting.remove(node);
+        visited.insert(node);
+        cyclic
+    }
+    visit(start, outgoing, &mut BTreeSet::new(), &mut BTreeSet::new())
+}
+
 /// The reason an operation record cannot safely represent recovery facts.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum OperationRecordError {
@@ -2243,6 +2906,9 @@ pub(crate) enum OperationRecordError {
     UnknownActionId {
         action_id: ActionId,
     },
+    InvalidSchedule,
+    InvalidGraph,
+    InvalidSkipReason,
     InvalidStatusTransition {
         from: ActionStatus,
         to: ActionStatus,
@@ -2260,6 +2926,12 @@ impl fmt::Display for OperationRecordError {
             Self::EmptyOperationId => formatter.write_str("operation ID must not be empty"),
             Self::EmptyActionId => formatter.write_str("action ID must not be empty"),
             Self::NoActions => formatter.write_str("an operation record must contain an action"),
+            Self::InvalidSchedule => formatter.write_str(
+                "an operation schedule must be a duplicate-free permutation of its actions",
+            ),
+            Self::InvalidGraph => formatter.write_str("an operation graph is invalid"),
+            Self::InvalidSkipReason => formatter
+                .write_str("a skipped action must have exactly one valid durable skip reason"),
             Self::UnsupportedActionKind { kind } => {
                 write!(formatter, "this slice cannot record action kind {kind:?}")
             }
@@ -2312,6 +2984,9 @@ impl std::error::Error for OperationRecordError {
             | Self::DuplicateResourceId { .. }
             | Self::DuplicateTargetPath { .. }
             | Self::UnknownActionId { .. }
+            | Self::InvalidSchedule
+            | Self::InvalidGraph
+            | Self::InvalidSkipReason
             | Self::InvalidStatusTransition { .. } => None,
         }
     }

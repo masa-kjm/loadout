@@ -9,7 +9,10 @@ use crate::domain::directory_link::ResolvedDirectoryLink;
 use crate::domain::file_copy::ResolvedFileCopy;
 use crate::domain::file_link::{LinkTarget, ResolvedFileLink};
 use crate::domain::ids::FullyQualifiedResourceId;
-use crate::domain::known::{KnownDirectoryLink, KnownFileCopy, KnownFileLink, KnownResource};
+use crate::domain::known::{
+    KnownDirectoryLink, KnownFileCopy, KnownFileLink, KnownResource, StaleTopologySnapshot,
+    TopologyAuthority, TopologyDelta,
+};
 use crate::domain::paths::ResolvedPath;
 
 /// The file-link action chosen by the planner.
@@ -31,6 +34,55 @@ pub(crate) enum ActionKind {
     RelocateDirectoryLink,
     RemoveDirectoryLink,
     Noop,
+}
+
+/// The closed semantic role assigned before action-graph construction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ActionRole {
+    CurrentCreate,
+    CurrentChange,
+    CurrentHandoff,
+    StaleRemove,
+    ForgetMissing,
+}
+
+/// One immutable graph node. The action ID is the canonical resource ID in v0.8.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GraphAction {
+    pub(crate) id: String,
+    pub(crate) resource_id: FullyQualifiedResourceId,
+    pub(crate) role: ActionRole,
+    pub(crate) topology_authority: TopologyAuthority,
+    pub(crate) topology_delta: TopologyDelta,
+}
+
+/// A direct dependency relation retained without stage-edge expansion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GraphDirectEdge {
+    pub(crate) from: String,
+    pub(crate) to: String,
+    pub(crate) origin: &'static str,
+}
+
+/// A compact stage relation with action memberships and canonical stage provenance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GraphBarrier {
+    pub(crate) id: String,
+    pub(crate) after: Vec<String>,
+    pub(crate) input: Vec<String>,
+    pub(crate) output: Vec<String>,
+    pub(crate) provenance: Vec<String>,
+}
+
+/// The planner's complete compact execution graph, independent of source order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PlannedActionGraph {
+    pub(crate) actions: Vec<GraphAction>,
+    pub(crate) direct_edges: Vec<GraphDirectEdge>,
+    pub(crate) barriers: Vec<GraphBarrier>,
+    pub(crate) schedule: Vec<String>,
+    /// The exact committed topology from which stale ordering and projection were selected.
+    pub(crate) stale_topology_snapshot: StaleTopologySnapshot,
 }
 
 /// The closed file-copy action vocabulary reserved for the copy planner and executor slice.
@@ -526,6 +578,27 @@ impl PlannedEffectHandoff {
 }
 
 impl PlannedResourceAction {
+    /// Maps this concrete lifecycle action to the one closed graph role.
+    pub(crate) fn action_role(&self) -> Option<ActionRole> {
+        Some(match self.kind() {
+            ActionKind::CreateLink | ActionKind::CreateCopy | ActionKind::CreateDirectoryLink => {
+                ActionRole::CurrentCreate
+            }
+            ActionKind::ReplaceLink
+            | ActionKind::RelocateLink
+            | ActionKind::ReplaceCopy
+            | ActionKind::RelocateCopy
+            | ActionKind::ReplaceDirectoryLink
+            | ActionKind::RelocateDirectoryLink => ActionRole::CurrentChange,
+            ActionKind::ReplaceOwnership | ActionKind::ReplaceEffect => ActionRole::CurrentHandoff,
+            ActionKind::RemoveLink | ActionKind::RemoveCopy | ActionKind::RemoveDirectoryLink => {
+                ActionRole::StaleRemove
+            }
+            ActionKind::ForgetMissing => ActionRole::ForgetMissing,
+            ActionKind::Noop => return None,
+        })
+    }
+
     pub(crate) fn kind(&self) -> ActionKind {
         match self {
             Self::FileLink(action) => action.kind(),
@@ -1001,6 +1074,7 @@ pub(crate) struct Plan {
     actions: Vec<PlannedAction>,
     resource_actions: Vec<PlannedResourceAction>,
     diagnostics: Vec<Diagnostic>,
+    graph: Option<PlannedActionGraph>,
 }
 
 impl Plan {
@@ -1022,6 +1096,17 @@ impl Plan {
         diagnostics: impl IntoIterator<Item = Diagnostic>,
     ) -> Result<Self, PlanError> {
         Self::from_resource_actions(actions, diagnostics)
+    }
+
+    /// Builds an executable plan together with the exact pure-planner graph handoff.
+    pub(crate) fn new_with_graph(
+        actions: impl IntoIterator<Item = PlannedResourceAction>,
+        diagnostics: impl IntoIterator<Item = Diagnostic>,
+        graph: PlannedActionGraph,
+    ) -> Result<Self, PlanError> {
+        let mut plan = Self::from_resource_actions(actions, diagnostics)?;
+        plan.graph = Some(graph);
+        Ok(plan)
     }
 
     fn from_resource_actions(
@@ -1059,6 +1144,7 @@ impl Plan {
             actions,
             resource_actions,
             diagnostics: diagnostics.into_iter().collect(),
+            graph: None,
         })
     }
 
@@ -1075,6 +1161,11 @@ impl Plan {
     /// Returns structured diagnostics without exposing mutable access.
     pub(crate) fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
+    }
+
+    /// Returns the exact compact graph selected by the planner when orchestration ran.
+    pub(crate) fn graph(&self) -> Option<&PlannedActionGraph> {
+        self.graph.as_ref()
     }
 
     /// Whether apply may execute this plan after preflight and confirmation.

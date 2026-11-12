@@ -1,7 +1,7 @@
-//! Explicit schema-3 to schema-4 document conversion.
+//! Explicit schema-4 to schema-5 document conversion.
 //!
 //! This module is the only crate boundary that parses legacy documents.
-//! Normal declaration and state readers deliberately accept schema 4 only.
+//! Normal declaration and state readers deliberately accept schema 5 only.
 
 #![allow(dead_code)] // The explicit authoring adapter consumes this facade in W4.
 
@@ -74,19 +74,19 @@ impl MigrationFacade {
                         .join("state.json")
                         .display()
                         .to_string(),
-                    source_schema_version: 3,
-                    target_schema_version: 4,
+                    source_schema_version: 4,
+                    target_schema_version: 5,
                 }]
             }
             MigrationOperation::Profiles => {
-                let paths = schema_3_to_4::profile_migration_document_paths(&request.context)
+                let paths = schema_4_to_5::profile_migration_document_paths(&request.context)
                     .map_err(MigrationFacadeError::Migration)?;
                 paths
                     .into_iter()
                     .map(|path| MigrationDocument {
                         path: path.display().to_string(),
-                        source_schema_version: 3,
-                        target_schema_version: 4,
+                        source_schema_version: 4,
+                        target_schema_version: 5,
                     })
                     .collect()
             }
@@ -94,33 +94,33 @@ impl MigrationFacade {
         Ok(MigrationPresentation {
             operation: request.operation,
             documents,
-            source_schema_version: 3,
-            target_schema_version: 4,
+            source_schema_version: 4,
+            target_schema_version: 5,
             required_next_step: match request.operation {
                 MigrationOperation::State => {
-                    "migrate profiles after the schema-4 state barrier is present"
+                    "migrate profiles after the schema-5 state barrier is present"
                 }
                 MigrationOperation::Profiles => {
-                    "resume only remaining schema-3 profiles if publication was interrupted"
+                    "resume only remaining schema-4 profiles if publication was interrupted"
                 }
             },
             ownership_invariant: "resource IDs, effects, and Known ownership do not change",
         })
     }
 
-    /// Selects only the registered 3-to-4 route.
+    /// Selects only the registered 4-to-5 route.
     pub(crate) fn execute(
         request: MigrationRequest,
     ) -> Result<MigrationOutcome, MigrationFacadeError> {
         match request.operation {
             MigrationOperation::State => {
                 let repository = StateRepository::new(request.context.state_directory().clone());
-                schema_3_to_4::migrate_state(&repository, &request.context)
+                schema_4_to_5::migrate_state(&repository, &request.context)
                     .map_err(MigrationFacadeError::State)?;
             }
             MigrationOperation::Profiles => {
                 let repository = StateRepository::new(request.context.state_directory().clone());
-                schema_3_to_4::migrate_profiles(&repository, &request.context)
+                schema_4_to_5::migrate_profiles(&repository, &request.context)
                     .map_err(MigrationFacadeError::State)?;
             }
         }
@@ -133,8 +133,8 @@ impl MigrationFacade {
 /// An adapter-visible failure that contains no route-private data or capability.
 #[derive(Debug)]
 pub(crate) enum MigrationFacadeError {
-    Migration(schema_3_to_4::MigrationError),
-    State(schema_3_to_4::MigrationExecutionError),
+    Migration(schema_4_to_5::MigrationError),
+    State(schema_4_to_5::MigrationExecutionError),
 }
 
 impl fmt::Display for MigrationFacadeError {
@@ -150,9 +150,9 @@ impl std::error::Error for MigrationFacadeError {}
 
 // Route-private parsing, validation, conversion, inventory, and publication logic deliberately
 // live in this named version-pair unit. The facade above is the route's only stable edge.
-mod schema_3_to_4;
+mod schema_4_to_5;
 
 #[cfg(test)]
-pub(crate) use schema_3_to_4::{
+pub(crate) use schema_4_to_5::{
     ProfilePublicationFaultPoint, fail_profile_publication_at_for_test,
 };

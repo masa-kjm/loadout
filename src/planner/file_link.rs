@@ -765,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_planner_orders_complete_output_by_phase_then_resource_identity() {
+    fn aggregate_planner_orders_independent_actions_by_fully_qualified_resource_identity() {
         let create = resource("zeta/create", "store/create", "home/.create");
         let old_replace = resource("base/replace", "store/replace-old", "home/.replace");
         let new_replace = resource("base/replace", "store/replace-new", "home/.replace");
@@ -793,9 +793,9 @@ mod tests {
                 .map(|action| (action.kind(), action.resource_id().as_str()))
                 .collect::<Vec<_>>(),
             [
-                (ActionKind::CreateLink, "zeta/create"),
-                (ActionKind::ReplaceLink, "base/replace"),
                 (ActionKind::RemoveLink, "alpha/stale"),
+                (ActionKind::ReplaceLink, "base/replace"),
+                (ActionKind::CreateLink, "zeta/create"),
             ]
         );
     }

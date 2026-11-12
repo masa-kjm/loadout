@@ -214,7 +214,7 @@ For `migrate`, output identifies every affected document, source and target sche
 
 | Status | Meaning |
 | --- | --- |
-| `0` | The command completed successfully. A plan may contain actions or only `noop` actions, and a `diff` report may contain drift. |
+| `0` | The command completed successfully. A plan may contain actions or no resource actions, and a `diff` report may contain drift. |
 | `1` | A runtime failure occurred, including an execution or state-commit failure. Earlier verified actions may remain applied. |
 | `2` | Input was invalid, a plan was blocked, preflight failed, recovery is uncertain, confirmation was declined, or required non-interactive confirmation was absent. No new planned target mutation is performed for this outcome; permitted prior-operation recovery cleanup and state commits may already have occurred. |
 
@@ -232,6 +232,5 @@ The current contract does not provide configuration reset, generic YAML editing,
 Every lifecycle command and every inspection command that reads a profile or state document uses the version-specific decoding rules in [Profiles](profiles.md#current-profile-schema) and [State and Recovery](state-and-recovery.md#current-state-schema).
 An unsupported profile or state schema version exits with the documented invalid-input category before target inspection, planning, recovery, state rewrite, or target mutation.
 
-Normal commands provide no old-schema reader, implicit conversion, compatibility alias, or schema-repair path.
-Only the explicit `migrate` commands may read a complete valid schema-3 document, and only for the lossless conversion defined by [Migration](migration.md).
+Normal commands provide no old-schema reader, implicit conversion, compatibility alias, or schema-repair path. Only the explicit `migrate` commands may read a complete valid schema-4 document, and only for the lossless conversion defined by [Migration](migration.md).
 An unsupported state file does not authorize observing or adopting a matching target, and its active operation is not recovered.

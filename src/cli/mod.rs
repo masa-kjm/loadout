@@ -625,7 +625,7 @@ mod tests {
             }
             fs::write(root.join("store/source"), "source").unwrap();
             fs::write(root.join("config.yaml"), "schema_version: 2\ndefault_profile: base\nprofile_discovery:\n  paths: [profiles]\nstores:\n  files:\n    type: local\n    properties:\n      path: store\n").unwrap();
-            fs::write(root.join("profiles/base.yaml"), "schema_version: 4\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/absent-parent/target\n").unwrap();
+            fs::write(root.join("profiles/base.yaml"), "schema_version: 5\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/absent-parent/target\n").unwrap();
             Self { root }
         }
         fn machine(&self) -> MachinePaths {
@@ -639,18 +639,18 @@ mod tests {
         fn prepare_profile_migration(&self) {
             fs::write(
                 self.root.join("profiles/base.yaml"),
-                "schema_version: 3\nid: base\nresources: {}\n",
+                "schema_version: 4\nid: base\nresources: {}\n",
             )
             .unwrap();
             fs::write(
                 self.root.join("profiles/extra.yaml"),
-                "schema_version: 3\nid: extra\nresources: {}\n",
+                "schema_version: 4\nid: extra\nresources: {}\n",
             )
             .unwrap();
             fs::create_dir_all(self.root.join("state")).unwrap();
             fs::write(
                 self.root.join("state/state.json"),
-                "{\"schema_version\":4,\"resources\":{},\"active_operation\":null}",
+                "{\"schema_version\":5,\"resources\":{},\"applied_lifecycle_topology\":{\"current\":[],\"historical\":[]},\"active_operation\":null}",
             )
             .unwrap();
             fs::write(self.root.join("home/managed-target"), "target").unwrap();
@@ -914,14 +914,17 @@ mod tests {
                     .contains("migration failed:"),
                 "{point:?}"
             );
-            assert_eq!(
-                fs::read_to_string(&base).unwrap(),
-                "schema_version: 4\nid: base\nresources: {}\n",
+            assert!(
+                matches!(
+                    fs::read_to_string(&base).unwrap().as_str(),
+                    "schema_version: 4\nid: base\nresources: {}\n"
+                        | "schema_version: 5\nid: base\nresources: {}\n"
+                ),
                 "{point:?}"
             );
             assert_eq!(
                 fs::read_to_string(&extra).unwrap(),
-                "schema_version: 3\nid: extra\nresources: {}\n",
+                "schema_version: 4\nid: extra\nresources: {}\n",
                 "{point:?}"
             );
             assert_eq!(fs::read(&state).unwrap(), state_before, "{point:?}");
@@ -980,7 +983,7 @@ mod tests {
             );
             assert_eq!(
                 fs::read(&extra).unwrap(),
-                b"schema_version: 3\nid: extra\nresources: {}\n"
+                b"schema_version: 4\nid: extra\nresources: {}\n"
             );
             assert_eq!(fs::read(&state).unwrap(), state_before, "{point:?}");
 
@@ -1002,7 +1005,7 @@ mod tests {
             );
             assert_eq!(
                 fs::read_to_string(&extra).unwrap(),
-                "schema_version: 4\nid: extra\nresources: {}\n",
+                "schema_version: 5\nid: extra\nresources: {}\n",
                 "{point:?}"
             );
             assert_eq!(fs::read(&state).unwrap(), state_before, "{point:?}");

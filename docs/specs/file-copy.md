@@ -12,7 +12,7 @@ The same external-concurrency limit applies: checks reject observable substituti
 ## Declaration and Resolution
 
 A v0.5 profile document using copy has schema version `2`.
-In the current contract, the same `file`/`copy` declaration is carried by profile schema version `3` under the [Current Profile Schema](profiles.md#current-profile-schema).
+In the current contract, the same `file`/`copy` declaration is carried by profile schema version `5` under the [Current Profile Schema](profiles.md#current-profile-schema). Orchestration facts do not alter copy ownership or its content fingerprint.
 
 ```yaml
 schema_version: 2

@@ -13,12 +13,15 @@ use crate::declaration::profile::{
     FileKind, FileOperation, ParameterValue, ProfileDeclaration, ValueOrReference, parse_kind,
     parse_operation,
 };
-use crate::domain::desired::{ResolvedDesired, ResolvedDesiredError, ResolvedResource};
+use crate::domain::desired::{
+    ResolvedDesired, ResolvedDesiredError, ResolvedOrchestration, ResolvedResource,
+    ResolvedResourceOrchestration, ResolvedStage,
+};
 use crate::domain::directory_link::ResolvedDirectoryLink;
 use crate::domain::file_copy::{ContentFingerprint, ResolvedFileCopy};
 use crate::domain::file_link::{ResolvedFileLink, ResolvedFileLinkError};
 use crate::domain::ids::{
-    FullyQualifiedResourceId, IdentifierError, ProfileId, ResourceId, StoreId,
+    FullyQualifiedResourceId, IdentifierError, InstanceNamespace, ProfileId, ResourceId, StoreId,
 };
 use crate::domain::paths::{
     ResolvedPath, ResolvedPathError, SourceRelativePath, has_windows_drive_prefix,
@@ -332,13 +335,15 @@ pub(crate) fn resolve(
     environment: &EnvironmentConfig,
     selected_root_profile: Option<&str>,
 ) -> Result<ResolvedDesired, ResolverError> {
-    let (root_profile, resources) =
+    let (root_profile, resources, orchestration) =
         resolve_resource_inputs(context, environment, selected_root_profile)?;
     let resources = resources
         .into_iter()
         .map(resolve_resource_for_desired)
         .collect::<Result<Vec<_>, _>>()?;
-    ResolvedDesired::new(root_profile, resources).map_err(ResolverError::InvalidDesired)
+    ResolvedDesired::new(root_profile, resources)
+        .map(|desired| desired.with_orchestration(orchestration))
+        .map_err(ResolverError::InvalidDesired)
 }
 
 /// Resolves one selected root profile and retains the verified source facts required by a later non-dry-run apply.
@@ -349,7 +354,7 @@ pub(crate) fn resolve_for_apply(
     environment: &EnvironmentConfig,
     selected_root_profile: Option<&str>,
 ) -> Result<ResolvedApplyInput, ResolverError> {
-    let (root_profile, resources) =
+    let (root_profile, resources, orchestration) =
         resolve_resource_inputs(context, environment, selected_root_profile)?;
     let mut resolved_resources = Vec::new();
     let mut verified_sources = BTreeMap::new();
@@ -404,6 +409,7 @@ pub(crate) fn resolve_for_apply(
         });
     }
     let desired = ResolvedDesired::new(root_profile, resolved_resources)
+        .map(|desired| desired.with_orchestration(orchestration))
         .map_err(ResolverError::InvalidDesired)?;
     Ok(ResolvedApplyInput {
         desired,
@@ -475,10 +481,11 @@ fn resolve_resource_inputs(
     context: &ResolverContext,
     environment: &EnvironmentConfig,
     selected_root_profile: Option<&str>,
-) -> Result<(ProfileId, Vec<ResolvedResourceInput>), ResolverError> {
+) -> Result<(ProfileId, Vec<ResolvedResourceInput>, ResolvedOrchestration), ResolverError> {
     let profiles = discover_profiles(context, environment)?;
     let root_profile = select_root_profile(environment, selected_root_profile, &profiles)?;
     let composed_profiles = compose_instances(&root_profile, &profiles)?;
+    let orchestration = resolve_orchestration(&composed_profiles, &profiles)?;
     let stores = resolve_stores(context, environment)?;
     let profile_paths = profiles
         .values()
@@ -499,7 +506,7 @@ fn resolve_resource_inputs(
                     source,
                 }
             })?;
-            let resource_id = FullyQualifiedResourceId::new(&instance.name, &resource_id);
+            let resource_id = FullyQualifiedResourceId::in_instance(&instance.name, &resource_id);
             let properties = resource.properties();
             let kind = parse_kind(&resolve_string(
                 properties.kind(),
@@ -570,7 +577,7 @@ fn resolve_resource_inputs(
             });
         }
     }
-    Ok((root_profile, resources))
+    Ok((root_profile, resources, orchestration))
 }
 
 #[derive(Debug)]
@@ -732,7 +739,7 @@ fn select_root_profile(
 #[derive(Clone, Debug)]
 struct ResolvedInstance {
     definition: ProfileId,
-    name: ProfileId,
+    name: InstanceNamespace,
     bindings: BTreeMap<String, ParameterValue>,
 }
 
@@ -810,11 +817,11 @@ fn compose_instances(
     }
     fn visit(
         definition: &ProfileId,
-        name: ProfileId,
+        name: InstanceNamespace,
         bindings: BTreeMap<String, ParameterValue>,
         profiles: &BTreeMap<ProfileId, DiscoveredProfile>,
         visiting: &mut Vec<ProfileId>,
-        instances: &mut BTreeMap<ProfileId, ResolvedInstance>,
+        instances: &mut BTreeMap<InstanceNamespace, ResolvedInstance>,
     ) -> Result<(), ResolverError> {
         if let Some(start) = visiting.iter().position(|current| current == definition) {
             let mut cycle = visiting[start..].to_vec();
@@ -851,7 +858,7 @@ fn compose_instances(
                     included_profile: child_definition.clone(),
                 }
             })?;
-            let child_name = match include.as_name() {
+            let child_alias = match include.as_name() {
                 Some(value) => ProfileId::parse(value.to_owned()).map_err(|source| {
                     ResolverError::InvalidIdentifier {
                         role: "instance ID",
@@ -867,6 +874,7 @@ fn compose_instances(
                     });
                 }
             };
+            let child_name = name.child(&child_alias);
             let mut child_bindings = BTreeMap::new();
             for (parameter, parameter_type) in child.declaration.parameters() {
                 let value = include.bindings().get(parameter).ok_or_else(|| {
@@ -924,13 +932,211 @@ fn compose_instances(
     let mut instances = BTreeMap::new();
     visit(
         root,
-        root.clone(),
+        InstanceNamespace::root(root),
         BTreeMap::new(),
         profiles,
         &mut Vec::new(),
         &mut instances,
     )?;
     Ok(instances.into_values().collect())
+}
+
+/// Resolves declaration-local ordering syntax to stable, instance-qualified facts.
+///
+/// This operates only on parsed declarations and composed instance identities, before
+/// source verification or any managed-target inspection boundary.
+fn resolve_orchestration(
+    instances: &[ResolvedInstance],
+    profiles: &BTreeMap<ProfileId, DiscoveredProfile>,
+) -> Result<ResolvedOrchestration, ResolverError> {
+    let mut resource_ids = BTreeSet::new();
+    let mut stage_ids = BTreeSet::new();
+
+    for instance in instances {
+        let declaration = &profiles[&instance.definition].declaration;
+        for (local_id, _) in declaration.resources() {
+            let local_id = ResourceId::parse(local_id.to_owned()).map_err(|source| {
+                ResolverError::InvalidIdentifier {
+                    role: "resource ID",
+                    value: local_id.to_owned(),
+                    source,
+                }
+            })?;
+            resource_ids.insert(FullyQualifiedResourceId::in_instance(
+                &instance.name,
+                &local_id,
+            ));
+        }
+        for (local_id, _) in declaration.stages() {
+            let local_id = ResourceId::parse(local_id.to_owned()).map_err(|source| {
+                ResolverError::InvalidIdentifier {
+                    role: "stage ID",
+                    value: local_id.to_owned(),
+                    source,
+                }
+            })?;
+            stage_ids.insert(
+                FullyQualifiedResourceId::in_instance(&instance.name, &local_id).to_string(),
+            );
+        }
+    }
+
+    let mut stages = Vec::new();
+    let mut resources = Vec::new();
+    for instance in instances {
+        let declaration = &profiles[&instance.definition].declaration;
+        for (local_id, stage) in declaration.stages() {
+            let stage_id = canonical_stage_id(local_id, &instance.name, &stage_ids, "stage")?;
+            let mut after = BTreeSet::new();
+            for reference in stage.after() {
+                let resolved =
+                    canonical_stage_id(reference, &instance.name, &stage_ids, "stage after")?;
+                if resolved == stage_id {
+                    return Err(ResolverError::InvalidOrchestrationRelation {
+                        owner: stage_id.clone(),
+                        reference: resolved,
+                        relation: "stage after",
+                        reason: "must not reference itself",
+                    });
+                }
+                if !after.insert(resolved.clone()) {
+                    return Err(ResolverError::InvalidOrchestrationRelation {
+                        owner: stage_id.clone(),
+                        reference: resolved,
+                        relation: "stage after",
+                        reason: "must not contain duplicates",
+                    });
+                }
+            }
+            stages.push(ResolvedStage::new(stage_id, after.into_iter().collect()));
+        }
+        for (local_id, resource) in declaration.resources() {
+            let local_id = ResourceId::parse(local_id.to_owned()).map_err(|source| {
+                ResolverError::InvalidIdentifier {
+                    role: "resource ID",
+                    value: local_id.to_owned(),
+                    source,
+                }
+            })?;
+            let resource_id = FullyQualifiedResourceId::in_instance(&instance.name, &local_id);
+            let stage = resource
+                .stage()
+                .map(|reference| canonical_local_stage_id(reference, &instance.name, &stage_ids))
+                .transpose()?;
+            let mut depends_on = BTreeSet::new();
+            for reference in resource.depends_on() {
+                let resolved =
+                    canonical_resource_id(reference, &instance.name, &resource_ids, "depends_on")?;
+                if resolved == resource_id {
+                    return Err(ResolverError::InvalidOrchestrationRelation {
+                        owner: resource_id.to_string(),
+                        reference: resolved.to_string(),
+                        relation: "depends_on",
+                        reason: "must not reference itself",
+                    });
+                }
+                if !depends_on.insert(resolved.clone()) {
+                    return Err(ResolverError::InvalidOrchestrationRelation {
+                        owner: resource_id.to_string(),
+                        reference: resolved.to_string(),
+                        relation: "depends_on",
+                        reason: "must not contain duplicates",
+                    });
+                }
+            }
+            resources.push(ResolvedResourceOrchestration::new(
+                resource_id,
+                stage,
+                depends_on.into_iter().collect(),
+            ));
+        }
+    }
+
+    Ok(ResolvedOrchestration::new(stages, resources))
+}
+
+fn canonical_resource_id(
+    reference: &str,
+    local_instance: &InstanceNamespace,
+    declared: &BTreeSet<FullyQualifiedResourceId>,
+    relation: &'static str,
+) -> Result<FullyQualifiedResourceId, ResolverError> {
+    let resolved = if reference.contains('/') {
+        FullyQualifiedResourceId::parse(reference).map_err(|_| {
+            ResolverError::InvalidOrchestrationReference {
+                reference: reference.to_owned(),
+                relation,
+                reason: "is not a fully-qualified resource ID",
+            }
+        })?
+    } else {
+        let local = ResourceId::parse(reference.to_owned()).map_err(|_| {
+            ResolverError::InvalidOrchestrationReference {
+                reference: reference.to_owned(),
+                relation,
+                reason: "is not a local resource ID",
+            }
+        })?;
+        FullyQualifiedResourceId::in_instance(local_instance, &local)
+    };
+    if !declared.contains(&resolved) {
+        return Err(ResolverError::InvalidOrchestrationReference {
+            reference: resolved.to_string(),
+            relation,
+            reason: "does not name a resolved resource instance",
+        });
+    }
+    Ok(resolved)
+}
+
+fn canonical_stage_id(
+    reference: &str,
+    local_instance: &InstanceNamespace,
+    declared: &BTreeSet<String>,
+    relation: &'static str,
+) -> Result<String, ResolverError> {
+    let resolved = if reference.contains('/') {
+        FullyQualifiedResourceId::parse(reference)
+            .map_err(|_| ResolverError::InvalidOrchestrationReference {
+                reference: reference.to_owned(),
+                relation,
+                reason: "is not a fully-qualified stage ID",
+            })?
+            .to_string()
+    } else {
+        let local = ResourceId::parse(reference.to_owned()).map_err(|_| {
+            ResolverError::InvalidOrchestrationReference {
+                reference: reference.to_owned(),
+                relation,
+                reason: "is not a local stage ID",
+            }
+        })?;
+        FullyQualifiedResourceId::in_instance(local_instance, &local).to_string()
+    };
+    if !declared.contains(&resolved) {
+        return Err(ResolverError::InvalidOrchestrationReference {
+            reference: resolved,
+            relation,
+            reason: "does not name a resolved stage instance",
+        });
+    }
+    Ok(resolved)
+}
+
+/// Resolves the resource `stage` field, which is deliberately local-only.
+fn canonical_local_stage_id(
+    reference: &str,
+    local_instance: &InstanceNamespace,
+    declared: &BTreeSet<String>,
+) -> Result<String, ResolverError> {
+    if reference.contains('/') {
+        return Err(ResolverError::InvalidOrchestrationReference {
+            reference: reference.to_owned(),
+            relation: "resource stage",
+            reason: "is not a local stage ID",
+        });
+    }
+    canonical_stage_id(reference, local_instance, declared, "resource stage")
 }
 
 fn compose_profiles(
@@ -1324,7 +1530,7 @@ pub(crate) enum ResolverError {
         included_profile: ProfileId,
     },
     ConflictingInstance {
-        instance: ProfileId,
+        instance: InstanceNamespace,
     },
     MissingParameterBinding {
         defining_profile: String,
@@ -1352,6 +1558,17 @@ pub(crate) enum ResolverError {
         defining_profile: String,
         instance: String,
         property: &'static str,
+        reason: &'static str,
+    },
+    InvalidOrchestrationReference {
+        reference: String,
+        relation: &'static str,
+        reason: &'static str,
+    },
+    InvalidOrchestrationRelation {
+        owner: String,
+        reference: String,
+        relation: &'static str,
         reason: &'static str,
     },
     MissingIncludedProfile {
@@ -1542,6 +1759,23 @@ impl fmt::Display for ResolverError {
                 formatter,
                 "profile {defining_profile} instance {instance} property {property} {reason}"
             ),
+            Self::InvalidOrchestrationReference {
+                reference,
+                relation,
+                reason,
+            } => write!(
+                formatter,
+                "invalid {relation} reference {reference}: {reason}"
+            ),
+            Self::InvalidOrchestrationRelation {
+                owner,
+                reference,
+                relation,
+                reason,
+            } => write!(
+                formatter,
+                "invalid {relation} relation from {owner} to {reference}: {reason}"
+            ),
             Self::MissingIncludedProfile {
                 including_profile,
                 included_profile,
@@ -1642,6 +1876,8 @@ impl std::error::Error for ResolverError {
             | Self::InvalidParameterBinding { .. }
             | Self::UndeclaredParameterReference { .. }
             | Self::InvalidPropertyValue { .. }
+            | Self::InvalidOrchestrationReference { .. }
+            | Self::InvalidOrchestrationRelation { .. }
             | Self::MissingIncludedProfile { .. }
             | Self::IncludeCycle { .. }
             | Self::MissingStore { .. }
@@ -1763,13 +1999,160 @@ mod tests {
                 .collect::<String>();
             format!("includes:\n{entries}")
         };
-        format!("schema_version: 4\nid: {id}\n{includes}resources:\n{resources}")
+        format!("schema_version: 5\nid: {id}\n{includes}resources:\n{resources}")
     }
 
     fn file_resource(resource_id: &str, source: &str, target: &str) -> String {
         format!(
             "  {resource_id}:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: {source}\n      target: {target}\n      operation: link\n"
         )
+    }
+
+    #[test]
+    fn resolver_canonicalizes_instance_scoped_stages_and_dependencies() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/base", "base");
+        workspace.write("store/root", "root");
+        workspace.write(
+            "profiles/base.yaml",
+            "schema_version: 5\nid: base\nstages:\n  prepare: { after: [] }\nresources:\n  config:\n    type: file\n    stage: prepare\n    properties:\n      kind: file\n      source: { store: dotfiles, path: base }\n      target: ~/.base\n      operation: link\n",
+        );
+        workspace.write(
+            "profiles/root.yaml",
+            "schema_version: 5\nid: root\nincludes:\n  - { id: base, as: first }\nstages:\n  deploy: { after: [root/first/prepare] }\nresources:\n  managed:\n    type: file\n    stage: deploy\n    depends_on: [root/first/config]\n    properties:\n      kind: file\n      source: { store: dotfiles, path: root }\n      target: ~/.root\n      operation: link\n",
+        );
+
+        let resolved = resolve(
+            &workspace.context(),
+            &environment(Some("root"), &["../profiles"], "../store"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved
+                .orchestration()
+                .stages()
+                .iter()
+                .map(|stage| (stage.id(), stage.after()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("root/deploy", &["root/first/prepare".to_owned()][..]),
+                ("root/first/prepare", &[][..]),
+            ]
+        );
+        let managed = resolved
+            .orchestration()
+            .resources()
+            .iter()
+            .find(|resource| resource.resource_id().as_str() == "root/managed")
+            .unwrap();
+        assert_eq!(managed.stage(), Some("root/deploy"));
+        assert_eq!(
+            managed
+                .depends_on()
+                .iter()
+                .map(|resource| resource.as_str())
+                .collect::<Vec<_>>(),
+            ["root/first/config"]
+        );
+    }
+
+    #[test]
+    fn resolver_uses_exact_nested_instance_namespaces_for_prerequisites() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/theme", "theme");
+        workspace.write("store/root", "root");
+        workspace.write(
+            "profiles/theme.yaml",
+            "schema_version: 5\nid: theme\nstages:\n  prepare: { after: [] }\nresources:\n  config:\n    type: file\n    stage: prepare\n    properties:\n      kind: file\n      source: { store: dotfiles, path: theme }\n      target: ~/.theme\n      operation: link\n",
+        );
+        workspace.write(
+            "profiles/editor.yaml",
+            "schema_version: 5\nid: editor\nincludes:\n  - { id: theme, as: theme }\nresources: {}\n",
+        );
+        workspace.write(
+            "profiles/root.yaml",
+            "schema_version: 5\nid: root\nincludes:\n  - { id: editor, as: editor }\nstages:\n  deploy: { after: [root/editor/theme/prepare] }\nresources:\n  managed:\n    type: file\n    stage: deploy\n    depends_on: [root/editor/theme/config]\n    properties:\n      kind: file\n      source: { store: dotfiles, path: root }\n      target: ~/.root\n      operation: link\n",
+        );
+
+        let resolved = resolve(
+            &workspace.context(),
+            &environment(Some("root"), &["../profiles"], "../store"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved
+                .orchestration()
+                .stages()
+                .iter()
+                .map(|stage| (stage.id(), stage.after()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("root/deploy", &["root/editor/theme/prepare".to_owned()][..]),
+                ("root/editor/theme/prepare", &[][..]),
+            ]
+        );
+        let managed = resolved
+            .orchestration()
+            .resources()
+            .iter()
+            .find(|resource| resource.resource_id().as_str() == "root/managed")
+            .unwrap();
+        assert_eq!(
+            managed
+                .depends_on()
+                .iter()
+                .map(FullyQualifiedResourceId::as_str)
+                .collect::<Vec<_>>(),
+            ["root/editor/theme/config"]
+        );
+    }
+
+    #[test]
+    fn resolver_rejects_qualified_resource_stage_before_store_resolution() {
+        let workspace = TestWorkspace::new();
+        workspace.write(
+            "profiles/root.yaml",
+            "schema_version: 5\nid: root\nstages:\n  local: { after: [] }\nresources:\n  managed:\n    type: file\n    stage: root/local\n    properties:\n      kind: file\n      source: { store: dotfiles, path: missing }\n      target: ~/.root\n      operation: link\n",
+        );
+
+        let error = resolve(
+            &workspace.context(),
+            &environment(Some("root"), &["../profiles"], "../missing-store"),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ResolverError::InvalidOrchestrationReference { relation, reason, .. }
+                if relation == "resource stage" && reason == "is not a local stage ID"
+        ));
+    }
+
+    #[test]
+    fn resolver_rejects_invalid_orchestration_before_store_resolution() {
+        let workspace = TestWorkspace::new();
+        workspace.write(
+            "profiles/root.yaml",
+            "schema_version: 5\nid: root\nstages:\n  first: { after: [missing] }\nresources: {}\n",
+        );
+
+        let error = resolve(
+            &workspace.context(),
+            &environment(Some("root"), &["../profiles"], "../missing-store"),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ResolverError::InvalidOrchestrationReference { reference, relation, .. }
+                if reference == "root/missing" && relation == "stage after"
+        ));
     }
 
     #[test]
@@ -1815,7 +2198,11 @@ mod tests {
                 .iter()
                 .map(|resource| resource.resource_id().as_str())
                 .collect::<Vec<_>>(),
-            ["base/git", "common/zsh", "workstation/shell"]
+            [
+                "workstation/base/git",
+                "workstation/common/zsh",
+                "workstation/shell"
+            ]
         );
         let canonical_source = ResolvedPath::from_platform_canonicalized(
             fs::canonicalize(workspace.path("store/git/config")).unwrap(),
@@ -1825,7 +2212,7 @@ mod tests {
         assert_eq!(
             resolved
                 .verified_sources()
-                .get(&FullyQualifiedResourceId::parse("base/git").unwrap())
+                .get(&FullyQualifiedResourceId::parse("workstation/base/git").unwrap())
                 .unwrap()
                 .path(),
             &canonical_source
@@ -1846,15 +2233,15 @@ mod tests {
         workspace.write("store/git/config", "content");
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 4\nid: base\nparameters: { target: string }\nresources:\n  git:\n    type: file\n    properties:\n      kind: file\n      source: { store: dotfiles, path: git/config }\n      target: { parameter: target }\n      operation: link\n",
+            "schema_version: 5\nid: base\nparameters: { target: string }\nresources:\n  git:\n    type: file\n    properties:\n      kind: file\n      source: { store: dotfiles, path: git/config }\n      target: { parameter: target }\n      operation: link\n",
         );
         workspace.write(
             "profiles/parent.yaml",
-            "schema_version: 4\nid: parent\nparameters: { target: string }\nincludes:\n  - id: base\n    as: named-base\n    with: { target: { parameter: target } }\nresources: {}\n",
+            "schema_version: 5\nid: parent\nparameters: { target: string }\nincludes:\n  - id: base\n    as: named-base\n    with: { target: { parameter: target } }\nresources: {}\n",
         );
         workspace.write(
             "profiles/workstation.yaml",
-            "schema_version: 4\nid: workstation\nincludes:\n  - id: parent\n    as: named-parent\n    with: { target: ~/.gitconfig }\nresources: {}\n",
+            "schema_version: 5\nid: workstation\nincludes:\n  - id: parent\n    as: named-parent\n    with: { target: ~/.gitconfig }\nresources: {}\n",
         );
         let resolved = resolve(
             &workspace.context(),
@@ -1864,7 +2251,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             resolved.resources()[0].resource_id().as_str(),
-            "named-base/git"
+            "workstation/named-parent/named-base/git"
         );
         assert_eq!(
             resolved.resources()[0].target_path().as_ref(),
@@ -1877,7 +2264,7 @@ mod tests {
         let workspace = TestWorkspace::new();
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 4\nid: base\nparameters: { kind: string, operation: string, target: string }\nresources:\n  config:\n    type: file\n    properties:\n      kind: { parameter: kind }\n      source: { store: dotfiles, path: config }\n      target: { parameter: target }\n      operation: { parameter: operation }\n",
+            "schema_version: 5\nid: base\nparameters: { kind: string, operation: string, target: string }\nresources:\n  config:\n    type: file\n    properties:\n      kind: { parameter: kind }\n      source: { store: dotfiles, path: config }\n      target: { parameter: target }\n      operation: { parameter: operation }\n",
         );
 
         let profiles = declared_profiles(
@@ -1914,7 +2301,7 @@ mod tests {
         workspace.write("store/git/config", "content");
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 4\nid: base\nparameters: { target: string }\nresources: {}\n",
+            "schema_version: 5\nid: base\nparameters: { target: string }\nresources: {}\n",
         );
         let base_environment = environment(Some("base"), &["../profiles"], "../store");
         assert!(matches!(
@@ -1924,7 +2311,7 @@ mod tests {
 
         workspace.write(
             "profiles/workstation.yaml",
-            "schema_version: 4\nid: workstation\nincludes:\n  - id: base\n    as: shared\n    with: { target: ~/.one }\n  - id: base\n    as: shared\n    with: { target: ~/.two }\nresources: {}\n",
+            "schema_version: 5\nid: workstation\nincludes:\n  - id: base\n    as: shared\n    with: { target: ~/.one }\n  - id: base\n    as: shared\n    with: { target: ~/.two }\nresources: {}\n",
         );
         let environment = environment(Some("workstation"), &["../profiles"], "../store");
         assert!(matches!(
@@ -1938,11 +2325,11 @@ mod tests {
         let workspace = TestWorkspace::new();
         workspace.write(
             "profiles/reusable.yaml",
-            "schema_version: 4\nid: reusable\nparameters: { target: string }\nresources: {}\n",
+            "schema_version: 5\nid: reusable\nparameters: { target: string }\nresources: {}\n",
         );
         workspace.write(
             "profiles/root.yaml",
-            "schema_version: 4\nid: root\nresources: {}\n",
+            "schema_version: 5\nid: root\nresources: {}\n",
         );
         let roots = discovered_roots(
             &workspace.context(),
@@ -1988,7 +2375,7 @@ mod tests {
         let environment = environment_without_stores("root", &["../profiles"]);
         workspace.write(
             "profiles/child.yaml",
-            "schema_version: 4\nid: child\nparameters: { text: string, count: integer, enabled: boolean, values: list }\nresources: {}\n",
+            "schema_version: 5\nid: child\nparameters: { text: string, count: integer, enabled: boolean, values: list }\nresources: {}\n",
         );
 
         for (name, include, expected) in [
@@ -2016,7 +2403,7 @@ mod tests {
             workspace.write(
                 "profiles/root.yaml",
                 &format!(
-                    "schema_version: 4\nid: root\nincludes:\n  - {include}\nresources: {{}}\n"
+                    "schema_version: 5\nid: root\nincludes:\n  - {include}\nresources: {{}}\n"
                 ),
             );
             let _no_targets = crate::test_support::forbid_target_inspection();
@@ -2032,7 +2419,9 @@ mod tests {
                             parameter,
                         },
                     ) =>
-                        defining_profile == "child" && instance == "child" && parameter == "values",
+                        defining_profile == "child"
+                            && instance == "root/child"
+                            && parameter == "values",
                     (
                         "unknown binding extra",
                         ResolverError::UnknownParameterBinding {
@@ -2040,7 +2429,10 @@ mod tests {
                             instance,
                             parameter,
                         },
-                    ) => defining_profile == "child" && instance == "child" && parameter == "extra",
+                    ) =>
+                        defining_profile == "child"
+                            && instance == "root/child"
+                            && parameter == "extra",
                     (
                         "invalid binding text",
                         ResolverError::InvalidParameterBinding {
@@ -2049,7 +2441,10 @@ mod tests {
                             parameter,
                             ..
                         },
-                    ) => defining_profile == "child" && instance == "child" && parameter == "text",
+                    ) =>
+                        defining_profile == "child"
+                            && instance == "root/child"
+                            && parameter == "text",
                     (
                         "invalid binding values",
                         ResolverError::InvalidParameterBinding {
@@ -2059,7 +2454,9 @@ mod tests {
                             ..
                         },
                     ) =>
-                        defining_profile == "child" && instance == "child" && parameter == "values",
+                        defining_profile == "child"
+                            && instance == "root/child"
+                            && parameter == "values",
                     _ => false,
                 },
                 "{name} must report its defining profile, instance, and binding: {expected}"
@@ -2074,11 +2471,11 @@ mod tests {
         let environment = environment_without_stores("root", &["../profiles"]);
         workspace.write(
             "profiles/child.yaml",
-            "schema_version: 4\nid: child\nparameters: { value: string }\nresources:\n  config:\n    type: file\n    properties:\n      kind: { parameter: missing }\n      source: { store: dotfiles, path: config }\n      target: { parameter: value }\n      operation: link\n",
+            "schema_version: 5\nid: child\nparameters: { value: string }\nresources:\n  config:\n    type: file\n    properties:\n      kind: { parameter: missing }\n      source: { store: dotfiles, path: config }\n      target: { parameter: value }\n      operation: link\n",
         );
         workspace.write(
             "profiles/root.yaml",
-            "schema_version: 4\nid: root\nincludes:\n  - id: child\n    as: child\n    with: { value: ~/.config }\nresources: {}\n",
+            "schema_version: 5\nid: root\nincludes:\n  - id: child\n    as: child\n    with: { value: ~/.config }\nresources: {}\n",
         );
         let _no_targets = crate::test_support::forbid_target_inspection();
         let _no_mutation = crate::test_support::forbid_mutation();
@@ -2086,29 +2483,29 @@ mod tests {
         assert!(matches!(
             error,
             ResolverError::UndeclaredParameterReference { defining_profile, instance, property, parameter }
-                if defining_profile == "child" && instance == "child" && property == "kind" && parameter == "missing"
+                if defining_profile == "child" && instance == "root/child" && property == "kind" && parameter == "missing"
         ));
 
         workspace.write(
             "profiles/child.yaml",
-            "schema_version: 4\nid: child\nparameters: { value: string }\nresources:\n  config:\n    type: file\n    properties:\n      kind: { parameter: value }\n      source: { store: dotfiles, path: config }\n      target: ~/.config\n      operation: link\n",
+            "schema_version: 5\nid: child\nparameters: { value: string }\nresources:\n  config:\n    type: file\n    properties:\n      kind: { parameter: value }\n      source: { store: dotfiles, path: config }\n      target: ~/.config\n      operation: link\n",
         );
         let error = resolve(&context, &environment, None).unwrap_err();
         assert!(matches!(
             error,
             ResolverError::InvalidPropertyValue { defining_profile, instance, property, reason }
-                if defining_profile == "child" && instance == "child" && property == "kind" && reason == "must be file or directory"
+                if defining_profile == "child" && instance == "root/child" && property == "kind" && reason == "must be file or directory"
         ));
 
         workspace.write(
             "profiles/child.yaml",
-            "schema_version: 4\nid: child\nparameters: { value: string }\nresources:\n  config:\n    type: file\n    properties:\n      kind: [file]\n      source: { store: dotfiles, path: config }\n      target: ~/.config\n      operation: link\n",
+            "schema_version: 5\nid: child\nparameters: { value: string }\nresources:\n  config:\n    type: file\n    properties:\n      kind: [file]\n      source: { store: dotfiles, path: config }\n      target: ~/.config\n      operation: link\n",
         );
         let error = resolve(&context, &environment, None).unwrap_err();
         assert!(matches!(
             error,
             ResolverError::InvalidPropertyValue { defining_profile, instance, property, reason }
-                if defining_profile == "child" && instance == "child" && property == "kind" && reason == "must be a string"
+                if defining_profile == "child" && instance == "root/child" && property == "kind" && reason == "must be a string"
         ));
     }
 
@@ -2118,11 +2515,11 @@ mod tests {
         workspace.write("store/config", "content");
         workspace.write(
             "profiles/child.yaml",
-            "schema_version: 4\nid: child\nparameters: { target: string, values: list }\nresources:\n  config:\n    type: file\n    properties:\n      kind: file\n      source: { store: dotfiles, path: config }\n      target: { parameter: target }\n      operation: link\n",
+            "schema_version: 5\nid: child\nparameters: { target: string, values: list }\nresources:\n  config:\n    type: file\n    properties:\n      kind: file\n      source: { store: dotfiles, path: config }\n      target: { parameter: target }\n      operation: link\n",
         );
         workspace.write(
             "profiles/root.yaml",
-            "schema_version: 4\nid: root\nincludes:\n  - id: child\n    as: first\n    with: { target: ~/.first, values: [one, 2, true] }\n  - id: child\n    as: first\n    with: { values: [one, 2, true], target: ~/.first }\n  - id: child\n    as: second\n    with: { target: ~/.second, values: [one, 2, true] }\nresources: {}\n",
+            "schema_version: 5\nid: root\nincludes:\n  - id: child\n    as: first\n    with: { target: ~/.first, values: [one, 2, true] }\n  - id: child\n    as: first\n    with: { values: [one, 2, true], target: ~/.first }\n  - id: child\n    as: second\n    with: { target: ~/.second, values: [one, 2, true] }\nresources: {}\n",
         );
 
         let resolved = resolve(
@@ -2137,7 +2534,7 @@ mod tests {
                 .iter()
                 .map(|resource| resource.resource_id().as_str())
                 .collect::<Vec<_>>(),
-            ["first/config", "second/config"]
+            ["root/first/config", "root/second/config"]
         );
     }
 

@@ -16,19 +16,24 @@ use crate::domain::hashes::{
 };
 use crate::domain::ids::{FullyQualifiedResourceId, FullyQualifiedResourceIdError};
 use crate::domain::known::{
-    KnownDirectoryLink, KnownDirectoryLinkError, KnownFileCopy, KnownFileCopyError, KnownFileLink,
-    KnownFileLinkError, KnownResource, KnownState, KnownStateError,
+    AppliedBarrier, AppliedDirectEdge, AppliedLifecycleTopology, KnownDirectoryLink,
+    KnownDirectoryLinkError, KnownFileCopy, KnownFileCopyError, KnownFileLink, KnownFileLinkError,
+    KnownResource, KnownState, KnownStateError, StaleTopologySnapshot, TopologyAuthority,
+    TopologyBarrierReplacement, TopologyDelta,
 };
 use crate::domain::paths::{ResolvedPath, ResolvedPathError};
-use crate::domain::plan::{ActionKind, TargetCondition};
+use crate::domain::plan::{
+    ActionKind, ActionRole, GraphAction, GraphBarrier, GraphDirectEdge, PlannedActionGraph,
+    TargetCondition,
+};
 use crate::state::operation::{
     ActionId, ActionStatus, OperationId, OperationRecord, OperationRecordError,
     PersistedCopyActionFacts, PersistedCopyRemovalFacts, PersistedEffectHandoffFacts,
-    RecordedAction,
+    RecordedAction, SkipReason,
 };
 use crate::state::repository::{CommitError, PersistedState};
 
-const STATE_SCHEMA_VERSION: u32 = 4;
+const STATE_SCHEMA_VERSION: u32 = 5;
 
 /// A strict on-disk representation of `state.json`.
 #[derive(Debug, Deserialize, Serialize)]
@@ -36,6 +41,7 @@ const STATE_SCHEMA_VERSION: u32 = 4;
 pub(super) struct StateDocument {
     schema_version: u32,
     resources: BTreeMap<String, PersistedKnownResource>,
+    applied_lifecycle_topology: PersistedTopology,
     active_operation: Option<PersistedOperationRecord>,
 }
 
@@ -58,6 +64,7 @@ impl StateDocument {
         Ok(Self {
             schema_version: STATE_SCHEMA_VERSION,
             resources,
+            applied_lifecycle_topology: PersistedTopology::from_topology(state.known().topology()),
             active_operation,
         })
     }
@@ -73,13 +80,220 @@ impl StateDocument {
             .into_iter()
             .map(|(resource_id, resource)| resource.into_known(resource_id))
             .collect::<Result<Vec<_>, _>>()?;
-        let known = KnownState::new(resources).map_err(StateDecodeError::InvalidKnownState)?;
+        let known = KnownState::new(resources)
+            .map_err(StateDecodeError::InvalidKnownState)?
+            .with_topology(self.applied_lifecycle_topology.into_topology()?);
         let active_operation = self
             .active_operation
             .map(PersistedOperationRecord::into_operation)
             .transpose()?;
         PersistedState::from_parts(known, active_operation)
     }
+}
+
+/// Strict wire representation of schema-5 applied topology.
+///
+/// Topology is state, not a reconstruction hint: all collections are canonical
+/// and source-array identity is preserved while decoding.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedTopology {
+    current: Vec<PersistedTopologyFact>,
+    historical: Vec<PersistedTopologyFact>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum PersistedTopologyFact {
+    Direct(PersistedDirectEdge),
+    Barrier(PersistedBarrier),
+}
+
+#[derive(Debug, Deserialize, Serialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(deny_unknown_fields)]
+struct PersistedDirectEdge {
+    from: String,
+    to: String,
+    origin: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(deny_unknown_fields)]
+struct PersistedBarrier {
+    id: String,
+    after: Vec<String>,
+    members: Vec<String>,
+    origin: String,
+}
+
+impl PersistedTopology {
+    fn from_topology(topology: &AppliedLifecycleTopology) -> Self {
+        Self {
+            current: topology
+                .current_direct()
+                .iter()
+                .map(|fact| PersistedTopologyFact::Direct(PersistedDirectEdge::from(fact)))
+                .chain(
+                    topology
+                        .current_barriers()
+                        .iter()
+                        .map(|fact| PersistedTopologyFact::Barrier(PersistedBarrier::from(fact))),
+                )
+                .collect(),
+            historical: topology
+                .historical_direct()
+                .iter()
+                .map(|fact| PersistedTopologyFact::Direct(PersistedDirectEdge::from(fact)))
+                .chain(
+                    topology
+                        .historical_barriers()
+                        .iter()
+                        .map(|fact| PersistedTopologyFact::Barrier(PersistedBarrier::from(fact))),
+                )
+                .collect(),
+        }
+    }
+
+    fn into_topology(self) -> Result<AppliedLifecycleTopology, StateDecodeError> {
+        let (current_direct, current_barriers) = decode_topology_facts(self.current, "current")?;
+        let (historical_direct, historical_barriers) =
+            decode_topology_facts(self.historical, "historical")?;
+        if current_direct
+            .iter()
+            .any(|fact| historical_direct.contains(fact))
+            || current_barriers
+                .iter()
+                .any(|fact| historical_barriers.contains(fact))
+        {
+            return Err(StateDecodeError::InvalidTopology(
+                "a topology fact occurs in both current and historical arrays",
+            ));
+        }
+        AppliedLifecycleTopology::try_new(
+            current_direct,
+            historical_direct,
+            current_barriers,
+            historical_barriers,
+        )
+        .map_err(|_| StateDecodeError::InvalidTopology("invalid applied lifecycle topology"))
+    }
+}
+
+fn decode_topology_facts(
+    facts: Vec<PersistedTopologyFact>,
+    array: &'static str,
+) -> Result<(Vec<AppliedDirectEdge>, Vec<AppliedBarrier>), StateDecodeError> {
+    let mut direct = Vec::new();
+    let mut barriers = Vec::new();
+    for fact in facts {
+        match fact {
+            PersistedTopologyFact::Direct(fact) => direct.push(AppliedDirectEdge::try_from(fact)?),
+            PersistedTopologyFact::Barrier(fact) => barriers.push(AppliedBarrier::try_from(fact)?),
+        }
+    }
+    if direct.windows(2).any(|pair| pair[0] >= pair[1])
+        || barriers.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(StateDecodeError::InvalidTopology(match array {
+            "current" => "noncanonical current topology facts",
+            _ => "noncanonical historical topology facts",
+        }));
+    }
+    Ok((direct, barriers))
+}
+
+impl From<&AppliedDirectEdge> for PersistedDirectEdge {
+    fn from(value: &AppliedDirectEdge) -> Self {
+        Self {
+            from: value.from.as_str().to_owned(),
+            to: value.to.as_str().to_owned(),
+            origin: value.origin.to_owned(),
+        }
+    }
+}
+
+impl TryFrom<PersistedDirectEdge> for AppliedDirectEdge {
+    type Error = StateDecodeError;
+    fn try_from(value: PersistedDirectEdge) -> Result<Self, Self::Error> {
+        if value.origin != "depends_on" {
+            return Err(StateDecodeError::InvalidTopology(
+                "direct-edge origin must be depends_on",
+            ));
+        }
+        Ok(Self {
+            from: FullyQualifiedResourceId::parse(&value.from)
+                .map_err(|_| StateDecodeError::InvalidTopology("invalid direct-edge source"))?,
+            to: FullyQualifiedResourceId::parse(&value.to).map_err(|_| {
+                StateDecodeError::InvalidTopology("invalid direct-edge destination")
+            })?,
+            origin: "depends_on",
+        })
+    }
+}
+
+impl From<&AppliedBarrier> for PersistedBarrier {
+    fn from(value: &AppliedBarrier) -> Self {
+        Self {
+            id: value.id.clone(),
+            after: value.after.clone(),
+            members: value
+                .members
+                .iter()
+                .map(|member| member.as_str().to_owned())
+                .collect(),
+            origin: "stage".to_owned(),
+        }
+    }
+}
+
+impl TryFrom<PersistedBarrier> for AppliedBarrier {
+    type Error = StateDecodeError;
+    fn try_from(value: PersistedBarrier) -> Result<Self, Self::Error> {
+        if value.origin != "stage"
+            || !value.id.starts_with("stage/")
+            || !is_sorted_unique(&value.after)
+            || !is_sorted_unique(&value.members)
+            || value.members.is_empty()
+        {
+            return Err(StateDecodeError::InvalidTopology("invalid barrier fact"));
+        }
+        let members = value
+            .members
+            .into_iter()
+            .map(|member| {
+                FullyQualifiedResourceId::parse(&member)
+                    .map_err(|_| StateDecodeError::InvalidTopology("invalid barrier member"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            id: value.id,
+            after: value.after,
+            members,
+            origin: "stage",
+        })
+    }
+}
+
+fn decode_sorted_unique<P, T>(
+    values: Vec<P>,
+    name: &'static str,
+) -> Result<Vec<T>, StateDecodeError>
+where
+    P: TryInto<T, Error = StateDecodeError>,
+    T: Ord,
+{
+    let decoded = values
+        .into_iter()
+        .map(TryInto::try_into)
+        .collect::<Result<Vec<T>, _>>()?;
+    if !is_sorted_unique(&decoded) {
+        return Err(StateDecodeError::InvalidTopology(name));
+    }
+    Ok(decoded)
+}
+
+fn is_sorted_unique<T: Ord>(values: &[T]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 /// Validates bytes as the current state schema without performing I/O or changing state.
@@ -292,6 +506,71 @@ struct PersistedOperationRecord {
     id: String,
     desired_hash: String,
     actions: BTreeMap<String, PersistedRecordedAction>,
+    schedule: Vec<String>,
+    skip_reasons: BTreeMap<String, PersistedSkipReason>,
+    graph: PersistedOperationGraph,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedOperationGraph {
+    actions: Vec<PersistedGraphAction>,
+    direct_edges: Vec<PersistedGraphDirectEdge>,
+    barriers: Vec<PersistedGraphBarrier>,
+    schedule: Vec<String>,
+    stale_topology_snapshot: PersistedTopology,
+}
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedGraphAction {
+    id: String,
+    resource_id: String,
+    role: String,
+    topology_authority: PersistedTopology,
+    topology_delta: PersistedTopologyDelta,
+}
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedGraphDirectEdge {
+    from: String,
+    to: String,
+    origin: String,
+}
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedGraphBarrier {
+    id: String,
+    after: Vec<String>,
+    input: Vec<String>,
+    output: Vec<String>,
+    provenance: Vec<String>,
+}
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedBarrierReplacement {
+    before: PersistedBarrier,
+    after: PersistedBarrier,
+}
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedTopologyDelta {
+    add_current_direct: Vec<PersistedDirectEdge>,
+    remove_current_direct: Vec<PersistedDirectEdge>,
+    add_historical_direct: Vec<PersistedDirectEdge>,
+    remove_historical_direct: Vec<PersistedDirectEdge>,
+    add_current_barriers: Vec<PersistedBarrier>,
+    remove_current_barriers: Vec<PersistedBarrier>,
+    add_historical_barriers: Vec<PersistedBarrier>,
+    remove_historical_barriers: Vec<PersistedBarrier>,
+    replace_current_barriers: Vec<PersistedBarrierReplacement>,
+    replace_historical_barriers: Vec<PersistedBarrierReplacement>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum PersistedSkipReason {
+    Dependency { blocking_action_id: String },
+    GlobalAbort { initiating_action_id: String },
 }
 
 impl PersistedOperationRecord {
@@ -309,6 +588,36 @@ impl PersistedOperationRecord {
             id: operation.id().as_str().to_owned(),
             desired_hash: operation.desired_hash().as_str().to_owned(),
             actions,
+            schedule: operation
+                .schedule()
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect(),
+            skip_reasons: operation
+                .schedule()
+                .iter()
+                .filter_map(|id| operation.skip_reason(id).map(|reason| (id, reason)))
+                .map(|(id, reason)| {
+                    let reason = match reason {
+                        SkipReason::Dependency { blocking_action_id } => {
+                            PersistedSkipReason::Dependency {
+                                blocking_action_id: blocking_action_id.as_str().to_owned(),
+                            }
+                        }
+                        SkipReason::GlobalAbort {
+                            initiating_action_id,
+                        } => PersistedSkipReason::GlobalAbort {
+                            initiating_action_id: initiating_action_id.as_str().to_owned(),
+                        },
+                    };
+                    (id.as_str().to_owned(), reason)
+                })
+                .collect(),
+            graph: PersistedOperationGraph::from_graph(
+                operation
+                    .graph()
+                    .expect("schema-5 active operations always retain their graph"),
+            ),
         })
     }
 
@@ -325,9 +634,285 @@ impl PersistedOperationRecord {
                 Ok((action_id, action.into_action()?))
             })
             .collect::<Result<Vec<_>, StateDecodeError>>()?;
-        OperationRecord::from_actions(id, desired_hash, actions)
+        let schedule = self
+            .schedule
+            .into_iter()
+            .map(ActionId::parse)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StateDecodeError::InvalidOperation)?;
+        let skip_reasons = self
+            .skip_reasons
+            .into_iter()
+            .map(|(action_id, reason)| {
+                let action_id =
+                    ActionId::parse(action_id).map_err(StateDecodeError::InvalidOperation)?;
+                let reason = match reason {
+                    PersistedSkipReason::Dependency { blocking_action_id } => {
+                        SkipReason::Dependency {
+                            blocking_action_id: ActionId::parse(blocking_action_id)
+                                .map_err(StateDecodeError::InvalidOperation)?,
+                        }
+                    }
+                    PersistedSkipReason::GlobalAbort {
+                        initiating_action_id,
+                    } => SkipReason::GlobalAbort {
+                        initiating_action_id: ActionId::parse(initiating_action_id)
+                            .map_err(StateDecodeError::InvalidOperation)?,
+                    },
+                };
+                Ok((action_id, reason))
+            })
+            .collect::<Result<BTreeMap<_, _>, StateDecodeError>>()?;
+        let graph = self.graph.into_graph()?;
+        OperationRecord::from_actions_with_schedule(id, desired_hash, actions, schedule)
+            .and_then(|operation| operation.with_graph(graph))
+            .and_then(|operation| operation.with_skip_reasons(skip_reasons))
             .map_err(StateDecodeError::InvalidOperation)
     }
+}
+
+impl PersistedOperationGraph {
+    fn from_graph(graph: &PlannedActionGraph) -> Self {
+        Self {
+            actions: graph
+                .actions
+                .iter()
+                .map(PersistedGraphAction::from_action)
+                .collect(),
+            direct_edges: graph
+                .direct_edges
+                .iter()
+                .map(|edge| PersistedGraphDirectEdge {
+                    from: edge.from.clone(),
+                    to: edge.to.clone(),
+                    origin: edge.origin.to_owned(),
+                })
+                .collect(),
+            barriers: graph
+                .barriers
+                .iter()
+                .map(|barrier| PersistedGraphBarrier {
+                    id: barrier.id.clone(),
+                    after: barrier.after.clone(),
+                    input: barrier.input.clone(),
+                    output: barrier.output.clone(),
+                    provenance: barrier.provenance.clone(),
+                })
+                .collect(),
+            schedule: graph.schedule.clone(),
+            stale_topology_snapshot: topology_to_persisted(&AppliedLifecycleTopology::new(
+                graph.stale_topology_snapshot.current_direct.clone(),
+                graph.stale_topology_snapshot.historical_direct.clone(),
+                graph.stale_topology_snapshot.current_barriers.clone(),
+                graph.stale_topology_snapshot.historical_barriers.clone(),
+            )),
+        }
+    }
+    fn into_graph(self) -> Result<PlannedActionGraph, StateDecodeError> {
+        let topology = self.stale_topology_snapshot.into_topology()?;
+        let actions = self
+            .actions
+            .into_iter()
+            .map(PersistedGraphAction::into_action)
+            .collect::<Result<Vec<_>, _>>()?;
+        let direct_edges = self
+            .direct_edges
+            .into_iter()
+            .map(|edge| {
+                if edge.origin != "depends_on" {
+                    return Err(StateDecodeError::InvalidOperation(
+                        OperationRecordError::InvalidGraph,
+                    ));
+                }
+                Ok(GraphDirectEdge {
+                    from: edge.from,
+                    to: edge.to,
+                    origin: "depends_on",
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let barriers = self
+            .barriers
+            .into_iter()
+            .map(|barrier| {
+                Ok(GraphBarrier {
+                    id: barrier.id,
+                    after: barrier.after,
+                    input: barrier.input,
+                    output: barrier.output,
+                    provenance: barrier.provenance,
+                })
+            })
+            .collect::<Result<Vec<_>, StateDecodeError>>()?;
+        Ok(PlannedActionGraph {
+            actions,
+            direct_edges,
+            barriers,
+            schedule: self.schedule,
+            stale_topology_snapshot: StaleTopologySnapshot {
+                current_direct: topology.current_direct().to_vec(),
+                historical_direct: topology.historical_direct().to_vec(),
+                current_barriers: topology.current_barriers().to_vec(),
+                historical_barriers: topology.historical_barriers().to_vec(),
+            },
+        })
+    }
+}
+
+impl PersistedGraphAction {
+    fn from_action(action: &GraphAction) -> Self {
+        Self {
+            id: action.id.clone(),
+            resource_id: action.resource_id.as_str().to_owned(),
+            role: role_name(action.role).to_owned(),
+            topology_authority: topology_to_persisted(&AppliedLifecycleTopology::new(
+                action.topology_authority.current_direct.clone(),
+                action.topology_authority.historical_direct.clone(),
+                action.topology_authority.current_barriers.clone(),
+                action.topology_authority.historical_barriers.clone(),
+            )),
+            topology_delta: delta_to_persisted(&action.topology_delta),
+        }
+    }
+    fn into_action(self) -> Result<GraphAction, StateDecodeError> {
+        let topology = self.topology_authority.into_topology()?;
+        let resource_id = FullyQualifiedResourceId::parse(&self.resource_id)
+            .map_err(|_| StateDecodeError::InvalidOperation(OperationRecordError::InvalidGraph))?;
+        Ok(GraphAction {
+            id: self.id,
+            resource_id,
+            role: parse_role(&self.role).ok_or(StateDecodeError::InvalidOperation(
+                OperationRecordError::InvalidGraph,
+            ))?,
+            topology_authority: TopologyAuthority {
+                current_direct: topology.current_direct().to_vec(),
+                historical_direct: topology.historical_direct().to_vec(),
+                current_barriers: topology.current_barriers().to_vec(),
+                historical_barriers: topology.historical_barriers().to_vec(),
+            },
+            topology_delta: persisted_to_delta(self.topology_delta)?,
+        })
+    }
+}
+
+fn role_name(role: ActionRole) -> &'static str {
+    match role {
+        ActionRole::CurrentCreate => "current_create",
+        ActionRole::CurrentChange => "current_change",
+        ActionRole::CurrentHandoff => "current_handoff",
+        ActionRole::StaleRemove => "stale_remove",
+        ActionRole::ForgetMissing => "forget_missing",
+    }
+}
+fn parse_role(value: &str) -> Option<ActionRole> {
+    Some(match value {
+        "current_create" => ActionRole::CurrentCreate,
+        "current_change" => ActionRole::CurrentChange,
+        "current_handoff" => ActionRole::CurrentHandoff,
+        "stale_remove" => ActionRole::StaleRemove,
+        "forget_missing" => ActionRole::ForgetMissing,
+        _ => return None,
+    })
+}
+fn topology_to_persisted(topology: &AppliedLifecycleTopology) -> PersistedTopology {
+    PersistedTopology::from_topology(topology)
+}
+fn delta_to_persisted(delta: &TopologyDelta) -> PersistedTopologyDelta {
+    PersistedTopologyDelta {
+        add_current_direct: delta
+            .add_current_direct
+            .iter()
+            .map(PersistedDirectEdge::from)
+            .collect(),
+        remove_current_direct: delta
+            .remove_current_direct
+            .iter()
+            .map(PersistedDirectEdge::from)
+            .collect(),
+        add_historical_direct: delta
+            .add_historical_direct
+            .iter()
+            .map(PersistedDirectEdge::from)
+            .collect(),
+        remove_historical_direct: delta
+            .remove_historical_direct
+            .iter()
+            .map(PersistedDirectEdge::from)
+            .collect(),
+        add_current_barriers: delta
+            .add_current_barriers
+            .iter()
+            .map(PersistedBarrier::from)
+            .collect(),
+        remove_current_barriers: delta
+            .remove_current_barriers
+            .iter()
+            .map(PersistedBarrier::from)
+            .collect(),
+        add_historical_barriers: delta
+            .add_historical_barriers
+            .iter()
+            .map(PersistedBarrier::from)
+            .collect(),
+        remove_historical_barriers: delta
+            .remove_historical_barriers
+            .iter()
+            .map(PersistedBarrier::from)
+            .collect(),
+        replace_current_barriers: delta
+            .replace_current_barriers
+            .iter()
+            .map(|replacement| PersistedBarrierReplacement {
+                before: PersistedBarrier::from(&replacement.before),
+                after: PersistedBarrier::from(&replacement.after),
+            })
+            .collect(),
+        replace_historical_barriers: delta
+            .replace_historical_barriers
+            .iter()
+            .map(|replacement| PersistedBarrierReplacement {
+                before: PersistedBarrier::from(&replacement.before),
+                after: PersistedBarrier::from(&replacement.after),
+            })
+            .collect(),
+    }
+}
+fn persisted_to_delta(delta: PersistedTopologyDelta) -> Result<TopologyDelta, StateDecodeError> {
+    let direct = |values: Vec<PersistedDirectEdge>| {
+        values
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<AppliedDirectEdge>, _>>()
+    };
+    let barrier = |values: Vec<PersistedBarrier>| {
+        values
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<AppliedBarrier>, _>>()
+    };
+    let replacement = |values: Vec<PersistedBarrierReplacement>| {
+        values
+            .into_iter()
+            .map(|value| {
+                TopologyBarrierReplacement::new(value.before.try_into()?, value.after.try_into()?)
+                    .map_err(|_| {
+                        StateDecodeError::InvalidOperation(OperationRecordError::InvalidGraph)
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
+    Ok(TopologyDelta {
+        add_current_direct: direct(delta.add_current_direct)?,
+        remove_current_direct: direct(delta.remove_current_direct)?,
+        add_historical_direct: direct(delta.add_historical_direct)?,
+        remove_historical_direct: direct(delta.remove_historical_direct)?,
+        add_current_barriers: barrier(delta.add_current_barriers)?,
+        remove_current_barriers: barrier(delta.remove_current_barriers)?,
+        add_historical_barriers: barrier(delta.add_historical_barriers)?,
+        remove_historical_barriers: barrier(delta.remove_historical_barriers)?,
+        replace_current_barriers: replacement(delta.replace_current_barriers)?,
+        replace_historical_barriers: replacement(delta.replace_historical_barriers)?,
+    })
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1361,6 +1946,7 @@ pub(crate) enum StateDecodeError {
         source: crate::domain::file_copy::ContentFingerprintError,
     },
     InvalidKnownState(KnownStateError),
+    InvalidTopology(&'static str),
     InvalidDesiredHash(HashParseError),
     InvalidOperation(OperationRecordError),
     InvalidTargetCondition,
@@ -1426,6 +2012,9 @@ impl fmt::Display for StateDecodeError {
                 "invalid content fingerprint for {resource_id}: {source}"
             ),
             Self::InvalidKnownState(error) => error.fmt(formatter),
+            Self::InvalidTopology(reason) => {
+                write!(formatter, "invalid applied lifecycle topology: {reason}")
+            }
             Self::InvalidDesiredHash(error) => error.fmt(formatter),
             Self::InvalidOperation(error) => error.fmt(formatter),
             Self::InvalidTargetCondition => {
@@ -1466,6 +2055,7 @@ impl std::error::Error for StateDecodeError {
             Self::UnsupportedSchemaVersion { .. }
             | Self::DefinitionHashMismatch { .. }
             | Self::NonNormalizedPath { .. }
+            | Self::InvalidTopology(_)
             | Self::InvalidTargetCondition
             | Self::SucceededActionKnownMismatch { .. }
             | Self::ActiveActionKnownMismatch { .. } => None,
@@ -1491,8 +2081,8 @@ mod tests {
             ResolvedPath::new(target.clone()).unwrap(),
         )
         .unwrap();
-        let document = json!({
-            "schema_version": 4,
+        let document = schema5_document(json!({
+            "schema_version": 5,
             "resources": { "base/nvim": { "definition_hash": directory_link_definition_hash(&old).unwrap().as_str(), "effect": { "kind": "directory_link", "source_path": old.source_path().as_ref(), "target_path": old.target_path().as_ref(), "link_target": old.source_path().as_ref() } } },
             "active_operation": { "id": "op-directory", "desired_hash": format!("sha256:{}", "a".repeat(64)), "actions": { "a1": {
                 "kind": "replace_directory_link", "resource_id": "base/nvim",
@@ -1506,7 +2096,7 @@ mod tests {
                 "temporary": { "path": temporary.as_ref(), "predicate": { "kind": "expected_directory_link", "target_path": temporary.as_ref(), "link_target": new_source.as_ref() } },
                 "status": "running"
             } } }
-        });
+        }));
         let decoded: StateDocument = serde_json::from_value(document).unwrap();
         let state = decoded.into_state().unwrap();
         let mut encoded = serde_json::to_value(StateDocument::from_state(&state).unwrap()).unwrap();
@@ -1680,6 +2270,83 @@ mod tests {
 
     // Construct the existing wire format directly, independently of the DTO encoder.
     // Paths are platform-local values only; these tests never access the filesystem.
+    fn schema5_document(mut document: Value) -> Value {
+        document["schema_version"] = json!(5);
+        document["applied_lifecycle_topology"] = json!({
+            "current": [], "historical": [],
+        });
+        if let Some(operation) = document["active_operation"].as_object_mut() {
+            let action_ids = operation["actions"]
+                .as_object()
+                .expect("fixture operation actions are an object")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            operation.insert("schedule".to_owned(), json!(action_ids));
+            let skipped = operation["actions"]
+                .as_object()
+                .expect("fixture operation actions are an object")
+                .iter()
+                .filter(|(_, action)| action["status"] == "skipped")
+                .map(|(id, _)| {
+                    (
+                        id.clone(),
+                        json!({ "kind": "global_abort", "initiating_action_id": id }),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            operation.insert("skip_reasons".to_owned(), Value::Object(skipped));
+            let graph_actions = operation["actions"]
+                .as_object()
+                .expect("fixture operation actions are an object")
+                .iter()
+                .map(|(id, action)| {
+                    let role = match action["kind"].as_str().expect("fixture action kind") {
+                        "create_link" | "create_copy" | "create_directory_link" => "current_create",
+                        "replace_link"
+                        | "relocate_link"
+                        | "replace_copy"
+                        | "relocate_copy"
+                        | "replace_directory_link"
+                        | "relocate_directory_link" => "current_change",
+                        "replace_ownership" | "replace_effect" => "current_handoff",
+                        "remove_link" | "remove_copy" | "remove_directory_link" => "stale_remove",
+                        "forget_missing" => "forget_missing",
+                        kind => panic!("unsupported fixture action kind {kind}"),
+                    };
+                    json!({
+                        "id": id,
+                        "resource_id": action["resource_id"],
+                        "role": role,
+                        "topology_authority": {
+                            "current": [], "historical": [],
+                        },
+                        "topology_delta": {
+                            "add_current_direct": [], "remove_current_direct": [],
+                            "add_historical_direct": [], "remove_historical_direct": [],
+                            "add_current_barriers": [], "remove_current_barriers": [],
+                            "add_historical_barriers": [], "remove_historical_barriers": [],
+                            "replace_current_barriers": [], "replace_historical_barriers": [],
+                        },
+                    })
+                })
+                .collect::<Vec<_>>();
+            operation.insert(
+                "graph".to_owned(),
+                json!({
+                    "actions": graph_actions,
+                    "direct_edges": [],
+                    "barriers": [],
+                    "schedule": action_ids,
+                    "stale_topology_snapshot": {
+                        "current": [], "historical": [],
+                    },
+                }),
+            );
+        }
+        document
+    }
+
     fn document_fixture(kind: &str, status: &str) -> Value {
         let root = std::env::temp_dir().join("loadout-codec-fixture");
         let source = root.join("store").join("config");
@@ -1710,8 +2377,8 @@ mod tests {
                 },
             });
         }
-        json!({
-            "schema_version": 4,
+        schema5_document(json!({
+            "schema_version": 5,
             "resources": resources,
             "active_operation": {
                 "id": "op-fixture",
@@ -1727,7 +2394,7 @@ mod tests {
                     },
                 },
             },
-        })
+        }))
     }
 
     #[test]
@@ -1744,7 +2411,7 @@ mod tests {
 
         let document = StateDocument::from_state(&state).unwrap();
         let encoded = serde_json::to_value(&document).unwrap();
-        assert_eq!(encoded["schema_version"], 4);
+        assert_eq!(encoded["schema_version"], 5);
         assert_eq!(
             encoded["resources"]["base/nvim"]["effect"]["kind"],
             "directory_link"
@@ -1772,8 +2439,8 @@ mod tests {
         )
         .unwrap();
         let definition_hash = definition_hash_for_copy_known(&old_copy).unwrap();
-        let document = json!({
-            "schema_version": 4,
+        let document = schema5_document(json!({
+            "schema_version": 5,
             "resources": {"base/config": {
                 "definition_hash": definition_hash.as_str(),
                 "effect": {
@@ -1819,7 +2486,7 @@ mod tests {
                     "status": "running",
                 }},
             },
-        });
+        }));
 
         let state = serde_json::from_value::<StateDocument>(document)
             .unwrap()
@@ -1862,8 +2529,8 @@ mod tests {
         let source = root.join("store").join("config");
         let target = root.join("home").join(".config");
         let fingerprint = format!("sha256:{}", "b".repeat(64));
-        let document = json!({
-            "schema_version": 4,
+        let document = schema5_document(json!({
+            "schema_version": 5,
             "resources": {},
             "active_operation": {
                 "id": "op-copy",
@@ -1893,7 +2560,7 @@ mod tests {
                     }
                 }
             }
-        });
+        }));
 
         let decoded: StateDocument = serde_json::from_value(document).unwrap();
         let state = decoded.into_state().unwrap();
@@ -1919,8 +2586,8 @@ mod tests {
     #[test]
     fn active_copy_without_its_recorded_temporary_is_rejected() {
         let root = std::env::temp_dir().join("loadout-codec-copy-operation-missing-temp");
-        let document = json!({
-            "schema_version": 4,
+        let document = schema5_document(json!({
+            "schema_version": 5,
             "resources": {},
             "active_operation": {
                 "id": "op-copy",
@@ -1941,7 +2608,7 @@ mod tests {
                     "status": "pending"
                 }}
             }
-        });
+        }));
         let decoded: StateDocument = serde_json::from_value(document).unwrap();
         assert!(matches!(
             decoded.into_state(),
@@ -1952,14 +2619,7 @@ mod tests {
     #[test]
     fn existing_action_documents_preserve_their_complete_json_for_every_status() {
         for kind in ["create_link", "remove_link", "forget_missing"] {
-            for status in [
-                "pending",
-                "running",
-                "succeeded",
-                "failed",
-                "skipped",
-                "uncertain",
-            ] {
+            for status in ["pending", "running", "succeeded", "failed", "uncertain"] {
                 let fixture = document_fixture(kind, status);
                 let state = serde_json::from_value::<StateDocument>(fixture.clone())
                     .unwrap()
@@ -1986,14 +2646,14 @@ mod tests {
         )
         .unwrap();
         let definition = definition_hash_for_copy_known(&copy).unwrap();
-        let fixture = json!({
-            "schema_version": 4,
+        let fixture = schema5_document(json!({
+            "schema_version": 5,
             "resources": {"base/config": {
                 "definition_hash": definition.as_str(),
                 "effect": {"kind": "file_copy", "source_path": source.as_ref(), "target_path": target.as_ref(), "content_fingerprint": fingerprint.as_str()}
             }},
             "active_operation": null
-        });
+        }));
 
         let state = serde_json::from_value::<StateDocument>(fixture.clone())
             .unwrap()
@@ -2038,6 +2698,53 @@ mod tests {
                 "unknown field at {pointer} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn schema5_active_operation_requires_a_complete_matching_graph() {
+        let fixture = document_fixture("create_link", "pending");
+
+        let mut absent_graph = fixture.clone();
+        absent_graph["active_operation"]
+            .as_object_mut()
+            .unwrap()
+            .remove("graph");
+        assert!(serde_json::from_value::<StateDocument>(absent_graph).is_err());
+
+        let mut schedule_mismatch = fixture.clone();
+        schedule_mismatch["active_operation"]["graph"]["schedule"] = json!(["other"]);
+        assert!(matches!(
+            serde_json::from_value::<StateDocument>(schedule_mismatch)
+                .unwrap()
+                .into_state(),
+            Err(StateDecodeError::InvalidOperation(
+                OperationRecordError::InvalidGraph
+            ))
+        ));
+
+        let mut unknown_edge_action = fixture.clone();
+        unknown_edge_action["active_operation"]["graph"]["direct_edges"] = json!([{
+            "from": "a1", "to": "other", "origin": "depends_on"
+        }]);
+        assert!(matches!(
+            serde_json::from_value::<StateDocument>(unknown_edge_action)
+                .unwrap()
+                .into_state(),
+            Err(StateDecodeError::InvalidOperation(
+                OperationRecordError::InvalidGraph
+            ))
+        ));
+
+        let mut missing_skip_reason = document_fixture("create_link", "skipped");
+        missing_skip_reason["active_operation"]["skip_reasons"] = json!({});
+        assert!(matches!(
+            serde_json::from_value::<StateDocument>(missing_skip_reason)
+                .unwrap()
+                .into_state(),
+            Err(StateDecodeError::InvalidOperation(
+                OperationRecordError::InvalidSkipReason
+            ))
+        ));
     }
 
     #[test]

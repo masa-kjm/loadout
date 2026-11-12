@@ -120,7 +120,34 @@ identifier_type!(ProfileId, IdentifierKind::Profile);
 identifier_type!(ResourceId, IdentifierKind::Resource);
 identifier_type!(StoreId, IdentifierKind::Store);
 
-/// A fully qualified resource ID has exactly one `<profile-id>/<resource-id>` boundary.
+/// A validated slash-qualified profile-instance namespace.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct InstanceNamespace(String);
+
+impl InstanceNamespace {
+    /// Creates the root instance namespace for one validated profile ID.
+    pub(crate) fn root(profile: &ProfileId) -> Self {
+        Self(profile.to_string())
+    }
+
+    /// Appends one validated instance alias to this namespace.
+    pub(crate) fn child(&self, alias: &ProfileId) -> Self {
+        Self(format!("{}/{}", self.0, alias))
+    }
+
+    /// Returns the canonical slash-qualified instance namespace.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for InstanceNamespace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// A fully qualified resource ID is an instance alias namespace followed by a resource ID.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct FullyQualifiedResourceId(String);
 
@@ -130,22 +157,26 @@ impl FullyQualifiedResourceId {
         Self(format!("{profile}/{resource}"))
     }
 
+    /// Combines a resolved instance namespace and a validated local resource ID.
+    pub(crate) fn in_instance(instance: &InstanceNamespace, resource: &ResourceId) -> Self {
+        Self(format!("{instance}/{resource}"))
+    }
+
     /// Parses and validates a persisted fully qualified resource ID.
     pub(crate) fn parse(value: &str) -> Result<Self, FullyQualifiedResourceIdError> {
-        let (profile, resource) = value
-            .split_once('/')
+        let mut segments = value.split('/').collect::<Vec<_>>();
+        let resource = segments
+            .pop()
+            .filter(|_| !segments.is_empty())
             .ok_or(FullyQualifiedResourceIdError::MissingSeparator)?;
 
-        if resource.contains('/') {
-            return Err(FullyQualifiedResourceIdError::MultipleSeparators);
+        for namespace_segment in segments {
+            ProfileId::parse(namespace_segment)
+                .map_err(FullyQualifiedResourceIdError::InvalidNamespaceSegment)?;
         }
+        ResourceId::parse(resource).map_err(FullyQualifiedResourceIdError::InvalidResourceId)?;
 
-        let profile =
-            ProfileId::parse(profile).map_err(FullyQualifiedResourceIdError::InvalidProfileId)?;
-        let resource = ResourceId::parse(resource)
-            .map_err(FullyQualifiedResourceIdError::InvalidResourceId)?;
-
-        Ok(Self::new(&profile, &resource))
+        Ok(Self(value.to_owned()))
     }
 
     /// Returns the stable resource identity used across lifecycle boundaries.
@@ -172,8 +203,7 @@ impl FromStr for FullyQualifiedResourceId {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FullyQualifiedResourceIdError {
     MissingSeparator,
-    MultipleSeparators,
-    InvalidProfileId(IdentifierError),
+    InvalidNamespaceSegment(IdentifierError),
     InvalidResourceId(IdentifierError),
 }
 
@@ -181,13 +211,14 @@ impl fmt::Display for FullyQualifiedResourceIdError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingSeparator => formatter.write_str(
-                "fully qualified resource ID must contain one '/' between profile and resource IDs",
+                "fully qualified resource ID must contain an instance namespace and resource ID",
             ),
-            Self::MultipleSeparators => formatter.write_str(
-                "fully qualified resource ID must contain exactly one '/' between profile and resource IDs",
-            ),
-            Self::InvalidProfileId(error) => write!(formatter, "invalid profile portion: {error}"),
-            Self::InvalidResourceId(error) => write!(formatter, "invalid resource portion: {error}"),
+            Self::InvalidNamespaceSegment(error) => {
+                write!(formatter, "invalid instance namespace segment: {error}")
+            }
+            Self::InvalidResourceId(error) => {
+                write!(formatter, "invalid resource portion: {error}")
+            }
         }
     }
 }
@@ -195,8 +226,8 @@ impl fmt::Display for FullyQualifiedResourceIdError {
 impl std::error::Error for FullyQualifiedResourceIdError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::InvalidProfileId(error) | Self::InvalidResourceId(error) => Some(error),
-            Self::MissingSeparator | Self::MultipleSeparators => None,
+            Self::InvalidNamespaceSegment(error) | Self::InvalidResourceId(error) => Some(error),
+            Self::MissingSeparator => None,
         }
     }
 }
@@ -302,18 +333,41 @@ mod tests {
     }
 
     #[test]
+    fn fully_qualified_resource_id_supports_nested_instance_namespaces() {
+        assert_eq!(
+            FullyQualifiedResourceId::parse("root/editor/theme/config")
+                .unwrap()
+                .as_str(),
+            "root/editor/theme/config"
+        );
+        let root = ProfileId::parse("root").unwrap();
+        let editor = ProfileId::parse("editor").unwrap();
+        let theme = ProfileId::parse("theme").unwrap();
+        let config = ResourceId::parse("config").unwrap();
+
+        assert_eq!(
+            FullyQualifiedResourceId::in_instance(
+                &InstanceNamespace::root(&root).child(&editor).child(&theme),
+                &config,
+            )
+            .as_str(),
+            "root/editor/theme/config"
+        );
+    }
+
+    #[test]
     fn fully_qualified_resource_id_rejects_invalid_structure_and_parts() {
         assert_eq!(
             FullyQualifiedResourceId::parse("base").unwrap_err(),
             FullyQualifiedResourceIdError::MissingSeparator
         );
-        assert_eq!(
-            FullyQualifiedResourceId::parse("base/git/config").unwrap_err(),
-            FullyQualifiedResourceIdError::MultipleSeparators
-        );
         assert!(matches!(
             FullyQualifiedResourceId::parse("Base/git-config"),
-            Err(FullyQualifiedResourceIdError::InvalidProfileId(_))
+            Err(FullyQualifiedResourceIdError::InvalidNamespaceSegment(_))
+        ));
+        assert!(matches!(
+            FullyQualifiedResourceId::parse("base//git-config"),
+            Err(FullyQualifiedResourceIdError::InvalidNamespaceSegment(_))
         ));
         assert!(matches!(
             FullyQualifiedResourceId::parse("base/Git-config"),

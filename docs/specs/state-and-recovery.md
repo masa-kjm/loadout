@@ -2,7 +2,7 @@
 
 ## Scope
 
-This specification defines v0.7.0 durable state, operation records, exclusive locking, atomic commits, and recovery after interruption for file-link, file-copy, and DirectoryLink resource effects.
+This specification defines v0.8.0 durable state, operation records, exclusive locking, atomic commits, applied lifecycle topology, and recovery after interruption for file-link, file-copy, and DirectoryLink resource effects.
 
 The v0.5.0 State Schema section supersedes the retained v0.3.0 state schema, hash formats, and operation representation. Retained state and recovery requirements continue to apply unless that section states otherwise, including the requirement that inspection validates state before relying on its facts.
 
@@ -503,21 +503,21 @@ Recovery observes only recorded predicates and may perform only this exact tempo
 
 ## Current State Schema
 
-This section supersedes the v0.6.0 State Schema for every normal lifecycle or inspection command that reads state.
-`state.json` has `schema_version: 4`; schema version `3`, every earlier version, and every unknown future version are invalid.
+This section supersedes the v0.7.0 State Schema for every normal lifecycle or inspection command that reads state.
+`state.json` has `schema_version: 5`; schema version `4`, every earlier version, and every unknown future version are invalid.
 The state repository rejects an invalid state version before target inspection, operation recovery, planning, state rewrite, or any target mutation.
 It does not decode the older document for conversion, recalculate its hashes, reinterpret an active operation, or write a replacement state file.
-Only the explicit migration operation in [Migration](migration.md) may parse a supported schema-3 state document.
+Only the explicit migration operation in [Migration](migration.md) may parse a supported schema-4 state document.
 
 An absent state file is an empty Known state.
-An existing schema-3 state file is not an empty state: it is an error that preserves the file and prevents a new plan.
+An existing schema-4 state file is not an empty state: it is an error that preserves the file and prevents a new plan.
 Its recorded effects and active operation are not ownership evidence and MUST NOT be observed, adopted, recovered, removed, replaced, or otherwise acted upon.
 
 The current logical Known-state structure is:
 
 ```json
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "resources": {
     "base/nvim-config": {
       "definition_hash": "sha256:...",
@@ -529,11 +529,12 @@ The current logical Known-state structure is:
       }
     }
   },
+  "applied_lifecycle_topology": { "current": [], "historical": [] },
   "active_operation": null
 }
 ```
 
-`schema_version`, `resources`, and `active_operation` are REQUIRED.
+`schema_version`, `resources`, `applied_lifecycle_topology`, and `active_operation` are REQUIRED.
 Unknown fields are errors at every object level.
 Each resource member contains exactly `definition_hash` and `effect`.
 `effect.kind` is exactly `file_link`, `file_copy`, or `directory_link`.
@@ -541,7 +542,7 @@ A `file_link` records `source_path`, `target_path`, and `link_target`; a `file_c
 Each effect rejects fields that do not belong to its kind.
 Resource IDs and normalized target paths are unique, all paths are absolute platform-normalized paths, and every definition hash and fingerprint has the required canonical form.
 
-`active_operation` is either `null` or an operation record using the retained action shapes or the [Directory-Link Operation Records](#directory-link-operation-records) shapes.
+`active_operation` is either `null` or a schema-5 action-graph operation record. Its resource-specific preconditions and postconditions retain the applicable [Directory-Link Operation Records](#directory-link-operation-records) safety shapes.
 An unrecognized action kind, predicate, effect, field, status, or invariant is invalid state and is rejected before recovery or target inspection.
 
 ### Current Canonical Hashes
@@ -550,11 +551,11 @@ An unrecognized action kind, predicate, effect, field, status, or invariant is i
 The exact per-effect definition value is the value owned by [File Links](file-link.md), [File Copies](file-copy.md), or [Directory Links](directory-link.md#declaration-and-resolution).
 The DirectoryLink definition is `loadout.resolved-directory-link.v1`; it includes `format`, `type`, `kind`, `operation`, `source_path`, and `target_path`, and excludes the resource ID, raw YAML, store ID, source-directory contents, metadata, and schema version.
 
-The current desired hash is exactly the hash of this JCS value:
+The current desired hash is exactly the hash of this JCS value; orchestration facts are excluded:
 
 ```json
 {
-  "format": "loadout.resolved-desired.v4",
+  "format": "loadout.resolved-desired.v5",
   "resources": [
     {
       "definition": {
@@ -574,4 +575,20 @@ The current desired hash is exactly the hash of this JCS value:
 `resources` sorts lexicographically by fully qualified `resource_id`.
 The resource ID is an input only to `desired_hash`; it is not an input to `definition_hash`.
 Schema versions, YAML mapping order, profile discovery/include order, raw declaration syntax, store IDs, source file content, source-directory contents, and metadata are not hash inputs.
-Schema-3 hashes are not aliases for schema-4 hashes and MUST NOT be accepted, recalculated, or compared to establish ownership by a normal command.
+Schema-4 hashes are not aliases for schema-5 hashes and MUST NOT be accepted, recalculated, or compared to establish ownership by a normal command.
+
+### Applied Lifecycle Topology and Operations
+
+`applied_lifecycle_topology` is a sorted object with `current` and `historical` arrays. It retains only topology facts successfully committed with verified actions. A topology direct-edge fact is `{ "from": "<resource-id>", "to": "<resource-id>", "origin": "depends_on" }`; it sorts by `from`, `to`, and `origin`. A topology barrier fact is `{ "id": "stage/<stage-id>", "after": ["stage/<stage-id>"], "members": ["<resource-id>"], "origin": "stage" }`; its arrays are sorted and duplicate-free and barriers sort by `id`. A fact's source-array-qualified identity is unique: an identical direct edge or barrier ID MUST NOT appear in both arrays. Unknown fields, duplicates, noncanonical sorting, malformed references, or invalid cross-array identity are invalid state before recovery or target observation.
+
+An active schema-5 operation contains exactly the graph and schedule selected before its first mutation: `actions`, `direct_edges`, `barriers`, and `schedule`, in addition to existing action preconditions and postconditions. Each action has a unique action ID, resource ID, typed action role, status, skip reason, topology authority, and planner-selected topology delta. `direct_edges` contains ordered action-ID pairs with `origin: "depends_on"`. Each barrier has stable ID `stage/<fully-qualified-stage-id>`, sorted `after` barrier IDs, sorted input and output action-ID sets, and provenance containing only canonical resolved IDs. `skip_reason` is null unless status is `skipped`; a skipped action is exactly `{ "kind": "dependency", "blocking_action_id": "<action-id>" }` or `{ "kind": "global_abort", "initiating_action_id": "<action-id>" }`. The state decoder rejects an unknown ID, missing action or barrier reference, duplicate ID or incidence, non-permutation schedule, invalid role/edge legality, status/reason mismatch, unsorted or duplicate collection, absent authority fact, or graph cycle before recovery or target observation.
+
+Before a non-dry-run mutation, the repository durably records the complete graph, schedule, action pre/postconditions, statuses, skip facts, and planner-selected topology authority/delta. After the exact post-condition is verified, it atomically publishes only the action's Known update, `succeeded` status, and authorized topology delta. It cannot derive, add, merge, reorder, or transfer topology. Ordering-only changes have no action and therefore create no operation, topology update, or state rewrite.
+
+A topology delta contains only sorted `add_current`, `remove_current`, `add_historical`, `remove_historical`, `replace_current`, and `replace_historical` arrays plus its authorizing action ID. Each replacement is `{ "before": <exact-barrier-fact>, "after": <exact-barrier-fact> }`: `before` must occur in the named source array, `after` must retain the same barrier ID with a strictly smaller sorted member array, and no delta may name one fact in more than one add, remove, or replacement position. Authority and every delta item contain exact facts; a removal may name only a fact present in its named source array.
+
+A direct edge is published only by its successor action after the predecessor's required post-condition is represented by a prior atomic Known/action commit in this operation or pre-operation Known state. A barrier relation is published only by a successful output member after all its applicable input memberships are committed. Operation input and output action IDs become durable barrier resource memberships only after their associated actions succeed. Partial success thus retains only independently verified memberships and no unproven cross-resource relation. A stale operation stores an immutable sorted `stale_topology_snapshot`: all committed current and historical facts whose members or direct-edge endpoints are stale, together with the exact incident facts for each stale action. It reverses only selected all-stale relations from that snapshot and never derives stale ordering from changed declarations.
+
+The planner assigns exactly one recorded removal owner for each snapshot fact, and recovery never transfers that authority. A direct edge is owned by its `to` endpoint's stale action; a multi-member barrier is owned successively by its member actions in reverse schedule order. A mixed fact incident to one stale action and one or more current resources has that stale action as sole owner and creates no stale scheduling edge. Each such barrier delta records the exact `before` and next `after` fact, replacing it while members remain and removing it only for the final member. A successful stale action atomically commits only its owned deletion or replacement, its verified Known update, and `succeeded`; failed or uncertain actions retain their topology facts and authority.
+
+Recovery classifies an active operation from its recorded graph, predicates, authority, durable temporary/publication facts where applicable, and required current observations only. It does not read changed declarations, replan, or resume the old schedule. An unprovable outcome remains `uncertain` and blocks a fresh plan. A later apply recovers first and then creates a fresh plan.

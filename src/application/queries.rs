@@ -601,7 +601,7 @@ mod tests {
             .unwrap();
             fs::write(
                 root.join("portable/profiles/base.yaml"),
-                "schema_version: 4\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.item\n",
+                "schema_version: 5\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.item\n",
             )
             .unwrap();
             let root = crate::domain::paths::ResolvedPath::from_platform_canonicalized(
@@ -834,8 +834,9 @@ mod tests {
         fs::write(
             workspace.root.join("state/state.json"),
             serde_json::json!({
-                "schema_version":4,
+                "schema_version": 5,
                 "resources": {},
+                "applied_lifecycle_topology": { "current": [], "historical": [] },
                 "active_operation": {
                     "id": "interrupted-operation",
                     "desired_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -851,6 +852,21 @@ mod tests {
                             },
                             "status": "pending",
                         },
+                    },
+                    "schedule": ["a1"],
+                    "skip_reasons": {},
+                    "graph": {
+                        "actions": [{
+                            "id": "a1",
+                            "resource_id": "base/pending",
+                            "role": "current_create",
+                            "topology_authority": { "current": [], "historical": [] },
+                            "topology_delta": { "add_current_direct": [], "remove_current_direct": [], "add_historical_direct": [], "remove_historical_direct": [], "add_current_barriers": [], "remove_current_barriers": [], "add_historical_barriers": [], "remove_historical_barriers": [], "replace_current_barriers": [], "replace_historical_barriers": [] },
+                        }],
+                        "direct_edges": [],
+                        "barriers": [],
+                        "schedule": ["a1"],
+                        "stale_topology_snapshot": { "current": [], "historical": [] },
                     },
                 },
             })
@@ -883,7 +899,7 @@ mod tests {
         let workspace = Workspace::new();
         fs::write(
             workspace.root.join("portable/profiles/base.yaml"),
-            "schema_version: 4\nid: base\nresources:\n  changed:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.changed\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.item\n",
+            "schema_version: 5\nid: base\nresources:\n  changed:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.changed\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.item\n",
         )
         .unwrap();
         let desired_item = desired_resources(&DeclarationRequest {
@@ -934,8 +950,9 @@ mod tests {
         fs::write(
             workspace.root.join("state/state.json"),
             serde_json::json!({
-                "schema_version":4,
+                "schema_version": 5,
                 "resources": resources,
+                "applied_lifecycle_topology": { "current": [], "historical": [] },
                 "active_operation": null,
             })
             .to_string(),
@@ -999,10 +1016,11 @@ mod tests {
         fs::write(
             workspace.root.join("state/state.json"),
             serde_json::json!({
-                "schema_version":4,
+                "schema_version": 5,
                 "resources": {
                     "base/item": persisted_known_file_link(&desired),
                 },
+                "applied_lifecycle_topology": { "current": [], "historical": [] },
                 "active_operation": {
                     "id": "interrupted-operation",
                     "desired_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -1018,6 +1036,21 @@ mod tests {
                             },
                             "status": "pending",
                         },
+                    },
+                    "schedule": ["a1"],
+                    "skip_reasons": {},
+                    "graph": {
+                        "actions": [{
+                            "id": "a1",
+                            "resource_id": "base/pending",
+                            "role": "current_create",
+                            "topology_authority": { "current": [], "historical": [] },
+                            "topology_delta": { "add_current_direct": [], "remove_current_direct": [], "add_historical_direct": [], "remove_historical_direct": [], "add_current_barriers": [], "remove_current_barriers": [], "add_historical_barriers": [], "remove_historical_barriers": [], "replace_current_barriers": [], "replace_historical_barriers": [] },
+                        }],
+                        "direct_edges": [],
+                        "barriers": [],
+                        "schedule": ["a1"],
+                        "stale_topology_snapshot": { "current": [], "historical": [] },
                     },
                 },
             })
@@ -1100,7 +1133,7 @@ mod tests {
         let workspace = Workspace::new();
         fs::write(
             workspace.root.join("portable/profiles/base.yaml"),
-            "schema_version: 4\nid: base\nresources:\n  another:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.another\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.blocked/item\n",
+            "schema_version: 5\nid: base\nresources:\n  another:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.another\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.blocked/item\n",
         )
         .unwrap();
         let blocked = workspace.root.join("home/.blocked");

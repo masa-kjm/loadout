@@ -11,12 +11,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::domain::hashes::{CanonicalHashError, DesiredHash};
 use crate::domain::known::{KnownFileLink, KnownState, KnownStateError};
 use crate::domain::paths::ResolvedPath;
-use crate::domain::plan::{ActionKind, PlannedAction, PlannedResourceAction};
+use crate::domain::plan::{ActionKind, PlannedAction, PlannedActionGraph, PlannedResourceAction};
 pub(crate) use crate::state::codec::StateDecodeError;
 use crate::state::codec::StateDocument;
 use crate::state::operation::{
     ActionId, ActionStatus, OperationId, OperationRecord, OperationRecordError, RecordedAction,
-    RecordedKnownStateUpdate,
+    RecordedKnownStateUpdate, SkipReason,
 };
 
 const STATE_FILE_NAME: &str = "state.json";
@@ -432,6 +432,19 @@ impl LockedStateRepository {
         if self.state.active_operation.is_some() {
             return Err(StateRepositoryError::ActiveOperationPresent);
         }
+        let (ids, operation) = self.build_resource_operation(desired_hash, actions)?;
+        let mut candidate = self.state.clone();
+        candidate.active_operation = Some(operation);
+        self.commit_candidate(candidate)?;
+        Ok(ids)
+    }
+
+    /// Builds pending action records entirely in memory before any state publication.
+    fn build_resource_operation(
+        &self,
+        desired_hash: DesiredHash,
+        actions: &[PlannedResourceAction],
+    ) -> Result<(Vec<ActionId>, OperationRecord), StateRepositoryError> {
         let mut reserved = self
             .state
             .known()
@@ -518,6 +531,124 @@ impl LockedStateRepository {
             recorded.push((id, facts));
         }
         let operation = OperationRecord::from_actions(new_operation_id(), desired_hash, recorded)
+            .map_err(StateRepositoryError::Operation)?;
+        Ok((ids, operation))
+    }
+
+    /// Records an operation using a planner-selected resource-ID schedule.
+    ///
+    /// The repository only translates immutable resource identity to its durable
+    /// action ID; it neither sorts nor derives a new execution order.
+    pub(crate) fn begin_resource_actions_with_schedule(
+        &mut self,
+        desired_hash: DesiredHash,
+        actions: &[PlannedResourceAction],
+        schedule: &[String],
+    ) -> Result<Vec<ActionId>, StateRepositoryError> {
+        if self.state.active_operation.is_some() {
+            return Err(StateRepositoryError::ActiveOperationPresent);
+        }
+        let (ids, operation) = self.build_resource_operation(desired_hash, actions)?;
+        let by_resource = actions
+            .iter()
+            .zip(&ids)
+            .map(|(action, id)| (action.resource_id().as_str(), id.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let scheduled = schedule
+            .iter()
+            .map(|resource_id| {
+                by_resource.get(resource_id.as_str()).cloned().ok_or(
+                    StateRepositoryError::Operation(OperationRecordError::InvalidSchedule),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut candidate = self.state.clone();
+        let actions = operation
+            .actions()
+            .map(|(id, action)| (id.clone(), action.clone()));
+        candidate.active_operation = Some(
+            OperationRecord::from_actions_with_schedule(
+                operation.id().clone(),
+                operation.desired_hash().clone(),
+                actions,
+                scheduled,
+            )
+            .map_err(StateRepositoryError::Operation)?,
+        );
+        self.commit_candidate(candidate)?;
+        Ok(ids)
+    }
+
+    /// Records the complete graph-backed operation before execution starts.
+    pub(crate) fn begin_resource_actions_with_graph(
+        &mut self,
+        desired_hash: DesiredHash,
+        actions: &[PlannedResourceAction],
+        graph: PlannedActionGraph,
+    ) -> Result<Vec<ActionId>, StateRepositoryError> {
+        if self.state.active_operation.is_some() {
+            return Err(StateRepositoryError::ActiveOperationPresent);
+        }
+        let (ids, operation) = self.build_resource_operation(desired_hash, actions)?;
+        let ids_by_resource = operation
+            .actions()
+            .map(|(id, action)| {
+                (
+                    action.resource_id().as_str().to_owned(),
+                    id.as_str().to_owned(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let action_id = |resource_id: &str| {
+            ids_by_resource
+                .get(resource_id)
+                .cloned()
+                .ok_or(StateRepositoryError::Operation(
+                    OperationRecordError::InvalidGraph,
+                ))
+        };
+        let mut graph = graph;
+        for node in &mut graph.actions {
+            node.id = action_id(node.resource_id.as_str())?;
+        }
+        for edge in &mut graph.direct_edges {
+            edge.from = action_id(&edge.from)?;
+            edge.to = action_id(&edge.to)?;
+        }
+        for barrier in &mut graph.barriers {
+            barrier.input = barrier
+                .input
+                .iter()
+                .map(|id| action_id(id))
+                .collect::<Result<_, _>>()?;
+            barrier.output = barrier
+                .output
+                .iter()
+                .map(|id| action_id(id))
+                .collect::<Result<_, _>>()?;
+        }
+        graph.schedule = graph
+            .schedule
+            .iter()
+            .map(|id| action_id(id))
+            .collect::<Result<_, _>>()?;
+        let scheduled = graph
+            .schedule
+            .iter()
+            .map(|id| ActionId::parse(id.clone()).map_err(StateRepositoryError::Operation))
+            .collect::<Result<Vec<_>, _>>()?;
+        let actions = operation
+            .actions()
+            .map(|(id, action)| (id.clone(), action.clone()));
+        let operation = OperationRecord::from_actions_with_schedule(
+            operation.id().clone(),
+            operation.desired_hash().clone(),
+            actions,
+            scheduled,
+        )
+        .map_err(StateRepositoryError::Operation)?;
+        let operation = operation
+            .with_graph(graph)
             .map_err(StateRepositoryError::Operation)?;
         let mut candidate = self.state.clone();
         candidate.active_operation = Some(operation);
@@ -672,6 +803,22 @@ impl LockedStateRepository {
         self.commit_candidate(candidate)
     }
 
+    /// Atomically records a graph-derived skipped status and its durable cause.
+    pub(crate) fn mark_skipped(
+        &mut self,
+        action_id: &ActionId,
+        reason: SkipReason,
+    ) -> Result<(), StateRepositoryError> {
+        let mut candidate = self.state.clone();
+        candidate
+            .active_operation
+            .as_mut()
+            .ok_or(StateRepositoryError::NoActiveOperation)?
+            .mark_skipped(action_id, reason)
+            .map_err(StateRepositoryError::Operation)?;
+        self.commit_candidate(candidate)
+    }
+
     /// Atomically commits a verified action's exact Known-state update and `succeeded` status.
     pub(crate) fn commit_succeeded(
         &mut self,
@@ -735,6 +882,21 @@ impl LockedStateRepository {
                 .with_directory_identity_replaced_by_id(&old_resource_id, new_resource)
                 .map_err(StateRepositoryError::KnownState)?,
         };
+        if let Some(operation) = candidate.active_operation.as_ref() {
+            if operation.graph().is_some() {
+                let (authority, delta) = operation
+                    .topology_for_action(action_id)
+                    .map_err(StateRepositoryError::Operation)?;
+                let topology = candidate
+                    .known
+                    .topology()
+                    .transition(authority, delta)
+                    .map_err(|_| {
+                        StateRepositoryError::Operation(OperationRecordError::InvalidGraph)
+                    })?;
+                candidate.known = candidate.known.clone().with_topology(topology);
+            }
+        }
         self.commit_candidate(candidate)
     }
 
@@ -2005,6 +2167,26 @@ mod tests {
     }
 
     #[test]
+    fn graph_conversion_failure_does_not_persist_a_partial_operation() {
+        let workspace = TestStateDirectory::new();
+        let repository = workspace.repository();
+        let mut locked = repository.acquire_exclusive().unwrap();
+        let action = PlannedResourceAction::from(create_action());
+        let graph = PlannedActionGraph {
+            schedule: vec!["base/missing".into()],
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            locked.begin_resource_actions_with_graph(desired_hash(), &[action], graph),
+            Err(StateRepositoryError::Operation(
+                OperationRecordError::InvalidGraph
+            ))
+        ));
+        assert!(repository.load().unwrap().active_operation().is_none());
+    }
+
+    #[test]
     fn copy_removal_record_round_trips_and_requires_the_exact_known_copy() {
         let workspace = TestStateDirectory::new();
         let repository = workspace.repository();
@@ -2045,8 +2227,9 @@ mod tests {
         assert!(action.temporary_path().is_none());
         assert!(action.copy_removal_facts().is_some());
 
+        locked.mark_running(&removal_id).unwrap();
         locked
-            .mark_without_known(&removal_id, ActionStatus::Skipped)
+            .mark_without_known(&removal_id, ActionStatus::Failed)
             .unwrap();
         locked.close_finished_operation().unwrap();
         let forget = PlannedResourceAction::FileCopy(PlannedFileCopyAction::ForgetMissing {
@@ -2368,7 +2551,7 @@ mod tests {
 
         let json: serde_json::Value =
             serde_json::from_slice(&fs::read(directory.state_file()).unwrap()).unwrap();
-        assert_eq!(json["schema_version"], 4);
+        assert_eq!(json["schema_version"], 5);
         assert!(
             json["resources"]["base/git"]["definition_hash"]
                 .as_str()
@@ -2669,9 +2852,12 @@ mod tests {
                     locked.mark_running(&action_id).unwrap();
                     locked.mark_without_known(&action_id, status).unwrap();
                 }
-                ActionStatus::Skipped => locked
-                    .mark_without_known(&action_id, ActionStatus::Skipped)
-                    .unwrap(),
+                ActionStatus::Skipped => {
+                    locked.mark_running(&action_id).unwrap();
+                    locked
+                        .mark_without_known(&action_id, ActionStatus::Failed)
+                        .unwrap();
+                }
                 ActionStatus::Succeeded => unreachable!(),
             }
             drop(locked);

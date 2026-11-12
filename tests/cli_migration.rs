@@ -47,12 +47,12 @@ impl Fixture {
         .unwrap();
         fs::write(
             root.join("portable/profiles/base.yaml"),
-            "schema_version: 3\nid: base\nresources: {}\n",
+            "schema_version: 4\nid: base\nresources: {}\n",
         )
         .unwrap();
         fs::write(
             root.join("state/loadout/state.json"),
-            "{\"schema_version\":3,\"resources\":{},\"active_operation\":null}",
+            "{\"schema_version\":4,\"resources\":{},\"active_operation\":null}",
         )
         .unwrap();
         fs::write(root.join("home/managed-target"), "unchanged").unwrap();
@@ -120,7 +120,7 @@ fn state_migration_without_yes_presents_the_boundary_and_leaves_everything_uncha
     assert!(text.contains("migration: state"), "{text}");
     assert!(text.contains("affected documents: 1"), "{text}");
     let document = format!(
-        "document: {} (schema 3 -> 4)",
+        "document: {} (schema 4 -> 5)",
         fixture
             .root
             .join("state")
@@ -129,7 +129,7 @@ fn state_migration_without_yes_presents_the_boundary_and_leaves_everything_uncha
             .display()
     );
     assert!(text.contains(&document), "expected {document:?} in {text}");
-    assert!(text.contains("schema versions: 3 -> 4"), "{text}");
+    assert!(text.contains("schema versions: 4 -> 5"), "{text}");
     assert!(text.contains("resource IDs, effects, and Known ownership do not change"));
     assert!(text.contains("requires --yes"), "{text}");
     assert_eq!(fixture.snapshot(), before);
@@ -140,7 +140,7 @@ fn profile_migration_confirmation_lists_each_exact_schema_three_document() {
     let fixture = Fixture::new();
     fs::write(
         fixture.root.join("portable/profiles/extra.yaml"),
-        "schema_version: 3\nid: extra\nresources: {}\n",
+        "schema_version: 4\nid: extra\nresources: {}\n",
     )
     .unwrap();
     let before = fixture.snapshot();
@@ -157,7 +157,7 @@ fn profile_migration_confirmation_lists_each_exact_schema_three_document() {
     assert!(text.contains("affected documents: 2"), "{text}");
     for profile in ["base.yaml", "extra.yaml"] {
         let document = format!(
-            "document: {} (schema 3 -> 4)",
+            "document: {} (schema 4 -> 5)",
             fixture
                 .root
                 .join("portable")
@@ -224,7 +224,7 @@ fn confirmed_state_then_profile_migration_only_changes_schema_versions() {
             &fs::read(fixture.root.join("state/loadout/state.json")).unwrap(),
         )
         .unwrap(),
-        serde_json::json!({"schema_version": 4, "resources": {}, "active_operation": null})
+        serde_json::json!({"schema_version": 5, "resources": {}, "applied_lifecycle_topology": {"current": [], "historical": []}, "active_operation": null})
     );
 
     let profiles = fixture.run(&[
@@ -246,7 +246,7 @@ fn confirmed_state_then_profile_migration_only_changes_schema_versions() {
     );
     assert_eq!(
         fs::read_to_string(fixture.root.join("portable/profiles/base.yaml")).unwrap(),
-        "schema_version: 4\nid: base\nresources: {}\n"
+        "schema_version: 5\nid: base\nresources: {}\n"
     );
     assert_eq!(
         fs::read(fixture.root.join("home/managed-target")).unwrap(),
@@ -260,17 +260,17 @@ fn confirmed_profile_migration_resumes_remaining_schema_three_documents_without_
     let fixture = Fixture::new();
     fs::write(
         fixture.root.join("portable/profiles/extra.yaml"),
-        "schema_version: 3\nid: extra\nresources: {}\n",
+        "schema_version: 4\nid: extra\nresources: {}\n",
     )
     .unwrap();
     fs::write(
         fixture.root.join("portable/profiles/base.yaml"),
-        "# already published\nschema_version: 4\nid: base\nresources: {}\n",
+        "# already published\nschema_version: 5\nid: base\nresources: {}\n",
     )
     .unwrap();
     fs::write(
         fixture.root.join("state/loadout/state.json"),
-        "{\"schema_version\":4,\"resources\":{},\"active_operation\":null}",
+        "{\"schema_version\":5,\"resources\":{},\"applied_lifecycle_topology\":{\"current\":[],\"historical\":[]},\"active_operation\":null}",
     )
     .unwrap();
     let published_before = fs::read(fixture.root.join("portable/profiles/base.yaml")).unwrap();
@@ -295,6 +295,6 @@ fn confirmed_profile_migration_resumes_remaining_schema_three_documents_without_
     );
     assert_eq!(
         fs::read_to_string(fixture.root.join("portable/profiles/extra.yaml")).unwrap(),
-        "schema_version: 4\nid: extra\nresources: {}\n"
+        "schema_version: 5\nid: extra\nresources: {}\n"
     );
 }

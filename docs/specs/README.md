@@ -12,7 +12,7 @@ These documents own the current v0.8.0 observable contracts. [Architecture](../a
 | Regular-file copies and content ownership | [File Copies](file-copy.md) |
 | Directory symbolic links | [Directory Links](directory-link.md) |
 | Desired/Known/Actual planning, preflight, apply, ordering | [Lifecycle](lifecycle.md) |
-| Durable state, operation records, locking, recovery | [State and Recovery](state-and-recovery.md) |
+| Durable state, operation records, locking, recovery | [State and Recovery: read by task](state-and-recovery.md#read-by-task) |
 | Command syntax, confirmation, exit statuses | [CLI](cli.md) |
 | Explicit schema-4-to-5 conversion | [Migration](migration.md) |
 | Initial portable bundle creation | [Initialization](init.md) |

@@ -2,20 +2,18 @@
 
 ## Scope
 
-This specification defines the v0.5.0 `copy` operation for a `file` resource.
+This specification defines the current `copy` operation for a `file` resource.
 It copies one regular file from a local store to one regular-file target below the current user's home directory.
 It does not define directory copying, metadata synchronization, remote sources, import, adoption, or migration.
 
 The source and target path syntax, physical containment requirements, no-follow parent checks, Windows path representation, and external filesystem concurrency limits in [File Links](file-link.md) apply to copies unless this specification states otherwise.
-The same external-concurrency limit applies: checks reject observable substitutions but do not provide atomic entry identity between a final recheck and an operating-system call.
 
 ## Declaration and Resolution
 
-A v0.5 profile document using copy has schema version `2`.
-In the current contract, the same `file`/`copy` declaration is carried by profile schema version `5` under the [Current Profile Schema](profiles.md#current-profile-schema). Orchestration facts do not alter copy ownership or its content fingerprint.
+The `file`/`copy` declaration uses profile schema version `5` under the [Current Profile Schema](profiles.md#current-profile-schema). Orchestration facts do not alter copy ownership or its content fingerprint.
 
 ```yaml
-schema_version: 2
+schema_version: 5
 id: workstation
 resources:
   git-config:
@@ -37,7 +35,7 @@ Actual inspection, preflight, and every executor mutation recheck prove target c
 
 Resolution for a copy computes `source_content_fingerprint` from the exact source bytes using SHA-256 and represents it as `sha256:<lowercase-hex>`.
 It records no timestamp, mode, ACL, ownership, extended attribute, line-ending normalization, or other metadata in that fingerprint.
-The copied target contains exactly those bytes; v0.5.0 neither preserves nor synchronizes source metadata.
+The copied target contains exactly those bytes; Loadout neither preserves nor synchronizes source metadata for this operation.
 
 The resolved copy definition is the JCS value:
 

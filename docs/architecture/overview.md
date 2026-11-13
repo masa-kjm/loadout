@@ -12,11 +12,10 @@ It does not reimplement package managers, runtime version resolution, secret man
 
 v0.8.0 supports two closed effects for one regular file from a local store: a link or a content-owned copy at a target path, plus a directory symbolic link for one local-store real directory.
 It retains read-only inspection of profiles, resources, and selected Desired/Known/Actual relations.
-Profiles may declare closed typed parameters and compose explicitly named instances; resolution substitutes those values before it produces Desired state for the unchanged lifecycle.
+Profiles may declare closed typed parameters and compose explicitly named instances; resolution substitutes those values before it produces Desired state.
 Profiles may additionally declare stable stages and direct prerequisites between canonical resolved resource instances. Task resources, remote stores, directory copying, parallel execution, numeric priorities, generic before/after relations, and declaration or include ordering controls are not part of the v0.8.0 executable surface.
 
-The first implementation must prefer a narrow, complete file-link lifecycle over generic extension mechanisms.
-In particular, v0.8.0 does not expose an external resource-plugin API.
+The current contract does not expose an external resource-plugin API.
 
 ## System Model
 
@@ -48,7 +47,7 @@ Resolved Desired ----+---- Known State Repository
 ```
 
 The command layer invokes this flow, presents diagnostics, obtains confirmation when required, and maps results to output and exit status.
-The application workflow coordinates the lifecycle calls in the required [Lifecycle](../specs/lifecycle.md) order. v0.4.0 does not require this coordination to be a separate subsystem: it may remain in the command implementation or move to an internal use case. In either form, coordination does not make resource-ownership, path-safety, planning, or durable-state decisions.
+The application workflow coordinates the calls in the required [Lifecycle](../specs/lifecycle.md) order. Coordination may reside in command code or an internal use case, but it does not make resource-ownership, path-safety, planning, or durable-state decisions.
 
 Inspection is a sibling query path.
 Profile inspection reads declarations, Desired-resource inspection reads a resolved Desired set, Known-resource inspection reads validated state, and `status` combines typed Desired, Known, and Actual facts for one selected profile.
@@ -137,13 +136,12 @@ Each resource type belongs to the same lifecycle: parse, resolve, inspect, plan,
 Adding a type may add a handler at those boundaries, but it must not cause command code to duplicate planning or ownership decisions.
 No handler may write durable state directly, render terminal output, or accept unresolved configuration syntax.
 
-This is a controlled internal extension boundary, not a commitment to dynamic plugins.
-New abstractions are introduced only when a second supported resource type needs the same boundary.
+This is a controlled internal extension boundary; shared abstractions must serve a boundary used by supported resource types.
 
 ## Platform Isolation
 
 The planner is platform-agnostic after resolution.
-Platform-specific code is limited to path resolution, filesystem observation, link creation, replacement behavior, and durability primitives.
+Platform-specific code is limited to path resolution, filesystem observation, resource creation, replacement behavior, and durability primitives.
 An unsupported or unsafe platform condition is a blocking diagnostic before a managed target is changed.
 
 The specifications define the exact Unix and Windows behavior, including path containment and link semantics.

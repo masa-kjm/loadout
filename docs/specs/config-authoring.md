@@ -2,7 +2,7 @@
 
 ## Scope
 
-This specification defines the v0.3.0 configuration inspection and authoring commands.
+This specification defines the current configuration inspection and authoring commands.
 They inspect or edit machine-local runtime configuration and portable environment configuration.
 They are not lifecycle commands and do not materialize resources.
 
@@ -43,14 +43,14 @@ It never edits loadout.yaml.
 config get and config set use schema-aware dot paths.
 They do not implement YAML Pointer, arbitrary YAML traversal, array indexing, or edits across documents.
 
-The v0.3.0 allowed scalar paths are:
+The allowed scalar paths are:
 
 - default_profile, whose value is a profile ID; and
 - stores.<store-id>.properties.path, whose value is a configuration-level path for a local store.
 
 config list reports all supported fields and their typed values.
 It does not print fields that are not part of the supported schema.
-Collection-valued fields, including profile_discovery.paths, have no config set operation in v0.3.0.
+Collection-valued fields, including profile_discovery.paths, have no config set operation.
 
 An unknown field, an invalid store ID, a store other than local, a value of the wrong type, or an invalid resolved path is an input error.
 config set applies the one typed change to the parsed document and validates the complete resulting document, including profile discovery and stores, before any write.
@@ -148,4 +148,4 @@ A missing, unexpected, or unprovable final observation returns status 1 and pres
 
 ## Non-Goals
 
-v0.3.0 provides no config reset, no generic YAML editor, no list or mapping structural edit, no portable profile or resource-declaration editing, no schema migration, and no multi-document transaction.
+Loadout provides no config reset, generic YAML editor, list or mapping structural edit, portable profile or resource-declaration editing, schema migration through `config`, or multi-document transaction.

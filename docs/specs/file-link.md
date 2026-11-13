@@ -61,7 +61,7 @@ Resolution produces an absolute target candidate below the current user's home d
 Before target observation or mutation, the inspector and executor MUST prove that the target is physically contained by the current user's canonical home directory.
 All target parent directories MUST already exist.
 From the canonical home directory to the target parent, each component MUST be a directory and MUST NOT be a symlink, junction, or reparse point.
-Loadout does not create target parent directories in v0.3.0.
+Loadout does not create target parent directories.
 
 The resolved target MUST NOT:
 
@@ -74,7 +74,7 @@ These checks protect source assets and Loadout control data from resource mutati
 
 ### Windows Path Representation
 
-On Windows, v0.3.0 accepts only absolute normal DOS paths such as `C:\Users\example\file` and ordinary UNC paths such as `\\server\share\file`.
+On Windows, Loadout accepts only absolute normal DOS paths such as `C:\Users\example\file` and ordinary UNC paths such as `\\server\share\file`.
 It accepts either separator at the declaration or state-decoding boundary and stores the resulting normal Windows path representation with backslash separators.
 Drive-relative paths, verbatim DOS and UNC paths beginning with `\\?\`, device namespaces such as `\\.\` or `\\??\`, and every other prefixed namespace are rejected.
 The physical canonicalization boundary may convert only the verbatim DOS or UNC form returned by the operating system for an already existing, verified source, home directory, or discovered profile; it never makes that spelling valid in a declaration, state document, or link value.
@@ -92,7 +92,7 @@ Filesystem observation and containment checks remain responsible for physical id
 Loadout creates an absolute file symbolic link whose target is the verified resolved source path.
 The exact normalized link target is recorded in Known state after post-condition verification.
 
-Loadout does not create relative links, hard links, directory links, junctions, or other reparse points in v0.3.0.
+The file-link operation does not create relative links, hard links, directory links, junctions, or other reparse points. Directory links have their own [specification](directory-link.md).
 
 ## Observation
 
@@ -122,7 +122,7 @@ It MUST NOT remove parent directories.
 If a stale resource target is `missing`, Loadout may remove its Known state record without a filesystem mutation.
 If its target is any other observation, removal is blocked by a conflict and Known state remains unchanged.
 
-v0.3.0 does not provide a force option, unmanaged-target takeover, or user-invoked ownership-transfer operation.
+Loadout does not provide a force option, unmanaged-target takeover, or user-invoked ownership-transfer operation.
 The lifecycle may perform the internal managed-resource identity handoff defined by [Replace Ownership](#replace-ownership) only when Known and Actual state prove Loadout's existing ownership.
 
 ## Mutation Contract
@@ -136,7 +136,7 @@ Create requires a safe parent path, a verified source, and a `missing` target.
 It creates the absolute symbolic link and then verifies `expected_link` against the planned source target.
 No Known state is committed until that verification succeeds.
 If the create attempt returns an error, a subsequently matching link alone MUST NOT authorize a Known-state update. In particular, an external process may create a matching unmanaged link after the final recheck, causing no-replace creation to fail with an already-existing-entry error. During execution, a failed create followed by `expected_link` MUST be classified as `uncertain`, preserving Known and the observed link.
-Recovery applies the same non-adoption rule to every unfinished create. A matching link does not prove that Loadout created it, including when the process stopped after a successful create syscall but before the Known-state commit. Recovery retains the action as `uncertain` and does not update Known until the target is missing and the recorded create can close as `failed`. v0.3.0 provides no automatic recovery path that adopts this link; any future explicit ownership-transfer operation requires its own specification and confirmation contract.
+Recovery applies the same non-adoption rule to every unfinished create. A matching link does not prove that Loadout created it, including when the process stopped after a successful create syscall but before the Known-state commit. Recovery retains the action as `uncertain` and does not update Known until the target is missing and the recorded create can close as `failed`. No automatic recovery path adopts this link; any future explicit ownership-transfer operation requires its own specification and confirmation contract.
 
 ### Replace
 
@@ -187,17 +187,15 @@ If the new target is not missing or the old target is not an expected link, the 
 
 ### Intended Supported Scope
 
-The v0.3.0 completion baseline is Linux on local ext4 (including ext4 within WSL2), macOS on local APFS, and Windows on local NTFS. Each combination requires create, remove, replace, relocate, both ownership handoffs, noop and forget-missing. This is intended support, not a claim that the current backend implements or has verified every capability. The [README](../../README.md#status) reports current implementation status.
+The intended supported baseline is Linux on local ext4 (including ext4 within WSL2), macOS on local APFS, and Windows on local NTFS. Each combination requires create, remove, replace, relocate, both ownership handoffs, noop, and forget-missing. [README](../../README.md#current-source-capabilities) summarizes current source capabilities; platform conformance requires the evidence below.
 
 Other operating systems and filesystems, network shares including SMB/NFS, WSL-mounted Windows volumes accessed through the Linux backend, and cross-filesystem replacement are outside the supported baseline. Accepted path spelling alone does not establish filesystem support. Unsupported capability requirements MUST be reported explicitly; an OS name alone is not evidence of the required filesystem guarantees.
 
-Except for the existing Unix create transition below, each capability MUST have native filesystem, executor/application, compiled-binary and applicable recovery evidence on its baseline combination before enablement, as required by [Testing Strategy](../development/testing.md#platform-conformance). Windows additionally requires settled path/state semantics and a retained-parent implementation that satisfies the operation guarantees. Symbolic-link privilege/policy and target access controls are runtime conditions: an action attempt denied by them is classified from its recorded predicates and post-observation rather than treated as a permanent platform-capability preflight failure. Native sharing and ACL denial aftermath is required when the runner can establish it; an unavailable denial fixture is recorded as unverified. No minimum OS release or architecture promise is introduced here: concrete API, OS, Rust target and filesystem requirements MUST be recorded before capability enablement. Removing a baseline platform or action requires an explicit scoped project-owner decision before changing the contract.
+Except for the [Unix create evidence exception](#unix-create-evidence-exception), each capability MUST have native filesystem, executor/application, compiled-binary, and applicable recovery evidence on its baseline combination before enablement, as required by [Testing Strategy](../development/testing.md#platform-conformance). Windows additionally requires settled path/state semantics and a retained-parent implementation that satisfies the operation guarantees. Symbolic-link privilege/policy and target access controls are runtime conditions: an action attempt denied by them is classified from its recorded predicates and post-observation rather than treated as a permanent platform-capability preflight failure. Native sharing and ACL denial aftermath is required when the runner can establish it; an unavailable denial fixture is recorded as unverified. No minimum OS release or architecture promise is introduced here: concrete API, OS, Rust target and filesystem requirements MUST be recorded before capability enablement. Removing a baseline platform or action requires an explicit scoped project-owner decision before changing the contract.
 
-### Existing Unix Create Transition
+### Unix Create Evidence Exception
 
-The Unix create capability already enabled before S1 may remain enabled while the execution boundary and conformance evidence are completed. This is a narrow exception to the pre-enablement evidence gate, not a claim that the existing implementation satisfies every revised execution requirement. The current `cfg(unix)` backend does not restrict creation to Linux or identify the filesystem type. Consequently, creation can be attempted on macOS and other Unix/filesystem combinations for which native evidence has not been established. Only Linux/local ext4 creation has recorded native evidence in the current work record; capability availability alone MUST NOT be reported as verified support.
-
-This exception preserves only the pre-S1 Unix create path. It does not itself authorize removal, replacement, source-changing handoff, relocation requiring removal, or Windows creation; each requires its own applicable evidence before enablement. The Unix execution-boundary work MUST bring create into the revised recheck and recorded-path observation contract. Before v0.3.0 completion, create still requires the full native evidence on every baseline combination, including macOS/APFS. The exception cannot be used to waive that completion requirement or infer support for excluded combinations.
+The existing Unix file-link create capability may remain available without the usual pre-enablement evidence gate. The `cfg(unix)` backend does not restrict creation to Linux or identify the filesystem type, so availability on another Unix/filesystem combination does not establish verified support. Create still requires the current recheck and recorded-path observation contract and full native evidence on each baseline combination. This exception does not enable removal, replacement, source-changing handoff, relocation requiring removal, or Windows creation without their own applicable evidence.
 
 ### Supported Representation
 

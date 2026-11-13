@@ -22,7 +22,6 @@ The fully qualified resource ID is `<instance-id>/<resource-id>`.
 It is the stable resource identity used in plans, diagnostics, operation records, and Known state.
 It does not include a filename, discovery path, target path, or source path.
 The selected root instance is named by its profile ID.
-Migration preserves the default instance name equal to the profile ID, so an unparameterized v0.6 resource retains its exact identity text.
 
 ## Profile File
 
@@ -150,7 +149,7 @@ The lifecycle specification determines whether that change creates, replaces, re
 
 ## Current Profile Schema
 
-This section supersedes the v0.7.0 profile schema for every normal lifecycle, validation, dry-run, and inspection command that reads a profile.
+This section defines the profile schema for every normal lifecycle, validation, dry-run, and inspection command that reads a profile.
 A current profile has `schema_version: 5`; schema version `4`, every earlier version, and every unknown future version are invalid.
 Loadout rejects that version mismatch before it resolves a store source, normalizes a target, observes a target, creates a plan, recovers an operation, or writes state.
 

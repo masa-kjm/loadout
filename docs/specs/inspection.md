@@ -3,7 +3,7 @@
 ## Scope
 
 This specification defines the v0.8.0 read-only inspection commands: `status`, `profile list`, `profile show`, `resource list`, `resource show`, and the `diff` extension.
-It extends the v0.3.0 `diff` inspection contract without changing that command.
+The [Lifecycle](lifecycle.md#diff) and [CLI](cli.md) specifications own the existing `diff` command.
 
 Inspection reports facts from the declaration, Resolved Desired, Known, and Actual layers.
 They are not Plans, do not select a repair, and do not change lifecycle ownership rules.

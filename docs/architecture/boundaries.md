@@ -52,7 +52,7 @@ The executor must reject that observed condition before the next mutation step. 
 
 The [File Links](../specs/file-link.md) and [File Copies](../specs/file-copy.md) specifications define effect-specific ownership and mutation proof.
 
-v0.3.0 has no forceful takeover of an unmanaged target.
+Loadout has no forceful takeover of an unmanaged target.
 Explicit transfer-of-ownership behavior, if ever introduced, requires its own specification and confirmation contract.
 
 ## Filesystem Mutation
@@ -107,7 +107,7 @@ The executor must not make a successful mutation appear managed until its post-c
 
 Apply records the complete operation graph and durable progress before a resource mutation and commits Known state only after verification. If execution stops, a resource without a confirmed post-condition is uncertain rather than successful. It records dependency skips only for actions reachable from an unsatisfied or non-success terminal predecessor, and global-abort skips for all other unstarted actions. Recovery classifies the durable operation only from its recorded facts and required current observations. A later apply recovers first and creates a fresh plan; it does not resume, reinterpret, or derive old ordering from changed declarations.
 
-v0.3.0 does not promise rollback of already verified resource actions.
+Loadout does not promise rollback of already verified resource actions.
 Failure cleanup must not remove user-visible artifacts other than Loadout's own temporary files.
 
 ## Schema-Version Boundary
@@ -134,5 +134,4 @@ If a dry-run mode is exposed, it must not create directories, acquire a mutating
 Future resource types must use the same ownership, inspection, planning, execution, verification, diagnostics, and state boundaries.
 They may not add a shortcut from command code to filesystem mutation or from a resource handler to durable state.
 
-The architecture does not require every future concept to be an abstraction today.
-v0.3.0 implements the file-link lifecycle completely first and adds a shared abstraction only when multiple implemented resource types need it.
+The architecture does not require an abstraction for an unimplemented resource type.

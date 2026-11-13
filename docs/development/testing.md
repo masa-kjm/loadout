@@ -8,6 +8,18 @@ It does not add runtime behavior, change an error outcome, or replace a specific
 Every behavior change must identify its owning specification and add evidence at the narrowest test layer that can prove the contract.
 An observable CLI or filesystem contract also requires an integration or acceptance test; a private unit test alone is not sufficient evidence.
 
+## Read by Task
+
+Start with the relevant row in the [Contract Matrix](#contract-matrix), then use the test layers below. The owning specification determines behavior; this page determines evidence.
+
+| Change | Evidence sections to read |
+| --- | --- |
+| Profile schema, ordering, or planning | [Pure Domain Tests](#pure-domain-tests); [Profile Parameters and Migration Evidence](#profile-parameters-and-migration-evidence) for parameters, schema boundaries, or migration. |
+| Resource mutation or ownership | [Filesystem Contract Tests](#filesystem-contract-tests), [State Repository Durability Tests](#state-repository-durability-tests), and [Executor and CLI Tests](#executor-and-cli-tests). |
+| State commit or recovery | [State Repository Durability Tests](#state-repository-durability-tests) and [Executor and CLI Tests](#executor-and-cli-tests); include [Filesystem Contract Tests](#filesystem-contract-tests) when recovery may clean a target or temporary. |
+| Platform capability or native behavior | [Platform Conformance](#platform-conformance), [Filesystem Contract Tests](#filesystem-contract-tests), and [Executor and CLI Tests](#executor-and-cli-tests). Include [State Repository Durability Tests](#state-repository-durability-tests) for recovery and [Platform Primitive Decisions](copy-platform-decision-record.md) for copy primitives. |
+| CLI or read-only inspection | [Executor and CLI Tests](#executor-and-cli-tests); use [Profile Parameters and Migration Evidence](#profile-parameters-and-migration-evidence) for migration commands. |
+
 ## Test Layers
 
 | Layer | Purpose | Typical evidence |
@@ -175,7 +187,7 @@ Platform-neutral tests may use a filesystem abstraction for deterministic failur
 The current binding and primitive choices are recorded in [File-Copy Platform Primitive Decisions](copy-platform-decision-record.md).
 Before enabling a platform/action, native evidence must compare every chosen `create-no-replace` approach against its required collision and failure aftermath; a candidate that cannot establish the required post-mutation classification remains fail-closed.
 
-The [intended supported scope](../specs/file-link.md#intended-supported-scope) requires the full action set on real Linux/ext4, macOS/APFS, and Windows/NTFS runners. Record OS/version, filesystem, Rust target/toolchain, capability, tests/results, and unrun cases. Native filesystem, executor/application, compiled-binary, and applicable recovery success evidence is required for every enabled capability, subject to the [existing Unix create transition](../specs/file-link.md#existing-unix-create-transition). That transition does not waive revised create execution checks or final native evidence on every baseline combination. macOS copy evidence includes the retained-parent APFS filesystem check and `VOL_CAP_INT_RENAME_EXCL` query before every enabled action, distinguishing enabled results from capability rejection. Where a capability is unavailable, prove safe preflight rejection instead of skipping the case.
+The [intended supported scope](../specs/file-link.md#intended-supported-scope) requires the full action set on real Linux/ext4, macOS/APFS, and Windows/NTFS runners. Record OS/version, filesystem, Rust target/toolchain, capability, tests/results, and unrun cases. Native filesystem, executor/application, compiled-binary, and applicable recovery success evidence is required for every enabled capability, subject to the [Unix create evidence exception](../specs/file-link.md#unix-create-evidence-exception). That exception does not waive current create execution checks or native evidence on every baseline combination. macOS copy evidence includes the retained-parent APFS filesystem check and `VOL_CAP_INT_RENAME_EXCL` query before every enabled action, distinguishing enabled results from capability rejection. Where a capability is unavailable, prove safe preflight rejection instead of skipping the case.
 
 Unix coverage must exercise no-follow final-link inspection, symlinked-parent rejection, atomic same-filesystem replacement and successful name-based removal under the observational concurrency contract, including the separate before/after-recheck cases above. Verify referents and parents are preserved in ordinary success and observed rejection cases. No atomic final-entry identity guarantee is required.
 Windows coverage must exercise file symbolic-link behavior when available and reject junctions or unsupported reparse points.

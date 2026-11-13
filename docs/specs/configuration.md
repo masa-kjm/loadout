@@ -89,7 +89,7 @@ A duplicate profile ID is an error that reports every defining file.
 
 `stores` is an object keyed by store ID.
 A store ID uses the same identifier grammar as a profile ID.
-The only v0.3.0 store type is `local`.
+The only current store type is `local`.
 
 ```yaml
 stores:
@@ -110,7 +110,7 @@ It may contain `..` because it is a configuration-level root path.
 The resolved store root is used only to read source assets.
 Loadout MUST NOT modify its contents while resolving, planning, applying, or recovering a resource.
 
-The [Configuration Authoring](config-authoring.md) specification defines the separate v0.3.0 commands that inspect or deliberately edit configuration.
+The [Configuration Authoring](config-authoring.md) specification defines the separate commands that inspect or deliberately edit configuration.
 Those commands do not change the schema or make store contents writable.
 
 ## Path Syntax

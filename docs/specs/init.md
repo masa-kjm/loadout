@@ -2,7 +2,7 @@
 
 ## Scope
 
-This specification defines the `init` authoring command introduced in v0.3.0.
+This specification defines the current `init` authoring command.
 It creates an initial portable environment bundle without selecting it as the machine-local default and without invoking the resource lifecycle.
 
 ## Command

@@ -10,11 +10,6 @@ It does not adopt an effect, invent an instance mapping, or perform an ownership
 Only complete, valid, losslessly convertible schema-4 profile and state documents are supported sources.
 Schema 3, unknown versions, malformed documents, invalid ordering, identity/effect/hash mismatches, active or uncertain operations, lock contention, and publication failures fail closed.
 
-## Historical Context
-
-The v0.7 schema-3-to-4 migration route is superseded and is not a v0.8 migration reader, command, route, or protocol.
-It is retained here only as historical release context and grants no compatibility behavior.
-
 ## Isolation
 
 `src/migration/` exclusively owns legacy schema-4 profile and state DTOs, source-schema parsing, inventory validation, lossless conversion, and migration-only preflight.

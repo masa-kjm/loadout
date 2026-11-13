@@ -6,6 +6,17 @@ This specification defines v0.8.0 durable state, operation records, exclusive lo
 
 Normal commands use only the current state schema. The explicit schema-4-to-5 authoring route is defined by [Migration](migration.md).
 
+## Read by Task
+
+Use these routes to locate the owning sections. For a resource mutation, also read its [resource specification](README.md#read-by-concern) and the [Lifecycle](lifecycle.md) contract.
+
+| Task | Start here | Continue with |
+| --- | --- | --- |
+| State decoding or hash changes | [Current State Schema](#current-state-schema), [Current Canonical Hashes](#current-canonical-hashes) | [Applied Lifecycle Topology and Operations](#applied-lifecycle-topology-and-operations) for graph or topology fields. |
+| Action-record shape or durable progress | [Operation Record](#operation-record), then [File Effect Action Records](#file-effect-action-records) or [Directory-Link Operation Records](#directory-link-operation-records) | [Applied Lifecycle Topology and Operations](#applied-lifecycle-topology-and-operations) for scheduled actions and topology facts. |
+| State locking or publication | [Locking](#locking), [Commit Protocol](#commit-protocol) | [Mutation Result Classification](#mutation-result-classification) when a target mutation may have occurred. |
+| Interrupted action or recovery | [Failure and Recovery](#failure-and-recovery), [Mutation Result Classification](#mutation-result-classification) | [Operation Record](#operation-record), the applicable [file](#file-effect-action-records) or [directory-link](#directory-link-operation-records) record, and [Commit Protocol](#commit-protocol). |
+
 ## State Files
 
 The state repository owns these files in the platform state directory defined by [Configuration](configuration.md):

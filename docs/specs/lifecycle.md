@@ -2,11 +2,9 @@
 
 ## Scope
 
-This specification defines the v0.3.0 lifecycle retained by v0.4.0 for validating declarations, inspecting drift, producing a plan, and applying a plan.
+This specification defines the current lifecycle for validating declarations, inspecting drift, producing a plan, and applying a plan.
 It owns planning decisions and the Desired/Known/Actual transition table.
 The File Links and State and Recovery specifications define the filesystem and durable-state mechanics used by those decisions.
-
-Every retained lifecycle requirement in this document remains a v0.8.0 requirement under the [v0.8.0 baseline](README.md#v080-baseline).
 
 ## Inputs
 
@@ -51,17 +49,7 @@ Conflicts are not actions.
 
 ### Planned Actions
 
-The v0.3.0 planner may produce these actions:
-
-| Action | Meaning |
-| --- | --- |
-| `create_link` | Create the desired link at a missing target. |
-| `replace_link` | Replace an expected managed link with a link to a new source at the same target. |
-| `relocate_link` | Create a new link at a new target, then remove the old expected link. |
-| `replace_ownership` | Replace an expected stale managed link at a target with a new resource identity. |
-| `remove_link` | Remove an expected stale managed link. |
-| `forget_missing` | Remove a stale Known-state record whose target is already missing. |
-| `noop` | Record that the desired resource is already satisfied. |
+The transition tables in this document, [File Copies](file-copy.md#planning), and [Directory Links](directory-link.md#planning-transitions) define the selectable actions for each effect. Cross-effect file handoffs use `replace_effect` as specified in [File-Copy and Cross-Effect Planning](#file-copy-and-cross-effect-planning).
 
 Each action identifies its fully qualified resource ID, resolved target or targets, expected precondition, required post-condition, and reason.
 The executor completes every step required by one action's post-condition before it begins another action.
@@ -97,8 +85,7 @@ When those link targets are equal, it is a state-only managed identity handoff; 
 In either case, it updates Known state from the old resource ID to the new one only after the required link post-condition is verified.
 The File Links and State and Recovery specifications define the corresponding mutation, no-mutation, and recovery-record requirements.
 
-A source file content change at the same resolved source path does not create an action.
-A file link always exposes the current source content; v0.3.0 does not fingerprint source content for link resources.
+A source file content change at the same resolved source path does not create a file-link action; [File Links](file-link.md) do not fingerprint source content.
 
 ## Preflight
 
@@ -161,10 +148,9 @@ A failed or uncertain action stops every later planned mutation. Every unstarted
 It reports the same Planned Actions and blocking diagnostics as a non-dry-run apply at the point of observation.
 It MUST NOT acquire an exclusive state lock, create an operation record, write state, create directories, create temporary files, or mutate a target.
 
-## v0.5.0 Resource Effects
+## File-Copy and Cross-Effect Planning
 
-This section supersedes the v0.3.0 action inventory and transition table for v0.5.0.
-The planner remains pure and receives source fingerprints as part of Resolved Desired copy values.
+The planner receives source fingerprints as part of Resolved Desired copy values.
 
 The actions are `create_link`, `replace_link`, `relocate_link`, `remove_link`, `create_copy`, `replace_copy`, `relocate_copy`, `remove_copy`, `replace_ownership`, `replace_effect`, `forget_missing`, and `noop`.
 `replace_effect` is the managed same-target handoff between `link` and `copy`.
@@ -179,44 +165,20 @@ It requires current Actual proof of the old Known effect and uses the final effe
 | Either final effect | Either old effect | Missing | Corresponding final-effect create; old Known remains until that action's normal state update rules apply |
 | Either final effect | Either old effect | Any unexpected or unsafe observation | Blocked conflict |
 
-For a handoff, the typed precondition is the complete old Known effect and the typed postcondition is the complete final effect plus absence of its recorded temporary when the final effect is staged.
-The state update removes the old identity's effect and records the final effect atomically with `succeeded`.
-`link -> copy` uses the handoff-specific primitive in [Link-to-Copy Effect Handoff](file-copy.md#link-to-copy-effect-handoff), whose old-target predicate is the expected link; `copy -> link` uses the handoff-specific primitive in [Copy-to-Link Effect Handoff](file-link.md#copy-to-link-effect-handoff), whose old-target predicate is the expected copy.
-Neither handoff is state-only.
-Each prepares the final effect as far as its destination type permits, immediately rechecks the old owned effect, removes that old target, creates or publishes the final effect with the destination type's no-replace semantics, verifies the final effect, and then commits Known.
-Handoffs do not promise continuous target availability, old-effect preservation after removal, backup, restoration, or rollback.
-The strong atomic replacement contract remains limited to ordinary `link -> link` replacement and source-changing link ownership replacement; it does not apply to either effect handoff.
+For a handoff, the typed precondition is the complete old Known effect and the typed postcondition is the complete final effect. Neither handoff is state-only or adopts an unmanaged entry. [Link-to-Copy Effect Handoff](file-copy.md#link-to-copy-effect-handoff) and [Copy-to-Link Effect Handoff](file-link.md#copy-to-link-effect-handoff) own their respective mutation and failure aftermath; [State and Recovery](state-and-recovery.md#file-effect-action-records) owns the action record and atomic Known update.
 
 A managed identity handoff requires a stale old resource identity, exactly one new Desired identity at the same normalized target, and current Actual proof of the old Known effect.
 For `file_copy` effects, the new Desired source is resolved and fingerprinted before planning.
 When the final copy fingerprint equals the old applied fingerprint, `replace_ownership` is state-only: after a final expected-copy observation, it replaces the old Known identity with the new one without allocating a temporary or mutating the target.
-When the fingerprints differ, `replace_ownership` uses the copy replacement lifecycle: it stages and verifies the final copy, persists `temporary_staged`, rechecks the old owned copy, removes it, publishes the staged copy with no-replace semantics, verifies the final copy, and atomically replaces the old Known identity with the new one.
-This copy identity handoff has the same failure aftermath and recovery classification as `replace_copy`; it does not inherit the strong link-replacement preservation contract.
+When the fingerprints differ, `replace_ownership` uses the [copy replacement lifecycle and recovery contract](file-copy.md#mutation-and-recovery), including its failure aftermath rather than the stronger link-replacement guarantee.
 When the shared target is missing, the planner uses `create_copy` with the stale identity recorded as superseded state.
 That create still has ordinary no-adoption create semantics, and only its verified success atomically removes the stale old Known identity while recording the new one.
 
-For either effect, a desired resource without Known state creates only at a missing target and otherwise blocks, except for the recorded stale identity superseded by a missing-target identity-handoff create described above.
-An unchanged known link is `noop` only when its expected link is Actual; an unchanged known copy is `noop` only when its target bytes equal the applied fingerprint and its current source fingerprint equals that applied fingerprint.
-An expected copy with a changed source fingerprint is `replace_copy`.
-An expected target whose definition changes at the same path uses the corresponding replacement or managed effect handoff.
-For either effect, a missing known target creates when desired or is forgotten when stale; every other unexpected observation blocks.
-Target relocation creates and verifies the new effect before removing the old expected effect as one contiguous action.
-For `relocate_copy`, the new target uses `create-no-replace`; after it is verified, removal still requires a fresh owned-old-copy proof.
-If either target cannot be proven by the action's recorded precondition or postcondition, the relocation is `uncertain` and is not rolled back.
-
-The preceding action inventory does not assign an execution order.
-Every action type is scheduled only through the schema-5 combined DAG in [Execution Order](#execution-order).
-No later action begins after an earlier action fails, and verified earlier actions are not rolled back.
+The [file-link transition table](#transition-table) and [copy transition table](file-copy.md#planning) own ordinary create, noop, replace, relocate, remove, and forget-missing selection. Both effects block unmanaged and unsafe observations. Every selected action is scheduled through the combined DAG in [Execution Order](#execution-order).
 
 ## Directory-Link Effect
 
-DirectoryLink adds the typed `directory_link` effect without changing the planner boundary or the schema-5 combined-DAG scheduling contract.
-Its complete Desired/Known/Actual transition table, including create, replace, relocate, remove, forget-missing, same-effect identity handoff, unmanaged matching-link rejection, and mixed-effect conflict, is owned by [Directory Links](directory-link.md#planning-transitions).
-
-A DirectoryLink relocate action remains contiguous.
-
-A DirectoryLink may hand off identity only to another DirectoryLink with the same normalized target and typed old-effect proof.
-FileLink/FileCopy to DirectoryLink handoff, and the reverse, are blocked conflicts with no executable target action.
+DirectoryLink uses the same planner boundary and combined-DAG scheduling contract. [Directory Links](directory-link.md#planning-transitions) owns its complete transition table, including contiguous relocation, same-effect identity handoff, and blocked mixed-effect handoff.
 
 ## Schema Gate
 

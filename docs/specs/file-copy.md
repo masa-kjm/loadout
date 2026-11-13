@@ -145,7 +145,7 @@ Its postcondition is the expected final copy and absence of the recorded tempora
 
 The primitive MUST NOT delete the expected link before the final copy is ready or overwrite an entry that appears after removal.
 It does not restore the old link if final publication fails.
-The action records its complete old link and final copy predicates, temporary fingerprint, path, and publication facts as defined by [State and Recovery](state-and-recovery.md#v050-state-schema).
+The action records its complete old link and final copy predicates, temporary fingerprint, path, and publication facts as defined by [State and Recovery](state-and-recovery.md#file-effect-action-records).
 
 For staged publication, the recorded temporary path and expected temporary fingerprint are part of the action until publication is verified.
 Immediately before staged publication, the executor rechecks both the exact temporary and final target.

@@ -21,7 +21,7 @@ An observable CLI or filesystem contract also requires an integration or accepta
 
 ## Contract Matrix
 
-The following matrix is the minimum evidence required before the version that owns each contract is considered complete.
+The following matrix identifies the minimum evidence for each current contract. The sections below specify test boundaries and failure cases that the matrix does not detail.
 
 | Contract owner | Required evidence |
 | --- | --- |
@@ -38,12 +38,9 @@ The following matrix is the minimum evidence required before the version that ow
 | [Configuration Authoring](../specs/config-authoring.md) | Read-only config commands leave configuration, state, store, and targets unchanged; typed-path and value rejection; complete-document validation; confirmation; runtime-selection creation and replacement; portable-configuration presentation preservation or rejection; publication failure and external-substitution aftermath; and Unix/Windows behavior. |
 | [Inspection](../specs/inspection.md) | Every `status`, profile, and resource grammar and selection conflict; declaration/Desired/Known/Actual read-set boundaries; deterministic ordering; active-operation display for `status` and existing `diff` only; Desired-only, Known-only, definition-changed, expected, drifted, unsafe, and unavailable status rows; invalid declaration/state behavior; partial status report behavior; and snapshots proving no target, store, configuration, state, lock, operation, or directory mutation. |
 
-Version-boundary tests reject schema-4, earlier, and unknown profile/state versions before target observation, recovery, state rewrite, or implicit conversion.
-Copy tests snapshot the target tree, state directory, store, and control files for every rejection and dry-run case and use only disposable locations.
-
 ## Pure Domain Tests
 
-For v0.8, pure domain tests additionally prove canonical cross-instance references; direct-plus-stage combined-cycle rejection; closed action-role legality; compact barrier size and canonical validation; fully-qualified-ID scheduling under composition permutations; satisfied and unstaged no-op cases; and topology authority/delta selection without I/O.
+Pure domain tests prove canonical cross-instance references; direct-plus-stage combined-cycle rejection; closed action-role legality; compact barrier size and canonical validation; fully-qualified-ID scheduling under composition permutations; satisfied and unstaged no-op cases; and topology authority/delta selection without I/O.
 
 Pure domain tests use resolved paths and typed observations only.
 They must not parse YAML, access a store, inspect the host filesystem, acquire a lock, or serialize state.
@@ -100,7 +97,7 @@ Copy create recovery tests must cover both an externally created matching file a
 
 Copy replacement, copy `replace_ownership` with changed bytes, and `link -> copy` tests require separate target, temporary, source and parent rechecks after temporary creation and immediately before old-effect removal. They prove that `temporary_staged` is durably recorded after temporary verification and before old-effect removal, and that cleanup rejects a temporary whose durable `temporary_staged` fact is absent. They prove success only for exact new bytes after recorded publication, definite failure for the exact old owned effect or a missing final target after eligible-temporary cleanup, and failed conflict for a safely observed different final entry. Unsafe or unavailable observations remain `uncertain`. They assert that removal happens only after verified staging, that final publication does not overwrite an entry, and that no old-copy or old-link restoration occurs after publication failure. `copy -> link` tests prove the same old-effect recheck and remove-then-no-replace-create lifecycle using the link destination semantics without allocating a link-replacement temporary. Required cleanup tests cover an already-missing temporary; a removal error followed by proven missing; a denied removal; a reported-success removal whose missing aftermath cannot be proven; a remaining or different entry; an unsafe parent; and an unavailable observation. Only the first two complete cleanup and permit the recorded `failed` result; every other case retains `uncertain`, the active-operation barrier, and Known state until manual correction permits recovery. Preserve the stronger old-effect preservation assertions only for ordinary file-link replacement and source-changing link ownership replacement.
 
-Windows path/state tests table-drive accepted normal DOS and ordinary UNC forms and rejected drive-relative, verbatim, device, reserved-name, trailing-space/period, dot-component, alternate-data-stream, and invalid-character forms. They prove separator canonicalization but case-exact collision, ownership, and hash behavior. They also reject nonconforming version-1 Known records and active operations before target observation or state rewrite; no test may accept them through migration or alias comparison.
+Windows path/state tests table-drive accepted normal DOS and ordinary UNC forms and rejected drive-relative, verbatim, device, reserved-name, trailing-space/period, dot-component, alternate-data-stream, and invalid-character forms. They prove separator canonicalization but case-exact collision, ownership, and hash behavior. They reject unsupported state versions before target observation or state rewrite; no test may accept them through implicit migration or alias comparison.
 
 Managed identity-handoff tests cover link and copy effects.
 For equal resolved link targets and same-fingerprint copy effects, they prove that the target is untouched, no replacement temporary path is allocated, and only the Known identity changes.
@@ -157,7 +154,7 @@ They assert that the command reports each category while leaving the target tree
 They also prove that `diff` neither needs nor reads a portable environment configuration.
 DirectoryLink `diff` and `status` cases prove no-follow `expected_directory_link`, missing, other-link, other-entry, unsafe-path, and unavailable observations without following a directory-link referent.
 
-Inspection acceptance tests invoke every v0.4.0 inspection command with disposable home, state, configuration, and store directories.
+Inspection acceptance tests invoke every inspection command with disposable home, state, configuration, and store directories.
 They assert command selection and output categories rather than exact human-readable prose.
 They snapshot the complete target tree, state directory, store, runtime configuration, portable configuration, and control files before and after each command; every snapshot must be identical.
 They also prove that no inspection command acquires the exclusive lock, creates a lock or state directory, writes an operation record, or invokes recovery.
@@ -175,10 +172,10 @@ The snapshots must be identical.
 
 Platform-neutral tests may use a filesystem abstraction for deterministic failure injection, but they do not replace real platform evidence.
 
-The current binding and primitive choices, including candidates that remain fail-closed, are recorded in [File-Copy Platform Primitive Decision Record](copy-platform-decision-record.md).
+The current binding and primitive choices are recorded in [File-Copy Platform Primitive Decisions](copy-platform-decision-record.md).
 Before enabling a platform/action, native evidence must compare every chosen `create-no-replace` approach against its required collision and failure aftermath; a candidate that cannot establish the required post-mutation classification remains fail-closed.
 
-The [intended supported scope](../specs/file-link.md#intended-supported-scope) requires the full action set on real Linux/ext4, macOS/APFS and Windows/NTFS runners. Record OS/version, filesystem, Rust target/toolchain, capability, tests/results and unrun cases. Native filesystem, executor/application, compiled-binary and applicable recovery success evidence is required before each capability is enabled, except for the explicitly retained [existing Unix create transition](../specs/file-link.md#existing-unix-create-transition). That path remains enabled beyond its verified Linux/ext4 evidence; its availability is not platform conformance. The transition does not waive revised create execution checks or final native evidence on every baseline combination. macOS copy enablement records a retained-parent APFS filesystem check and VOL_CAP_INT_RENAME_EXCL query before every enabled action; its artifact distinguishes that enabled result from capability rejection. Safe unsupported rejection is required where a capability is unavailable, but does not complete the intended successful action. Baseline rejection tests remain until implementation enables that capability; then replace always-unsupported expectations with success and actual capability-failure cases.
+The [intended supported scope](../specs/file-link.md#intended-supported-scope) requires the full action set on real Linux/ext4, macOS/APFS, and Windows/NTFS runners. Record OS/version, filesystem, Rust target/toolchain, capability, tests/results, and unrun cases. Native filesystem, executor/application, compiled-binary, and applicable recovery success evidence is required for every enabled capability, subject to the [existing Unix create transition](../specs/file-link.md#existing-unix-create-transition). That transition does not waive revised create execution checks or final native evidence on every baseline combination. macOS copy evidence includes the retained-parent APFS filesystem check and `VOL_CAP_INT_RENAME_EXCL` query before every enabled action, distinguishing enabled results from capability rejection. Where a capability is unavailable, prove safe preflight rejection instead of skipping the case.
 
 Unix coverage must exercise no-follow final-link inspection, symlinked-parent rejection, atomic same-filesystem replacement and successful name-based removal under the observational concurrency contract, including the separate before/after-recheck cases above. Verify referents and parents are preserved in ordinary success and observed rejection cases. No atomic final-entry identity guarantee is required.
 Windows coverage must exercise file symbolic-link behavior when available and reject junctions or unsupported reparse points.
@@ -228,21 +225,6 @@ Every migration rejection and success test proves zero target, store, materializ
 Native Unix and Windows migration conformance exercises same-directory replacement and state-lock contention in disposable directories.
 It records operating-system version, filesystem, Rust toolchain, exact command, and whether the evidence ran natively; cross-compilation is not Windows-native evidence.
 An unavailable required capability must demonstrate the documented fail-closed preflight rather than being skipped.
-
-## DirectoryLink Release Checklist
-
-The following evidence maps the DirectoryLink contract to the release gate. The focused tests named here supplement, rather than replace, the locked suite and the native CI jobs.
-
-| Contract area | Required evidence | Current test or gate |
-| --- | --- | --- |
-| Declaration, schema boundary, hashes, and transitions | Strict decoding, typed Desired/Known/Actual values, every transition row, and blocked mixed-effect handoff | Domain, resolver, planner, and state-codec tests; `cargo test --locked` |
-| No-follow source and target safety | Real-directory source validation without descendant traversal; unmanaged, unsafe, and unsupported target preservation | `inspection::source`, `inspection::file_link`, and DirectoryLink rejection tests |
-| Execution and recovery | Create, replacement, relocation, removal, ownership handoff, durable operation facts, failure aftermath, and recovery | DirectoryLink executor, application, state-repository, and operation tests |
-| CLI and zero mutation | Typed `validate`, `plan`, `apply`, `diff`, `status`, profile/resource inspection, blocked outcomes, and dry run | `tests/cli_read_only.rs` in a disposable environment |
-| Linux/ext4 and macOS/APFS | Native no-follow inspection, symlinked-parent rejection, atomic replacement, and link-entry-only removal | `tests/native_directory_link_platform.rs` in the CI native-directory-link probe |
-| Windows/NTFS | Directory-symlink lifecycle, junction rejection, replacement-guarantee rejection, and sharing-denial aftermath | `tests/native_directory_link_windows_platform.rs` in the CI native Windows DirectoryLink probe |
-
-The CI evidence artifacts record runner OS, filesystem, Rust toolchain, exact commands, and outcomes. A platform without a required capability must record the documented preflight rejection; it is not silently skipped.
 
 ## Change Checklist
 

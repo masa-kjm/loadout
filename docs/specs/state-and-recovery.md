@@ -4,7 +4,7 @@
 
 This specification defines v0.8.0 durable state, operation records, exclusive locking, atomic commits, applied lifecycle topology, and recovery after interruption for file-link, file-copy, and DirectoryLink resource effects.
 
-The v0.5.0 State Schema section supersedes the retained v0.3.0 state schema, hash formats, and operation representation. Retained state and recovery requirements continue to apply unless that section states otherwise, including the requirement that inspection validates state before relying on its facts.
+Normal commands use only the current state schema. The explicit schema-4-to-5 authoring route is defined by [Migration](migration.md).
 
 ## State Files
 
@@ -22,134 +22,95 @@ The state directory and lock file may be created by a non-dry-run apply.
 If `state.json` is unreadable, invalid JSON, has an unsupported schema version, or violates an invariant, Loadout MUST abort before it inspects a managed target or creates a mutation.
 It MUST NOT repair, migrate, or overwrite the state automatically.
 
-## Known State Schema
+## Current State Schema
 
-The following is the logical state schema.
-The order of object members has no meaning.
+Normal lifecycle and inspection commands use this schema for every state document they read.
+`state.json` has `schema_version: 5`; schema version `4`, every earlier version, and every unknown future version are invalid.
+The state repository rejects an invalid state version before target inspection, operation recovery, planning, state rewrite, or any target mutation.
+It does not decode the older document for conversion, recalculate its hashes, reinterpret an active operation, or write a replacement state file.
+Only the explicit migration operation in [Migration](migration.md) may parse a supported schema-4 state document.
+
+An absent state file is an empty Known state.
+An existing schema-4 state file is not an empty state: it is an error that preserves the file and prevents a new plan.
+Its recorded effects and active operation are not ownership evidence and MUST NOT be observed, adopted, recovered, removed, replaced, or otherwise acted upon.
+
+The logical Known-state structure is:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 5,
   "resources": {
-    "base/git-config": {
+    "base/nvim-config": {
       "definition_hash": "sha256:...",
-      "file_link": {
-        "source_path": "/home/example/dotfiles/git/config",
-        "target_path": "/home/example/.gitconfig",
-        "link_target": "/home/example/dotfiles/git/config"
+      "effect": {
+        "kind": "directory_link",
+        "source_path": "/home/example/dotfiles/nvim",
+        "target_path": "/home/example/.config/nvim",
+        "link_target": "/home/example/dotfiles/nvim"
       }
     }
   },
+  "applied_lifecycle_topology": { "current": [], "historical": [] },
   "active_operation": null
 }
 ```
 
-`schema_version` is REQUIRED and MUST be `1`.
-`resources` is REQUIRED and is an object keyed by fully qualified resource ID.
-`active_operation` is REQUIRED and is either `null` or an operation record.
+`schema_version`, `resources`, `applied_lifecycle_topology`, and `active_operation` are REQUIRED.
 Unknown fields are errors at every object level.
+Each resource member contains exactly `definition_hash` and `effect`.
+`effect.kind` is exactly `file_link`, `file_copy`, or `directory_link`.
+A `file_link` records `source_path`, `target_path`, and `link_target`; a `file_copy` records `source_path`, `target_path`, and `content_fingerprint`; and a `directory_link` records `source_path`, `target_path`, and `link_target`.
+Each effect rejects fields that do not belong to its kind.
+Resource IDs and normalized target paths are unique, all paths are absolute platform-normalized paths without home shorthand or relative components, and every definition hash and fingerprint has the required canonical form.
+On Windows, every stored path and operation path uses the normal DOS or ordinary UNC representation in [Windows Path Representation](file-link.md#windows-path-representation).
+A path alias or mismatched recorded hash is not repaired or reinterpreted to establish ownership.
+Known state records only verified post-conditions; a later destructive action still requires current Actual ownership proof.
 
-Each Known file-link resource contains:
-
-| Field | Meaning |
-| --- | --- |
-| `definition_hash` | `sha256:<lowercase-hex>` hash of the canonical resolved declaration defined in [Canonical Hashes](#canonical-hashes), excluding source file content. |
-| `source_path` | Verified resolved source path at the successful application. |
-| `target_path` | Resolved target path at the successful application. |
-| `link_target` | Exact normalized absolute symbolic-link target created by Loadout. |
-
-The key and `target_path` are unique across `resources`.
-All stored paths are absolute, normalized for the current platform, and contain no home shorthand or relative components.
-On Windows, every stored path and every path in an active operation must satisfy the normal DOS or ordinary UNC representation in [Windows Path Representation](file-link.md#windows-path-representation).
-Schema version 1 has no implicit path migration: a document whose Windows paths are not in that representation, or whose recorded hash no longer matches its exact normalized path values, is rejected before target inspection, planning, or state mutation.
-Loadout does not rewrite a state document, recalculate a hash, or reinterpret an active operation to accept an alias.
-
-Known state records only post-conditions that were verified after an operation.
-It is not a substitute for actual filesystem inspection before a later destructive action.
+`active_operation` is either `null` or a schema-5 action-graph operation record. Its resource-specific preconditions and postconditions retain the applicable [Directory-Link Operation Records](#directory-link-operation-records) safety shapes.
+An unrecognized action kind, predicate, effect, field, status, or invariant is invalid state and is rejected before recovery or target inspection.
 
 ## Canonical Hashes
 
-`definition_hash` and `desired_hash` use the string form `sha256:<lowercase-hex>`.
-Their hash input is the UTF-8 encoding of a JSON Canonicalization Scheme (JCS; RFC 8785) value.
-They MUST NOT be derived from YAML, JSON, or other source-document serialization.
+### Current Canonical Hashes
 
-For a v0.3.0 file-link resource, the canonical value for `definition_hash` is exactly this object, using the resource's resolved values:
+`definition_hash` and `desired_hash` are SHA-256 hashes of UTF-8 JSON Canonicalization Scheme (JCS; RFC 8785) values and use `sha256:<lowercase-hex>` representation.
+They are not derived from source YAML or JSON serialization. Resolved paths receive no additional case, separator, or Unicode normalization while hashing.
+A copy's source bytes are not a definition-hash input; its verified Known effect records the applied content fingerprint.
+The exact per-effect definition value is the value owned by [File Links](file-link.md), [File Copies](file-copy.md), or [Directory Links](directory-link.md#declaration-and-resolution).
+The DirectoryLink definition is `loadout.resolved-directory-link.v1`; it includes `format`, `type`, `kind`, `operation`, `source_path`, and `target_path`, and excludes the resource ID, raw YAML, store ID, source-directory contents, metadata, and schema version.
 
-```json
-{
-  "format": "loadout.resolved-file-link.v1",
-  "kind": "file",
-  "operation": "link",
-  "source_path": "/home/example/dotfiles/git/config",
-  "target_path": "/home/example/.gitconfig",
-  "type": "file"
-}
-```
-
-`source_path` and `target_path` are the absolute, platform-normalized paths in Resolved Desired.
-No additional path, case, separator, or Unicode normalization is applied while hashing.
-The definition representation does not contain a resource ID; fully qualified resource ID is resource identity rather than definition content.
-
-The canonical value for `desired_hash` is exactly this object.
-Its `resources` array contains resource objects sorted lexicographically by `resource_id`, and each `definition` value is the preceding definition object:
+The current desired hash is exactly the hash of this JCS value; orchestration facts are excluded:
 
 ```json
 {
-  "format": "loadout.resolved-desired.v1",
+  "format": "loadout.resolved-desired.v5",
   "resources": [
     {
       "definition": {
-        "format": "loadout.resolved-file-link.v1",
-        "kind": "file",
+        "format": "loadout.resolved-directory-link.v1",
+        "kind": "directory",
         "operation": "link",
-        "source_path": "/home/example/dotfiles/git/config",
-        "target_path": "/home/example/.gitconfig",
+        "source_path": "/home/example/dotfiles/nvim",
+        "target_path": "/home/example/.config/nvim",
         "type": "file"
       },
-      "resource_id": "base/git-config"
+      "resource_id": "base/nvim-config"
     }
   ]
 }
 ```
 
-`resource_id` is the fully qualified resource ID and is a `desired_hash` input only.
-Document schema versions, store IDs, profile-discovery order, raw declaration syntax, and source file content are not hash inputs.
-The v0.3.0 state schema fixes these canonical representations.
-Changing either representation requires a new state schema and explicit migration; Loadout MUST NOT silently recalculate an existing hash with a different representation.
+`resources` sorts lexicographically by fully qualified `resource_id`.
+The resource ID is an input only to `desired_hash`; it is not an input to `definition_hash`.
+Schema versions, YAML mapping order, profile discovery/include order, raw declaration syntax, store IDs, source file content, source-directory contents, and metadata are not hash inputs.
+Schema-4 hashes are not aliases for schema-5 hashes and MUST NOT be accepted, recalculated, or compared to establish ownership by a normal command.
 
 ## Operation Record
 
-An operation record describes work that has begun but may not be complete.
-
-```json
-{
-  "id": "01JEXAMPLE...",
-  "desired_hash": "sha256:...",
-  "actions": {
-    "a1": {
-      "kind": "create_link",
-      "resource_id": "base/git-config",
-      "precondition": { "target": "missing" },
-      "postcondition": {
-        "target": "expected_link",
-        "link_target": "/home/example/dotfiles/git/config"
-      },
-      "status": "pending"
-    }
-  }
-}
-```
-
-`id` is a newly generated opaque operation ID.
-`desired_hash` is the [Canonical Hashes](#canonical-hashes) value that identifies the Resolved Desired set used to produce the original plan.
-`actions` is an object keyed by an opaque action ID; each action records enough resolved preconditions and post-conditions for recovery without rereading the old profile.
-
-For `replace_link`, `remove_link`, and `replace_ownership`, the precondition records the old expected link target.
-For `replace_link`, and for `replace_ownership` whose resolved link targets differ, the record also contains its unique action-local temporary sibling path and expected temporary link target.
-This path is not a declared resource target and is used only to complete or safely clean up that replacement.
-For a relocate action, the record includes both old and new targets and their required final observations.
-For `replace_ownership`, the record includes `old_resource_id`, `new_resource_id`, the resolved target path, and both the old and new expected link targets.
-The temporary sibling fields are absent when the old and new resolved link targets are equal.
+An active operation records the selected work and the facts needed for recovery without rereading its original profile.
+It has a newly generated opaque `id`, the [Canonical Hashes](#canonical-hashes) `desired_hash` of the original Resolved Desired set, and an `actions` object keyed by opaque action IDs.
+Each action records typed resolved preconditions and postconditions, its kind, resource ID, and status; the operation also records the graph facts in [Applied Lifecycle Topology and Operations](#applied-lifecycle-topology-and-operations).
+Unknown fields or invalid combinations are invalid state.
 
 Each action status is one of:
 
@@ -157,168 +118,20 @@ Each action status is one of:
 | --- | --- |
 | `pending` | The action has not started. |
 | `running` | The start was committed, but completion is not known. |
-| `succeeded` | The required post-condition was verified and the corresponding Known state update was committed. |
-| `failed` | The action returned a definite failure while its recorded precondition or Known state remained valid. |
-| `skipped` | The action was not attempted because an earlier action ended the operation. It has no effect. |
-| `uncertain` | Actual observation cannot prove either the recorded precondition or post-condition. |
+| `succeeded` | The required post-condition was verified and the Known and authorized topology updates were committed. |
+| `failed` | A definite failure was classified; prior Known facts remain unless an action-specific contract says otherwise. |
+| `skipped` | The action was not attempted because a recorded dependency or global abort prevented it. |
+| `uncertain` | Recorded observations cannot prove an authorized result. |
 
 `pending`, `running`, and `uncertain` are not successful states.
 
-## Locking
+For `replace_link`, `remove_link`, and link `replace_ownership`, the precondition records the old expected link target.
+For `replace_link`, and for link `replace_ownership` whose resolved link targets differ, the record also contains its unique action-local temporary sibling path and expected link target.
+The temporary is not a declared resource target and is used only for the recorded replacement or safe cleanup.
+A relocate action records both old and new targets and their required observations.
+`replace_ownership` records `old_resource_id`, `new_resource_id`, complete old and final effects, and the applicable expected effect predicates; equal link targets have no temporary.
 
-Every non-dry-run apply MUST acquire an exclusive operating-system lock associated with `state.lock` before it reads state for execution.
-It holds the lock until it has closed or retained the active operation record after the apply attempt.
-
-If the lock cannot be acquired, apply MUST fail without inspecting a managed target, recording progress, or mutating a target.
-The lock implementation must not rely on a stale-file heuristic.
-Process termination releases the operating-system lock according to platform semantics.
-
-`validate`, `diff`, `plan`, and dry-run apply do not acquire this exclusive lock.
-The v0.4.0 inspection commands also do not acquire it, create a lock file, recover an operation, or write state.
-
-## Commit Protocol
-
-Every state update, including an operation status transition, MUST be an atomic replacement of the complete state file:
-
-1. Write the complete new state to a unique temporary file in the state directory.
-2. Flush the temporary file.
-3. Re-open, parse, and validate the written state.
-4. Atomically replace `state.json` with the temporary file.
-5. Flush the state directory when the platform supports it.
-
-If the replacement fails, the previous `state.json` remains authoritative.
-Loadout removes only its own temporary state file when cleanup is safe.
-It MUST NOT remove target files, source files, profile files, or other user-visible artifacts as failure cleanup.
-
-The state repository writes `running` before a resource mutation.
-After a successful mutation, it verifies the resource post-condition and atomically commits the Known-state update together with that action's `succeeded` status.
-It does not update Known state before verification.
-
-For a `replace_ownership` action whose resolved link targets are equal, the state repository writes `running` before the final no-follow verification.
-It performs no filesystem mutation.
-When that verification proves the recorded old ownership and shared expected link, it atomically replaces the old Known resource identity with the new one together with the action's `succeeded` status.
-
-## Mutation Result Classification
-
-After an executor attempts a mutation, it MUST perform the action's no-follow post-mutation observation before deciding the operation result.
-The observation, rather than the operating system call's success or error result alone, decides whether Known state may change.
-For a create attempt that returns an error, the execution-time exception below takes precedence over the general post-condition row.
-
-| Observation after an attempted mutation | Required result |
-| --- | --- |
-| The recorded post-condition holds exactly and the action's required success evidence is durable | Atomically commit the matching Known-state update and mark the action `succeeded`. |
-| The recorded precondition still holds exactly | Mark the action `failed`; leave Known state unchanged. |
-| Neither condition holds exactly, or observation is unsafe or unavailable | Mark the action `uncertain`; leave Known state unchanged. |
-
-An action has no additional success evidence unless its action-specific contract defines it.
-For sequential copy replacement and effect handoff, the required success evidence is `publication_attempted == true`.
-
-During execution, a failed `create_link` or `create_copy` attempt followed by its expected final effect MUST remain `uncertain`, with Known unchanged. The observed effect can have been created externally after the final recheck, so its matching value does not establish successful creation by this attempt. This includes an already-existing-entry error and errors whose physical effects cannot be distinguished from external creation. A failed create whose recorded missing precondition still holds remains `failed`; unsafe or unavailable observations remain `uncertain`. This exception does not alter removal or replacement result classification.
-
-The [external filesystem concurrency contract](file-link.md#external-filesystem-concurrency) applies to execution and recovery observations and cleanup. The state lock does not exclude unrelated filesystem mutation. After a removal race, `missing` at the recorded target can be indistinguishable from ordinary success: when every required recorded postcondition and path association holds, the result is `succeeded`, Known is removed, and apply can ultimately exit 0. This does not prove which entry was deleted and does not require a race diagnostic based on information unavailable to production observations.
-
-Required observations include the recorded path association, not just the contents of a retained parent handle. They are not a globally atomic snapshot. If required facts cannot be established, retain uncertainty; postcondition verification does not restore atomic entry-identity or continuous-containment guarantees.
-
-This rule covers permission, sharing, lock, read-only-filesystem, process-interruption, and other platform errors that occur after an action has been marked `running`.
-It also applies if an operating system call reports an error but a later observation proves the recorded post-condition, subject to the failed-create execution exception above.
-For a multi-step action such as `relocate_link`, the recorded precondition and post-condition include every required target observation; a partial relocation is therefore `uncertain`.
-
-A `replace_link` action, and a `replace_ownership` action whose resolved link targets differ, also requires its recorded temporary sibling path to be `missing` as part of the complete post-condition.
-When its old-target precondition still holds and the recorded temporary path is the exact temporary link, the executor or recovery may remove that temporary entry only after a fresh no-follow safety recheck.
-It may mark the replacement `failed` only after that temporary path is `missing`.
-An observed unexpected or unsafe temporary entry MUST NOT be removed. An unremovable temporary or unprovable cleanup aftermath makes the replacement `uncertain`. Cleanup is limited to the exact recorded path, with no sibling scanning, and shares the recheck-to-syscall limitation. A failed recheck after temporary creation does not imply that no mutation occurred; existing effects are classified using the recorded predicates.
-
-When an action-specific copy classification requires eligible staged-temporary cleanup before it can become `failed` or `failed` with a conflict, cleanup is complete only when the recorded temporary pathname is freshly proven `missing`.
-The temporary may already be missing, or it may become missing after a permitted removal attempt; an operating-system success or error result alone does not decide completion.
-
-| Required staged-temporary cleanup observation | Required result |
-| --- | --- |
-| Recorded temporary is safely observed missing before cleanup, or is safely observed missing after an eligible removal attempt | Cleanup is complete; apply the recorded final-target classification. |
-| Eligible removal is denied or reports an error, and missing cannot be proven afterward | `uncertain`; retain the action and Known state. |
-| An eligible removal attempt reports success but the recorded temporary is not proven missing afterward | `uncertain`; retain the action and Known state. |
-| The recorded temporary is present but different, ineligible, unsafe, or unavailable | Do not remove it; mark `uncertain` and retain the action and Known state. |
-
-An `uncertain` cleanup aftermath retains the active operation as a global barrier.
-An operator may correct the exact recorded temporary artifact manually, after which recovery re-observes the recorded temporary and final-target predicates; it does not infer cleanup from a prior removal attempt.
-
-For v0.5 copy replacement and effect handoff, the preceding general table is refined as follows during both execution and recovery. A `replace_copy`, copy `replace_ownership` with changed bytes, or `link -> copy` action whose final copy postcondition holds and whose recorded `publication_attempted` fact is true is `succeeded`. If its old-effect precondition still holds, it is `failed` after eligible-temporary cleanup. If its final target is safely observed as missing, it is `failed` after eligible-temporary cleanup; Known remains the old effect and a fresh plan may create the desired copy at the missing target. If the final target is a safely observed entry matching neither predicate, it is `failed` with a conflict and does not mutate that entry. Unsafe or unavailable observation remains `uncertain`.
-
-The same final-observation classification applies to `copy -> link`, except that it has no staged copy temporary. Its final-link postcondition with `publication_attempted` is `succeeded`; its old-copy precondition or a safely observed missing final target is `failed`; a safely observed different entry is `failed` with a conflict; and unsafe or unavailable observation is `uncertain`.
-These sequential actions do not restore an old effect, back it up, or roll it back. This exception does not change `replace_link` or source-changing `replace_ownership`, whose temporary cleanup and old-effect-preservation rules remain in force.
-
-## Failure and Recovery
-
-Before a non-dry-run apply creates its fresh plan, it reconciles any `active_operation` while holding the exclusive lock.
-Recovery observes only the paths recorded in that operation record; it does not execute the old plan or mutate a declared resource target.
-It may perform only the replacement-temporary cleanup explicitly authorized by Mutation Result Classification.
-
-For each unfinished action, recovery applies the same evidence rules:
-
-| Action status and observation | Recovery result |
-| --- | --- |
-| `pending` | Mark `skipped`; leave Known state unchanged. |
-| `running`; recorded post-condition holds exactly and the action's required success evidence is durable | Commit the corresponding Known-state update and mark `succeeded`. |
-| `running`; recorded precondition still holds exactly | Mark `failed`; leave the prior Known state unchanged. |
-| `running`; neither condition holds exactly, or inspection is unsafe | Mark `uncertain`; retain Known state unchanged. |
-
-An unfinished `create_link` or `create_copy` is an exception to the recorded-postcondition row. Whether its status is `running` or `uncertain`, an observed expected final effect remains `uncertain` and Known remains unchanged. That observation cannot prove that Loadout created the effect: it is indistinguishable from external creation after the final recheck, including when the create syscall returned success before the process stopped. If the recorded create target is `missing`, recovery marks the action `failed`; every other observation remains `uncertain`. This deliberately sacrifices automatic recovery of a successful create whose Known commit was interrupted in order to preserve the rule that Loadout does not adopt an unmanaged matching effect.
-
-For `relocate_link`, both required final observations must hold to prove success.
-A partial relocation, such as both old and new links existing, is `uncertain`.
-
-`relocate_copy` is also a two-target action. It succeeds only when its complete recorded new-copy and old-target-missing postcondition holds, and fails only when its complete recorded precondition still holds. Any partial relocation remains `uncertain`; the single-target missing-final exception for sequential copy replacement does not apply.
-
-For a running state-only `replace_ownership` action, recovery commits the recorded identity handoff only when the old Known resource identity remains present and Actual observation proves the recorded shared expected effect.
-That recovery performs no target mutation.
-This covers equal resolved link targets and copy effects with the same target and applied fingerprint.
-For a copy `replace_ownership` action with changed bytes, recovery instead uses the sequential copy-replacement classification, including `temporary_staged`, `publication_attempted`, and the old-to-new Known identity update on success.
-Any other observation follows the normal recorded-precondition and post-condition classification.
-
-After every action has a final status of `succeeded`, `failed`, or `skipped`, the repository removes `active_operation` in a final atomic commit.
-If any action is `uncertain`, the repository retains the operation record and apply returns a blocking diagnostic without creating a new plan.
-An active operation containing `uncertain` is a global barrier: it prevents every fresh plan and every new planned target mutation, including work for resources not named by the uncertain action.
-Read-only inspection may report the active operation but MUST NOT reconcile it or use it to permit a partial apply.
-
-An operator may correct the filesystem manually.
-A later apply re-runs recovery and proceeds only if every formerly uncertain action can then be proven successful or failed by its recorded conditions. For `create_link` and `create_copy`, only the recorded missing precondition can close an uncertain action; a matching final effect remains open.
-
-Verified actions from before a failure remain in Known state.
-v0.3.0 does not roll them back.
-
-## v0.5.0 State Schema
-
-This section supersedes the v0.3.0 state schema, hash formats, and operation representation for v0.5.0.
-`state.json` has `schema_version: 2`; version `1` and every other version are rejected before target observation, recovery, planning, or state rewrite.
-v0.5.0 does not migrate, decode for conversion, or reinterpret a version-1 state file.
-
-Each `resources` member has `definition_hash` and exactly one tagged `effect` object.
-
-```json
-{
-  "schema_version": 2,
-  "resources": {
-    "base/git-config": {
-      "definition_hash": "sha256:...",
-      "effect": {
-        "kind": "file_copy",
-        "source_path": "/home/example/dotfiles/git/config",
-        "target_path": "/home/example/.gitconfig",
-        "content_fingerprint": "sha256:..."
-      }
-    }
-  },
-  "active_operation": null
-}
-```
-
-`effect.kind` is exactly `file_link` or `file_copy`.
-A `file_link` effect records `source_path`, `target_path`, and `link_target` as before.
-A `file_copy` effect records `source_path`, `target_path`, and the SHA-256 fingerprint of the exact copied bytes.
-Unknown fields, a mismatched effect, duplicate target paths, invalid fingerprints, or an invalid active operation are errors.
-
-The v0.5 desired hash uses `loadout.resolved-desired.v2` and sorts resource IDs lexicographically.
-Its resource definition is the effect-specific resolved definition from [File Links](file-link.md) or [File Copies](file-copy.md).
-The definition hash does not include copy source content; the copy Known record does.
+### File Effect Action Records
 
 Every copy action records its effect kind, resolved source and target, planned source fingerprint, precondition, and postcondition.
 A staged copy publication, every `replace_copy`, every copy `replace_ownership` with changed bytes, and every `link -> copy` effect handoff also records its action-local temporary path and fingerprint until publication completes.
@@ -331,29 +144,6 @@ Neither fact authorizes a Known update without the required postcondition observ
 For an action with a temporary, that temporary is part of the post-condition and must be missing before `succeeded` is committed.
 A direct `create-no-replace` action has no temporary and records the final missing precondition and exact final-copy postcondition needed to classify an incomplete or otherwise unproved final entry as `uncertain`.
 `replace_effect` and `replace_ownership` record both old and final effects and require the old effect's ownership predicate before any final-effect publication.
-
-An active v2 operation has this exact logical shape; unknown fields are errors.
-
-```json
-{
-  "id": "opaque-operation-id",
-  "desired_hash": "sha256:...",
-  "actions": {
-    "a1": {
-      "kind": "replace_effect",
-      "resource_id": "base/git-config",
-      "old_effect": { "kind": "file_link", "source_path": "/store/old", "target_path": "/home/example/.gitconfig", "link_target": "/store/old" },
-      "final_effect": { "kind": "file_copy", "source_path": "/store/new", "target_path": "/home/example/.gitconfig", "content_fingerprint": "sha256:..." },
-      "temporary": { "path": "/home/example/.loadout-tmp", "kind": "file_copy", "content_fingerprint": "sha256:..." },
-      "temporary_staged": false,
-      "publication_attempted": false,
-      "precondition": { "kind": "expected_file_link", "target_path": "/home/example/.gitconfig", "link_target": "/store/old" },
-      "postcondition": { "kind": "expected_file_copy", "target_path": "/home/example/.gitconfig", "content_fingerprint": "sha256:...", "temporary": "missing" },
-      "status": "pending"
-    }
-  }
-}
-```
 
 Every action contains `kind`, `resource_id`, typed `precondition`, typed `postcondition`, and `status`.
 Copy publication actions additionally contain the boolean `publication_attempted`; staged copy actions additionally contain the boolean `temporary_staged`.
@@ -383,24 +173,13 @@ When both effects are links with different resolved targets, it uses the final l
 Mixed link/copy effects use `replace_effect`, not `replace_ownership`.
 A `create_copy` selected for a missing-target identity handoff records `superseded_resource_id`; its successful Known update removes that stale record and records the final copy under the new resource identity.
 
-For a running `replace_effect`, recovery observes the recorded target and an optional recorded temporary only.
-If the complete final effect holds, every staged temporary is missing, and `publication_attempted` is true, it atomically commits the final Known effect and `succeeded`.
-If the complete old effect holds, a `link -> copy` action requires staged-temporary cleanup under the cleanup table before recovery marks `failed` and retains the old Known effect.
-If the final target is safely observed as missing, a `link -> copy` action likewise requires staged-temporary cleanup under that table before recovery marks `failed` and retains the old Known effect.
-If required cleanup is incomplete, including because the temporary is different, ineligible, unsafe, or unavailable, recovery marks `uncertain` and retains the active operation rather than closing it as `failed`.
-If the final target is safely observed as a different entry, recovery marks `failed` with a conflict and retains the old Known effect without mutating the final target; this classification does not itself require temporary cleanup.
-If the target observation is unsafe or unavailable, it retains `uncertain` and the old Known effect.
-An unexpected or ineligible temporary is preserved; it changes the classification to `uncertain` whenever cleanup is required, and otherwise does not change the safely observed different-final conflict classification.
-For a failed create of either final effect, a matching final observation remains `uncertain` under the non-adoption rule.
-The general mutation classification and recovery tables apply to every other v0.5 action.
-
-## Directory-Link Operation Records
+### Directory-Link Operation Records
 
 The [Current State Schema](#current-state-schema) defines `directory_link` as a third typed Known effect and its serialized schema version and exact JSON shape.
 Its definition and ownership fields are the resolved source path, resolved target path, exact normalized link target, and definition hash in [Directory Links](directory-link.md#typed-actual-and-known-effects).
 
-DirectoryLink action records have no extension fields: every field not required below is forbidden.
-Every record contains `kind`, `status`, and the listed fields.
+DirectoryLink action records permit only the resource-specific fields required below; the operation's common graph facts remain subject to [Applied Lifecycle Topology and Operations](#applied-lifecycle-topology-and-operations).
+Every record contains `kind`, `status`, and its listed resource-specific fields.
 `expected_directory_link` predicates have exactly `kind`, `target_path`, and `link_target`; `missing` predicates have exactly `kind` and `target_path`.
 Every effect object is the exact `directory_link` effect defined by the [Current State Schema](#current-state-schema).
 
@@ -474,7 +253,7 @@ A source-changing `replace_ownership` has the same predicates and temporary reco
 Its success update removes the old Known identity and records the final DirectoryLink under the new identity atomically with `succeeded`.
 A `replace_directory_link` updates the existing resource identity to the final effect atomically with `succeeded`.
 
-### Directory-Link Replacement Rechecks
+#### Directory-Link Replacement Rechecks
 
 Immediately before temporary creation, the executor rechecks final-source real-directory safety, containment, the shared safe parent, target `expected_directory_link` for the recorded old link target, temporary `missing`, and declared-path association for target and temporary.
 After creation, it verifies the temporary against its exact recorded expected-directory-link predicate and rechecks the required path association.
@@ -488,7 +267,7 @@ The exact final postcondition authorizes the Known update and `succeeded`, inclu
 If the old target precondition still holds, failure is definite only after required temporary cleanup is proven complete.
 Every different, unsafe, unavailable, or otherwise unprovable target/temporary observation is `uncertain` and retains the old Known effect and active-operation barrier.
 
-### Directory-Link Temporary Cleanup and Recovery
+#### Directory-Link Temporary Cleanup and Recovery
 
 Cleanup may address only the exact recorded temporary sibling after a fresh no-follow recheck proves its expected directory-link predicate, safe parent, containment, and declared-path association.
 It MUST NOT scan siblings, remove a different link or entry, follow the temporary link, remove its referent, or remove a parent.
@@ -501,83 +280,7 @@ A different temporary, unsafe or unavailable observation, denied removal, a remo
 It preserves the observed entry, retains the active operation, and does not retry, replan, restore, or otherwise mutate a target.
 Recovery observes only recorded predicates and may perform only this exact temporary cleanup; it never resumes the old plan.
 
-## Current State Schema
-
-This section supersedes the v0.7.0 State Schema for every normal lifecycle or inspection command that reads state.
-`state.json` has `schema_version: 5`; schema version `4`, every earlier version, and every unknown future version are invalid.
-The state repository rejects an invalid state version before target inspection, operation recovery, planning, state rewrite, or any target mutation.
-It does not decode the older document for conversion, recalculate its hashes, reinterpret an active operation, or write a replacement state file.
-Only the explicit migration operation in [Migration](migration.md) may parse a supported schema-4 state document.
-
-An absent state file is an empty Known state.
-An existing schema-4 state file is not an empty state: it is an error that preserves the file and prevents a new plan.
-Its recorded effects and active operation are not ownership evidence and MUST NOT be observed, adopted, recovered, removed, replaced, or otherwise acted upon.
-
-The current logical Known-state structure is:
-
-```json
-{
-  "schema_version": 5,
-  "resources": {
-    "base/nvim-config": {
-      "definition_hash": "sha256:...",
-      "effect": {
-        "kind": "directory_link",
-        "source_path": "/home/example/dotfiles/nvim",
-        "target_path": "/home/example/.config/nvim",
-        "link_target": "/home/example/dotfiles/nvim"
-      }
-    }
-  },
-  "applied_lifecycle_topology": { "current": [], "historical": [] },
-  "active_operation": null
-}
-```
-
-`schema_version`, `resources`, `applied_lifecycle_topology`, and `active_operation` are REQUIRED.
-Unknown fields are errors at every object level.
-Each resource member contains exactly `definition_hash` and `effect`.
-`effect.kind` is exactly `file_link`, `file_copy`, or `directory_link`.
-A `file_link` records `source_path`, `target_path`, and `link_target`; a `file_copy` records `source_path`, `target_path`, and `content_fingerprint`; and a `directory_link` records `source_path`, `target_path`, and `link_target`.
-Each effect rejects fields that do not belong to its kind.
-Resource IDs and normalized target paths are unique, all paths are absolute platform-normalized paths, and every definition hash and fingerprint has the required canonical form.
-
-`active_operation` is either `null` or a schema-5 action-graph operation record. Its resource-specific preconditions and postconditions retain the applicable [Directory-Link Operation Records](#directory-link-operation-records) safety shapes.
-An unrecognized action kind, predicate, effect, field, status, or invariant is invalid state and is rejected before recovery or target inspection.
-
-### Current Canonical Hashes
-
-`definition_hash` and `desired_hash` are SHA-256 hashes of UTF-8 JCS values and use `sha256:<lowercase-hex>` representation.
-The exact per-effect definition value is the value owned by [File Links](file-link.md), [File Copies](file-copy.md), or [Directory Links](directory-link.md#declaration-and-resolution).
-The DirectoryLink definition is `loadout.resolved-directory-link.v1`; it includes `format`, `type`, `kind`, `operation`, `source_path`, and `target_path`, and excludes the resource ID, raw YAML, store ID, source-directory contents, metadata, and schema version.
-
-The current desired hash is exactly the hash of this JCS value; orchestration facts are excluded:
-
-```json
-{
-  "format": "loadout.resolved-desired.v5",
-  "resources": [
-    {
-      "definition": {
-        "format": "loadout.resolved-directory-link.v1",
-        "kind": "directory",
-        "operation": "link",
-        "source_path": "/home/example/dotfiles/nvim",
-        "target_path": "/home/example/.config/nvim",
-        "type": "file"
-      },
-      "resource_id": "base/nvim-config"
-    }
-  ]
-}
-```
-
-`resources` sorts lexicographically by fully qualified `resource_id`.
-The resource ID is an input only to `desired_hash`; it is not an input to `definition_hash`.
-Schema versions, YAML mapping order, profile discovery/include order, raw declaration syntax, store IDs, source file content, source-directory contents, and metadata are not hash inputs.
-Schema-4 hashes are not aliases for schema-5 hashes and MUST NOT be accepted, recalculated, or compared to establish ownership by a normal command.
-
-### Applied Lifecycle Topology and Operations
+## Applied Lifecycle Topology and Operations
 
 `applied_lifecycle_topology` is a sorted object with `current` and `historical` arrays. It retains only topology facts successfully committed with verified actions. A topology direct-edge fact is `{ "from": "<resource-id>", "to": "<resource-id>", "origin": "depends_on" }`; it sorts by `from`, `to`, and `origin`. A topology barrier fact is `{ "id": "stage/<stage-id>", "after": ["stage/<stage-id>"], "members": ["<resource-id>"], "origin": "stage" }`; its arrays are sorted and duplicate-free and barriers sort by `id`. A fact's source-array-qualified identity is unique: an identical direct edge or barrier ID MUST NOT appear in both arrays. Unknown fields, duplicates, noncanonical sorting, malformed references, or invalid cross-array identity are invalid state before recovery or target observation.
 
@@ -592,3 +295,123 @@ A direct edge is published only by its successor action after the predecessor's 
 The planner assigns exactly one recorded removal owner for each snapshot fact, and recovery never transfers that authority. A direct edge is owned by its `to` endpoint's stale action; a multi-member barrier is owned successively by its member actions in reverse schedule order. A mixed fact incident to one stale action and one or more current resources has that stale action as sole owner and creates no stale scheduling edge. Each such barrier delta records the exact `before` and next `after` fact, replacing it while members remain and removing it only for the final member. A successful stale action atomically commits only its owned deletion or replacement, its verified Known update, and `succeeded`; failed or uncertain actions retain their topology facts and authority.
 
 Recovery classifies an active operation from its recorded graph, predicates, authority, durable temporary/publication facts where applicable, and required current observations only. It does not read changed declarations, replan, or resume the old schedule. An unprovable outcome remains `uncertain` and blocks a fresh plan. A later apply recovers first and then creates a fresh plan.
+
+## Locking
+
+Every non-dry-run apply MUST acquire an exclusive operating-system lock associated with `state.lock` before it reads state for execution.
+It holds the lock until it has closed or retained the active operation record after the apply attempt.
+
+If the lock cannot be acquired, apply MUST fail without inspecting a managed target, recording progress, or mutating a target.
+The lock implementation must not rely on a stale-file heuristic.
+Process termination releases the operating-system lock according to platform semantics.
+
+`validate`, `diff`, `plan`, and dry-run apply do not acquire this exclusive lock.
+Read-only inspection commands also do not acquire it, create a lock file, recover an operation, or write state.
+
+## Commit Protocol
+
+Every state update, including an operation status transition, MUST be an atomic replacement of the complete state file:
+
+1. Write the complete new state to a unique temporary file in the state directory.
+2. Flush the temporary file.
+3. Re-open, parse, and validate the written state.
+4. Atomically replace `state.json` with the temporary file.
+5. Flush the state directory when the platform supports it.
+
+If the replacement fails, the previous `state.json` remains authoritative.
+Loadout removes only its own temporary state file when cleanup is safe.
+It MUST NOT remove target files, source files, profile files, or other user-visible artifacts as failure cleanup.
+
+The state repository writes `running` before a resource mutation.
+After a mutation, the executor verifies the resource post-condition; the repository atomically commits the Known-state update together with that action's `succeeded` status only after verification.
+It does not update Known state before verification.
+
+For a state-only `replace_ownership` action, the repository writes `running` before final no-follow verification and performs no target mutation.
+When verification proves recorded old ownership and the shared expected link, copy, or DirectoryLink effect, it atomically replaces the old Known identity with the new one and marks the action `succeeded`.
+
+## Mutation Result Classification
+
+After an executor attempts a mutation, it MUST perform the action's no-follow post-mutation observation before deciding the operation result.
+The observation, rather than the operating system call's success or error result alone, decides whether Known state may change.
+For a create attempt that returns an error, the execution-time exception below takes precedence over the general post-condition row.
+
+| Observation after an attempted mutation | Required result |
+| --- | --- |
+| The recorded post-condition holds exactly and the action's required success evidence is durable | Atomically commit the matching Known-state update and mark the action `succeeded`. |
+| The recorded precondition still holds exactly | Mark the action `failed`; leave Known state unchanged. |
+| Neither condition holds exactly, or observation is unsafe or unavailable | Mark the action `uncertain`; leave Known state unchanged. |
+
+An action has no additional success evidence unless its action-specific contract defines it.
+For sequential copy replacement and effect handoff, the required success evidence is `publication_attempted == true`.
+
+During execution, a failed `create_link` or `create_copy` attempt followed by its expected final effect MUST remain `uncertain`, with Known unchanged. The observed effect can have been created externally after the final recheck, so its matching value does not establish successful creation by this attempt. This includes an already-existing-entry error and errors whose physical effects cannot be distinguished from external creation. A failed create whose recorded missing precondition still holds remains `failed`; unsafe or unavailable observations remain `uncertain`. This exception does not alter removal or replacement result classification.
+
+The [external filesystem concurrency contract](file-link.md#external-filesystem-concurrency) applies to execution and recovery observations and cleanup. The state lock does not exclude unrelated filesystem mutation. After a removal race, `missing` at the recorded target can be indistinguishable from ordinary success: when every required recorded postcondition and path association holds, the result is `succeeded`, Known is removed, and apply can ultimately exit 0. This does not prove which entry was deleted and does not require a race diagnostic based on information unavailable to production observations.
+
+Required observations include the recorded path association, not just the contents of a retained parent handle. They are not a globally atomic snapshot. If required facts cannot be established, retain uncertainty; postcondition verification does not restore atomic entry-identity or continuous-containment guarantees.
+
+This rule covers permission, sharing, lock, read-only-filesystem, process-interruption, and other platform errors that occur after an action has been marked `running`.
+It also applies if an operating system call reports an error but a later observation proves the recorded post-condition, subject to the failed-create execution exception above.
+For a multi-step action such as `relocate_link`, the recorded precondition and post-condition include every required target observation; a partial relocation is therefore `uncertain`.
+
+A `replace_link` action, and a `replace_ownership` action whose resolved link targets differ, also requires its recorded temporary sibling path to be `missing` as part of the complete post-condition.
+When its old-target precondition still holds and the recorded temporary path is the exact temporary link, the executor or recovery may remove that temporary entry only after a fresh no-follow safety recheck.
+It may mark the replacement `failed` only after that temporary path is `missing`.
+An observed unexpected or unsafe temporary entry MUST NOT be removed. An unremovable temporary or unprovable cleanup aftermath makes the replacement `uncertain`. Cleanup is limited to the exact recorded path, with no sibling scanning, and shares the recheck-to-syscall limitation. A failed recheck after temporary creation does not imply that no mutation occurred; existing effects are classified using the recorded predicates.
+
+When an action-specific copy classification requires eligible staged-temporary cleanup before it can become `failed` or `failed` with a conflict, cleanup is complete only when the recorded temporary pathname is freshly proven `missing`.
+The temporary may already be missing, or it may become missing after a permitted removal attempt; an operating-system success or error result alone does not decide completion.
+
+| Required staged-temporary cleanup observation | Required result |
+| --- | --- |
+| Recorded temporary is safely observed missing before cleanup, or is safely observed missing after an eligible removal attempt | Cleanup is complete; apply the recorded final-target classification. |
+| Eligible removal is denied or reports an error, and missing cannot be proven afterward | `uncertain`; retain the action and Known state. |
+| An eligible removal attempt reports success but the recorded temporary is not proven missing afterward | `uncertain`; retain the action and Known state. |
+| The recorded temporary is present but different, ineligible, unsafe, or unavailable | Do not remove it; mark `uncertain` and retain the action and Known state. |
+
+An `uncertain` cleanup aftermath retains the active operation as a global barrier.
+An operator may correct the exact recorded temporary artifact manually, after which recovery re-observes the recorded temporary and final-target predicates; it does not infer cleanup from a prior removal attempt.
+
+For sequential copy replacement and effect handoff, the preceding general table is refined as follows during both execution and recovery. A `replace_copy`, copy `replace_ownership` with changed bytes, or `link -> copy` action whose final copy postcondition holds and whose recorded `publication_attempted` fact is true is `succeeded`. If its old-effect precondition still holds, it is `failed` after eligible-temporary cleanup. If its final target is safely observed as missing, it is `failed` after eligible-temporary cleanup; Known remains the old effect and a fresh plan may create the desired copy at the missing target. If the final target is a safely observed entry matching neither predicate, it is `failed` with a conflict and does not mutate that entry. Unsafe or unavailable observation remains `uncertain`.
+
+The same final-observation classification applies to `copy -> link`, except that it has no staged copy temporary. Its final-link postcondition with `publication_attempted` is `succeeded`; its old-copy precondition or a safely observed missing final target is `failed`; a safely observed different entry is `failed` with a conflict; and unsafe or unavailable observation is `uncertain`.
+A safely observed different-final conflict does not itself require staged-temporary cleanup; an unexpected or ineligible temporary is preserved and makes the action `uncertain` whenever cleanup is required.
+These sequential actions do not restore an old effect, back it up, or roll it back. This exception does not change `replace_link` or source-changing `replace_ownership`, whose temporary cleanup and old-effect-preservation rules remain in force.
+
+## Failure and Recovery
+
+Before a non-dry-run apply creates its fresh plan, it reconciles any `active_operation` while holding the exclusive lock.
+Recovery observes only the paths recorded in that operation record; it does not execute the old plan or mutate a declared resource target.
+It may perform only the replacement-temporary cleanup explicitly authorized by Mutation Result Classification.
+
+For each unfinished action, recovery applies the same evidence rules:
+
+| Action status and observation | Recovery result |
+| --- | --- |
+| `pending` | Mark `skipped`; leave Known state unchanged. |
+| `running`; recorded post-condition holds exactly and the action's required success evidence is durable | Commit the corresponding Known-state update and mark `succeeded`. |
+| `running`; recorded precondition still holds exactly | Mark `failed`; leave the prior Known state unchanged. |
+| `running`; neither condition holds exactly, or inspection is unsafe | Mark `uncertain`; retain Known state unchanged. |
+
+An unfinished `create_link` or `create_copy` is an exception to the recorded-postcondition row. Whether its status is `running` or `uncertain`, an observed expected final effect remains `uncertain` and Known remains unchanged. That observation cannot prove that Loadout created the effect: it is indistinguishable from external creation after the final recheck, including when the create syscall returned success before the process stopped. If the recorded create target is `missing`, recovery marks the action `failed`; every other observation remains `uncertain`. This deliberately sacrifices automatic recovery of a successful create whose Known commit was interrupted in order to preserve the rule that Loadout does not adopt an unmanaged matching effect.
+
+For `relocate_link`, both required final observations must hold to prove success.
+A partial relocation, such as both old and new links existing, is `uncertain`.
+
+`relocate_copy` is also a two-target action. It succeeds only when its complete recorded new-copy and old-target-missing postcondition holds, and fails only when its complete recorded precondition still holds. Any partial relocation remains `uncertain`; the single-target missing-final exception for sequential copy replacement does not apply.
+
+For a running state-only `replace_ownership` action, recovery commits the recorded identity handoff only when the old Known resource identity remains present and Actual observation proves the recorded shared expected effect.
+That recovery performs no target mutation.
+This covers equal resolved file-link or DirectoryLink targets and copy effects with the same target and applied fingerprint.
+For a copy `replace_ownership` action with changed bytes, recovery instead uses the sequential copy-replacement classification, including `temporary_staged`, `publication_attempted`, and the old-to-new Known identity update on success.
+Any other observation follows the normal recorded-precondition and post-condition classification.
+
+After every action has a final status of `succeeded`, `failed`, or `skipped`, the repository removes `active_operation` in a final atomic commit.
+If any action is `uncertain`, the repository retains the operation record and apply returns a blocking diagnostic without creating a new plan.
+An active operation containing `uncertain` is a global barrier: it prevents every fresh plan and every new planned target mutation, including work for resources not named by the uncertain action.
+Read-only inspection may report the active operation but MUST NOT reconcile it or use it to permit a partial apply.
+
+An operator may correct the filesystem manually.
+A later apply re-runs recovery and proceeds only if every formerly uncertain action can then be proven successful or failed by its recorded conditions. For `create_link` and `create_copy`, only the recorded missing precondition can close an uncertain action; a matching final effect remains open.
+
+Verified actions from before a failure remain in Known state; recovery does not roll them back.

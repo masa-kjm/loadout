@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.8.0
+
+- Added compact, deterministic lifecycle action-graph scheduling with fail-closed relation validation, durable applied lifecycle topology, and recovery-aware operation records.
+
 ## v0.7.0
 
 - Added composable schema-4 profiles with typed parameter bindings and stable resource identities for profile instances.

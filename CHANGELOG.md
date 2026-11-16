@@ -1,8 +1,9 @@
 # Changelog
 
-## v0.8.0
+## v0.8.1
 
 - Added compact, deterministic lifecycle action-graph scheduling with fail-closed relation validation, durable applied lifecycle topology, and recovery-aware operation records.
+- Added explicit schema-4-to-5 state and profile migration for existing v0.7.0 installations.
 
 ## v0.7.0
 

@@ -70,14 +70,16 @@ Their selection rules, typed field model, confirmation, publication, failure aft
 ### `loadout migrate`
 
 ```text
-loadout migrate state --config <path> [--yes]
-loadout migrate profiles --config <path> [--yes]
+loadout migrate --config <path> [--to-schema <N>] [--yes]
 ```
 
-These are explicit schema-migration authoring commands, not lifecycle or inspection commands.
-They present the document inventory, source and target versions, required next step, and the no-ID/effect/ownership-change guarantee before any write.
-`--yes` is required non-interactively and does not bypass source validation, locking, publication validation, or the mandatory state-first ordering.
-Their complete state-first protocol, partial-completion boundary, and failure aftermath are defined by [Migration](migration.md).
+This single explicit authoring command migrates state and profiles together.
+`--to-schema` selects managed-document generation 4 or 5 and defaults to the binary's latest generation, 5.
+It does not select a release version or change runtime or environment configuration schemas.
+The former `migrate state` and `migrate profiles` forms are argument errors that identify the new syntax and change no document.
+Before confirmation it presents all discovered documents, their current and target generations, routes or no-change status, the write set, and whether normal commands can use the completed inventory.
+`--yes` is required non-interactively and bypasses only confirmation.
+Complete-inventory validation, confirmed-snapshot comparison, state-before-profiles order, partial completion, and failure aftermath are defined by [Migration](migration.md).
 
 ### `loadout validate`
 
@@ -208,7 +210,7 @@ Observed drift is reportable state, not a `diff` runtime failure.
 
 For `config`, output identifies the inspected or changed configuration file and the selected field or path when applicable.
 
-For `migrate`, output identifies every affected document, source and target schema versions, the required next step, and that migration changes no resource ID, effect, or ownership evidence.
+For `migrate`, output identifies every discovered state and profile document, its current and target schema generations, selected routes or no-change status, the exact write set, normal-command availability after completion, and that migration changes no resource ID, effect, or ownership evidence.
 
 ## Exit Status
 
@@ -232,5 +234,5 @@ The current contract does not provide configuration reset, generic YAML editing,
 Every lifecycle command and every inspection command that reads a profile or state document uses the version-specific decoding rules in [Profiles](profiles.md#current-profile-schema) and [State and Recovery](state-and-recovery.md#current-state-schema).
 An unsupported profile or state schema version exits with the documented invalid-input category before target inspection, planning, recovery, state rewrite, or target mutation.
 
-Normal commands provide no old-schema reader, implicit conversion, compatibility alias, or schema-repair path. Only the explicit `migrate` commands may read a complete valid schema-4 document, and only for the lossless conversion defined by [Migration](migration.md).
+Normal commands provide no old-schema reader, implicit conversion, compatibility alias, or schema-repair path. Only the explicit `migrate` command may read complete valid schema-3 or schema-4 documents for the lossless conversion defined by [Migration](migration.md).
 An unsupported state file does not authorize observing or adopting a matching target, and its active operation is not recovered.

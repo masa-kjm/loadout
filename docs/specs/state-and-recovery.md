@@ -4,7 +4,7 @@
 
 This specification defines v0.8.0 durable state, operation records, exclusive locking, atomic commits, applied lifecycle topology, and recovery after interruption for file-link, file-copy, and DirectoryLink resource effects.
 
-Normal commands use only the current state schema. The explicit schema-4-to-5 authoring route is defined by [Migration](migration.md).
+Normal commands use only the current state schema. The explicit schema-3-to-4-to-5 authoring operation is defined by [Migration](migration.md).
 
 ## Read by Task
 
@@ -39,10 +39,10 @@ Normal lifecycle and inspection commands use this schema for every state documen
 `state.json` has `schema_version: 5`; schema version `4`, every earlier version, and every unknown future version are invalid.
 The state repository rejects an invalid state version before target inspection, operation recovery, planning, state rewrite, or any target mutation.
 It does not decode the older document for conversion, recalculate its hashes, reinterpret an active operation, or write a replacement state file.
-Only the explicit migration operation in [Migration](migration.md) may parse a supported schema-4 state document.
+Only the explicit migration operation in [Migration](migration.md) may parse a supported schema-3 or schema-4 state document.
 
 An absent state file is an empty Known state.
-An existing schema-4 state file is not an empty state: it is an error that preserves the file and prevents a new plan.
+An existing schema-3 or schema-4 state file is not an empty state: it is an error that preserves the file and prevents a new plan.
 Its recorded effects and active operation are not ownership evidence and MUST NOT be observed, adopted, recovered, removed, replaced, or otherwise acted upon.
 
 The logical Known-state structure is:

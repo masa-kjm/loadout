@@ -15,7 +15,7 @@ They apply to every implementation, including tests, authoring commands, inspect
 | Desired/Known/Actual classification and action selection | Planner | Perform I/O, mutate state, invoke commands, or print. |
 | Immediate precondition recheck, mutation, and post-condition verification | Executor | Create an unplanned action or reclassify an action after planning. |
 | State lock, operation progress, Known state, and atomic commit | State repository | Delegate authoritative state writes to command or resource code. |
-| Schema-4 parsing, inventory validation, lossless conversion, migration-only preflight, and publication decisions | Migration facade and its explicitly registered private version-pair route | Be imported or invoked by normal declaration, state, resolver, planner, executor, or inspection paths. |
+| Schema-3/4 parsing, route registration, inventory validation, compatibility proof, lossless conversion, confirmed-snapshot comparison, and migration-only publication decisions | Migration facade, separate internal state/profile responsibilities, and private adjacent-generation routes | Be imported or invoked by normal declaration, state, resolver, planner, executor, or inspection paths. |
 | Platform-specific path and filesystem primitives | Filesystem implementation | Decide ownership, desired state, or user-visible policy. |
 | Read-only inspection report assembly | Inspection query | Plan, recover, mutate state, acquire the apply lock, or infer ownership from a target match. |
 
@@ -76,14 +76,16 @@ It has its own explicit filesystem, collision, durability, and failure-after-eff
 `init` may create a complete, previously absent `.loadout` bundle in the current directory, but it must not edit an existing control file, initialize version control, modify native assets, acquire the state lock, or write state.
 `config use` may change only the machine-local runtime selection, and `config set` may change only the one portable configuration field authorized by the Configuration Authoring specification.
 Neither command may acquire the state lock, write state, mutate a store or resource target, or authorize ownership adoption.
-`migrate state` may use only the state repository's narrow exclusive-lock and atomic-publication interfaces; it must not enter lifecycle recovery or mutation.
-`migrate profiles` may change only validated profile schema-version fields after the schema-5 state barrier exists or state is absent.
-The command adapter may only construct a migration request from parsed command options, present facade-provided data, obtain confirmation, invoke the selected migration operation once, and render its structured outcome.
+`migrate` is one public command.
+The facade owns complete-inventory planning, confirmed-snapshot comparison, and sequencing of separate internal state and profile migration responsibilities.
+The state responsibility alone uses the state repository's narrow exclusive-lock and migration-publication interfaces without entering lifecycle recovery or mutation.
+The profile responsibility owns profile validation, safe publication, and resumption.
+The command adapter obtains facade presentation, invokes facade execution once after confirmation or `--yes` acceptance, and renders the structured outcome.
 It must not parse a legacy document, discover an inventory, decide profile/state eligibility, inspect an active operation, compare inventory snapshots, acquire a state lock, construct a conversion candidate, or publish a document.
 The migration facade is the only migration capability visible outside its private module; its request, presentation, and outcome values are data-only and cannot carry a legacy DTO, parsed document, inventory iterator, conversion candidate, lock or transaction guard, path handle, writer, or publication capability.
-Each supported source-to-target route is a private named unit beneath that boundary.
-For v0.8, `schema_4_to_5` contains its legacy DTOs, parsing, validation, conversion, and route-specific tests, and the facade is its sole stable edge.
-Adding a route requires a distinct private unit and explicit facade registration; retiring one removes both that registration and the unit after its documented support window.
+Each supported adjacent-generation route is a private named unit beneath that boundary.
+Generation 3→4 and 4→5 routes contain their legacy DTOs, parsing, validation, conversion, and route-specific tests, and the facade is their sole stable edge.
+Adding a generation requires state and profile routes with explicit facade registration; retiring a route removes both its registration and unit after its documented support window.
 An unsupported route fails at facade selection, and neither route addition nor retirement creates a normal compatibility reader or exposes route-private APIs.
 All lifecycle commands, resource implementations, and the state repository remain forbidden from writing Loadout control files.
 
@@ -117,7 +119,7 @@ A command must reject an unsupported version before an inspection, planning deci
 A command need not read or validate a persisted control document that its operation does not depend on.
 It must not ignore unknown ordering, ownership, recovery, or resource-effect data in order to continue.
 
-v0.8 normal lifecycle, validation, dry-run, and inspection deliberately provide no schema-4 compatibility reader. They reject schema 4 and every unsupported version rather than transforming it during validation, planning, application, recovery, or inspection. Only the dedicated migration module may parse a supported schema-4 document, and it is reachable only through the confirmed authoring commands specified by [Migration](../specs/migration.md).
+Normal lifecycle, validation, dry-run, and inspection deliberately provide no schema-3 or schema-4 compatibility reader. They reject those and every unsupported version rather than transforming them during validation, planning, application, recovery, or inspection. Only the dedicated migration module may parse a supported legacy document, and it is reachable only through the confirmed authoring command specified by [Migration](../specs/migration.md).
 
 ## Diagnostics and Errors
 

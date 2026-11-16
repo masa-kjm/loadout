@@ -126,7 +126,7 @@ Apply is sequential in v0.8.0. The planner first classifies lifecycle actions, t
 | Planner | Classify Resolved Desired, Known, and Actual state into a deterministic Plan. |
 | Executor | Perform planned actions, recheck immediate mutation safety, and verify post-conditions. |
 | State repository | Own the state lock, operation records, durable Known state, and atomic commits. |
-| Migration facade | Select an explicitly registered private version-pair route and own schema-4 inventory discovery, conversion eligibility, state-first interlocks, conversion, and publication decisions; expose only request, presentation, and outcome data to the command adapter. |
+| Migration facade | Register private adjacent-generation routes, plan the complete mixed inventory, prove compatibility, bind and compare the confirmed snapshot, and sequence separate internal state and profile migration responsibilities; expose only request, presentation, and outcome data to the command adapter. |
 | Filesystem implementation | Perform platform-specific filesystem observation and mutation behind the executor's contract. |
 | Inspection query | Assemble typed read-only reports from declarations, Resolved Desired, Known state, and Actual observations without making a lifecycle decision. |
 

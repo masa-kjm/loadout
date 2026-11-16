@@ -167,7 +167,7 @@ The accepted `(properties.kind, properties.operation)` pairs are exactly:
 The `directory_link` declaration and resolution rules are defined by [Directory Links](directory-link.md).
 
 Normal commands do not decode a version-4 profile for conversion, reinterpret it as version 5, or provide an implicit migration path.
-The explicit schema-4-to-5 authoring operation is defined by [Migration](migration.md).
+The explicit schema-3-to-4-to-5 authoring operation is defined by [Migration](migration.md).
 An invalid version is a validation diagnostic, not an input from which a target or existing effect may be inspected or adopted.
 
 ## Schema-5 Orchestration

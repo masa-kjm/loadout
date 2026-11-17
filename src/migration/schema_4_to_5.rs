@@ -12,7 +12,9 @@ use serde_json::Value as JsonValue;
 use serde_yaml::{Mapping as YamlMapping, Value as YamlValue};
 
 use crate::declaration::environment_config::{EnvironmentConfig, EnvironmentConfigError};
-use crate::declaration::profile::ProfileDeclaration;
+use crate::declaration::profile::{
+    FileKind, FileOperation, ProfileDeclaration, ValueOrReference, parse_kind, parse_operation,
+};
 use crate::domain::ids::{ProfileId, ResourceId};
 use crate::domain::paths::ResolvedPath;
 use crate::filesystem::is_link_or_reparse_point;
@@ -97,7 +99,7 @@ fn profile_publication_boundary(point: ProfilePublicationFaultPoint) -> io::Resu
 /// Converts one complete schema-4 profile without inventing parameters or instances.
 pub(super) fn convert_profile(source: &str) -> Result<String, MigrationError> {
     validate_legacy_profile_source(source)?;
-    let candidate = replace_root_schema_version(source)?;
+    let candidate = replace_root_schema_version(source, '4', '5')?;
     ProfileDeclaration::parse(&candidate).map_err(MigrationError::Profile)?;
     Ok(candidate)
 }
@@ -105,6 +107,102 @@ pub(super) fn convert_profile(source: &str) -> Result<String, MigrationError> {
 /// Validates a schema-4 profile through its strict legacy shape and current-schema candidate.
 pub(super) fn validate_schema_four_profile(source: &str) -> Result<(), MigrationError> {
     convert_profile(source).map(|_| ())
+}
+
+/// Validates schema-4 declarations for the continuous route without widening the old CLI.
+pub(super) fn profile_facts_continuous(
+    source: &str,
+) -> Result<(ProfileId, Vec<ProfileId>), MigrationError> {
+    let document: YamlValue = serde_yaml::from_str(source).map_err(MigrationError::Profile)?;
+    let mapping = document
+        .as_mapping()
+        .ok_or(MigrationError::InvalidLegacyProfile)?;
+    require_yaml_keys(
+        mapping,
+        &[
+            "schema_version",
+            "id",
+            "parameters",
+            "includes",
+            "resources",
+        ],
+    )?;
+    let version = mapping
+        .get(YamlValue::String("schema_version".to_owned()))
+        .and_then(YamlValue::as_u64)
+        .ok_or(MigrationError::InvalidLegacyProfile)?;
+    if version != LEGACY_SCHEMA_VERSION {
+        return Err(MigrationError::UnsupportedSchemaVersion {
+            document: "profile",
+            actual: version,
+        });
+    }
+    if let Some(includes) = mapping.get(YamlValue::String("includes".to_owned())) {
+        for include in includes
+            .as_sequence()
+            .ok_or(MigrationError::InvalidLegacyProfile)?
+        {
+            require_yaml_keys(
+                include
+                    .as_mapping()
+                    .ok_or(MigrationError::InvalidLegacyProfile)?,
+                &["id", "as", "with"],
+            )?;
+        }
+    }
+    let resources = mapping
+        .get(YamlValue::String("resources".to_owned()))
+        .and_then(YamlValue::as_mapping)
+        .ok_or(MigrationError::InvalidLegacyProfile)?;
+    for resource in resources.values() {
+        require_yaml_keys(
+            resource
+                .as_mapping()
+                .ok_or(MigrationError::InvalidLegacyProfile)?,
+            &["type", "properties"],
+        )?;
+    }
+    let candidate = replace_root_schema_version(source, '4', '5')?;
+    let parsed = ProfileDeclaration::parse(&candidate).map_err(MigrationError::Profile)?;
+    let id = ProfileId::parse(parsed.id().to_owned())
+        .map_err(|_| MigrationError::InvalidLegacyProfile)?;
+    for parameter in parsed.parameters().keys() {
+        ProfileId::parse(parameter.to_owned()).map_err(|_| MigrationError::InvalidLegacyProfile)?;
+    }
+    for (resource_id, resource) in parsed.resources() {
+        ResourceId::parse(resource_id.to_owned())
+            .map_err(|_| MigrationError::InvalidLegacyProfile)?;
+        let properties = resource.properties();
+        let kind = match properties.kind() {
+            ValueOrReference::Value(value) => value.as_string().and_then(parse_kind),
+            ValueOrReference::Reference(_) => None,
+        };
+        let operation = match properties.operation() {
+            ValueOrReference::Value(value) => value.as_string().and_then(parse_operation),
+            ValueOrReference::Reference(_) => None,
+        };
+        if matches!(properties.kind(), ValueOrReference::Value(_)) && kind.is_none()
+            || matches!(properties.operation(), ValueOrReference::Value(_)) && operation.is_none()
+            || kind == Some(FileKind::Directory) && operation == Some(FileOperation::Copy)
+        {
+            return Err(MigrationError::InvalidLegacyProfile);
+        }
+    }
+    let includes = parsed
+        .includes()
+        .iter()
+        .map(|include| {
+            ProfileId::parse(include.id().to_owned())
+                .map_err(|_| MigrationError::InvalidLegacyProfile)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((id, includes))
+}
+
+/// Converts a schema-4 document for a fully validated continuous inventory.
+pub(super) fn convert_profile_continuous(source: &str) -> Result<String, MigrationError> {
+    profile_facts_continuous(source)?;
+    replace_root_schema_version(source, '4', '5')
 }
 
 /// Converts a complete inactive schema-4 state document after preserving its facts byte-for-byte.
@@ -970,7 +1068,11 @@ fn require_yaml_string<'a>(mapping: &'a YamlMapping, key: &str) -> Result<&'a st
 ///
 /// Profile migration must not normalize comments, mapping order, quoting, or other authoring
 /// representation because the schema version is the only permitted profile change.
-fn replace_root_schema_version(source: &str) -> Result<String, MigrationError> {
+pub(super) fn replace_root_schema_version(
+    source: &str,
+    from: char,
+    to: char,
+) -> Result<String, MigrationError> {
     let mut result = String::with_capacity(source.len());
     let mut replaced = false;
 
@@ -980,7 +1082,7 @@ fn replace_root_schema_version(source: &str) -> Result<String, MigrationError> {
                 .or_else(|| flow_root_schema_version_value_start(line))
             {
                 let value = &line[value_start..];
-                if let Some(suffix) = value.strip_prefix('4') {
+                if let Some(suffix) = value.strip_prefix(from) {
                     if suffix.is_empty()
                         || suffix.chars().next().is_some_and(char::is_whitespace)
                         || suffix.starts_with('#')
@@ -988,7 +1090,7 @@ fn replace_root_schema_version(source: &str) -> Result<String, MigrationError> {
                         || suffix.starts_with('}')
                     {
                         result.push_str(&line[..value_start]);
-                        result.push('5');
+                        result.push(to);
                         result.push_str(suffix);
                         replaced = true;
                         continue;

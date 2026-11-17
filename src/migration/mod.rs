@@ -1,16 +1,14 @@
-//! Explicit schema-4 to schema-5 document conversion.
+//! Explicit managed-document migration and staged continuous-route planning.
 //!
 //! This module is the only crate boundary that parses legacy documents.
 //! Normal declaration and state readers deliberately accept schema 5 only.
-
-#![allow(dead_code)] // The explicit authoring adapter consumes this facade in W4.
 
 use std::fmt;
 
 use crate::resolver::ResolverContext;
 use crate::state::repository::StateRepository;
 
-/// The one explicit operation selected by the future authoring adapter.
+/// One legacy public operation retained until the unified command is introduced.
 ///
 /// This is data only: it carries no parsed legacy document, inventory, lock, writer, or publication capability.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,6 +59,15 @@ pub(crate) struct MigrationOutcome {
 pub(crate) struct MigrationFacade;
 
 impl MigrationFacade {
+    /// Builds the complete continuous-route plan without publishing a document.
+    #[allow(dead_code)] // The new command adapter consumes this entry after publication support is added.
+    fn plan_continuous(
+        context: &ResolverContext,
+        target: u32,
+    ) -> Result<continuous::MigrationPlan, continuous::PlanError> {
+        continuous::MigrationPlan::build(context, target)
+    }
+
     pub(crate) fn present(
         request: &MigrationRequest,
     ) -> Result<MigrationPresentation, MigrationFacadeError> {
@@ -148,11 +155,12 @@ impl fmt::Display for MigrationFacadeError {
 
 impl std::error::Error for MigrationFacadeError {}
 
-// The schema-3 route is private and conversion-only until the continuous-route facade is added.
+// The schema-3 route remains private and conversion-only until publication support is added.
+mod continuous;
 mod schema_3_to_4;
 
-// Route-private parsing, validation, conversion, inventory, and publication logic deliberately
-// live in this named version-pair unit. The facade above is the route's only stable edge.
+// The existing 4-to-5 route retains the old command's publication path.
+// Continuous planning selects private routes through the facade.
 mod schema_4_to_5;
 
 #[cfg(test)]

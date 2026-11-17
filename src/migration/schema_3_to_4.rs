@@ -97,6 +97,12 @@ fn validate_legacy_profile_source(source: &str) -> Result<LegacyProfileFacts, Sc
     Ok(LegacyProfileFacts { id, includes })
 }
 
+/// Returns the complete schema-3 declaration's inventory facts.
+pub(super) fn profile_facts(source: &str) -> Result<(ProfileId, Vec<ProfileId>), Schema3To4Error> {
+    let facts = validate_legacy_profile_source(source)?;
+    Ok((facts.id, facts.includes))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LegacyStateDocument {

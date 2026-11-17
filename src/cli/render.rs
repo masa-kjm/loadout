@@ -15,35 +15,79 @@ use std::{
     path::Path,
 };
 
+pub(super) struct MigrationRenderDocument {
+    pub(super) path: String,
+    pub(super) source_generation: Option<u32>,
+    pub(super) target_generation: u32,
+    pub(super) route: Vec<(u32, u32)>,
+    pub(super) will_publish: bool,
+}
+
 pub(super) fn migration_presentation(
     out: &mut impl Write,
-    operation: &str,
-    documents: &[(String, u32, u32)],
-    source_schema_version: u32,
-    target_schema_version: u32,
-    required_next_step: &str,
+    configuration_path: &str,
+    documents: &[MigrationRenderDocument],
+    normal_commands_available: bool,
     ownership_invariant: &str,
 ) -> io::Result<()> {
-    writeln!(out, "migration: {operation}")?;
-    writeln!(out, "affected documents: {}", documents.len())?;
-    for (path, source_schema_version, target_schema_version) in documents {
+    writeln!(out, "migration: state and profiles")?;
+    writeln!(out, "configuration: {configuration_path}")?;
+    writeln!(out, "documents: {}", documents.len())?;
+    for document in documents {
+        let source = document
+            .source_generation
+            .map(|version| format!("schema {version}"))
+            .unwrap_or_else(|| "absent".to_owned());
+        let route = if document.route.is_empty() {
+            "no change".to_owned()
+        } else {
+            let mut generations = vec![document.route[0].0.to_string()];
+            generations.extend(document.route.iter().map(|(_, to)| to.to_string()));
+            generations.join(" -> ")
+        };
         writeln!(
             out,
-            "document: {} (schema {} -> {})",
-            path, source_schema_version, target_schema_version
+            "document: {} ({source} -> schema {}; route: {route}; write: {})",
+            document.path,
+            document.target_generation,
+            if document.will_publish { "yes" } else { "no" },
         )?;
     }
     writeln!(
         out,
-        "schema versions: {} -> {}",
-        source_schema_version, target_schema_version
+        "write set: {} document(s)",
+        documents
+            .iter()
+            .filter(|document| document.will_publish)
+            .count()
     )?;
-    writeln!(out, "required next step: {required_next_step}")?;
-    writeln!(out, "ownership guarantee: {ownership_invariant}")
+    writeln!(out, "ownership guarantee: {ownership_invariant}")?;
+    migration_availability(out, normal_commands_available)
 }
 
-pub(super) fn migration_outcome(out: &mut impl Write, operation: &str) -> io::Result<()> {
-    writeln!(out, "migration completed: {operation}")
+pub(super) fn migration_outcome(
+    out: &mut impl Write,
+    target_generation: u32,
+    published_documents: usize,
+    normal_commands_available: bool,
+) -> io::Result<()> {
+    writeln!(
+        out,
+        "migration completed: schema {}; published {} document(s)",
+        target_generation, published_documents
+    )?;
+    migration_availability(out, normal_commands_available)
+}
+
+fn migration_availability(out: &mut impl Write, available: bool) -> io::Result<()> {
+    if available {
+        writeln!(out, "normal commands after migration: available")
+    } else {
+        writeln!(
+            out,
+            "normal commands after migration: unavailable; schema-5-only readers cannot read schema-4 documents"
+        )
+    }
 }
 
 pub(super) fn action_name(kind: ActionKind) -> &'static str {

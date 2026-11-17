@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.8.2
+
+- Replaced `migrate state` and `migrate profiles` with one confirmed `loadout migrate --config <path> [--to-schema 4|5] [--yes]` command.
+- Added continuous schema-3-to-4-to-5 migration for mixed state and profile inventories, including target generation 4, complete preflight, confirmed-snapshot checks, and resumable partial publication.
+
 ## v0.8.1
 
 - Added compact, deterministic lifecycle action-graph scheduling with fail-closed relation validation, durable applied lifecycle topology, and recovery-aware operation records.

@@ -502,7 +502,8 @@ mod tests {
     #[test]
     fn route_outputs_can_continue_to_schema_five_without_changing_known_facts() {
         let profile_four = convert_profile(PROFILE).unwrap();
-        let profile_five = super::super::schema_4_to_5::convert_profile(&profile_four).unwrap();
+        let profile_five =
+            super::super::schema_4_to_5::convert_profile_continuous(&profile_four).unwrap();
         assert_eq!(
             profile_five,
             PROFILE.replacen("schema_version: 3", "schema_version: 5", 1)

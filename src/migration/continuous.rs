@@ -1,7 +1,6 @@
-//! Read-only planning for registered adjacent managed-document migrations.
+//! Planning and confirmed publication for registered adjacent managed-document migrations.
 
-#![allow(dead_code)] // Publication and the single public command are added in later stages.
-
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
@@ -133,6 +132,10 @@ pub(super) struct PlanPresentation {
 }
 
 impl MigrationPlan {
+    pub(super) fn confirmation_fingerprint(&self) -> [u8; 32] {
+        Sha256::digest(format!("{self:?}").as_bytes()).into()
+    }
+
     pub(super) fn execute_confirmed(&mut self, context: &ResolverContext) -> Result<(), PlanError> {
         self.execute_confirmed_with_hook(context, |_| {})
     }
@@ -376,6 +379,7 @@ impl MigrationPlan {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn sequence(
         &self,
         mut publish_state: impl FnMut(&PlannedDocument) -> Result<(), PlanError>,
@@ -850,6 +854,33 @@ mod tests {
     }
 
     #[test]
+    fn facade_execution_rejects_a_changed_presentation_snapshot_before_lock_or_write() {
+        for state_generation in [None, Some(3), Some(5)] {
+            let fixture = Fixture::new();
+            fixture.profile("old", 3);
+            if let Some(generation) = state_generation {
+                fixture.state(generation);
+            }
+            let request = super::super::MigrationRequest::new(fixture.context.clone(), 5);
+            let presented = super::super::MigrationFacade::present(&request).unwrap();
+            let state_path = fixture.root.join("state/state.json");
+            let original_state = fs::read(&state_path).ok();
+            let profile_path = fixture.root.join("profiles/old.yaml");
+            let original_profile = fs::read(&profile_path).unwrap();
+            fs::write(fixture.root.join("profiles/external.txt"), b"external").unwrap();
+            let error = super::super::MigrationFacade::execute(request, &presented).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("confirmed migration snapshot changed")
+            );
+            assert_eq!(fs::read(&state_path).ok(), original_state);
+            assert_eq!(fs::read(&profile_path).unwrap(), original_profile);
+            assert!(!fixture.root.join("state/state.lock").exists());
+        }
+    }
+
+    #[test]
     fn state_lock_contention_keeps_all_confirmed_documents_unchanged() {
         let fixture = Fixture::new();
         fixture.state(3);
@@ -1113,13 +1144,12 @@ mod tests {
     }
 
     #[test]
-    fn continuous_route_accepts_schema_four_parameters_without_widening_old_route() {
+    fn continuous_route_accepts_schema_four_parameters() {
         let fixture = Fixture::new();
         fixture.state(4);
         let source =
             "schema_version: 4\nid: themed\nparameters: { theme: string }\nresources: {}\n";
         fs::write(fixture.root.join("profiles/themed.yaml"), source).unwrap();
-        assert!(schema_4_to_5::convert_profile(source).is_err());
         let plan = super::super::MigrationFacade::plan_continuous(&fixture.context, 5).unwrap();
         assert_eq!(
             plan.profiles[0].candidate,

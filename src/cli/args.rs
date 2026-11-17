@@ -64,10 +64,7 @@ enum ParsedCommand {
         command: ParsedConfigCommand,
     },
     #[command(about = "Explicitly migrate supported profile and state schemas.")]
-    Migrate {
-        #[command(subcommand)]
-        command: ParsedMigrationCommand,
-    },
+    Migrate(MigrationArgs),
     #[command(about = "Report drift between recorded state and managed targets.")]
     Diff,
     #[command(about = "Report Desired, Known, and observed target facts without planning.")]
@@ -161,16 +158,15 @@ struct MigrationArgs {
         help = "Select the portable environment configuration file to migrate."
     )]
     config: OsString,
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(u32).range(4..=5),
+        help = "Select managed-document schema generation 4 or 5."
+    )]
+    to_schema: Option<u32>,
     #[arg(long, help = "Proceed without an interactive confirmation prompt.")]
     yes: bool,
-}
-
-#[derive(Subcommand)]
-enum ParsedMigrationCommand {
-    #[command(about = "Migrate schema-4 state before profile documents.")]
-    State(MigrationArgs),
-    #[command(about = "Migrate remaining schema-4 profile documents after state.")]
-    Profiles(MigrationArgs),
 }
 
 #[derive(Subcommand)]
@@ -266,9 +262,10 @@ pub(super) enum ConfigCommand {
 }
 
 #[derive(Debug, PartialEq)]
-pub(super) enum MigrationCommand {
-    State { config: OsString, yes: bool },
-    Profiles { config: OsString, yes: bool },
+pub(super) struct MigrationCommand {
+    pub(super) config: OsString,
+    pub(super) target_schema: u32,
+    pub(super) yes: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -300,6 +297,17 @@ pub(super) enum ResourceCommand {
 }
 
 pub(super) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, clap::Error> {
+    let args = args.into_iter().collect::<Vec<_>>();
+    if args.first().is_some_and(|value| value == "migrate")
+        && args
+            .get(1)
+            .is_some_and(|value| value == "state" || value == "profiles")
+    {
+        return Err(Error::raw(
+            ErrorKind::UnknownArgument,
+            "migrate state and migrate profiles were removed; use loadout migrate --config <path> [--to-schema <N>] [--yes]",
+        ));
+    }
     let cli = Cli::try_parse_from(std::iter::once(OsString::from("loadout")).chain(args))?;
     let command = match cli.command {
         ParsedCommand::Init(args) => Command::Init {
@@ -345,15 +353,10 @@ pub(super) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
                 yes,
             },
         }),
-        ParsedCommand::Migrate { command } => Command::Migrate(match command {
-            ParsedMigrationCommand::State(args) => MigrationCommand::State {
-                config: args.config,
-                yes: args.yes,
-            },
-            ParsedMigrationCommand::Profiles(args) => MigrationCommand::Profiles {
-                config: args.config,
-                yes: args.yes,
-            },
+        ParsedCommand::Migrate(args) => Command::Migrate(MigrationCommand {
+            config: args.config,
+            target_schema: args.to_schema.unwrap_or(5),
+            yes: args.yes,
         }),
         ParsedCommand::Diff => Command::Diff,
         ParsedCommand::Status(args) => Command::Status {
@@ -440,8 +443,7 @@ impl Command {
             | Self::Apply { config, .. }
             | Self::Status { config, .. } => config.as_ref(),
             Self::Config(command) => command.config(),
-            Self::Migrate(MigrationCommand::State { config, .. })
-            | Self::Migrate(MigrationCommand::Profiles { config, .. }) => Some(config),
+            Self::Migrate(command) => Some(&command.config),
             Self::Profile(ProfileCommand::List { config })
             | Self::Profile(ProfileCommand::Show { config, .. }) => config.as_ref(),
             Self::Resource(ResourceCommand::DesiredList { config, .. })
@@ -476,6 +478,22 @@ mod tests {
 
     #[test]
     fn parses_each_supported_command() {
+        assert_eq!(
+            parse_strings(&["migrate", "--config", "config.yaml", "--yes"]).unwrap(),
+            Command::Migrate(MigrationCommand {
+                config: OsString::from("config.yaml"),
+                target_schema: 5,
+                yes: true,
+            })
+        );
+        assert_eq!(
+            parse_strings(&["migrate", "--config", "config.yaml", "--to-schema", "4"]).unwrap(),
+            Command::Migrate(MigrationCommand {
+                config: OsString::from("config.yaml"),
+                target_schema: 4,
+                yes: false,
+            })
+        );
         assert_eq!(
             parse_strings(&["validate", "--config", "config.yaml", "base"]).unwrap(),
             Command::Validate {
@@ -599,6 +617,10 @@ mod tests {
             vec!["validate", "--config", ""],
             vec!["plan", "first", "second"],
             vec!["apply", "--yes", "--yes"],
+            vec!["migrate", "state", "--config", "config.yaml"],
+            vec!["migrate", "profiles", "--config", "config.yaml"],
+            vec!["migrate", "--config", "config.yaml", "--to-schema", "3"],
+            vec!["migrate", "--config", "config.yaml", "--to-schema", "6"],
         ] {
             assert!(parse_strings(&args).is_err(), "{args:?} must reject");
         }

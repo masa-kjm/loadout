@@ -13,6 +13,10 @@ use serde_yaml::Value as YamlValue;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+pub(super) mod publication;
+
+pub(super) use publication::publish;
+
 pub(super) fn plan_document(
     path: PathBuf,
     source: Vec<u8>,

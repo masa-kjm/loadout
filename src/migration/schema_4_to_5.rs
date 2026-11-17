@@ -102,6 +102,11 @@ pub(super) fn convert_profile(source: &str) -> Result<String, MigrationError> {
     Ok(candidate)
 }
 
+/// Validates a schema-4 profile through its strict legacy shape and current-schema candidate.
+pub(super) fn validate_schema_four_profile(source: &str) -> Result<(), MigrationError> {
+    convert_profile(source).map(|_| ())
+}
+
 /// Converts a complete inactive schema-4 state document after preserving its facts byte-for-byte.
 pub(super) fn convert_state(source: &[u8]) -> Result<Vec<u8>, MigrationError> {
     let legacy: LegacyStateDocument =
@@ -128,6 +133,11 @@ pub(super) fn convert_state(source: &[u8]) -> Result<Vec<u8>, MigrationError> {
     .map_err(MigrationError::State)?;
     validate_current_state_bytes(&candidate).map_err(MigrationError::InvalidConvertedState)?;
     Ok(candidate)
+}
+
+/// Validates a schema-4 state through its strict legacy DTO and current-schema candidate.
+pub(super) fn validate_schema_four_state(source: &[u8]) -> Result<(), MigrationError> {
+    convert_state(source).map(|_| ())
 }
 
 /// Performs the state-first barrier under the repository's exclusive migration lock.

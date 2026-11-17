@@ -1,6 +1,6 @@
 # Specifications
 
-These documents own the current v0.8.0 observable contracts and the staged v0.8.2 migration contract awaiting implementation. [Architecture](../architecture/README.md) owns responsibility boundaries; [Testing Strategy](../development/testing.md) owns verification evidence.
+These documents own the current v0.8.0 observable contracts and the implemented v0.8.2 continuous-migration contract. [Architecture](../architecture/README.md) owns responsibility boundaries; [Testing Strategy](../development/testing.md) owns verification evidence.
 
 ## Read by concern
 

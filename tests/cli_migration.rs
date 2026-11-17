@@ -78,6 +78,27 @@ impl Fixture {
         snapshot_into(&self.root, &self.root, &mut snapshot);
         snapshot
     }
+
+    fn profile(&self, name: &str, generation: u32) {
+        fs::write(
+            self.root
+                .join("portable/profiles")
+                .join(format!("{name}.yaml")),
+            format!("schema_version: {generation}\nid: {name}\nresources: {{}}\n"),
+        )
+        .unwrap();
+    }
+
+    fn state(&self, generation: u32) {
+        let value = match generation {
+            3 | 4 => format!(
+                "{{\"schema_version\":{generation},\"resources\":{{}},\"active_operation\":null}}"
+            ),
+            5 => "{\"schema_version\":5,\"resources\":{},\"applied_lifecycle_topology\":{\"current\":[],\"historical\":[]},\"active_operation\":null}".to_owned(),
+            _ => panic!("unsupported fixture generation"),
+        };
+        fs::write(self.root.join("state/loadout/state.json"), value).unwrap();
+    }
 }
 
 fn snapshot_into(root: &Path, path: &Path, snapshot: &mut BTreeMap<PathBuf, Vec<u8>>) {
@@ -104,197 +125,212 @@ impl Drop for Fixture {
     }
 }
 
-#[test]
-fn state_migration_without_yes_presents_the_boundary_and_leaves_everything_unchanged() {
-    let fixture = Fixture::new();
-    let before = fixture.snapshot();
-
-    let output = fixture.run(&["migrate", "state", "--config", "../portable/config.yaml"]);
-    let text = format!(
+fn text(output: &Output) -> String {
+    format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
-    );
-
-    assert_eq!(output.status.code(), Some(2), "{text}");
-    assert!(text.contains("migration: state"), "{text}");
-    assert!(text.contains("affected documents: 1"), "{text}");
-    let document = format!(
-        "document: {} (schema 4 -> 5)",
-        fixture
-            .root
-            .join("state")
-            .join("loadout")
-            .join("state.json")
-            .display()
-    );
-    assert!(text.contains(&document), "expected {document:?} in {text}");
-    assert!(text.contains("schema versions: 4 -> 5"), "{text}");
-    assert!(text.contains("resource IDs, effects, and Known ownership do not change"));
-    assert!(text.contains("requires --yes"), "{text}");
-    assert_eq!(fixture.snapshot(), before);
-}
-
-#[test]
-fn profile_migration_confirmation_lists_each_exact_schema_three_document() {
-    let fixture = Fixture::new();
-    fs::write(
-        fixture.root.join("portable/profiles/extra.yaml"),
-        "schema_version: 4\nid: extra\nresources: {}\n",
     )
-    .unwrap();
+}
+
+#[test]
+fn presentation_lists_full_write_set_and_noninteractive_decline_changes_nothing() {
+    let fixture = Fixture::new();
+    fixture.state(3);
+    fixture.profile("base", 3);
+    fixture.profile("middle", 4);
+    fixture.profile("current", 5);
     let before = fixture.snapshot();
-
-    let output = fixture.run(&["migrate", "profiles", "--config", "../portable/config.yaml"]);
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+    let output = fixture.run(&["migrate", "--config", "../portable/config.yaml"]);
+    let report = text(&output);
+    assert_eq!(output.status.code(), Some(2), "{report}");
+    assert!(report.contains("migration: state and profiles"), "{report}");
+    assert!(report.contains("documents: 4"), "{report}");
+    assert!(
+        report.contains("route: 3 -> 4 -> 5; write: yes"),
+        "{report}"
     );
-
-    assert_eq!(output.status.code(), Some(2), "{text}");
-    assert!(text.contains("migration: profiles"), "{text}");
-    assert!(text.contains("affected documents: 2"), "{text}");
-    for profile in ["base.yaml", "extra.yaml"] {
-        let document = format!(
-            "document: {} (schema 4 -> 5)",
-            fixture
-                .root
-                .join("portable")
-                .join("profiles")
-                .join(profile)
-                .display()
-        );
-        assert!(text.contains(&document), "expected {document:?} in {text}");
-    }
-    assert!(text.contains("required next step:"), "{text}");
-    assert!(text.contains("resource IDs, effects, and Known ownership do not change"));
-    assert!(text.contains("requires --yes"), "{text}");
+    assert!(report.contains("route: 4 -> 5; write: yes"), "{report}");
+    assert!(report.contains("route: no change; write: no"), "{report}");
+    assert!(report.contains("write set: 3 document(s)"), "{report}");
+    assert!(
+        report.contains("normal commands after migration: available"),
+        "{report}"
+    );
+    assert!(
+        report.contains("resource IDs, effects, and Known ownership do not change"),
+        "{report}"
+    );
+    assert!(report.contains("requires --yes"), "{report}");
     assert_eq!(fixture.snapshot(), before);
 }
 
 #[test]
-fn profiles_before_the_state_barrier_fail_without_publishing_a_profile() {
+fn one_confirmed_command_migrates_state_and_profiles_to_default_generation() {
     let fixture = Fixture::new();
-    let before = fixture.snapshot();
-
-    let output = fixture.run(&[
-        "migrate",
-        "profiles",
-        "--config",
-        "../portable/config.yaml",
-        "--yes",
-    ]);
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    assert_eq!(output.status.code(), Some(1), "{text}");
-    assert!(text.contains("migration: profiles"), "{text}");
-    assert!(text.contains("migration failed:"), "{text}");
-    assert_eq!(fixture.snapshot(), before);
-}
-
-#[test]
-fn confirmed_state_then_profile_migration_only_changes_schema_versions() {
-    let fixture = Fixture::new();
+    fixture.state(3);
+    fixture.profile("base", 3);
+    fixture.profile("middle", 4);
     let target_before = fs::read(fixture.root.join("home/managed-target")).unwrap();
-
-    let state = fixture.run(&[
-        "migrate",
-        "state",
-        "--config",
-        "../portable/config.yaml",
-        "--yes",
-    ]);
-    let state_text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&state.stdout),
-        String::from_utf8_lossy(&state.stderr)
-    );
-    assert_eq!(state.status.code(), Some(0), "{state_text}");
+    let output = fixture.run(&["migrate", "--config", "../portable/config.yaml", "--yes"]);
+    let report = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{report}");
     assert!(
-        state_text.contains("migration completed: state"),
-        "{state_text}"
+        report.contains("migration completed: schema 5; published 3 document(s)"),
+        "{report}"
     );
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(
-            &fs::read(fixture.root.join("state/loadout/state.json")).unwrap(),
-        )
-        .unwrap(),
-        serde_json::json!({"schema_version": 5, "resources": {}, "applied_lifecycle_topology": {"current": [], "historical": []}, "active_operation": null})
-    );
-
-    let profiles = fixture.run(&[
-        "migrate",
-        "profiles",
-        "--config",
-        "../portable/config.yaml",
-        "--yes",
-    ]);
-    let profiles_text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&profiles.stdout),
-        String::from_utf8_lossy(&profiles.stderr)
-    );
-    assert_eq!(profiles.status.code(), Some(0), "{profiles_text}");
-    assert!(
-        profiles_text.contains("migration completed: profiles"),
-        "{profiles_text}"
-    );
-    assert_eq!(
-        fs::read_to_string(fixture.root.join("portable/profiles/base.yaml")).unwrap(),
-        "schema_version: 5\nid: base\nresources: {}\n"
-    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.root.join("state/loadout/state.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["schema_version"], 5);
+    for name in ["base", "middle"] {
+        assert!(
+            fs::read_to_string(
+                fixture
+                    .root
+                    .join("portable/profiles")
+                    .join(format!("{name}.yaml"))
+            )
+            .unwrap()
+            .contains("schema_version: 5")
+        );
+    }
     assert_eq!(
         fs::read(fixture.root.join("home/managed-target")).unwrap(),
         target_before
     );
+    let before = fixture.snapshot();
+    let no_change = fixture.run(&["migrate", "--config", "../portable/config.yaml", "--yes"]);
+    assert_eq!(no_change.status.code(), Some(0), "{}", text(&no_change));
+    assert!(text(&no_change).contains("published 0 document(s)"));
+    assert_eq!(fixture.snapshot(), before);
 }
 
 #[test]
-fn confirmed_profile_migration_resumes_remaining_schema_three_documents_without_rewriting_schema_four()
- {
+fn target_four_warns_then_target_five_completes() {
     let fixture = Fixture::new();
-    fs::write(
-        fixture.root.join("portable/profiles/extra.yaml"),
-        "schema_version: 4\nid: extra\nresources: {}\n",
-    )
-    .unwrap();
-    fs::write(
-        fixture.root.join("portable/profiles/base.yaml"),
-        "# already published\nschema_version: 5\nid: base\nresources: {}\n",
-    )
-    .unwrap();
-    fs::write(
-        fixture.root.join("state/loadout/state.json"),
-        "{\"schema_version\":5,\"resources\":{},\"applied_lifecycle_topology\":{\"current\":[],\"historical\":[]},\"active_operation\":null}",
-    )
-    .unwrap();
-    let published_before = fs::read(fixture.root.join("portable/profiles/base.yaml")).unwrap();
-
+    fixture.state(3);
+    fixture.profile("base", 3);
     let output = fixture.run(&[
         "migrate",
-        "profiles",
         "--config",
         "../portable/config.yaml",
+        "--to-schema",
+        "4",
         "--yes",
     ]);
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+    let report = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    assert!(
+        report
+            .matches("schema-5-only readers cannot read schema-4 documents")
+            .count()
+            >= 2,
+        "{report}"
     );
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.root.join("state/loadout/state.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["schema_version"], 4);
+    let validate = fixture.run(&["validate", "--config", "../portable/config.yaml"]);
+    assert_ne!(validate.status.code(), Some(0));
+    let next = fixture.run(&[
+        "migrate",
+        "--config",
+        "../portable/config.yaml",
+        "--to-schema",
+        "5",
+        "--yes",
+    ]);
+    assert_eq!(next.status.code(), Some(0), "{}", text(&next));
+}
 
-    assert_eq!(output.status.code(), Some(0), "{text}");
+#[test]
+fn absent_state_stays_absent_and_mixed_profiles_resume() {
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.root.join("state/loadout/state.json")).unwrap();
+    fixture.profile("base", 3);
+    fixture.profile("middle", 4);
+    fixture.profile("current", 5);
+    let current = fs::read(fixture.root.join("portable/profiles/current.yaml")).unwrap();
+    let output = fixture.run(&["migrate", "--config", "../portable/config.yaml", "--yes"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(!fixture.root.join("state/loadout/state.json").exists());
+    assert!(!fixture.root.join("state/loadout/state.lock").exists());
     assert_eq!(
-        fs::read(fixture.root.join("portable/profiles/base.yaml")).unwrap(),
-        published_before
+        fs::read(fixture.root.join("portable/profiles/current.yaml")).unwrap(),
+        current
     );
-    assert_eq!(
-        fs::read_to_string(fixture.root.join("portable/profiles/extra.yaml")).unwrap(),
-        "schema_version: 5\nid: extra\nresources: {}\n"
-    );
+    for name in ["base", "middle"] {
+        assert!(
+            fs::read_to_string(
+                fixture
+                    .root
+                    .join("portable/profiles")
+                    .join(format!("{name}.yaml"))
+            )
+            .unwrap()
+            .contains("schema_version: 5")
+        );
+    }
+}
+
+#[test]
+fn old_subcommands_and_unsupported_targets_are_input_errors_without_writes() {
+    let fixture = Fixture::new();
+    let before = fixture.snapshot();
+    for args in [
+        vec![
+            "migrate",
+            "state",
+            "--config",
+            "../portable/config.yaml",
+            "--yes",
+        ],
+        vec![
+            "migrate",
+            "profiles",
+            "--config",
+            "../portable/config.yaml",
+            "--yes",
+        ],
+        vec![
+            "migrate",
+            "--config",
+            "../portable/config.yaml",
+            "--to-schema",
+            "3",
+            "--yes",
+        ],
+        vec![
+            "migrate",
+            "--config",
+            "../portable/config.yaml",
+            "--to-schema",
+            "6",
+            "--yes",
+        ],
+    ] {
+        let output = fixture.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{}", text(&output));
+        assert!(text(&output).contains("loadout migrate") || text(&output).contains("--to-schema"));
+        assert_eq!(fixture.snapshot(), before);
+    }
+}
+
+#[test]
+fn target_four_rejects_newer_document_before_writing() {
+    let fixture = Fixture::new();
+    fixture.profile("new", 5);
+    let before = fixture.snapshot();
+    let output = fixture.run(&[
+        "migrate",
+        "--config",
+        "../portable/config.yaml",
+        "--to-schema",
+        "4",
+        "--yes",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert_eq!(fixture.snapshot(), before);
 }

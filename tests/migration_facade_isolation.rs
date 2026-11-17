@@ -1499,8 +1499,8 @@ fn oracle_accepts_the_direct_data_only_facade_call() {
     let source = r#"
         use crate::migration::{MigrationFacade, MigrationOutcome, MigrationPresentation, MigrationRequest};
         fn dispatch(request: MigrationRequest) -> Result<MigrationOutcome, ()> {
-            let _presentation: MigrationPresentation = MigrationFacade::present(&request);
-            MigrationFacade::execute(request).map_err(|_| ())
+            let presentation: MigrationPresentation = MigrationFacade::present(&request).map_err(|_| ())?;
+            MigrationFacade::execute(request, &presentation).map_err(|_| ())
         }
     "#;
     assert_eq!(fixture_rule(source), None);
@@ -1893,6 +1893,7 @@ struct Oracle {
     scopes: Vec<BTreeMap<String, Binding>>,
     violations: Vec<&'static str>,
     facade_dispatches: usize,
+    facade_presentations: usize,
     current_functions: Vec<String>,
     facade_functions: Vec<String>,
     local_calls: Vec<(String, String)>,
@@ -1907,6 +1908,7 @@ impl Oracle {
             scopes: vec![BTreeMap::new()],
             violations: Vec::new(),
             facade_dispatches: 0,
+            facade_presentations: 0,
             current_functions: Vec::new(),
             facade_functions: Vec::new(),
             local_calls: Vec::new(),
@@ -1921,6 +1923,7 @@ impl Oracle {
             scopes: vec![BTreeMap::new()],
             violations: Vec::new(),
             facade_dispatches: 0,
+            facade_presentations: 0,
             current_functions: Vec::new(),
             facade_functions: Vec::new(),
             local_calls: Vec::new(),
@@ -1968,6 +1971,9 @@ impl Oracle {
             1 => {}
             0 => {}
             _ => self.reject("multiple facade dispatches"),
+        }
+        if !self.fixture && self.facade_presentations != 1 {
+            self.reject("migration adapter must call facade presentation once");
         }
         if self.fixture
             && self.local_calls.iter().any(|(_, callee)| {
@@ -2114,8 +2120,6 @@ impl Oracle {
                         | "MigrationRequest"
                         | "MigrationPresentation"
                         | "MigrationOutcome"
-                        | "MigrationFacadeError"
-                        | "MigrationOperation"
                 )
             {
                 self.reject(
@@ -2222,6 +2226,14 @@ impl<'ast> Visit<'ast> for Oracle {
 
     fn visit_expr_call(&mut self, expression: &'ast syn::ExprCall) {
         if let Expr::Path(path) = expression.func.as_ref() {
+            let segments = path_segments(&path.path);
+            if segments.last().is_some_and(|segment| segment == "present")
+                && segments.len() >= 2
+                && (segments[segments.len() - 2] == "MigrationFacade"
+                    || self.resolve(&segments[segments.len() - 2]) == Some(Binding::Facade))
+            {
+                self.facade_presentations += 1;
+            }
             match self.classify_path(&path.path) {
                 Some(Binding::FacadeDispatch) => {
                     self.facade_dispatches += 1;

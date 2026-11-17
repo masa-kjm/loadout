@@ -4,18 +4,18 @@ Loadout is a local environment manager built around explicit desired state, owne
 
 ## Status
 
-v0.7.0 is the latest published release. The current source tree packages the [v0.8.0 contract](docs/README.md) as a v0.8.1 release candidate, including explicit schema-4-to-5 migration and resource ordering. The v0.8.0 tag did not produce a GitHub Release.
+v0.7.0 is the latest published release. The current source tree implements the [v0.8.0 contract](docs/README.md) and the staged v0.8.2 continuous-migration contract, while package version and release metadata remain at v0.8.1. The v0.8.0 tag did not produce a GitHub Release.
 The current command surface is defined by the [CLI specification](docs/specs/cli.md).
 Release archives can be installed with the Unix and Windows installer scripts in `scripts/`; these install the latest published release by default.
 The published package's Rust library target is not yet a supported public API.
 
-Normal v0.8.0 commands reject earlier profile and state schemas; only the explicit [migration commands](docs/specs/migration.md) read complete valid schema-4 inputs.
+Normal commands reject earlier profile and state schemas; only the explicit [migration command](docs/specs/migration.md) reads complete valid schema-3 and schema-4 inputs.
 
 ## Current Source Capabilities
 
 The current source tree materializes a regular file from a local store as either a file symbolic link or a content-owned regular-file copy, and a local-store real directory as a directory symbolic link.
 It provides profile composition, validation, planning, drift inspection, conflict detection, state locking, verified application, crash recovery, and read-only inspection of declarations, Desired resources, Known state, and Actual observations.
-Profile composition supports typed parameters. Schema-5 profiles add stable instance-scoped stages and direct resource prerequisites, which the planner schedules deterministically. The explicit `migrate state` and `migrate profiles` commands convert supported v0.7.0 schema-4 inputs in that order.
+Profile composition supports typed parameters. Schema-5 profiles add stable instance-scoped stages and direct resource prerequisites, which the planner schedules deterministically. The explicit `loadout migrate --config <path>` command advances state and profiles together through supported schema generations 3, 4, and 5.
 
 Loadout checks recorded ownership and filesystem safety immediately before mutations, but does not exclude concurrent external changes. An entry substituted after the last check can be deleted or replaced, and successful postcondition verification may not reveal the race. See the [file-link concurrency contract](docs/specs/file-link.md#external-filesystem-concurrency) for the scope and limits of these guarantees.
 

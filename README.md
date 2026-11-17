@@ -4,7 +4,7 @@ Loadout is a local environment manager built around explicit desired state, owne
 
 ## Status
 
-v0.7.0 is the latest published release. The current source tree implements the [v0.8.0 contract](docs/README.md) and the staged v0.8.2 continuous-migration contract, while package version and release metadata remain at v0.8.1. The v0.8.0 tag did not produce a GitHub Release.
+v0.8.1 is the latest published release. This source tree prepares v0.8.2 with the [continuous-migration contract](docs/specs/migration.md). The v0.8.0 tag did not produce a GitHub Release.
 The current command surface is defined by the [CLI specification](docs/specs/cli.md).
 Release archives can be installed with the Unix and Windows installer scripts in `scripts/`; these install the latest published release by default.
 The published package's Rust library target is not yet a supported public API.
@@ -34,7 +34,7 @@ irm https://raw.githubusercontent.com/masa-kjm/loadout/main/scripts/install.ps1 
 ```
 
 Both installers accept an exact release tag through `--version vX.Y.Z` or `-Version vX.Y.Z` and install below `~/.local/bin` or `%USERPROFILE%\.local\bin` by default. They download and verify the release archive's SHA-256 sidecar before installation.
-The example below uses the current source-tree schema and requires a build from this tree until v0.8.1 is released; the latest published v0.7.0 archive uses schema-4 profiles.
+The example below uses schema-5 profiles and works with v0.8.1 or a build from this source tree. The v0.8.2 candidate also supports explicit migration from complete schema-3 and schema-4 documents.
 
 ## Basic Usage with the Current Source Tree
 

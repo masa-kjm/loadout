@@ -1473,6 +1473,11 @@ fn production_tree_exposes_only_a_private_facade_edge() {
     assert_private_module(&root.join("lib.rs"), "migration", &mut violations);
     assert_private_module(
         &root.join("migration/mod.rs"),
+        "continuous",
+        &mut violations,
+    );
+    assert_private_module(
+        &root.join("migration/mod.rs"),
         "schema_3_to_4",
         &mut violations,
     );

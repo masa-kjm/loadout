@@ -316,6 +316,100 @@ pub(crate) fn validate_current_profile_schemas(
     discover_profiles(context, environment).map(|_| ())
 }
 
+/// Validates a migration candidate inventory through normal composition and target binding without reading sources or targets.
+pub(crate) fn validate_migration_inventory(
+    context: &ResolverContext,
+    declarations: &BTreeMap<ProfileId, (ProfileDeclaration, PathBuf)>,
+) -> Result<(), ResolverError> {
+    let profiles = declarations
+        .iter()
+        .map(|(id, (declaration, path))| {
+            Ok((
+                id.clone(),
+                DiscoveredProfile {
+                    declaration: declaration.clone(),
+                    file_path: ResolvedPath::new(path.clone())
+                        .map_err(ResolverError::InvalidPath)?,
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, ResolverError>>()?;
+    for (root, profile) in &profiles {
+        if !profile.declaration.parameters().is_empty() {
+            continue;
+        }
+        let instances = compose_instances(root, &profiles)?;
+        resolve_orchestration(&instances, &profiles)?;
+        let mut targets = BTreeMap::new();
+        for instance in &instances {
+            for (local_id, resource) in profiles[&instance.definition].declaration.resources() {
+                let local_id = ResourceId::parse(local_id.to_owned()).map_err(|source| {
+                    ResolverError::InvalidIdentifier {
+                        role: "resource ID",
+                        value: local_id.to_owned(),
+                        source,
+                    }
+                })?;
+                let resource_id = FullyQualifiedResourceId::in_instance(&instance.name, &local_id);
+                let properties = resource.properties();
+                let kind = parse_kind(&resolve_string(
+                    properties.kind(),
+                    instance,
+                    profiles[&instance.definition].declaration.id(),
+                    "kind",
+                )?)
+                .ok_or_else(|| ResolverError::InvalidPropertyValue {
+                    defining_profile: profiles[&instance.definition].declaration.id().to_owned(),
+                    instance: instance.name.to_string(),
+                    property: "kind",
+                    reason: "must be file or directory",
+                })?;
+                let operation = parse_operation(&resolve_string(
+                    properties.operation(),
+                    instance,
+                    profiles[&instance.definition].declaration.id(),
+                    "operation",
+                )?)
+                .ok_or_else(|| ResolverError::InvalidPropertyValue {
+                    defining_profile: profiles[&instance.definition].declaration.id().to_owned(),
+                    instance: instance.name.to_string(),
+                    property: "operation",
+                    reason: "must be link or copy",
+                })?;
+                if kind == FileKind::Directory && operation == FileOperation::Copy {
+                    return Err(ResolverError::InvalidPropertyValue {
+                        defining_profile: profiles[&instance.definition]
+                            .declaration
+                            .id()
+                            .to_owned(),
+                        instance: instance.name.to_string(),
+                        property: "operation",
+                        reason: "directory resources support only operation: link",
+                    });
+                }
+                let raw_target = resolve_string(
+                    properties.target(),
+                    instance,
+                    profiles[&instance.definition].declaration.id(),
+                    "target",
+                )?;
+                let target = bind_target_path(&raw_target, context)?;
+                if let Some(first_resource_id) = targets.insert(target.clone(), resource_id.clone())
+                {
+                    return Err(ResolverError::InvalidDesired(
+                        ResolvedDesiredError::DuplicateTarget {
+                            target_path: target,
+                            first_resource_id,
+                            duplicate_resource_id: resource_id,
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Resolves every declared local-store root for a read-only configuration view.
 pub(crate) fn resolved_store_paths(
     context: &ResolverContext,

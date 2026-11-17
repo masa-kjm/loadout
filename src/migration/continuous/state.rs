@@ -1,10 +1,40 @@
 //! State-specific validation before migration publication.
 
 use super::super::{schema_3_to_4, schema_4_to_5};
-use super::{PlanError, PlannedDocument, Route, select_routes};
+use super::{MigrationPlan, PlanError, PlannedDocument, Route, select_routes};
+use crate::resolver::ResolverContext;
+use crate::state::repository::StateRepository;
 use crate::state::validate_current_state_bytes;
 use serde_json::Value as JsonValue;
 use std::path::PathBuf;
+
+pub(super) fn publish(
+    plan: &MigrationPlan,
+    context: &ResolverContext,
+    document: &PlannedDocument,
+) -> Result<(), PlanError> {
+    let repository = StateRepository::new(context.state_directory().clone());
+    let locked = repository
+        .acquire_exclusive_for_migration()
+        .map_err(|error| PlanError::Invalid(error.to_string()))?;
+    plan.compare_confirmed(context)?;
+    if locked
+        .read_source()
+        .map_err(|error| PlanError::Invalid(error.to_string()))?
+        != document.source
+    {
+        return Err(PlanError::ConfirmedSnapshotChanged);
+    }
+    locked
+        .publish_migration_candidate(&document.source, &document.candidate, |bytes| {
+            validate_state(document.target_generation, bytes).map_err(|error| error.to_string())
+        })
+        .map_err(|error| PlanError::Invalid(error.to_string()))?;
+    if super::read_regular(&document.path)? != document.candidate {
+        return Err(PlanError::ConfirmedSnapshotChanged);
+    }
+    validate_state(document.target_generation, &document.candidate)
+}
 
 pub(super) fn plan_document(
     path: PathBuf,

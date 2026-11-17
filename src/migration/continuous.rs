@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::declaration::environment_config::EnvironmentConfig;
 use crate::domain::ids::ProfileId;
+use crate::domain::paths::ResolvedPath;
 use crate::filesystem::is_link_or_reparse_point;
 use crate::resolver::ResolverContext;
 
@@ -132,6 +133,42 @@ pub(super) struct PlanPresentation {
 }
 
 impl MigrationPlan {
+    pub(super) fn execute_confirmed(&mut self, context: &ResolverContext) -> Result<(), PlanError> {
+        self.execute_confirmed_with_hook(context, |_| {})
+    }
+
+    fn execute_confirmed_with_hook(
+        &mut self,
+        context: &ResolverContext,
+        mut after_publication: impl FnMut(&Path),
+    ) -> Result<(), PlanError> {
+        self.compare_confirmed(context)?;
+        if let Some(document) = self.state.clone().filter(|item| item.needs_publication()) {
+            state::publish(self, context, &document)?;
+            self.record_verified_publication(&document.path)?;
+            after_publication(&document.path);
+        }
+        if let Some(state) = &self.state {
+            if state.source_generation != self.target_generation
+                || read_regular(&state.path)? != state.candidate
+            {
+                return Err(PlanError::ConfirmedSnapshotChanged);
+            }
+        }
+        for document in self
+            .profiles
+            .clone()
+            .into_iter()
+            .filter(|item| item.needs_publication())
+        {
+            self.compare_confirmed(context)?;
+            profiles::publish(&document)?;
+            self.record_verified_publication(&document.path)?;
+            after_publication(&document.path);
+        }
+        Ok(())
+    }
+
     pub(super) fn presentation(&self) -> PlanPresentation {
         let mut documents = Vec::new();
         documents.push(match &self.state {
@@ -190,6 +227,9 @@ impl MigrationPlan {
                 path: declared.clone(),
                 source,
             })?;
+            let physical = ResolvedPath::from_platform_canonicalized(physical)
+                .map_err(|error| PlanError::Invalid(error.to_string()))?
+                .into_path_buf();
             require_plain_directory(&declared)?;
             let mut entries = BTreeMap::new();
             for entry in fs::read_dir(&physical).map_err(|source| PlanError::Io {
@@ -715,6 +755,301 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn confirmed_execution_publishes_state_first_and_resumes_mixed_inventory() {
+        let fixture = Fixture::new();
+        fixture.state(3);
+        fixture.profile("old", 3);
+        fixture.profile("middle", 4);
+        fixture.profile("new", 5);
+        let mut plan = super::super::MigrationFacade::plan_continuous(&fixture.context, 5).unwrap();
+        plan.execute_confirmed(&fixture.context).unwrap();
+        assert_eq!(
+            state::state_version(&fs::read(fixture.root.join("state/state.json")).unwrap())
+                .unwrap(),
+            5
+        );
+        for name in ["old", "middle", "new"] {
+            let source =
+                fs::read_to_string(fixture.root.join("profiles").join(format!("{name}.yaml")))
+                    .unwrap();
+            assert_eq!(profiles::profile_version(&source).unwrap(), 5);
+        }
+        let mut resumed =
+            super::super::MigrationFacade::plan_continuous(&fixture.context, 5).unwrap();
+        assert!(
+            resumed
+                .profiles
+                .iter()
+                .all(|item| !item.needs_publication())
+        );
+        resumed.execute_confirmed(&fixture.context).unwrap();
+    }
+
+    #[test]
+    fn confirmed_execution_supports_target_four_and_absent_state() {
+        let fixture = Fixture::new();
+        fixture.profile("old", 3);
+        let mut plan = super::super::MigrationFacade::plan_continuous(&fixture.context, 4).unwrap();
+        plan.execute_confirmed(&fixture.context).unwrap();
+        assert!(!fixture.root.join("state").exists());
+        let source = fs::read_to_string(fixture.root.join("profiles/old.yaml")).unwrap();
+        assert_eq!(profiles::profile_version(&source).unwrap(), 4);
+        let mut next = super::super::MigrationFacade::plan_continuous(&fixture.context, 5).unwrap();
+        next.execute_confirmed(&fixture.context).unwrap();
+        assert_eq!(
+            profiles::profile_version(
+                &fs::read_to_string(fixture.root.join("profiles/old.yaml")).unwrap()
+            )
+            .unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn state_publication_can_stop_at_schema_four_without_widening_normal_reader() {
+        let fixture = Fixture::new();
+        fixture.state(3);
+        fixture.profile("old", 3);
+        let mut plan = super::super::MigrationFacade::plan_continuous(&fixture.context, 4).unwrap();
+        plan.execute_confirmed(&fixture.context).unwrap();
+        let bytes = fs::read(fixture.root.join("state/state.json")).unwrap();
+        assert_eq!(state::state_version(&bytes).unwrap(), 4);
+        assert!(crate::state::validate_current_state_bytes(&bytes).is_err());
+        let mut next = super::super::MigrationFacade::plan_continuous(&fixture.context, 5).unwrap();
+        next.execute_confirmed(&fixture.context).unwrap();
+        assert_eq!(
+            state::state_version(&fs::read(fixture.root.join("state/state.json")).unwrap())
+                .unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn confirmed_execution_rejects_changed_inventory_before_a_write() {
+        let fixture = Fixture::new();
+        fixture.state(3);
+        fixture.profile("old", 3);
+        let mut plan = super::super::MigrationFacade::plan_continuous(&fixture.context, 5).unwrap();
+        fs::write(fixture.root.join("profiles/external.txt"), b"external").unwrap();
+        assert!(plan.execute_confirmed(&fixture.context).is_err());
+        assert_eq!(
+            state::state_version(&fs::read(fixture.root.join("state/state.json")).unwrap())
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            profiles::profile_version(
+                &fs::read_to_string(fixture.root.join("profiles/old.yaml")).unwrap()
+            )
+            .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn state_lock_contention_keeps_all_confirmed_documents_unchanged() {
+        let fixture = Fixture::new();
+        fixture.state(3);
+        fixture.profile("old", 3);
+        let repository = crate::state::repository::StateRepository::new(
+            fixture.context.state_directory().clone(),
+        );
+        let _locked = repository.acquire_exclusive_for_migration().unwrap();
+        let mut plan = super::super::MigrationFacade::plan_continuous(&fixture.context, 5).unwrap();
+        assert!(plan.execute_confirmed(&fixture.context).is_err());
+        assert_eq!(
+            state::state_version(&fs::read(fixture.root.join("state/state.json")).unwrap())
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            profiles::profile_version(
+                &fs::read_to_string(fixture.root.join("profiles/old.yaml")).unwrap()
+            )
+            .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn state_replacement_failure_retains_original_and_stops_profiles() {
+        use crate::state::repository::{
+            MigrationPublicationFault, fail_migration_publication_at_for_test,
+        };
+
+        let fixture = Fixture::new();
+        fixture.state(3);
+        fixture.profile("old", 3);
+        let state_path = fixture.root.join("state/state.json");
+        let profile_path = fixture.root.join("profiles/old.yaml");
+        let original_state = fs::read(&state_path).unwrap();
+        let original_profile = fs::read(&profile_path).unwrap();
+        let mut plan = super::super::MigrationFacade::plan_continuous(&fixture.context, 5).unwrap();
+        let _fault = fail_migration_publication_at_for_test(MigrationPublicationFault::Replace);
+        let error = plan.execute_confirmed(&fixture.context).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot atomically replace state file")
+        );
+        assert_eq!(fs::read(&state_path).unwrap(), original_state);
+        assert_eq!(fs::read(&profile_path).unwrap(), original_profile);
+        let mut resumed =
+            super::super::MigrationFacade::plan_continuous(&fixture.context, 5).unwrap();
+        resumed.execute_confirmed(&fixture.context).unwrap();
+        assert_eq!(
+            state::state_version(&fs::read(&state_path).unwrap()).unwrap(),
+            5
+        );
+        assert_eq!(
+            profiles::profile_version(&fs::read_to_string(&profile_path).unwrap()).unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn unverified_state_publication_reports_failure_without_rollback_or_profile_publication() {
+        use crate::state::repository::{
+            MigrationPublicationFault, fail_migration_publication_at_for_test,
+        };
+
+        let fixture = Fixture::new();
+        fixture.state(3);
+        fixture.profile("old", 3);
+        let state_path = fixture.root.join("state/state.json");
+        let profile_path = fixture.root.join("profiles/old.yaml");
+        let original_profile = fs::read(&profile_path).unwrap();
+        let mut plan = super::super::MigrationFacade::plan_continuous(&fixture.context, 5).unwrap();
+        let expected_candidate = plan.state.as_ref().unwrap().candidate.clone();
+        let _fault = fail_migration_publication_at_for_test(
+            MigrationPublicationFault::PostPublicationValidation,
+        );
+        let error = plan.execute_confirmed(&fixture.context).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("publication could not be verified")
+        );
+        assert_eq!(fs::read(&state_path).unwrap(), expected_candidate);
+        assert_eq!(fs::read(&profile_path).unwrap(), original_profile);
+        assert_eq!(plan.state.as_ref().unwrap().source_generation, 3);
+        let mut resumed =
+            super::super::MigrationFacade::plan_continuous(&fixture.context, 5).unwrap();
+        assert_eq!(resumed.state.as_ref().unwrap().source_generation, 5);
+        resumed.execute_confirmed(&fixture.context).unwrap();
+        assert_eq!(fs::read(&state_path).unwrap(), expected_candidate);
+        assert_eq!(
+            profiles::profile_version(&fs::read_to_string(&profile_path).unwrap()).unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn external_change_after_state_publication_stops_profile_publication_and_resumes() {
+        let fixture = Fixture::new();
+        fixture.state(3);
+        fixture.profile("old", 3);
+        let mut plan = super::super::MigrationFacade::plan_continuous(&fixture.context, 5).unwrap();
+        let external = fixture.root.join("profiles/external.txt");
+        let state_path = fixture.root.join("state/state.json");
+        assert!(
+            plan.execute_confirmed_with_hook(&fixture.context, |path| {
+                if path == state_path {
+                    fs::write(&external, b"external").unwrap();
+                }
+            })
+            .is_err()
+        );
+        assert_eq!(
+            state::state_version(&fs::read(&state_path).unwrap()).unwrap(),
+            5
+        );
+        assert_eq!(
+            profiles::profile_version(
+                &fs::read_to_string(fixture.root.join("profiles/old.yaml")).unwrap()
+            )
+            .unwrap(),
+            3
+        );
+        fs::remove_file(&external).unwrap();
+        let mut resumed =
+            super::super::MigrationFacade::plan_continuous(&fixture.context, 5).unwrap();
+        resumed.execute_confirmed(&fixture.context).unwrap();
+        assert_eq!(
+            profiles::profile_version(
+                &fs::read_to_string(fixture.root.join("profiles/old.yaml")).unwrap()
+            )
+            .unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn profile_replacement_failure_retains_original_and_later_run_resumes() {
+        let fixture = Fixture::new();
+        fixture.profile("old", 3);
+        let path = fixture.root.join("profiles/old.yaml");
+        let original = fs::read(&path).unwrap();
+        let mut plan = super::super::MigrationFacade::plan_continuous(&fixture.context, 5).unwrap();
+        profiles::publication::fail_once_at(profiles::publication::PublicationFault::Replace);
+        assert!(plan.execute_confirmed(&fixture.context).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let mut resumed =
+            super::super::MigrationFacade::plan_continuous(&fixture.context, 5).unwrap();
+        resumed.execute_confirmed(&fixture.context).unwrap();
+        assert_eq!(
+            profiles::profile_version(&fs::read_to_string(&path).unwrap()).unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn profile_post_replacement_failure_reports_failure_and_can_resume() {
+        let fixture = Fixture::new();
+        fixture.profile("old", 3);
+        let mut plan = super::super::MigrationFacade::plan_continuous(&fixture.context, 5).unwrap();
+        profiles::publication::fail_once_at(profiles::publication::PublicationFault::AfterReplace);
+        assert!(plan.execute_confirmed(&fixture.context).is_err());
+        let path = fixture.root.join("profiles/old.yaml");
+        assert_eq!(
+            profiles::profile_version(&fs::read_to_string(&path).unwrap()).unwrap(),
+            5
+        );
+        let mut resumed =
+            super::super::MigrationFacade::plan_continuous(&fixture.context, 5).unwrap();
+        resumed.execute_confirmed(&fixture.context).unwrap();
+    }
+
+    #[test]
+    fn external_change_after_first_profile_stops_remaining_publications() {
+        let fixture = Fixture::new();
+        fixture.profile("a", 3);
+        fixture.profile("b", 3);
+        let mut plan = super::super::MigrationFacade::plan_continuous(&fixture.context, 5).unwrap();
+        let first = fixture.root.join("profiles/a.yaml");
+        let external = fixture.root.join("profiles/external.txt");
+        assert!(
+            plan.execute_confirmed_with_hook(&fixture.context, |path| {
+                if path == first {
+                    fs::write(&external, b"external").unwrap();
+                }
+            })
+            .is_err()
+        );
+        assert_eq!(
+            profiles::profile_version(&fs::read_to_string(&first).unwrap()).unwrap(),
+            5
+        );
+        assert_eq!(
+            profiles::profile_version(
+                &fs::read_to_string(fixture.root.join("profiles/b.yaml")).unwrap()
+            )
+            .unwrap(),
+            3
+        );
     }
 
     #[test]

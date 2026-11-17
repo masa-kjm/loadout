@@ -27,6 +27,56 @@ static NEXT_OPERATION_NONCE: AtomicU64 = AtomicU64::new(0);
 static NEXT_TEMPORARY_NONCE: AtomicU64 = AtomicU64::new(0);
 static NEXT_REPLACEMENT_NONCE: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MigrationPublicationFault {
+    Replace,
+    PostPublicationValidation,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MIGRATION_PUBLICATION_FAULT: std::cell::Cell<Option<MigrationPublicationFault>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct MigrationPublicationFaultGuard;
+
+#[cfg(test)]
+pub(crate) fn fail_migration_publication_at_for_test(
+    point: MigrationPublicationFault,
+) -> MigrationPublicationFaultGuard {
+    MIGRATION_PUBLICATION_FAULT.with(|slot| {
+        assert!(
+            slot.get().is_none(),
+            "migration publication fault already installed"
+        );
+        slot.set(Some(point));
+    });
+    MigrationPublicationFaultGuard
+}
+
+#[cfg(test)]
+impl Drop for MigrationPublicationFaultGuard {
+    fn drop(&mut self) {
+        MIGRATION_PUBLICATION_FAULT.with(|slot| slot.set(None));
+    }
+}
+
+#[cfg(test)]
+fn migration_publication_boundary(point: MigrationPublicationFault) -> io::Result<()> {
+    MIGRATION_PUBLICATION_FAULT.with(|slot| {
+        if slot.get() == Some(point) {
+            slot.set(None);
+            Err(io::Error::other(format!(
+                "injected migration publication failure at {point:?}"
+            )))
+        } else {
+            Ok(())
+        }
+    })
+}
+
 /// A complete in-memory state snapshot validated against the v0.2.0 state schema.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PersistedState {
@@ -291,6 +341,165 @@ impl MigrationLockedStateRepository {
         })();
         result.map_err(StateRepositoryError::Commit)
     }
+
+    /// Publishes one migration-only generation after a caller-owned validator checks the reopened candidate.
+    pub(crate) fn publish_migration_candidate(
+        &self,
+        expected_source: &[u8],
+        candidate: &[u8],
+        validate: impl Fn(&[u8]) -> Result<(), String>,
+    ) -> Result<(), StateRepositoryError> {
+        let state_path = self.repository.state_file_path();
+        let check = |path: &Path, expected: &[u8]| -> Result<(), CommitError> {
+            let metadata =
+                fs::symlink_metadata(path).map_err(|source| CommitError::MigrationCheck {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            if !metadata.is_file() || crate::filesystem::is_link_or_reparse_point(&metadata) {
+                return Err(CommitError::MigrationCheck {
+                    path: path.to_path_buf(),
+                    source: io::Error::other("migration state is not a plain file"),
+                });
+            }
+            let actual = fs::read(path).map_err(|source| CommitError::MigrationCheck {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            if actual != expected {
+                return Err(CommitError::MigrationCheck {
+                    path: path.to_path_buf(),
+                    source: io::Error::other("migration state bytes changed"),
+                });
+            }
+            Ok(())
+        };
+        validate(candidate).map_err(|message| {
+            StateRepositoryError::Commit(CommitError::MigrationCheck {
+                path: state_path.clone(),
+                source: io::Error::other(message),
+            })
+        })?;
+        check(&state_path, expected_source).map_err(StateRepositoryError::Commit)?;
+        let temporary_path = migration_temporary_path(&self.repository)?;
+        let result = (|| {
+            let mut temporary = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary_path)
+                .map_err(|source| CommitError::TemporaryCreate {
+                    path: temporary_path.clone(),
+                    source,
+                })?;
+            temporary
+                .write_all(candidate)
+                .map_err(|source| CommitError::TemporaryWrite {
+                    path: temporary_path.clone(),
+                    source,
+                })?;
+            temporary
+                .sync_all()
+                .map_err(|source| CommitError::TemporaryFlush {
+                    path: temporary_path.clone(),
+                    source,
+                })?;
+            drop(temporary);
+            check(&temporary_path, candidate)?;
+            validate(
+                &fs::read(&temporary_path).map_err(|source| CommitError::MigrationCheck {
+                    path: temporary_path.clone(),
+                    source,
+                })?,
+            )
+            .map_err(|message| CommitError::MigrationCheck {
+                path: temporary_path.clone(),
+                source: io::Error::other(message),
+            })?;
+            check(&state_path, expected_source)?;
+            check(&temporary_path, candidate)?;
+            #[cfg(test)]
+            migration_publication_boundary(MigrationPublicationFault::Replace).map_err(
+                |source| CommitError::StateReplacement {
+                    temporary_path: temporary_path.clone(),
+                    state_path: state_path.clone(),
+                    source,
+                },
+            )?;
+            replace_migration_file(&temporary_path, &state_path).map_err(|source| {
+                CommitError::StateReplacement {
+                    temporary_path: temporary_path.clone(),
+                    state_path: state_path.clone(),
+                    source,
+                }
+            })?;
+            flush_state_directory(self.repository.state_directory.as_ref()).map_err(|source| {
+                CommitError::DirectoryFlushAfterReplacement {
+                    state_directory: self.repository.state_directory.as_ref().to_path_buf(),
+                    source,
+                }
+            })?;
+            #[cfg(test)]
+            migration_publication_boundary(MigrationPublicationFault::PostPublicationValidation)
+                .map_err(|source| CommitError::MigrationPostPublication {
+                    path: state_path.clone(),
+                    source,
+                })?;
+            check(&state_path, candidate).map_err(|error| {
+                CommitError::MigrationPostPublication {
+                    path: state_path.clone(),
+                    source: io::Error::other(error.to_string()),
+                }
+            })?;
+            validate(
+                &fs::read(&state_path)
+                    .map_err(|source| CommitError::MigrationCheck {
+                        path: state_path.clone(),
+                        source,
+                    })
+                    .map_err(|error| CommitError::MigrationPostPublication {
+                        path: state_path.clone(),
+                        source: io::Error::other(error.to_string()),
+                    })?,
+            )
+            .map_err(|message| CommitError::MigrationPostPublication {
+                path: state_path.clone(),
+                source: io::Error::other(message),
+            })
+        })();
+        result.map_err(StateRepositoryError::Commit)
+    }
+}
+
+#[cfg(unix)]
+fn replace_migration_file(temporary: &Path, final_path: &Path) -> io::Result<()> {
+    fs::rename(temporary, final_path)
+}
+
+#[cfg(windows)]
+fn replace_migration_file(temporary: &Path, final_path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MoveFileExW};
+    let source = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = final_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn migration_temporary_path(repository: &StateRepository) -> Result<PathBuf, StateRepositoryError> {
@@ -1485,6 +1694,14 @@ pub(crate) enum CommitError {
         path: PathBuf,
         source: Box<StateRepositoryError>,
     },
+    MigrationCheck {
+        path: PathBuf,
+        source: io::Error,
+    },
+    MigrationPostPublication {
+        path: PathBuf,
+        source: io::Error,
+    },
     StateReplacement {
         temporary_path: PathBuf,
         state_path: PathBuf,
@@ -1513,7 +1730,10 @@ impl CommitError {
     }
 
     fn replacement_completed(&self) -> bool {
-        if matches!(self, Self::DirectoryFlushAfterReplacement { .. }) {
+        if matches!(
+            self,
+            Self::DirectoryFlushAfterReplacement { .. } | Self::MigrationPostPublication { .. }
+        ) {
             return true;
         }
         #[cfg(test)]
@@ -1573,6 +1793,16 @@ impl fmt::Display for CommitError {
                 "temporary state file {} failed validation: {source}",
                 path.display()
             ),
+            Self::MigrationCheck { path, source } => write!(
+                formatter,
+                "migration state check failed for {}: {source}",
+                path.display()
+            ),
+            Self::MigrationPostPublication { path, source } => write!(
+                formatter,
+                "migration state publication could not be verified at {}: {source}",
+                path.display()
+            ),
             Self::StateReplacement {
                 temporary_path,
                 state_path,
@@ -1613,6 +1843,8 @@ impl std::error::Error for CommitError {
             Self::TemporaryCreate { source, .. }
             | Self::TemporaryWrite { source, .. }
             | Self::TemporaryFlush { source, .. }
+            | Self::MigrationCheck { source, .. }
+            | Self::MigrationPostPublication { source, .. }
             | Self::StateReplacement { source, .. }
             | Self::DirectoryFlushAfterReplacement { source, .. } => Some(source),
             Self::TemporaryValidation { source, .. } => Some(source.as_ref()),

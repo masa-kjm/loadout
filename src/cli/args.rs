@@ -355,7 +355,9 @@ pub(super) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
         }),
         ParsedCommand::Migrate(args) => Command::Migrate(MigrationCommand {
             config: args.config,
-            target_schema: args.to_schema.unwrap_or(5),
+            target_schema: args
+                .to_schema
+                .unwrap_or(crate::schema_generation::CURRENT_MANAGED_GENERATION),
             yes: args.yes,
         }),
         ParsedCommand::Diff => Command::Diff,

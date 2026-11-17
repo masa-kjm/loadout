@@ -9,6 +9,7 @@ mod declaration;
 mod application;
 
 mod domain;
+mod schema_generation;
 
 #[allow(dead_code)]
 mod executor;

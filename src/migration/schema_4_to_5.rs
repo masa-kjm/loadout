@@ -13,7 +13,7 @@ use crate::state::repository::StateDecodeError;
 use crate::state::validate_current_state_bytes;
 
 const LEGACY_SCHEMA_VERSION: u64 = 4;
-const CURRENT_SCHEMA_VERSION: u64 = 5;
+const TARGET_SCHEMA_VERSION: u64 = 5;
 
 pub(super) fn validate_schema_four_profile(source: &str) -> Result<(), MigrationError> {
     profile_facts_continuous(source).map(|_| ())
@@ -129,7 +129,7 @@ pub(super) fn convert_state(source: &[u8]) -> Result<Vec<u8>, MigrationError> {
     }
 
     let candidate = serde_json::to_vec(&serde_json::json!({
-        "schema_version": CURRENT_SCHEMA_VERSION,
+        "schema_version": TARGET_SCHEMA_VERSION,
         "resources": legacy.resources,
         "applied_lifecycle_topology": {
             "current": [],
@@ -484,7 +484,7 @@ mod tests {
         let converted = convert_state(source.as_bytes()).unwrap();
         let value: JsonValue = serde_json::from_slice(&converted).unwrap();
         let original: JsonValue = serde_json::from_str(&source).unwrap();
-        assert_eq!(value["schema_version"], CURRENT_SCHEMA_VERSION);
+        assert_eq!(value["schema_version"], TARGET_SCHEMA_VERSION);
         assert_eq!(value["resources"], original["resources"]);
         assert_eq!(
             value["resources"]["base/git-config"]["definition_hash"],

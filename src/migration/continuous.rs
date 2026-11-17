@@ -12,6 +12,7 @@ use crate::domain::ids::ProfileId;
 use crate::domain::paths::ResolvedPath;
 use crate::filesystem::is_link_or_reparse_point;
 use crate::resolver::ResolverContext;
+use crate::schema_generation::CURRENT_MANAGED_GENERATION;
 
 use super::{schema_3_to_4, schema_4_to_5};
 
@@ -199,7 +200,7 @@ impl MigrationPlan {
         }));
         PlanPresentation {
             configuration_path: self.configuration_path.clone(),
-            normal_commands_available: self.target_generation == 5
+            normal_commands_available: self.target_generation == CURRENT_MANAGED_GENERATION
                 || documents
                     .iter()
                     .all(|document| document.source_generation.is_none()),

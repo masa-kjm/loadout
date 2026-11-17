@@ -1473,6 +1473,11 @@ fn production_tree_exposes_only_a_private_facade_edge() {
     assert_private_module(&root.join("lib.rs"), "migration", &mut violations);
     assert_private_module(
         &root.join("migration/mod.rs"),
+        "schema_3_to_4",
+        &mut violations,
+    );
+    assert_private_module(
+        &root.join("migration/mod.rs"),
         "schema_4_to_5",
         &mut violations,
     );
@@ -1502,6 +1507,11 @@ fn oracle_rejects_every_required_facade_bypass_class() {
         (
             "route-private-import",
             "use crate::migration::schema_4_to_5::convert_state; fn f() {}",
+            "route-private migration import",
+        ),
+        (
+            "schema-three-route-private-import",
+            "use crate::migration::schema_3_to_4::convert_state; fn f() {}",
             "route-private migration import",
         ),
         (
@@ -1993,8 +2003,9 @@ impl Oracle {
         {
             return Some(Binding::FacadeDispatch);
         }
-        if ends_with(&segments, &["migration", "schema_4_to_5"])
-            || segments.iter().any(|segment| segment == "schema_4_to_5")
+        if segments
+            .iter()
+            .any(|segment| matches!(segment.as_str(), "schema_3_to_4" | "schema_4_to_5"))
         {
             return Some(Binding::RoutePrivateMigration);
         }
@@ -2103,10 +2114,9 @@ impl Oracle {
                 )
             {
                 self.reject(
-                    if suffix
-                        .first()
-                        .is_some_and(|segment| segment == "schema_4_to_5")
-                    {
+                    if suffix.first().is_some_and(|segment| {
+                        matches!(segment.as_str(), "schema_3_to_4" | "schema_4_to_5")
+                    }) {
                         "route-private migration import"
                     } else {
                         "non-facade migration import"

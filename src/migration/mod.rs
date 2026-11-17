@@ -148,6 +148,9 @@ impl fmt::Display for MigrationFacadeError {
 
 impl std::error::Error for MigrationFacadeError {}
 
+// The schema-3 route is private and conversion-only until the continuous-route facade is added.
+mod schema_3_to_4;
+
 // Route-private parsing, validation, conversion, inventory, and publication logic deliberately
 // live in this named version-pair unit. The facade above is the route's only stable edge.
 mod schema_4_to_5;

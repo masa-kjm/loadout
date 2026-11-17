@@ -1730,24 +1730,23 @@ impl CommitError {
     }
 
     fn replacement_completed(&self) -> bool {
-        if matches!(
+        let published = matches!(
             self,
             Self::DirectoryFlushAfterReplacement { .. } | Self::MigrationPostPublication { .. }
-        ) {
-            return true;
-        }
+        );
         #[cfg(test)]
         {
-            matches!(
-                self,
-                Self::Injected {
-                    stage: CommitStage::FlushDirectory
-                }
-            )
+            published
+                || matches!(
+                    self,
+                    Self::Injected {
+                        stage: CommitStage::FlushDirectory
+                    }
+                )
         }
         #[cfg(not(test))]
         {
-            false
+            published
         }
     }
 }

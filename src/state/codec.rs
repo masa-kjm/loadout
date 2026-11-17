@@ -26,14 +26,13 @@ use crate::domain::plan::{
     ActionKind, ActionRole, GraphAction, GraphBarrier, GraphDirectEdge, PlannedActionGraph,
     TargetCondition,
 };
+use crate::schema_generation::CURRENT_MANAGED_GENERATION;
 use crate::state::operation::{
     ActionId, ActionStatus, OperationId, OperationRecord, OperationRecordError,
     PersistedCopyActionFacts, PersistedCopyRemovalFacts, PersistedEffectHandoffFacts,
     RecordedAction, SkipReason,
 };
 use crate::state::repository::{CommitError, PersistedState};
-
-const STATE_SCHEMA_VERSION: u32 = 5;
 
 /// A strict on-disk representation of `state.json`.
 #[derive(Debug, Deserialize, Serialize)]
@@ -62,7 +61,7 @@ impl StateDocument {
             .map(PersistedOperationRecord::from_operation)
             .transpose()?;
         Ok(Self {
-            schema_version: STATE_SCHEMA_VERSION,
+            schema_version: CURRENT_MANAGED_GENERATION,
             resources,
             applied_lifecycle_topology: PersistedTopology::from_topology(state.known().topology()),
             active_operation,
@@ -70,7 +69,7 @@ impl StateDocument {
     }
 
     pub(super) fn into_state(self) -> Result<PersistedState, StateDecodeError> {
-        if self.schema_version != STATE_SCHEMA_VERSION {
+        if self.schema_version != CURRENT_MANAGED_GENERATION {
             return Err(StateDecodeError::UnsupportedSchemaVersion {
                 actual: self.schema_version,
             });
@@ -1965,7 +1964,7 @@ impl fmt::Display for StateDecodeError {
         match self {
             Self::UnsupportedSchemaVersion { actual } => write!(
                 formatter,
-                "unsupported state schema_version {actual}; expected {STATE_SCHEMA_VERSION}"
+                "unsupported state schema_version {actual}; expected {CURRENT_MANAGED_GENERATION}"
             ),
             Self::InvalidResourceId { value, source } => {
                 write!(

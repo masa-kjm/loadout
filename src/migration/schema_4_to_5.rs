@@ -64,12 +64,20 @@ pub(super) fn profile_facts_continuous(
         .and_then(YamlValue::as_mapping)
         .ok_or(MigrationError::InvalidLegacyProfile)?;
     for resource in resources.values() {
-        require_yaml_keys(
-            resource
-                .as_mapping()
-                .ok_or(MigrationError::InvalidLegacyProfile)?,
-            &["type", "properties"],
-        )?;
+        let resource = resource
+            .as_mapping()
+            .ok_or(MigrationError::InvalidLegacyProfile)?;
+        require_yaml_keys(resource, &["type", "properties"])?;
+        let path = resource
+            .get(YamlValue::String("properties".to_owned()))
+            .and_then(YamlValue::as_mapping)
+            .and_then(|properties| properties.get(YamlValue::String("source".to_owned())))
+            .and_then(YamlValue::as_mapping)
+            .and_then(|source| source.get(YamlValue::String("path".to_owned())))
+            .ok_or(MigrationError::InvalidLegacyProfile)?;
+        if !matches!(path, YamlValue::String(_)) {
+            return Err(MigrationError::InvalidLegacyProfile);
+        }
     }
     let candidate = replace_root_schema_version(source, '4', '5')?;
     let parsed = ProfileDeclaration::parse(&candidate).map_err(MigrationError::Profile)?;
@@ -417,6 +425,12 @@ mod tests {
         assert!(
             convert_profile_continuous(&PROFILE.replace("id: base", "stages: {}\nid: base"))
                 .is_err()
+        );
+        assert!(
+            convert_profile_continuous(
+                &PROFILE.replace("path: git/config", "path: { parameter: source-path }")
+            )
+            .is_err()
         );
     }
 

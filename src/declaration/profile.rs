@@ -253,13 +253,13 @@ impl FileLinkProperties {
 #[serde(deny_unknown_fields)]
 pub(crate) struct SourceDeclaration {
     store: String,
-    path: String,
+    path: ValueOrReference,
 }
 impl SourceDeclaration {
     pub(crate) fn store(&self) -> &str {
         &self.store
     }
-    pub(crate) fn path(&self) -> &str {
+    pub(crate) fn path(&self) -> &ValueOrReference {
         &self.path
     }
 }

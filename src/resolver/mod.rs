@@ -284,7 +284,10 @@ pub(crate) fn declared_profiles(
                             DeclaredPropertyValue::Reference { .. } => FileOperation::Link,
                         },
                         store_id: properties.source().store().to_owned(),
-                        source_path: properties.source().path().to_owned(),
+                        source_path: DeclaredPropertyValue::from_value_or_reference(
+                            properties.source().path(),
+                        )
+                        .presentation(),
                         target_path: target_value.presentation(),
                         kind_value,
                         operation_value,
@@ -648,7 +651,12 @@ fn resolve_resource_inputs(
                     resource_id: resource_id.clone(),
                     store_id,
                 })?;
-            let source_components = parse_source_path(properties.source().path())?;
+            let source_components = parse_source_path(&resolve_string(
+                properties.source().path(),
+                &instance,
+                profile.declaration.id(),
+                "source.path",
+            )?)?;
             let target_path = bind_target_path(
                 &resolve_string(
                     properties.target(),
@@ -960,13 +968,7 @@ fn compose_instances(
                         source,
                     }
                 })?,
-                None if child.declaration.parameters().is_empty() => child_definition.clone(),
-                None => {
-                    return Err(ResolverError::MissingParameterizedIncludeAlias {
-                        including_profile: definition.clone(),
-                        included_profile: child_definition,
-                    });
-                }
+                None => child_definition.clone(),
             };
             let child_name = name.child(&child_alias);
             let mut child_bindings = BTreeMap::new();
@@ -1619,10 +1621,6 @@ pub(crate) enum ResolverError {
     ParameterizedRoot {
         root_profile: ProfileId,
     },
-    MissingParameterizedIncludeAlias {
-        including_profile: ProfileId,
-        included_profile: ProfileId,
-    },
     ConflictingInstance {
         instance: InstanceNamespace,
     },
@@ -1799,13 +1797,6 @@ impl fmt::Display for ResolverError {
                 formatter,
                 "selected root profile {root_profile} must not declare parameters"
             ),
-            Self::MissingParameterizedIncludeAlias {
-                including_profile,
-                included_profile,
-            } => write!(
-                formatter,
-                "profile {including_profile} must name parameterized include {included_profile} with as"
-            ),
             Self::ConflictingInstance { instance } => write!(
                 formatter,
                 "instance {instance} is reached with conflicting definition or bindings"
@@ -1963,7 +1954,6 @@ impl std::error::Error for ResolverError {
             | Self::MissingRootProfile
             | Self::RootProfileNotDiscovered { .. }
             | Self::ParameterizedRoot { .. }
-            | Self::MissingParameterizedIncludeAlias { .. }
             | Self::ConflictingInstance { .. }
             | Self::MissingParameterBinding { .. }
             | Self::UnknownParameterBinding { .. }
@@ -2351,6 +2341,59 @@ mod tests {
             resolved.resources()[0].target_path().as_ref(),
             workspace.path("home/.gitconfig")
         );
+    }
+
+    #[test]
+    fn resolver_substitutes_source_path_and_defaults_parameterized_alias() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/work", "content");
+        workspace.write(
+            "profiles/reusable.yaml",
+            "schema_version: 5\nid: reusable\nparameters: { source-path: string, target: string }\nresources:\n  config:\n    type: file\n    properties:\n      kind: file\n      source: { store: dotfiles, path: { parameter: source-path } }\n      target: { parameter: target }\n      operation: link\n",
+        );
+        workspace.write(
+            "profiles/workstation.yaml",
+            "schema_version: 5\nid: workstation\nincludes:\n  - id: reusable\n    with: { source-path: git/work, target: ~/.gitconfig }\nresources: {}\n",
+        );
+        let environment = environment(Some("workstation"), &["../profiles"], "../store");
+        let resolved = resolve(&workspace.context(), &environment, None).unwrap();
+        assert_eq!(
+            resolved.resources()[0].resource_id().as_str(),
+            "workstation/reusable/config"
+        );
+        assert_eq!(
+            resolved.resources()[0].source_path().as_ref(),
+            workspace.path("store/git/work")
+        );
+
+        workspace.write(
+            "profiles/workstation.yaml",
+            "schema_version: 5\nid: workstation\nincludes:\n  - id: reusable\n    with: { source-path: git/work, target: ~/.gitconfig }\n  - id: reusable\n    as: second\n    with: { source-path: git/work, target: ~/.gitconfig-second }\nresources: {}\n",
+        );
+        let resolved = resolve(&workspace.context(), &environment, None).unwrap();
+        assert_eq!(resolved.resources().len(), 2);
+        assert_eq!(
+            resolved.resources()[1].resource_id().as_str(),
+            "workstation/second/config"
+        );
+
+        workspace.write(
+            "profiles/workstation.yaml",
+            "schema_version: 5\nid: workstation\nincludes:\n  - id: reusable\n    with: { source-path: git/work, target: ~/.gitconfig }\n  - id: reusable\n    with: { source-path: git/work, target: ~/.gitconfig-second }\nresources: {}\n",
+        );
+        assert!(matches!(
+            resolve(&workspace.context(), &environment, None),
+            Err(ResolverError::ConflictingInstance { .. })
+        ));
+
+        workspace.write(
+            "profiles/workstation.yaml",
+            "schema_version: 5\nid: workstation\nincludes:\n  - id: reusable\n    with: { source-path: ../outside, target: ~/.gitconfig }\nresources: {}\n",
+        );
+        assert!(matches!(
+            resolve(&workspace.context(), &environment, None),
+            Err(ResolverError::InvalidSourcePath { .. })
+        ));
     }
 
     #[test]

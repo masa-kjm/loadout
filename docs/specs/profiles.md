@@ -74,7 +74,7 @@ Only a complete permitted resource-property value or a complete include binding 
 ```
 
 No partial string, additional reference field, nested reference, list-element reference, or other reference location is valid.
-The initial property contract permits a reference only where that property's literal contract permits the same whole YAML value.
+The initial property contract permits a reference in `properties.kind`, `properties.operation`, `properties.target`, and `properties.source.path` only where that property's literal contract permits the same whole YAML value.
 After substitution, existing resource validation owns property type, closed-enum, path normalization, containment, store, source-kind, and target validation.
 A list substituted into a property that does not accept a list is invalid.
 
@@ -91,7 +91,8 @@ includes:
 ```
 
 `id` names a discovered profile.
-`as` defaults to `id` only when the referenced profile declares no parameters; otherwise it is REQUIRED.
+`as` is optional and defaults to `id`, including when the referenced profile declares parameters.
+If the same resolved instance name is reached with a different definition or canonical typed bindings, resolution rejects the conflict; distinct parameterized instances need distinct names.
 `with` supplies every declared parameter exactly once, supplies no unknown parameter, and each value exactly matches the declared type.
 An include-binding reference resolves only from the including instance's already-bound parameters.
 A resource-property reference resolves only from its defining instance's already-bound parameters.

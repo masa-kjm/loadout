@@ -468,6 +468,86 @@ fn plan_conflict_and_runtime_state_error_have_distinct_exit_status() {
 }
 
 #[test]
+fn cli_accepts_parameterized_source_path_with_default_instance_name() {
+    let f = Fixture::new();
+    f.write("store/alternate", "alternate content\n");
+    f.write(
+        "portable/profiles/reusable.yaml",
+        "schema_version: 5\nid: reusable\nparameters: { source-path: string, target-path: string }\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source: { store: files, path: { parameter: source-path } }\n      target: { parameter: target-path }\n",
+    );
+    f.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 5\nid: base\nincludes:\n  - id: reusable\n    with: { source-path: alternate, target-path: ~/target }\nresources: {}\n",
+    );
+
+    expect(
+        f.run(&["validate", "--config", "../portable/config.yaml"]),
+        0,
+        &["base"],
+    );
+    expect(
+        f.run(&["plan", "--config", "../portable/config.yaml"]),
+        0,
+        &["base/reusable/item", "create_link"],
+    );
+    assert!(!f.path("home/target").exists());
+    assert!(!f.path("state/loadout/state.json").exists());
+}
+
+#[test]
+fn cli_rejects_conflicting_default_alias_and_invalid_bound_source_without_mutation() {
+    let f = Fixture::new();
+    f.write("home/untouched", "unchanged\n");
+    f.write(
+        "portable/profiles/reusable.yaml",
+        "schema_version: 5\nid: reusable\nparameters: { source-path: string, target-path: string }\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source: { store: files, path: { parameter: source-path } }\n      target: { parameter: target-path }\n",
+    );
+    for (name, includes, diagnostic) in [
+        (
+            "conflicting alias",
+            "  - id: reusable\n    with: { source-path: source, target-path: ~/target }\n  - id: reusable\n    with: { source-path: source, target-path: ~/second }\n",
+            "conflicting",
+        ),
+        (
+            "invalid bound source",
+            "  - id: reusable\n    with: { source-path: ../outside, target-path: ~/target }\n",
+            "invalid source path",
+        ),
+    ] {
+        f.write(
+            "portable/profiles/base.yaml",
+            &format!("schema_version: 5\nid: base\nincludes:\n{includes}resources: {{}}\n"),
+        );
+        for command in ["validate", "plan"] {
+            expect(
+                f.run(&[command, "--config", "../portable/config.yaml"]),
+                2,
+                &[diagnostic],
+            );
+        }
+        let before = f.snapshot();
+        let output = f
+            .command()
+            .args(["apply", "--yes", "--config", "../portable/config.yaml"])
+            .output()
+            .unwrap();
+        expect(output, 2, &[diagnostic]);
+        assert_eq!(fs::read(f.path("home/untouched")).unwrap(), b"unchanged\n");
+        assert!(!f.path("home/target").exists(), "{name}");
+        assert!(!f.path("home/second").exists(), "{name}");
+        assert!(!f.path("state/loadout/state.json").exists(), "{name}");
+        let after = f.snapshot();
+        let non_state = |snapshot: BTreeMap<PathBuf, Vec<u8>>| {
+            snapshot
+                .into_iter()
+                .filter(|(path, _)| !path.starts_with(f.path("state")))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(non_state(after), non_state(before), "{name}");
+    }
+}
+
+#[test]
 fn diff_needs_no_configuration_even_with_unfinished_operation() {
     let f = Fixture::new();
     f.write("config/loadout/loadout.yaml", "invalid");

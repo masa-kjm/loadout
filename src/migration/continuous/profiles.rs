@@ -93,6 +93,7 @@ pub(super) fn validate_completed_inventory(
 ) -> Result<(), PlanError> {
     let mut declarations = BTreeMap::<ProfileId, ProfileDeclaration>::new();
     let mut resolved_declarations = BTreeMap::new();
+    let mut source_generations = BTreeMap::new();
     for document in documents {
         let candidate = std::str::from_utf8(&document.candidate)
             .map_err(|_| PlanError::Invalid("converted profile is not UTF-8".to_owned()))?;
@@ -107,6 +108,7 @@ pub(super) fn validate_completed_inventory(
         let id = ProfileId::parse(declaration.id().to_owned())
             .map_err(|error| PlanError::Invalid(error.to_string()))?;
         resolved_declarations.insert(id.clone(), (declaration.clone(), document.path.clone()));
+        source_generations.insert(id.clone(), document.source_generation);
         declarations.insert(id, declaration);
     }
     for (id, declaration) in &declarations {
@@ -121,16 +123,16 @@ pub(super) fn validate_completed_inventory(
             let included_id = ProfileId::parse(include.id().to_owned())
                 .map_err(|error| PlanError::Invalid(error.to_string()))?;
             let included = &declarations[&included_id];
-            let alias = match include.as_name() {
-                Some(alias) => alias.to_owned(),
-                None if included.parameters().is_empty() => include.id().to_owned(),
-                None => {
-                    return Err(PlanError::Invalid(format!(
-                        "parameterized profile {} requires an instance alias",
-                        included_id.as_str()
-                    )));
-                }
-            };
+            if source_generations[id] == 4
+                && include.as_name().is_none()
+                && !included.parameters().is_empty()
+            {
+                return Err(PlanError::Invalid(format!(
+                    "schema-4 parameterized profile {} requires an instance alias",
+                    included_id.as_str()
+                )));
+            }
+            let alias = include.as_name().unwrap_or(include.id()).to_owned();
             for (parameter, expected) in included.parameters() {
                 let binding = include.bindings().get(parameter).ok_or_else(|| {
                     PlanError::Invalid(format!(
@@ -176,6 +178,7 @@ pub(super) fn validate_completed_inventory(
                 resource.properties().kind(),
                 resource.properties().operation(),
                 resource.properties().target(),
+                resource.properties().source().path(),
             ] {
                 if let ValueOrReference::Reference(parameter) = value {
                     if !matches!(
@@ -270,8 +273,16 @@ pub(super) fn profile_facts(
                 }
                 StoreId::parse(properties.source().store().to_owned())
                     .map_err(|error| PlanError::Invalid(error.to_string()))?;
-                SourceRelativePath::parse(properties.source().path())
-                    .map_err(|error| PlanError::Invalid(format!("{error:?}")))?;
+                match properties.source().path() {
+                    ValueOrReference::Value(value) => {
+                        let path = value.as_string().ok_or_else(|| {
+                            PlanError::Invalid("profile source.path must be a string".to_owned())
+                        })?;
+                        SourceRelativePath::parse(path)
+                            .map_err(|error| PlanError::Invalid(format!("{error:?}")))?;
+                    }
+                    ValueOrReference::Reference(_) => {}
+                }
             }
             for (stage, _) in profile.stages() {
                 ResourceId::parse(stage.to_owned())

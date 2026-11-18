@@ -2,28 +2,22 @@
 
 Loadout is a local environment manager built around explicit desired state, ownership-aware filesystem operations, and durable recovery.
 
-## Status
+## Features
 
-v0.8.1 is the latest published release. This source tree prepares v0.8.2 with the [continuous-migration contract](docs/specs/migration.md). The v0.8.0 tag did not produce a GitHub Release.
-The current command surface is defined by the [CLI specification](docs/specs/cli.md).
-Release archives can be installed with the Unix and Windows installer scripts in `scripts/`; these install the latest published release by default.
-The published package's Rust library target is not yet a supported public API.
-
-Normal commands reject earlier profile and state schemas; only the explicit [migration command](docs/specs/migration.md) reads complete valid schema-3 and schema-4 inputs.
-
-## Current Source Capabilities
-
-The current source tree materializes a regular file from a local store as either a file symbolic link or a content-owned regular-file copy, and a local-store real directory as a directory symbolic link.
-It provides profile composition, validation, planning, drift inspection, conflict detection, state locking, verified application, crash recovery, and read-only inspection of declarations, Desired resources, Known state, and Actual observations.
-Profile composition supports typed parameters. Schema-5 profiles add stable instance-scoped stages and direct resource prerequisites, which the planner schedules deterministically. The explicit `loadout migrate --config <path>` command advances state and profiles together through supported schema generations 3, 4, and 5.
-
-Loadout checks recorded ownership and filesystem safety immediately before mutations, but does not exclude concurrent external changes. An entry substituted after the last check can be deleted or replaced, and successful postcondition verification may not reveal the race. See the [file-link concurrency contract](docs/specs/file-link.md#external-filesystem-concurrency) for the scope and limits of these guarantees.
-
-The documented platform baseline is Linux/local ext4, macOS/local APFS, and Windows/local NTFS. See [File Links](docs/specs/file-link.md#intended-supported-scope), [File Copies](docs/specs/file-copy.md#platform-requirements), and [Directory Links](docs/specs/directory-link.md#platform-requirements) for the exact scope and evidence requirements.
+- Link or copy files and link directories from local stores.
+- Compose profiles with typed parameters, resource prerequisites, and stages.
+- Validate and preview changes before applying them with ownership checks and crash recovery.
+- Inspect managed state and drift with read-only commands.
 
 ## Installation
 
-After a GitHub Release is published, install its latest archive with one of the following commands:
+With Homebrew:
+
+```sh
+brew install masa-kjm/tap/loadout
+```
+
+Alternatively, install a release archive with the Unix or Windows installer:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/masa-kjm/loadout/main/scripts/install.sh | bash
@@ -34,102 +28,55 @@ irm https://raw.githubusercontent.com/masa-kjm/loadout/main/scripts/install.ps1 
 ```
 
 Both installers accept an exact release tag through `--version vX.Y.Z` or `-Version vX.Y.Z` and install below `~/.local/bin` or `%USERPROFILE%\.local\bin` by default. They download and verify the release archive's SHA-256 sidecar before installation.
-The example below uses schema-5 profiles and works with v0.8.1 or a build from this source tree. The v0.8.2 candidate also supports explicit migration from complete schema-3 and schema-4 documents.
 
-## Basic Usage with the Current Source Tree
+## Basic Usage
 
-Loadout retains the environment configuration and profile-file model. The local store can live anywhere; it does not need to be inside the directory containing the configuration. For example:
+From the directory where you keep your source files, create a Loadout configuration and select it for this machine:
 
-```text
-loadout-config/
-├── config.yaml
-└── profiles/
-    └── workstation.yaml
-
-~/src/dotfiles/
-└── gitconfig
+```sh
+loadout init
+loadout config use ./.loadout/config.yaml
 ```
 
-`config.yaml`:
-
-```yaml
-schema_version: 2
-default_profile: workstation
-
-profile_discovery:
-  paths:
-    - ./profiles
-
-stores:
-  dotfiles:
-    type: local
-    properties:
-      path: ~/src/dotfiles
-```
-
-`profiles/workstation.yaml`:
+`init` creates `.loadout/config.yaml` and an empty `.loadout/profiles/base.yaml`. It configures the current directory as the `native` store. Add a source file named `example.txt` in this directory, then replace `base.yaml` with:
 
 ```yaml
 schema_version: 5
-id: workstation
+id: base
 resources:
-  git-config:
+  example:
     type: file
     properties:
       kind: file
       source:
-        store: dotfiles
-        path: gitconfig
-      target: ~/.gitconfig
+        store: native
+        path: example.txt
+      target: ~/.loadout-example.txt
       operation: copy
 ```
 
-The source file must already exist, and the target's parent directories must already exist. Paths such as `./profiles` are relative to `config.yaml`, while `~/src/dotfiles` is resolved from the user's home directory. From `loadout-config/`, validate and preview the changes:
+Choose a target name that does not already exist. Validate the profile, review the plan, then apply it:
 
 ```sh
-loadout validate --config ./config.yaml
-loadout plan --config ./config.yaml
+loadout validate
+loadout plan
+loadout apply
 ```
 
-Apply the plan after reviewing it:
-
-```sh
-loadout apply --config ./config.yaml
-```
-
-Use `--yes` when running `apply` non-interactively. `--dry-run` performs the apply lifecycle without changing the filesystem. To inspect managed state and drift, run:
+`config use` and `apply` ask for confirmation in an interactive terminal; add `--yes` for non-interactive use. To inspect drift later, run:
 
 ```sh
 loadout diff
 ```
 
-Read-only inspection commands report facts without planning or repairing a resource:
-
-```sh
-loadout status --config ./config.yaml
-loadout profile list --config ./config.yaml
-loadout resource list --config ./config.yaml
-loadout resource list --known
-```
-
-### Initialize a portable environment
-
-To start an empty environment repository, run this command from its root:
-
-```sh
-loadout init
-loadout validate --config ./.loadout/config.yaml
-```
-
-`init` creates only `.loadout/config.yaml` and `.loadout/profiles/base.yaml`; it does not change runtime configuration, initialize Git, or modify native assets.
+For an existing configuration, reusable profiles, ordering, and more commands, see the [User Guide](docs/user-guide.md).
 
 ## Documentation
 
 The authoritative current-source contract is in [`docs/`](docs/README.md).
 
+- [User Guide](docs/user-guide.md) walks through setup and everyday use.
 - [Architecture](docs/architecture/README.md) defines system responsibilities and boundaries.
 - [Specifications](docs/specs/README.md) define the observable contracts.
 - [Testing Strategy](docs/development/testing.md) defines the required evidence for those contracts.
 - [Future Considerations](docs/future/README.md) records non-binding work outside the current contract.
-
-Future and draft material cannot change the v0.8.0 source contract.

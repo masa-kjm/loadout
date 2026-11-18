@@ -4,7 +4,7 @@ Follow these instructions for changes in this repository.
 
 ## Authority and scope
 
-Read [documentation authority](docs/README.md), then the documents that own the changed behavior: [architecture](docs/architecture/README.md) for responsibilities and safety boundaries, [specifications](docs/specs/README.md) for observable contracts, and [testing strategy](docs/development/testing.md) for required evidence.
+Read the documents that own the changed behavior: [architecture](docs/architecture/README.md) for responsibilities and safety boundaries, [specifications](docs/specs/README.md) for observable contracts, and [testing strategy](docs/development/testing.md) for required evidence.
 Architecture and specifications are authoritative; `docs/future/`, `local/`, and other drafts are not.
 Do not derive current behavior from a historical schema or release section when a current section supersedes it.
 If the authoritative documents conflict or leave a safety-, ownership-, persistence-, platform-, or schema-sensitive choice unclear, report the ambiguity before deciding it.

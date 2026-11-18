@@ -1,6 +1,6 @@
 # Future Considerations
 
-This directory records design work that is explicitly outside the current v0.8.0 contract.
+This directory records design work that is explicitly outside the current version contract.
 It is not a specification, implementation plan, compatibility promise, or user-facing command reference.
 
 Future documents may identify risks, prerequisites, and candidate constraints.

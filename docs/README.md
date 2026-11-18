@@ -1,11 +1,8 @@
 # Loadout Documentation
 
-The current source-tree contract is v0.8.0 with the v0.8.2 continuous-migration contract implemented ahead of release. Read the documents that own the area you are changing:
-
+- [User Guide](user-guide.md) provides task-oriented setup and usage examples derived from the specifications.
 - [Architecture](architecture/README.md) owns the system model, responsibilities, and safety boundaries.
 - [Specifications](specs/README.md) own observable behavior, schemas, ownership, lifecycle, state, recovery, and CLI contracts.
 - [Testing Strategy: read by task](development/testing.md#read-by-task) owns the evidence required to verify those contracts. [Platform Primitive Decisions](development/copy-platform-decision-record.md) records current implementation choices for file-copy publication.
 
-The current resource effects are file links, file copies, and directory links from local stores. For entry points, read [Profiles](specs/profiles.md), [Lifecycle](specs/lifecycle.md), and the applicable [resource specification](specs/README.md). [Migration](specs/migration.md) owns continuous migration; normal readers use only the current schemas.
-
-`future/` contains non-binding work outside v0.8.0. `draft/` contains exploratory material. Neither changes the current contract. Historical behavior belongs to the relevant Git revision or release tag.
+`future/` contains non-binding work outside current version. Historical behavior belongs to the relevant Git revision or release tag.

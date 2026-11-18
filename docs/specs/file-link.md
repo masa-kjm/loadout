@@ -187,7 +187,7 @@ If the new target is not missing or the old target is not an expected link, the 
 
 ### Intended Supported Scope
 
-The intended supported baseline is Linux on local ext4 (including ext4 within WSL2), macOS on local APFS, and Windows on local NTFS. Each combination requires create, remove, replace, relocate, both ownership handoffs, noop, and forget-missing. [README](../../README.md#current-source-capabilities) summarizes current source capabilities; platform conformance requires the evidence below.
+The intended supported baseline is Linux on local ext4 (including ext4 within WSL2), macOS on local APFS, and Windows on local NTFS. Each combination requires create, remove, replace, relocate, both ownership handoffs, noop, and forget-missing. Platform conformance requires the evidence below.
 
 Other operating systems and filesystems, network shares including SMB/NFS, WSL-mounted Windows volumes accessed through the Linux backend, and cross-filesystem replacement are outside the supported baseline. Accepted path spelling alone does not establish filesystem support. Unsupported capability requirements MUST be reported explicitly; an OS name alone is not evidence of the required filesystem guarantees.
 

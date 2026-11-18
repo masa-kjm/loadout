@@ -1188,6 +1188,12 @@ mod tests {
         )
         .unwrap();
         assert!(super::super::MigrationFacade::plan_continuous(&fixture.context, 5).is_err());
+        fs::write(
+            &root,
+            "schema_version: 4\nid: root\nincludes: [{ id: themed, with: { theme: blue } }, { id: themed, with: { theme: red } }]\nresources: {}\n",
+        )
+        .unwrap();
+        assert!(super::super::MigrationFacade::plan_continuous(&fixture.context, 5).is_err());
     }
 
     #[test]

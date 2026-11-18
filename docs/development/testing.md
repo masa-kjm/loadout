@@ -204,7 +204,7 @@ Platform-specific tests run only in disposable directories and must clean up onl
 
 ## Profile Parameters and Migration Evidence
 
-Schema-5 declaration and resolver tests cover every closed parameter type, empty and non-empty scalar lists, whole-value references, root-parameter rejection, typed binding mismatch, unknown/missing/duplicate bindings, scope, invalid YAML lookalikes, nested-list rejection, and post-substitution resource validation.
+Schema-5 declaration and resolver tests cover every closed parameter type, empty and non-empty scalar lists, whole-value references including `source.path`, root-parameter rejection, typed binding mismatch, unknown/missing/duplicate bindings, scope, invalid YAML lookalikes, nested-list rejection, and post-substitution resource validation.
 They cover instance aliases, repeated equal-binding deduplication, conflicting repeated aliases, definition-reachability cycles, target collisions, and mapping/list-order and scalar-type canonicalization.
 Hash fixtures prove schema-5 fully qualified IDs are lexicographically ordered in `loadout.resolved-desired.v5`, definition hashes exclude instance identity and raw parameter syntax, and alias changes identity while binding/effect changes do not.
 

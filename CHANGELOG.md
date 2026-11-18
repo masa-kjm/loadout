@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.8.3
+
+- Allow profiles to bind `source.path` from a string parameter.
+- Allow parameterized includes to omit `as`, defaulting to the included profile ID and rejecting conflicting bindings under the same instance name.
+
 ## v0.8.2
 
 - Replaced `migrate state` and `migrate profiles` with one confirmed `loadout migrate --config <path> [--to-schema 4|5] [--yes]` command.

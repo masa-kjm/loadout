@@ -10,12 +10,12 @@ They apply to every implementation, including tests, authoring commands, inspect
 | Concern | Owner | Other layers must not do |
 | --- | --- | --- |
 | Command parsing, confirmation, formatting, and exit status | Command adapter | Reimplement lifecycle, ownership, filesystem policy, or migration eligibility/publication decisions. |
-| Declaration parsing, typed parameter binding, instance composition, path binding, and semantic validation | Resolver and validator | Inspect target state, mutate the filesystem, write state, or decode a legacy migration DTO. |
+| Declaration parsing, typed parameter binding, instance composition, path binding, effective phase membership, direct-dependency normalization, diagnostic provenance, and semantic validation | Resolver and validator | Inspect target state, mutate the filesystem, write state, or decode a legacy migration DTO. |
 | Target and parent observation | Actual state inspector | Change the filesystem or treat an observation as durable ownership. |
-| Desired/Known/Actual classification and action selection | Planner | Perform I/O, mutate state, invoke commands, or print. |
+| Desired/Known/Actual classification, action selection, compact phase reachability, recorded-order conflict proof, conservative rebuild set, and topology authority selection | Planner | Perform I/O, mutate state, invoke commands, or print. |
 | Immediate precondition recheck, mutation, and post-condition verification | Executor | Create an unplanned action or reclassify an action after planning. |
 | State lock, operation progress, Known state, and atomic commit | State repository | Delegate authoritative state writes to command or resource code. |
-| Schema-3/4 parsing, route registration, inventory validation, compatibility proof, lossless conversion, confirmed-snapshot comparison, and migration-only publication decisions | Migration facade, separate internal state/profile responsibilities, and private adjacent-generation routes | Be imported or invoked by normal declaration, state, resolver, planner, executor, or inspection paths. |
+| Older-generation parsing, route registration, complete-inventory validation, compatibility proof, representable conversion, confirmed-snapshot comparison, and migration-only publication decisions | Migration facade, separate internal state/profile responsibilities, and private adjacent-generation routes | Be imported or invoked by normal declaration, state, resolver, planner, executor, or inspection paths. |
 | Platform-specific path and filesystem primitives | Filesystem implementation | Decide ownership, desired state, or user-visible policy. |
 | Read-only inspection report assembly | Inspection query | Plan, recover, mutate state, acquire the apply lock, or infer ownership from a target match. |
 
@@ -84,7 +84,7 @@ The command adapter obtains facade presentation, invokes facade execution once a
 It must not parse a legacy document, discover an inventory, decide profile/state eligibility, inspect an active operation, compare inventory snapshots, acquire a state lock, construct a conversion candidate, or publish a document.
 The migration facade is the only migration capability visible outside its private module; its request, presentation, and outcome values are data-only and cannot carry a legacy DTO, parsed document, inventory iterator, conversion candidate, lock or transaction guard, path handle, writer, or publication capability.
 Each supported adjacent-generation route is a private named unit beneath that boundary.
-Generation 3→4 and 4→5 routes contain their legacy DTOs, parsing, validation, conversion, and route-specific tests, and the facade is their sole stable edge.
+Generation 3→4, 4→5, and 5→6 routes contain their legacy DTOs, parsing, validation, conversion, and route-specific tests, and the facade is their sole stable edge.
 Adding a generation requires state and profile routes with explicit facade registration; retiring a route removes both its registration and unit after its documented support window.
 An unsupported route fails at facade selection, and neither route addition nor retirement creates a normal compatibility reader or exposes route-private APIs.
 All lifecycle commands, resource implementations, and the state repository remain forbidden from writing Loadout control files.
@@ -119,7 +119,7 @@ A command must reject an unsupported version before an inspection, planning deci
 A command need not read or validate a persisted control document that its operation does not depend on.
 It must not ignore unknown ordering, ownership, recovery, or resource-effect data in order to continue.
 
-Normal lifecycle, validation, dry-run, and inspection deliberately provide no schema-3 or schema-4 compatibility reader. They reject those and every unsupported version rather than transforming them during validation, planning, application, recovery, or inspection. Only the dedicated migration module may parse a supported legacy document, and it is reachable only through the confirmed authoring command specified by [Migration](../specs/migration.md).
+Normal lifecycle, validation, dry-run, and inspection deliberately provide no older-schema compatibility reader. They reject every unsupported version rather than transforming it during validation, planning, application, recovery, or inspection. Only the dedicated migration module may parse a supported legacy document, and it is reachable only through the confirmed authoring command specified by [Migration](../specs/migration.md).
 
 ## Diagnostics and Errors
 

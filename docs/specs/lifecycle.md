@@ -24,7 +24,7 @@ The planner MUST NOT access the filesystem, read a store, write state, acquire a
 
 ## Validate
 
-Profile validation parses the environment configuration and discovered profiles, resolves a selected root profile when one is supplied, and performs the static checks defined by Configuration and Profiles.
+Profile validation parses the environment configuration and discovered profiles, resolves exactly the selected root and its closure, and performs the static checks defined by Configuration and Profiles. Without an explicit root it selects the configured default. Document-only discovery is not proof that a profile can resolve as a root.
 It does not inspect resource targets and makes no mutation.
 
 ## Diff
@@ -132,15 +132,23 @@ A failed recheck prevents the next mutation step and records failure or uncertai
 
 ## Execution Order
 
-Apply is sequential in v0.8.0. The planner first classifies normal lifecycle actions, then constructs and validates one combined DAG. The relation contains only typed legal lifecycle/replacement relations, canonical direct `depends_on` prerequisites, compact stage barriers, and permissible historical stale-removal topology. The planner rejects every combined cycle before operation creation or target mutation. An unsupported action-role pair is a blocking diagnostic with no fallback.
+Apply is sequential. The planner first classifies normal lifecycle actions, then constructs and validates one combined DAG. The relation contains only typed legal lifecycle/replacement relations, canonical direct prerequisites from either declaration form, compact root-phase barriers, and permissible historical stale-removal topology. The planner rejects every combined cycle before operation creation or target mutation. An unsupported action-role pair is a blocking diagnostic with no fallback.
 
 The only action roles are `current_create`, `current_change`, `current_handoff`, `stale_remove`, and `forget_missing`. Current-to-current direct and forward-stage relations are legal. `stale_remove` and `forget_missing` are stale actions and may relate only by reversing a selected applied-topology edge whose endpoints are stale. Current-to-stale, stale-to-current, and every unspecified pair are illegal. Resource-specific replacement or handoff predicates remain additional required safety predicates and never override this closed legality table.
 
-The Plan stores unique actions, sorted direct action edges with `origin: "depends_on"`, compact barrier units, and a schedule that is a permutation of the action IDs. A barrier has stable ID `stage/<fully-qualified-stage-id>`, sorted `after` barrier IDs, sorted input/output action-ID sets, and provenance containing only canonical resolved IDs. Barrier stages MUST NOT be serialized as an n-by-m cross-product of action edges. Direct edges, barrier incidences, action IDs, and schedule members are unique and canonical. A graph with an unknown reference, duplicate or noncanonical collection, invalid status/reason relation, invalid role relation, missing scheduled action, or cycle is invalid before recovery or target observation.
+The Plan stores unique actions, sorted direct action edges with `origin: "depends_on"`, compact barrier units, and a schedule that is a permutation of the action IDs. A barrier has stable ID `stage/<selected-root-instance-id>/<phase-name>`, sorted `after` barrier IDs, sorted input/output action-ID sets, and provenance containing only canonical resolved IDs. Empty phases remain graph nodes for transitive reachability without synthetic actions or n-by-m action edges. Direct edges, barrier incidences, action IDs, and schedule members are unique and canonical. A graph with an unknown reference, duplicate or noncanonical collection, invalid status/reason relation, invalid role relation, missing scheduled action, or cycle is invalid before recovery or target observation.
 
 The schedule is a deterministic sequential topological order. Independent ready actions use fully qualified resource ID only as a tie-breaker. YAML mapping order, include order, declaration order, collection order, source order, and lexical renaming are not ordering APIs. An ordering-only declaration change creates no resource action, active operation, applied-topology update, or state rewrite. An unstaged resource creates no barrier membership. A satisfied prerequisite creates no synthetic action.
 
 A failed or uncertain action stops every later planned mutation. Every unstarted action reachable from an unsatisfied or non-success terminal predecessor records a dependency skip naming that blocking action. Every other unstarted action records a global-abort skip naming the first failed or uncertain action that stopped execution. Verified earlier effects are not rolled back.
+
+### Recorded-order conflicts
+
+Before selecting a new topology delta, the planner compares resource-level reachability implied by the selected root's new direct edges and phase graph with reachability proven by both current and historical recorded topology for the same Known resource IDs. A path in one direction in recorded topology and a path in the opposite direction in proposed ordering is a conflict even if neither resource needs an action and even when phase names differ. The read-only Plan reports the endpoint IDs, old and proposed directions, and their recorded and declaration sources. It does not treat a newly declared phase as recorded membership for an unchanged Known resource.
+
+The conservative rebuild set is computed from an undirected graph of recorded direct edges, barrier memberships, and barrier relations. It contains every connected component touching either conflicting endpoint, including all recorded members in those components. This expansion is diagnostic only and is never stored as pairwise topology edges. Any action that would publish the contradictory new relation is blocked before a new operation record or target mutation. Ordering-only changes alone create no operation or state rewrite. A non-dry-run apply may already have recovered an old operation; its effects are reported separately.
+
+For old `A → B` and proposed `B → A`, the Plan reports both directions and the recorded component containing `A` and `B` as the minimum conservative rebuild set. If a recorded `C → A` shares the component, `C` is included. The operator removes the entire reported set from Desired, applies its stale removal under recorded order until every member and old ordering fact is gone, then restores the new declarations and replans. An incomplete removal or uncertain operation cannot be presented as completed rebuilding. Stale removal follows only recorded topology, never the contradictory new declaration.
 
 ## Dry Run
 
@@ -186,7 +194,7 @@ Before a normal lifecycle command observes a target, reconciles an active operat
 For non-dry-run apply, acquiring the exclusive lock may precede this gate, but the gate precedes recovery and every other mutable state-repository operation.
 
 If any required document has an unsupported schema version or invalid schema shape, the command reports invalid input and performs none of those actions.
-In particular, it does not recover a schema-4 active operation, inspect a target that matches a schema-4 Known effect, or create a replacement state document. The explicit [Migration](migration.md) authoring operation is outside this lifecycle and is the only schema-4 conversion path.
+In particular, it does not recover an older-schema active operation, inspect a target that matches an older-schema Known effect, or create a replacement state document. The explicit [Migration](migration.md) authoring operation is outside this lifecycle and is the only conversion path.
 An absent state file is the only state input that the current contract treats as an empty Known state.
 
 Inspection commands apply the same gate only to documents their read-only contract names.

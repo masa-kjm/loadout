@@ -2,7 +2,7 @@
 
 ## Scope
 
-This specification defines v0.8.0 profile files, typed parameters, named-instance composition, resource declarations, orchestration declarations, and static validation.
+This specification defines current profile files, typed parameters, named-instance composition, resource declarations, orchestration declarations, and static validation.
 The `file` resource supports file `link`, `copy`, and directory `link`; see [File Links](file-link.md), [File Copies](file-copy.md), and [Directory Links](directory-link.md) for runtime behavior.
 
 ## Identifiers
@@ -28,7 +28,7 @@ The selected root instance is named by its profile ID.
 One profile file defines one profile.
 
 ```yaml
-schema_version: 5
+schema_version: 6
 id: workstation
 includes:
   - id: base
@@ -52,9 +52,9 @@ Unknown fields are errors at every object level.
 The resource value MUST contain `type` and `properties`.
 The only current type is `file`.
 Its accepted `kind` and `operation` pairs are defined in [Current Profile Schema](#current-profile-schema) and its effect-specific properties are defined by [File Links](file-link.md), [File Copies](file-copy.md), and [Directory Links](directory-link.md).
-Every normal profile reader rejects a schema version other than `5` before it resolves a source, observes a target, creates a plan, recovers an operation, or writes state.
+Every normal profile reader rejects a schema version other than `6` before it resolves a source, observes a target, creates a plan, recovers an operation, or writes state.
 
-## Schema-5 Parameters and References
+## Parameters and References
 
 The current profile schema permits an optional `parameters` mapping from a parameter name to exactly one closed type: `string`, `integer`, `boolean`, or `list`.
 Omission means that the profile declares no parameters.
@@ -80,7 +80,7 @@ A list substituted into a property that does not accept a list is invalid.
 
 ## Includes
 
-Each include has `id`, optional `as`, and optional `with` fields:
+Each include has `id`, optional `as`, `with`, and `stage` fields:
 
 ```yaml
 includes:
@@ -92,11 +92,11 @@ includes:
 
 `id` names a discovered profile.
 `as` is optional and defaults to `id`, including when the referenced profile declares parameters.
-If the same resolved instance name is reached with a different definition or canonical typed bindings, resolution rejects the conflict; distinct parameterized instances need distinct names.
+If the same resolved instance name is reached with a different definition or canonical typed bindings, resolution rejects the conflict; distinct parameterized instances need distinct names. Reaching that instance with different effective phase membership for any of its resources also rejects resolution, even if definitions and bindings agree.
 `with` supplies every declared parameter exactly once, supplies no unknown parameter, and each value exactly matches the declared type.
 An include-binding reference resolves only from the including instance's already-bound parameters.
 A resource-property reference resolves only from its defining instance's already-bound parameters.
-Includes do not accept conditional expressions, filesystem paths, override directives, ambient binding, interpolation, or shell expansion.
+Includes do not accept conditional expressions, filesystem paths, other override directives, ambient binding, interpolation, or shell expansion.
 
 Loadout resolves includes into named instances.
 Include cycles are rejected over definition-profile reachability, including self-includes.
@@ -112,14 +112,15 @@ Profile composition is a set of fully qualified resources; two different resourc
 Resolving a root profile produces one Resolved Desired set.
 Before a planner receives it, the resolver MUST:
 
-1. Discover and parse all profile files.
+1. Discover and parse all profile files, including syntax of every ordering declaration even if it will be overridden.
 2. Reject duplicate profile IDs and invalid identifiers.
 3. Resolve includes and reject cycles or missing include IDs.
 4. Substitute every permitted whole-value reference in its defining instance scope.
 5. Resolve each store reference and resource-local source path.
 6. Normalize every resource to its fully qualified ID and resolved paths.
-7. Validate the resulting resource declaration and reject duplicate targets after platform-aware normalization.
-8. Produce deterministic resource ordering by fully qualified resource ID.
+7. Resolve effective phases and direct dependencies against the selected include graph and reject invalid references, cycles, and inconsistent repeated-instance membership.
+8. Validate the resulting resource declaration and reject duplicate targets after platform-aware normalization.
+9. Produce deterministic resource ordering by fully qualified resource ID.
 
 The resolver MUST NOT read a target, write a file, acquire the state lock, or update state.
 
@@ -151,7 +152,7 @@ The lifecycle specification determines whether that change creates, replaces, re
 ## Current Profile Schema
 
 This section defines the profile schema for every normal lifecycle, validation, dry-run, and inspection command that reads a profile.
-A current profile has `schema_version: 5`; schema version `4`, every earlier version, and every unknown future version are invalid.
+A current profile has `schema_version: 6`; every earlier version and every unknown future version are invalid.
 Loadout rejects that version mismatch before it resolves a store source, normalizes a target, observes a target, creates a plan, recovers an operation, or writes state.
 
 The profile object, include objects, resource envelope, and resource `properties` objects reject unknown fields at every level.
@@ -167,16 +168,20 @@ The accepted `(properties.kind, properties.operation)` pairs are exactly:
 `directory` with `copy`, and every other pair, are invalid.
 The `directory_link` declaration and resolution rules are defined by [Directory Links](directory-link.md).
 
-Normal commands do not decode a version-4 profile for conversion, reinterpret it as version 5, or provide an implicit migration path.
-The explicit schema-3-to-4-to-5 authoring operation is defined by [Migration](migration.md).
+Normal commands do not decode an older profile for conversion or provide an implicit migration path.
+The explicit schema-3-to-4-to-5-to-6 authoring operation is defined by [Migration](migration.md).
 An invalid version is a validation diagnostic, not an input from which a target or existing effect may be inspected or adopted.
 
-## Schema-5 Orchestration
+## Schema-6 Orchestration
 
-The top-level profile object has optional `stages` and existing `resources` members. `stages` is a mapping from a local stage name to an object with exactly one required member, `after`. `after` is an array of stage-reference strings and may be empty for an explicit root stage. A resource envelope has optional `stage`, a scalar local-stage name, and optional `depends_on`, an array of resource-reference strings. Omitting `depends_on` and declaring `depends_on: []` are absence-equivalent: both produce no prerequisite facts, no graph edges, and no ordering effect. Unknown fields, duplicate references, duplicate resource IDs, self references, a resource naming an undeclared local stage, or a malformed reference are invalid.
+Only the selected root may declare `stages`. It is a mapping from phase names matching the identifier grammar to closed objects with required `after`, a duplicate-free array of phase names from the same mapping. An empty array declares an explicit initial phase. Self references and cycles are invalid. An included profile containing `stages` is invalid even when an enclosing `includes[].stage` overrides every resource membership. The canonical phase ID is `stage/<selected-root-instance-id>/<phase-name>`; it is independent of child identity, include path, and traversal order. A profile with its own `stages` may be selected as a root if it otherwise satisfies root requirements.
 
-A local resource or stage reference is its local identifier and MUST name a member declared in the same resolved profile instance. A qualified reference contains `/` and is an exact fully qualified resolved ID: a slash-joined nonempty sequence of instance aliases followed by the local resource or stage key. A qualified reference is never reinterpreted as a local identifier. Local resource IDs and local stage names use the profile identifier grammar and MUST NOT contain `/`.
+An include may declare `stage: <phase-name>`. A resource may declare `stage: <phase-name>` and `depends_on: [<local-resource-id>, ...]`. These are scalar identifiers without `/`; `depends_on` names only resources in the same resolved instance, and a qualified cross-instance spelling is invalid even when it would resolve. Omitted and empty dependency arrays are equivalent. Every declaration is parsed and syntax-checked, including overridden `stage` values. Only a resource's effective phase is checked for existence in the selected root's `stages` mapping. Its effective phase is the first include `stage` encountered on the path from the selected root to its defining instance, otherwise its own resource `stage`, otherwise none. An outer include assignment therefore applies to the whole descendant subtree and wins over inner assignments and resource declarations. For a deduplicated instance, every path must yield the same effective phase for each resource; equal memberships retain ordinary definition and binding deduplication. A child selected alone must satisfy its own root requirements, including any effective resource phases it declares.
 
-Resolution canonicalizes every valid reference to a fully qualified resource or stage ID before planner input. Profile IDs, stack names, includes, generic groups, YAML names, and include positions are never dependency targets. Reused and parameterized instances therefore have distinct stage namespaces and cannot capture sibling local names. Resolution rejects a missing, ambiguous, invalid, or self reference before target observation or mutation. Orchestration facts are not effect or ownership hash inputs.
+Every profile may also declare `resource_dependencies`, a sequence of closed objects with exactly required string fields `before` and `after`. Each endpoint is a local resource ID or a slash-joined path of one or more include aliases followed by a resource ID. The path is relative to the declaring instance and follows actual include edges; it never starts with the selected root ID and contains neither `.` nor `..`. Every endpoint must resolve uniquely inside that instance's include closure. The two endpoints must be in different resolved instances. Unknown, ambiguous, self, same-instance, and duplicate canonical edges are invalid, including duplicates across parent declarations and local `depends_on`. An endpoint path cannot capture a sibling or ancestor outside the declaring closure.
 
-`depends_on` constrains a legal current-Desired successor action behind its predecessor's planned action. If the predecessor's required post-condition already holds, it satisfies the prerequisite without a synthetic `NOOP` action. A stage relation constrains applicable legal actions in its later stage behind applicable legal actions in its earlier stage through the compact barrier representation in [Lifecycle](lifecycle.md). Unstaged resources are members of no barrier. Declaration, mapping, include, discovery, and lexical resource-name order are not execution-order controls.
+The resolver normalizes both dependency forms to `(before, after)` pairs of fully qualified resource IDs. The Plan and durable direct edge use `origin: "depends_on"` for either form. Declaration location and reference spelling are diagnostic provenance and never durable identity. Read-only Desired presentation retains each resource's effective phase and source, either its own declaration or the winning include path, and each direct dependency's declaration source. For equal effective memberships reached through multiple include paths, an include assignment takes display precedence over an equal resource declaration; among include assignments, choose the lexicographically smallest slash-joined alias path from the selected root whose first assigned `stage` supplies that membership. Equal candidate paths collapse to one source. If no path assigns a phase, display the defining resource declaration. This rule changes only presentation, never phase identity, deduplication, ordering, or ownership. A source location uses stable profile ID, include-alias path, and resource ID; YAML position and include order are not identities. Phase, dependency, and provenance facts are excluded from definition and Desired ownership hashes.
+
+For example, a selected `workstation` root can declare phases `early` and `late` with `late.after: [early]`, include `base` as `base` with `stage: early` and `app` as `app`, and declare `resource_dependencies: [{before: base/git, after: app/editor}]`. The resource `base/git` is effectively in `stage/workstation/early` even if its own declaration says `stage: late`; that overridden spelling must still be syntactically valid. The parent edge resolves to `base/git → app/editor`. If `base` is selected alone, its `late` declaration requires a local root `stages.late`.
+
+`depends_on` and parent dependencies constrain legal current-Desired successor actions behind their predecessors. A predecessor whose required post-condition already holds satisfies its prerequisite without a synthetic action. Phase relations constrain applicable actions through compact barriers in [Lifecycle](lifecycle.md). Unstaged resources belong to no barrier. Declaration, mapping, include, discovery, and lexical resource-name order are not execution-order controls.

@@ -10,10 +10,10 @@ The source and target path syntax, physical containment requirements, no-follow 
 
 ## Declaration and Resolution
 
-The `file`/`copy` declaration uses profile schema version `5` under the [Current Profile Schema](profiles.md#current-profile-schema). Orchestration facts do not alter copy ownership or its content fingerprint.
+The `file`/`copy` declaration uses profile schema version `6` under the [Current Profile Schema](profiles.md#current-profile-schema). Orchestration facts do not alter copy ownership or its content fingerprint.
 
 ```yaml
-schema_version: 5
+schema_version: 6
 id: workstation
 resources:
   git-config:

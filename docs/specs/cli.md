@@ -74,7 +74,7 @@ loadout migrate --config <path> [--to-schema <N>] [--yes]
 ```
 
 This single explicit authoring command migrates state and profiles together.
-`--to-schema` selects managed-document generation 4 or 5 and defaults to the binary's latest generation, 5.
+`--to-schema` selects managed-document generation 4, 5, or 6 and defaults to the binary's latest generation, 6.
 It does not select a release version or change runtime or environment configuration schemas.
 The former `migrate state` and `migrate profiles` forms are argument errors that identify the new syntax and change no document.
 Before confirmation it presents all discovered documents, their current and target generations, routes or no-change status, the write set, and whether normal commands can use the completed inventory.
@@ -84,16 +84,11 @@ Complete-inventory validation, confirmed-snapshot comparison, state-before-profi
 ### `loadout validate`
 
 ```text
-loadout validate [--config <path>] [--all | <profile-id>]
+loadout validate [--config <path>] [<profile-id>]
 ```
 
 With a positional profile ID, this command validates that root profile and its include closure.
-Without a profile ID or `--all`, it validates the environment configuration's `default_profile` and its include closure.
-`--all` validates every discovered profile declaration and resolves every root-eligible profile as a possible root profile; it MUST NOT be combined with a positional profile ID.
-Profiles that declare parameters are not root-eligible, so `--all` does not select or reject them as roots solely for declaring parameters.
-They remain subject to discovery and declaration validation and are fully resolved when reached by a root-eligible profile through an include with bindings.
-
-When neither a profile ID nor `--all` is supplied, `default_profile` is REQUIRED.
+Without a profile ID, it validates the environment configuration's required `default_profile` and its include closure. It does not resolve every discovered profile as a root. All discovered documents receive declaration parsing; selected-root semantic validation is separate. A profile requiring parent phase assignment is not silently accepted as a root. `--all` is an argument error with status `2` and no target, state, or control-file mutation.
 
 The command performs parsing, resolution, and static validation.
 It may inspect configuration files and store-source entry kinds, but it MUST NOT inspect a resource target, acquire the state lock, write state, or mutate the filesystem.
@@ -200,7 +195,9 @@ For `plan` and `apply`, output identifies:
 - each action's target and reason; and
 - every blocking diagnostic with the affected resource or path when available.
 
-For `validate`, output identifies the profile or profiles checked and every diagnostic.
+The report also identifies each Desired resource's effective phase and whether its source is its own declaration or the winning include path, and each normalized direct dependency with its declaration source. A recorded-order conflict identifies both directions and sources, the conservative rebuild set, and the full stale-removal and reapply procedure. This applies when the Plan has no resource actions.
+
+For `validate`, output identifies the selected root and its checked closure and every diagnostic.
 
 For `diff`, output identifies every inspected Known resource, its target, its observation result, and every unfinished or uncertain operation.
 
@@ -210,7 +207,7 @@ Observed drift is reportable state, not a `diff` runtime failure.
 
 For `config`, output identifies the inspected or changed configuration file and the selected field or path when applicable.
 
-For `migrate`, output identifies every discovered state and profile document, its current and target schema generations, selected routes or no-change status, the exact write set, normal-command availability after completion, and that migration changes no resource ID, effect, or ownership evidence.
+For `migrate`, output identifies every discovered state and profile document, its current and target schema generations, selected routes or no-change status, the exact write set, normal-command availability after completion, and that migration changes no resource ID, effect, or ownership evidence. Before confirmation it identifies any phase relation whose migration to a root broadens ordering, with that root and the newly constrained resources.
 
 ## Exit Status
 
@@ -234,5 +231,5 @@ The current contract does not provide configuration reset, generic YAML editing,
 Every lifecycle command and every inspection command that reads a profile or state document uses the version-specific decoding rules in [Profiles](profiles.md#current-profile-schema) and [State and Recovery](state-and-recovery.md#current-state-schema).
 An unsupported profile or state schema version exits with the documented invalid-input category before target inspection, planning, recovery, state rewrite, or target mutation.
 
-Normal commands provide no old-schema reader, implicit conversion, compatibility alias, or schema-repair path. Only the explicit `migrate` command may read complete valid schema-3 or schema-4 documents for the lossless conversion defined by [Migration](migration.md).
+Normal commands provide no old-schema reader, implicit conversion, compatibility alias, or schema-repair path. Only the explicit `migrate` command may read complete valid older documents for the conversion defined by [Migration](migration.md).
 An unsupported state file does not authorize observing or adopting a matching target, and its active operation is not recovered.

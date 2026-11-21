@@ -127,5 +127,4 @@ A lexical path-prefix comparison is never sufficient to prove filesystem contain
 
 When `default_profile` is set, it must equal a discovered profile ID.
 It supplies the root profile for `validate`, `plan`, and `apply` when their optional positional profile ID is omitted.
-`validate --all` does not use `default_profile`.
 It does not record an active profile and does not alter profile composition.

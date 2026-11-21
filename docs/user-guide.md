@@ -110,7 +110,7 @@ includes:
 resources: {}
 ```
 
-Create both source files in the store before validating. Each parameter reference occupies the whole YAML value. `as` defaults to the included profile ID; give instances different names when their bindings differ. See [Parameters and References](specs/profiles.md#schema-5-parameters-and-references) and [Includes](specs/profiles.md#includes).
+Create both source files in the store before validating. Each parameter reference occupies the whole YAML value. `as` defaults to the included profile ID; give instances different names when their bindings differ. See [Parameters and References](specs/profiles.md#parameters-and-references) and [Includes](specs/profiles.md#includes).
 
 As a separate example, use `depends_on` for one resource that must follow another. Use stages when a group must follow another group. This profile applies `git-ignore` after `git-config`, then applies `editor-config` after the `files` stage:
 
@@ -148,7 +148,7 @@ resources:
       operation: copy
 ```
 
-Loadout orders applicable actions according to these relationships; YAML declaration order does not control execution order. See [Orchestration](specs/profiles.md#schema-5-orchestration) and [Execution Order](specs/lifecycle.md#execution-order).
+Loadout orders applicable actions according to these relationships; YAML declaration order does not control execution order. See [Orchestration](specs/profiles.md#schema-6-orchestration) and [Execution Order](specs/lifecycle.md#execution-order).
 
 ## Inspect and Maintain
 

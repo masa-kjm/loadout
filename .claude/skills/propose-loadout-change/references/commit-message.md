@@ -16,6 +16,8 @@ Use this subject format:
 
 ```text
 <type>(<scope>): <imperative summary>
+
+List any changes in bullet points(-), as needed.
 ```
 
 The scope is optional.

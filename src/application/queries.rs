@@ -177,7 +177,6 @@ pub(crate) struct ConfigurationValueReport {
 
 #[derive(Debug)]
 pub(crate) enum QueryError {
-    ProfileStateGenerationMismatch,
     ConfigurationRead {
         path: crate::domain::paths::ResolvedPath,
         source: io::Error,
@@ -356,7 +355,6 @@ fn status_with_inspector(
         &std::path::Path,
     ) -> Result<FileLinkInspector, TargetInspectionError>,
 ) -> Result<StatusReport, QueryError> {
-    ensure_matching_generations()?;
     let state = repository.load().map_err(QueryError::State)?;
     let active_operation = state.active_operation().cloned();
     let desired = match resolve_desired(request) {
@@ -525,7 +523,6 @@ pub(crate) fn diff(
 
 /// Shared plan/dry-run path: no exclusive lock, recovery, or mutation preflight.
 pub(crate) fn plan_request(request: &DeclarationRequest) -> Result<PlanReport, QueryError> {
-    ensure_matching_generations()?;
     let desired = resolve_desired(request)?;
     let state = StateRepository::new(request.context.state_directory().clone())
         .load()
@@ -547,15 +544,6 @@ pub(crate) fn plan_request(request: &DeclarationRequest) -> Result<PlanReport, Q
             &directory_actual,
         ),
     })
-}
-
-pub(crate) fn ensure_matching_generations() -> Result<(), QueryError> {
-    if crate::schema_generation::CURRENT_PROFILE_GENERATION
-        != crate::schema_generation::CURRENT_MANAGED_GENERATION
-    {
-        return Err(QueryError::ProfileStateGenerationMismatch);
-    }
-    Ok(())
 }
 
 /// Returns the first resource that requires DirectoryLink lifecycle support.
@@ -590,49 +578,18 @@ mod tests {
 
     static NEXT_WORKSPACE: AtomicU64 = AtomicU64::new(0);
 
-    #[test]
-    fn staged_profile_state_generation_mismatch_blocks_plan_status_and_apply_without_writes() {
-        let workspace = Workspace::new();
-        fs::write(
-            workspace.root.join("portable/profiles/base.yaml"),
-            "schema_version: 6\nid: base\nresources: {}\n",
-        )
-        .unwrap();
-        let request = DeclarationRequest {
-            context: workspace.context(),
-            root: None,
-        };
-        let state_entries_before = fs::read_dir(workspace.root.join("state")).unwrap().count();
-        assert!(matches!(
-            plan_request(&request),
-            Err(QueryError::ProfileStateGenerationMismatch)
-        ));
-        assert!(matches!(
-            status(&request, &workspace.repository()),
-            Err(QueryError::ProfileStateGenerationMismatch)
-        ));
-        let failure = crate::application::apply::apply_request(&request, |_| true).unwrap_err();
-        assert!(matches!(
-            failure.cause,
-            crate::application::apply::ApplyFailureCause::Input(
-                QueryError::ProfileStateGenerationMismatch
-            )
-        ));
-        assert_eq!(
-            fs::read_dir(workspace.root.join("state")).unwrap().count(),
-            state_entries_before
-        );
-        assert!(!workspace.root.join("home/.item").exists());
-    }
-
     struct Workspace {
         root: std::path::PathBuf,
     }
 
     impl Workspace {
         fn new() -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time follows the Unix epoch")
+                .as_nanos();
             let root = std::env::temp_dir().join(format!(
-                "loadout-queries-{}-{}",
+                "loadout-queries-{}-{}-{nonce}",
                 std::process::id(),
                 NEXT_WORKSPACE.fetch_add(1, Ordering::Relaxed)
             ));
@@ -648,7 +605,7 @@ mod tests {
             .unwrap();
             fs::write(
                 root.join("portable/profiles/base.yaml"),
-                "schema_version: 5\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.item\n",
+                "schema_version: 6\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.item\n",
             )
             .unwrap();
             let root = crate::domain::paths::ResolvedPath::from_platform_canonicalized(
@@ -881,7 +838,7 @@ mod tests {
         fs::write(
             workspace.root.join("state/state.json"),
             serde_json::json!({
-                "schema_version": 5,
+                "schema_version": 6,
                 "resources": {},
                 "applied_lifecycle_topology": { "current": [], "historical": [] },
                 "active_operation": {
@@ -908,7 +865,7 @@ mod tests {
                             "resource_id": "base/pending",
                             "role": "current_create",
                             "topology_authority": { "current": [], "historical": [] },
-                            "topology_delta": { "add_current_direct": [], "remove_current_direct": [], "add_historical_direct": [], "remove_historical_direct": [], "add_current_barriers": [], "remove_current_barriers": [], "add_historical_barriers": [], "remove_historical_barriers": [], "replace_current_barriers": [], "replace_historical_barriers": [] },
+                            "topology_delta": { "add_current_direct": [], "remove_current_direct": [], "add_historical_direct": [], "remove_historical_direct": [], "add_current_barriers": [], "remove_current_barriers": [], "add_historical_barriers": [], "remove_historical_barriers": [], "advance_current_barriers": [], "advance_historical_barriers": [], "replace_current_barriers": [], "replace_historical_barriers": [] },
                         }],
                         "direct_edges": [],
                         "barriers": [],
@@ -946,7 +903,7 @@ mod tests {
         let workspace = Workspace::new();
         fs::write(
             workspace.root.join("portable/profiles/base.yaml"),
-            "schema_version: 5\nid: base\nresources:\n  changed:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.changed\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.item\n",
+            "schema_version: 6\nid: base\nresources:\n  changed:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.changed\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.item\n",
         )
         .unwrap();
         let desired_item = desired_resources(&DeclarationRequest {
@@ -997,7 +954,7 @@ mod tests {
         fs::write(
             workspace.root.join("state/state.json"),
             serde_json::json!({
-                "schema_version": 5,
+                "schema_version": 6,
                 "resources": resources,
                 "applied_lifecycle_topology": { "current": [], "historical": [] },
                 "active_operation": null,
@@ -1063,7 +1020,7 @@ mod tests {
         fs::write(
             workspace.root.join("state/state.json"),
             serde_json::json!({
-                "schema_version": 5,
+                "schema_version": 6,
                 "resources": {
                     "base/item": persisted_known_file_link(&desired),
                 },
@@ -1092,7 +1049,7 @@ mod tests {
                             "resource_id": "base/pending",
                             "role": "current_create",
                             "topology_authority": { "current": [], "historical": [] },
-                            "topology_delta": { "add_current_direct": [], "remove_current_direct": [], "add_historical_direct": [], "remove_historical_direct": [], "add_current_barriers": [], "remove_current_barriers": [], "add_historical_barriers": [], "remove_historical_barriers": [], "replace_current_barriers": [], "replace_historical_barriers": [] },
+                            "topology_delta": { "add_current_direct": [], "remove_current_direct": [], "add_historical_direct": [], "remove_historical_direct": [], "add_current_barriers": [], "remove_current_barriers": [], "add_historical_barriers": [], "remove_historical_barriers": [], "advance_current_barriers": [], "advance_historical_barriers": [], "replace_current_barriers": [], "replace_historical_barriers": [] },
                         }],
                         "direct_edges": [],
                         "barriers": [],
@@ -1180,7 +1137,7 @@ mod tests {
         let workspace = Workspace::new();
         fs::write(
             workspace.root.join("portable/profiles/base.yaml"),
-            "schema_version: 5\nid: base\nresources:\n  another:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.another\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.blocked/item\n",
+            "schema_version: 6\nid: base\nresources:\n  another:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.another\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.blocked/item\n",
         )
         .unwrap();
         let blocked = workspace.root.join("home/.blocked");

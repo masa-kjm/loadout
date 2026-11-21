@@ -6,14 +6,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::domain::desired::ResolvedDesired;
-use crate::domain::diagnostic::Diagnostic;
+use crate::domain::diagnostic::{Diagnostic, OrderingBlockReason};
 use crate::domain::ids::FullyQualifiedResourceId;
 use crate::domain::known::{
-    AppliedBarrier, AppliedDirectEdge, KnownState, StaleTopologySnapshot,
+    AppliedBarrier, AppliedDirectEdge, KnownState, StaleTopologySnapshot, TopologyBarrierAdvance,
     TopologyBarrierReplacement,
 };
 use crate::domain::plan::{
-    ActionKind, ActionRole, GraphAction, GraphBarrier, GraphDirectEdge, PlannedActionGraph,
+    ActionRole, GraphAction, GraphBarrier, GraphDirectEdge, PlannedActionGraph,
     PlannedResourceAction,
 };
 
@@ -87,6 +87,9 @@ pub(crate) fn schedule(
         .iter()
         .map(|fact| (fact.resource_id().clone(), fact))
         .collect::<BTreeMap<_, _>>();
+    result
+        .diagnostics
+        .extend(recorded_order_conflicts(desired, known));
     let mut direct_edges = BTreeSet::<(FullyQualifiedResourceId, FullyQualifiedResourceId)>::new();
     let mut satisfied_direct =
         BTreeSet::<(FullyQualifiedResourceId, FullyQualifiedResourceId)>::new();
@@ -107,7 +110,14 @@ pub(crate) fn schedule(
                 None if is_current(successor_role) && known.get_variant(predecessor).is_some() => {
                     satisfied_direct.insert((predecessor.clone(), successor.clone()));
                 }
-                _ => result.diagnostics.push(blocking(successor)),
+                Some(_) => result.diagnostics.push(blocking(
+                    successor,
+                    OrderingBlockReason::UnsupportedActionRoles,
+                )),
+                None => result.diagnostics.push(blocking(
+                    successor,
+                    OrderingBlockReason::UnprovedPredecessor,
+                )),
             }
         }
     }
@@ -126,66 +136,54 @@ pub(crate) fn schedule(
     for members in stage_members.values_mut() {
         members.sort();
     }
-    let emitted_stage_ids = stage_members
-        .iter()
-        .filter_map(|(stage, members)| {
-            orchestration
-                .stages()
-                .iter()
-                .find(|candidate| candidate.id() == stage)
-                .filter(|candidate| {
-                    candidate
-                        .after()
-                        .iter()
-                        .any(|after| stage_members.contains_key(after))
-                })
-                .map(|_| format!("stage/{stage}"))
-                .filter(|_| !members.is_empty())
-        })
-        .collect::<BTreeSet<_>>();
     for stage in orchestration.stages() {
-        let Some(outputs) = stage_members.get(stage.id()) else {
-            continue;
-        };
         let mut inputs = Vec::new();
         for after in stage.after() {
-            let Some(members) = stage_members.get(after) else {
-                continue;
-            };
-            inputs.extend(members.iter().cloned());
-            for output in outputs {
-                if members
-                    .iter()
-                    .any(|input| !legal_stage(roles[input], roles[output]))
-                {
-                    result.diagnostics.push(blocking(output));
+            if let Some(members) = stage_members.get(after) {
+                inputs.extend(members.iter().cloned());
+                if let Some(outputs) = stage_members.get(stage.id()) {
+                    for output in outputs {
+                        if members
+                            .iter()
+                            .any(|input| !legal_stage(roles[input], roles[output]))
+                        {
+                            result.diagnostics.push(blocking(
+                                output,
+                                OrderingBlockReason::UnsupportedActionRoles,
+                            ));
+                        }
+                    }
                 }
             }
         }
         inputs.sort();
         inputs.dedup();
-        if !inputs.is_empty() {
-            result.graph.barriers.push(GraphBarrier {
-                id: format!("stage/{}", stage.id()),
-                after: stage
-                    .after()
-                    .iter()
-                    .map(|id| format!("stage/{id}"))
-                    .filter(|id| emitted_stage_ids.contains(id))
-                    .collect(),
-                input: inputs.iter().map(|id| id.as_str().to_owned()).collect(),
-                output: outputs.iter().map(|id| id.as_str().to_owned()).collect(),
-                provenance: {
-                    let mut provenance = std::iter::once(stage.id().to_owned())
-                        .chain(stage.after().iter().cloned())
-                        .collect::<Vec<_>>();
-                    provenance.sort();
-                    provenance.dedup();
-                    provenance
-                },
-            });
-        }
+        result.graph.barriers.push(GraphBarrier {
+            id: stage.id().to_owned(),
+            after: stage.after().to_vec(),
+            input: inputs.iter().map(|id| id.as_str().to_owned()).collect(),
+            output: stage_members
+                .get(stage.id())
+                .into_iter()
+                .flatten()
+                .map(|id| id.as_str().to_owned())
+                .collect(),
+            provenance: {
+                let mut provenance = std::iter::once(stage.id().to_owned())
+                    .chain(stage.after().iter().cloned())
+                    .collect::<Vec<_>>();
+                provenance.sort();
+                provenance.dedup();
+                provenance
+            },
+        });
     }
+    result.diagnostics.extend(attach_recorded_order_constraints(
+        &mut result.graph,
+        known,
+        &resources,
+        &roles,
+    ));
     result
         .graph
         .direct_edges
@@ -201,16 +199,390 @@ pub(crate) fn schedule(
     if result.graph.schedule.len() != action_ids.len() {
         result.graph.schedule.clear();
         if let Some(id) = action_ids.first() {
-            result.diagnostics.push(blocking(id));
+            result
+                .diagnostics
+                .push(blocking(id, OrderingBlockReason::Cycle));
         }
     }
-    select_topology_publication(
+    let publication_blocks = select_topology_publication(
         &mut result.graph,
         &satisfied_direct,
         orchestration,
         &resources,
+        known,
+    );
+    result.diagnostics.extend(
+        publication_blocks
+            .iter()
+            .map(|id| blocking(id, OrderingBlockReason::UnprovedTopologyPublication)),
     );
     result
+}
+
+/// Retains old barrier order when a new member joins a previously recorded phase.
+fn attach_recorded_order_constraints(
+    graph: &mut PlannedActionGraph,
+    known: &KnownState,
+    resources: &BTreeMap<
+        FullyQualifiedResourceId,
+        &crate::domain::desired::ResolvedResourceOrchestration,
+    >,
+    roles: &BTreeMap<FullyQualifiedResourceId, ActionRole>,
+) -> Vec<Diagnostic> {
+    let recorded = known
+        .topology()
+        .current_barriers()
+        .iter()
+        .chain(known.topology().historical_barriers())
+        .map(|fact| (fact.id.as_str(), fact))
+        .collect::<BTreeMap<_, _>>();
+    let mut blocked = Vec::new();
+    for action in &graph.actions {
+        if !is_current(action.role) {
+            continue;
+        }
+        let Some(stage) = resources
+            .get(&action.resource_id)
+            .and_then(|resource| resource.stage())
+        else {
+            continue;
+        };
+        let Some(existing) = recorded.get(stage) else {
+            continue;
+        };
+        if existing.members.contains(&action.resource_id) {
+            continue;
+        }
+        let Some(output) = graph
+            .barriers
+            .iter_mut()
+            .find(|barrier| barrier.id == stage)
+        else {
+            blocked.push(blocking(
+                &action.resource_id,
+                OrderingBlockReason::UnprovedRecordedPredecessor,
+            ));
+            continue;
+        };
+        let mut pending = existing.after.clone();
+        let mut visited = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            let Some(predecessor) = recorded.get(id.as_str()) else {
+                blocked.push(blocking(
+                    &action.resource_id,
+                    OrderingBlockReason::UnprovedRecordedPredecessor,
+                ));
+                break;
+            };
+            output.provenance.push(id);
+            pending.extend(predecessor.after.iter().cloned());
+            for member in &predecessor.members {
+                match roles.get(member) {
+                    Some(role) if is_current(*role) => {
+                        output.input.push(member.as_str().to_owned());
+                    }
+                    None if known.get_variant(member).is_some()
+                        && resources.contains_key(member) => {}
+                    _ => blocked.push(blocking(
+                        &action.resource_id,
+                        OrderingBlockReason::UnprovedRecordedPredecessor,
+                    )),
+                }
+            }
+        }
+        output.input.sort();
+        output.input.dedup();
+        output.provenance.sort();
+        output.provenance.dedup();
+        if output.input.iter().any(|id| output.output.contains(id)) {
+            blocked.push(blocking(
+                &action.resource_id,
+                OrderingBlockReason::UnprovedRecordedPredecessor,
+            ));
+        }
+    }
+    blocked
+}
+
+type OrderingEdges = BTreeMap<String, BTreeMap<String, String>>;
+
+/// Compares resource reachability, including ordering that has no current action.
+fn recorded_order_conflicts(desired: &ResolvedDesired, known: &KnownState) -> Vec<Diagnostic> {
+    let mut recorded = OrderingEdges::new();
+    let topology = known.topology();
+    for (array, facts) in [
+        ("current", topology.current_direct()),
+        ("historical", topology.historical_direct()),
+    ] {
+        for fact in facts {
+            add_ordering_edge(
+                &mut recorded,
+                fact.from.as_str(),
+                fact.to.as_str(),
+                format!("recorded {array} direct {} -> {}", fact.from, fact.to),
+            );
+        }
+    }
+    let barriers = topology
+        .current_barriers()
+        .iter()
+        .map(|barrier| (barrier.id.as_str(), ("current", barrier)))
+        .chain(
+            topology
+                .historical_barriers()
+                .iter()
+                .map(|barrier| (barrier.id.as_str(), ("historical", barrier))),
+        )
+        .collect::<BTreeMap<_, _>>();
+    for (array, barrier) in barriers.values() {
+        for predecessor in &barrier.after {
+            let Some((input_array, input)) = barriers.get(predecessor.as_str()) else {
+                continue;
+            };
+            for from in &input.members {
+                for to in &barrier.members {
+                    add_ordering_edge(
+                        &mut recorded,
+                        from.as_str(),
+                        to.as_str(),
+                        format!(
+                            "recorded {input_array} phase {} -> {array} phase {}",
+                            input.id, barrier.id
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    let orchestration = desired.orchestration();
+    let mut proposed = OrderingEdges::new();
+    let mut phase_members = BTreeMap::<&str, Vec<(&str, Option<&str>)>>::new();
+    for resource in orchestration.resources() {
+        for predecessor in resource.depends_on() {
+            let source = resource
+                .dependency_sources()
+                .iter()
+                .find(|(id, _)| id == predecessor)
+                .map(|(_, source)| source.clone())
+                .unwrap_or_else(|| {
+                    format!(
+                        "declared direct {} -> {}",
+                        predecessor,
+                        resource.resource_id()
+                    )
+                });
+            add_ordering_edge(
+                &mut proposed,
+                predecessor.as_str(),
+                resource.resource_id().as_str(),
+                source,
+            );
+        }
+        if let Some(stage) = resource.stage() {
+            phase_members
+                .entry(stage)
+                .or_default()
+                .push((resource.resource_id().as_str(), resource.stage_source()));
+        }
+    }
+    let phases = orchestration
+        .stages()
+        .iter()
+        .map(|phase| (phase.id(), phase))
+        .collect::<BTreeMap<_, _>>();
+    for phase in orchestration.stages() {
+        let mut ancestors = BTreeSet::new();
+        let mut pending = phase.after().to_vec();
+        while let Some(id) = pending.pop() {
+            if ancestors.insert(id.clone()) {
+                if let Some(predecessor) = phases.get(id.as_str()) {
+                    pending.extend(predecessor.after().iter().cloned());
+                }
+            }
+        }
+        for ancestor in ancestors {
+            let (Some(inputs), Some(outputs)) = (
+                phase_members.get(ancestor.as_str()),
+                phase_members.get(phase.id()),
+            ) else {
+                continue;
+            };
+            for (from, from_source) in inputs {
+                for (to, to_source) in outputs {
+                    let phase_path = declared_phase_path(&phases, &ancestor, phase.id())
+                        .unwrap_or_else(|| vec![ancestor.clone(), phase.id().to_owned()]);
+                    add_ordering_edge(
+                        &mut proposed,
+                        from,
+                        to,
+                        format!(
+                            "declared phase path {}; membership {} -> {}",
+                            phase_path.join(" -> "),
+                            from_source.unwrap_or("<unspecified>"),
+                            to_source.unwrap_or("<unspecified>")
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    let known_ids = known
+        .variants()
+        .map(|resource| resource.resource_id().as_str().to_owned())
+        .collect::<Vec<_>>();
+    let rebuild_graph = recorded_rebuild_graph(topology);
+    let mut conflicts = Vec::new();
+    for old_before in &known_ids {
+        for old_after in &known_ids {
+            if old_before == old_after {
+                continue;
+            }
+            let (Some(old_sources), Some(proposed_sources)) = (
+                ordering_path(&recorded, old_before, old_after),
+                ordering_path(&proposed, old_after, old_before),
+            ) else {
+                continue;
+            };
+            let mut rebuild = rebuild_component(&rebuild_graph, old_before);
+            rebuild.extend(rebuild_component(&rebuild_graph, old_after));
+            conflicts.push(Diagnostic::RecordedOrderConflict {
+                old_before: FullyQualifiedResourceId::parse(old_before)
+                    .expect("Known ID is canonical"),
+                old_after: FullyQualifiedResourceId::parse(old_after)
+                    .expect("Known ID is canonical"),
+                old_sources,
+                proposed_before: FullyQualifiedResourceId::parse(old_after)
+                    .expect("Known ID is canonical"),
+                proposed_after: FullyQualifiedResourceId::parse(old_before)
+                    .expect("Known ID is canonical"),
+                proposed_sources,
+                rebuild_set: rebuild
+                    .into_iter()
+                    .filter_map(|node| node.strip_prefix("resource:").map(ToOwned::to_owned))
+                    .map(|id| {
+                        FullyQualifiedResourceId::parse(&id).expect("recorded ID is canonical")
+                    })
+                    .collect(),
+            });
+        }
+    }
+    conflicts
+}
+
+fn declared_phase_path(
+    phases: &BTreeMap<&str, &crate::domain::desired::ResolvedStage>,
+    ancestor: &str,
+    descendant: &str,
+) -> Option<Vec<String>> {
+    let mut pending =
+        std::collections::VecDeque::from([(descendant.to_owned(), vec![descendant.to_owned()])]);
+    let mut visited = BTreeSet::new();
+    while let Some((current, path)) = pending.pop_front() {
+        if !visited.insert(current.clone()) {
+            continue;
+        }
+        if current == ancestor {
+            return Some(path.into_iter().rev().collect());
+        }
+        for predecessor in phases.get(current.as_str())?.after() {
+            let mut next = path.clone();
+            next.push(predecessor.clone());
+            pending.push_back((predecessor.clone(), next));
+        }
+    }
+    None
+}
+
+fn add_ordering_edge(edges: &mut OrderingEdges, from: &str, to: &str, source: String) {
+    edges
+        .entry(from.to_owned())
+        .or_default()
+        .entry(to.to_owned())
+        .and_modify(|existing| {
+            if source < *existing {
+                *existing = source.clone();
+            }
+        })
+        .or_insert(source);
+}
+
+fn ordering_path(edges: &OrderingEdges, start: &str, target: &str) -> Option<Vec<String>> {
+    let mut pending = std::collections::VecDeque::from([(start.to_owned(), Vec::new())]);
+    let mut visited = BTreeSet::from([start.to_owned()]);
+    while let Some((node, path)) = pending.pop_front() {
+        for (successor, source) in edges.get(&node).into_iter().flat_map(|edges| edges.iter()) {
+            if !visited.insert(successor.clone()) {
+                continue;
+            }
+            let mut next = path.clone();
+            next.push(source.clone());
+            if successor == target {
+                return Some(next);
+            }
+            pending.push_back((successor.clone(), next));
+        }
+    }
+    None
+}
+
+fn recorded_rebuild_graph(
+    topology: &crate::domain::known::AppliedLifecycleTopology,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut graph = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut connect = |left: String, right: String| {
+        graph.entry(left.clone()).or_default().insert(right.clone());
+        graph.entry(right).or_default().insert(left);
+    };
+    for fact in topology
+        .current_direct()
+        .iter()
+        .chain(topology.historical_direct())
+    {
+        connect(
+            format!("resource:{}", fact.from),
+            format!("resource:{}", fact.to),
+        );
+    }
+    for barrier in topology
+        .current_barriers()
+        .iter()
+        .chain(topology.historical_barriers())
+    {
+        let node = format!("barrier:{}", barrier.id);
+        for member in &barrier.members {
+            connect(node.clone(), format!("resource:{member}"));
+        }
+        for predecessor in &barrier.after {
+            connect(node.clone(), format!("barrier:{predecessor}"));
+        }
+    }
+    graph
+}
+
+fn rebuild_component(
+    graph: &BTreeMap<String, BTreeSet<String>>,
+    resource_id: &str,
+) -> BTreeSet<String> {
+    let start = format!("resource:{resource_id}");
+    let mut pending = vec![start.clone()];
+    let mut visited = BTreeSet::from([start]);
+    while let Some(node) = pending.pop() {
+        for neighbor in graph
+            .get(&node)
+            .into_iter()
+            .flat_map(|neighbors| neighbors.iter())
+        {
+            if visited.insert(neighbor.clone()) {
+                pending.push(neighbor.clone());
+            }
+        }
+    }
+    visited
 }
 
 /// Assigns each direct fact to the successor action that can verify and publish it.
@@ -222,7 +594,8 @@ fn select_topology_publication(
         FullyQualifiedResourceId,
         &crate::domain::desired::ResolvedResourceOrchestration,
     >,
-) {
+    known: &KnownState,
+) -> Vec<FullyQualifiedResourceId> {
     let direct_facts = graph
         .direct_edges
         .iter()
@@ -236,111 +609,204 @@ fn select_topology_publication(
         })
         .chain(satisfied_direct.iter().cloned())
         .collect::<BTreeSet<_>>();
-    for (from, to) in direct_facts {
-        let Some(node) = graph.actions.iter_mut().find(|node| node.resource_id == to) else {
+    let roles = graph
+        .actions
+        .iter()
+        .map(|node| (node.resource_id.clone(), node.role))
+        .collect::<BTreeMap<_, _>>();
+    let snapshot = graph.stale_topology_snapshot.clone();
+    let mut projected = known.topology().clone();
+    let mut blocked = Vec::new();
+    for action_id in graph.schedule.clone() {
+        let Some(node) = graph.actions.iter_mut().find(|node| node.id == action_id) else {
             continue;
         };
-        let fact = AppliedDirectEdge {
-            from,
-            to,
-            origin: "depends_on",
-        };
-        node.topology_authority.current_direct.push(fact.clone());
-        node.topology_delta.add_current_direct.push(fact);
+        if is_current(node.role) {
+            for (from, to) in direct_facts
+                .iter()
+                .filter(|(_, to)| *to == node.resource_id)
+            {
+                let fact = AppliedDirectEdge {
+                    from: from.clone(),
+                    to: to.clone(),
+                    origin: "depends_on",
+                };
+                if !projected.current_direct().contains(&fact)
+                    && !projected.historical_direct().contains(&fact)
+                {
+                    node.topology_authority.current_direct.push(fact.clone());
+                    node.topology_delta.add_current_direct.push(fact);
+                }
+            }
+            if !select_stage_topology_publication(node, orchestration, resources, &projected) {
+                blocked.push(node.resource_id.clone());
+                continue;
+            }
+        } else {
+            select_stale_topology_publication(node, &snapshot, &projected, &roles);
+        }
+        match projected.transition(&node.topology_authority, &node.topology_delta) {
+            Ok(next) => projected = next,
+            Err(_) => blocked.push(node.resource_id.clone()),
+        }
     }
-    let positions = graph
-        .schedule
-        .iter()
-        .enumerate()
-        .map(|(position, id)| (id.clone(), position))
-        .collect::<BTreeMap<_, _>>();
-    select_stage_topology_publication(graph, orchestration, resources, &positions);
-    select_stale_topology_publication(graph, &positions);
+    blocked
 }
 
 /// Publishes stage facts only from actions that verified a member of that stage.
 fn select_stage_topology_publication(
-    graph: &mut PlannedActionGraph,
+    node: &mut GraphAction,
     orchestration: &crate::domain::desired::ResolvedOrchestration,
     resources: &BTreeMap<
         FullyQualifiedResourceId,
         &crate::domain::desired::ResolvedResourceOrchestration,
     >,
-    positions: &BTreeMap<String, usize>,
-) {
-    let mut members = BTreeMap::<String, Vec<FullyQualifiedResourceId>>::new();
-    let mut action_stages = BTreeMap::<String, Vec<String>>::new();
-    for action in &graph.actions {
-        if let Some(stage) = resources
-            .get(&action.resource_id)
-            .and_then(|resource| resource.stage())
-        {
-            members
-                .entry(stage.to_owned())
-                .or_default()
-                .push(action.resource_id.clone());
-            action_stages
-                .entry(stage.to_owned())
-                .or_default()
-                .push(action.id.clone());
-        }
-    }
-    for actions in action_stages.values_mut() {
-        actions.sort_by_key(|id| positions.get(id).copied().unwrap_or(usize::MAX));
-    }
+    projected: &crate::domain::known::AppliedLifecycleTopology,
+) -> bool {
+    let resource_id = &node.resource_id;
+    let Some(stage_id) = resources
+        .get(resource_id)
+        .and_then(|resource| resource.stage())
+    else {
+        return true;
+    };
     let stages = orchestration
         .stages()
         .iter()
         .map(|stage| (stage.id().to_owned(), stage))
         .collect::<BTreeMap<_, _>>();
-    let facts = members
+    let Some(stage) = stages.get(stage_id) else {
+        return false;
+    };
+    let facts = projected
+        .current_barriers()
         .iter()
-        .filter_map(|(stage_id, stage_members)| {
-            stages.get(stage_id).map(|stage| {
-                (
-                    format!("stage/{stage_id}"),
-                    AppliedBarrier {
-                        id: format!("stage/{stage_id}"),
-                        after: stage
-                            .after()
-                            .iter()
-                            .map(|id| format!("stage/{id}"))
-                            .collect(),
-                        members: stage_members.clone(),
-                        origin: "stage",
-                    },
-                )
-            })
-        })
+        .map(|fact| (fact.id.clone(), (true, fact.clone())))
+        .chain(
+            projected
+                .historical_barriers()
+                .iter()
+                .map(|fact| (fact.id.clone(), (false, fact.clone()))),
+        )
         .collect::<BTreeMap<_, _>>();
-    for stage_id in members.keys() {
-        let Some(fact) = facts.get(&format!("stage/{stage_id}")) else {
-            continue;
-        };
-        let owner = action_stages
-            .get(stage_id)
-            .and_then(|actions| actions.last())
-            .cloned();
-        let Some(owner) = owner else {
-            continue;
-        };
-        if let Some(node) = graph.actions.iter_mut().find(|node| node.id == owner) {
-            let mut pending = vec![fact.id.clone()];
-            let mut authority = BTreeMap::new();
-            while let Some(id) = pending.pop() {
-                let Some(candidate) = facts.get(&id) else {
-                    continue;
-                };
-                if authority.insert(id, candidate.clone()).is_none() {
-                    pending.extend(candidate.after.iter().cloned());
-                }
+    let id = canonical_phase_id(stage_id);
+    let before = facts.get(&id).cloned();
+    let mut ancestors = BTreeSet::new();
+    let mut pending = stage.after().to_vec();
+    while let Some(ancestor) = pending.pop() {
+        if ancestors.insert(canonical_phase_id(&ancestor)) {
+            if let Some(predecessor) = stages.get(&ancestor) {
+                pending.extend(predecessor.after().iter().cloned());
             }
-            node.topology_authority
-                .current_barriers
-                .extend(authority.into_values());
-            node.topology_delta.add_current_barriers.push(fact.clone());
         }
     }
+    let mut proved = ancestors.clone();
+    if let Some((_, fact)) = &before {
+        if !fact.members.contains(resource_id) {
+            let mut pending = fact.after.clone();
+            while let Some(predecessor) = pending.pop() {
+                if !proved.insert(predecessor.clone()) {
+                    continue;
+                }
+                let Some((_, recorded)) = facts.get(&predecessor) else {
+                    return false;
+                };
+                pending.extend(recorded.after.iter().cloned());
+            }
+        }
+    }
+    if proved.iter().any(|ancestor| {
+        facts.get(ancestor).is_some_and(|(_, fact)| {
+            fact.members
+                .iter()
+                .any(|member| !resources.contains_key(member))
+        })
+    }) {
+        return false;
+    }
+    let candidates = ancestors
+        .into_iter()
+        .filter(|ancestor| facts.contains_key(ancestor))
+        .collect::<BTreeSet<_>>();
+    let mut after = before
+        .as_ref()
+        .map(|(_, fact)| fact.after.iter().cloned().collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    for candidate in &candidates {
+        if after.contains(candidate) {
+            continue;
+        }
+        if candidates
+            .iter()
+            .chain(after.iter())
+            .any(|other| other != candidate && recorded_phase_reaches(&facts, candidate, other))
+        {
+            continue;
+        }
+        after.insert(candidate.clone());
+    }
+    let mut members = before
+        .as_ref()
+        .map(|(_, fact)| fact.members.clone())
+        .unwrap_or_default();
+    if !members.contains(resource_id) {
+        members.push(resource_id.clone());
+        members.sort();
+    }
+    let next = AppliedBarrier {
+        id,
+        after: after.into_iter().collect(),
+        members,
+        origin: "stage",
+    };
+    match before {
+        None => {
+            node.topology_authority.current_barriers.push(next.clone());
+            node.topology_delta.add_current_barriers.push(next);
+        }
+        Some((is_current_array, previous)) if previous != next => {
+            let advance = TopologyBarrierAdvance::new(previous.clone(), next)
+                .expect("current output advances only its member and proved predecessors");
+            if is_current_array {
+                node.topology_authority.current_barriers.push(previous);
+                node.topology_delta.advance_current_barriers.push(advance);
+            } else {
+                node.topology_authority.historical_barriers.push(previous);
+                node.topology_delta
+                    .advance_historical_barriers
+                    .push(advance);
+            }
+        }
+        Some(_) => {}
+    }
+    true
+}
+
+fn recorded_phase_reaches(
+    facts: &BTreeMap<String, (bool, AppliedBarrier)>,
+    ancestor: &str,
+    descendant: &str,
+) -> bool {
+    let mut pending = vec![descendant.to_owned()];
+    let mut visited = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id.clone()) {
+            continue;
+        }
+        if id == ancestor {
+            return true;
+        }
+        if let Some((_, fact)) = facts.get(&id) {
+            pending.extend(fact.after.iter().cloned());
+        }
+    }
+    false
+}
+
+fn canonical_phase_id(id: &str) -> String {
+    id.strip_prefix("stage/")
+        .map(|_| id.to_owned())
+        .unwrap_or_else(|| format!("stage/{id}"))
 }
 
 fn final_scheduled_member(
@@ -361,102 +827,105 @@ fn final_scheduled_member(
 }
 
 fn select_stale_topology_publication(
-    graph: &mut PlannedActionGraph,
-    positions: &BTreeMap<String, usize>,
+    node: &mut GraphAction,
+    snapshot: &StaleTopologySnapshot,
+    projected: &crate::domain::known::AppliedLifecycleTopology,
+    roles: &BTreeMap<FullyQualifiedResourceId, ActionRole>,
 ) {
-    let stale = graph
-        .actions
-        .iter()
-        .filter(|action| {
-            matches!(
-                action.role,
-                ActionRole::StaleRemove | ActionRole::ForgetMissing
-            )
-        })
-        .map(|action| action.id.clone())
-        .collect::<BTreeSet<_>>();
     for (is_current, edges) in [
-        (true, &graph.stale_topology_snapshot.current_direct),
-        (false, &graph.stale_topology_snapshot.historical_direct),
+        (true, &snapshot.current_direct),
+        (false, &snapshot.historical_direct),
     ] {
         for edge in edges {
             // In a fully stale relation the successor owns the reversed removal.
             // An incident mixed fact has exactly one stale endpoint, which is its sole owner.
-            let owner = if stale.contains(edge.to.as_str()) {
-                edge.to.as_str()
+            let owner = if matches!(
+                roles.get(&edge.to),
+                Some(ActionRole::StaleRemove | ActionRole::ForgetMissing)
+            ) {
+                &edge.to
             } else {
-                edge.from.as_str()
+                &edge.from
             };
-            if !stale.contains(owner) {
+            if owner != &node.resource_id {
                 continue;
             }
-            if let Some(node) = graph.actions.iter_mut().find(|node| node.id == owner) {
-                if is_current {
-                    node.topology_authority.current_direct.push(edge.clone());
-                    node.topology_delta.remove_current_direct.push(edge.clone());
-                } else {
-                    node.topology_authority.historical_direct.push(edge.clone());
-                    node.topology_delta
-                        .remove_historical_direct
-                        .push(edge.clone());
-                }
+            if is_current && projected.current_direct().contains(edge) {
+                node.topology_authority.current_direct.push(edge.clone());
+                node.topology_delta.remove_current_direct.push(edge.clone());
+            } else if !is_current && projected.historical_direct().contains(edge) {
+                node.topology_authority.historical_direct.push(edge.clone());
+                node.topology_delta
+                    .remove_historical_direct
+                    .push(edge.clone());
             }
         }
     }
-    for (is_current, barriers) in [
-        (true, &graph.stale_topology_snapshot.current_barriers),
-        (false, &graph.stale_topology_snapshot.historical_barriers),
-    ] {
-        for barrier in barriers {
-            let mut owners = barrier
-                .members
+    let before = projected
+        .current_barriers()
+        .iter()
+        .map(|fact| (fact.id.clone(), (true, fact.clone())))
+        .chain(
+            projected
+                .historical_barriers()
                 .iter()
-                .filter(|member| stale.contains(member.as_str()))
-                .map(|member| member.as_str())
-                .collect::<Vec<_>>();
-            owners.sort_by_key(|owner| positions.get(*owner).copied().unwrap_or(usize::MAX));
-            let mut before = barrier.clone();
-            for owner in owners {
-                let mut after = before.clone();
-                after.members.retain(|member| member.as_str() != owner);
-                let Some(node) = graph.actions.iter_mut().find(|node| node.id == owner) else {
-                    continue;
-                };
+                .map(|fact| (fact.id.clone(), (false, fact.clone()))),
+        )
+        .collect::<BTreeMap<_, _>>();
+    let mut after = before.clone();
+    let mut emptied = BTreeSet::new();
+    for (id, (_, fact)) in &before {
+        if !fact.members.contains(&node.resource_id) {
+            continue;
+        }
+        let projected_fact = &mut after.get_mut(id).expect("selected barrier exists").1;
+        projected_fact
+            .members
+            .retain(|member| member != &node.resource_id);
+        if projected_fact.members.is_empty() {
+            after.remove(id);
+            emptied.insert(id.clone());
+        }
+    }
+    if !emptied.is_empty() {
+        for (_, fact) in after.values_mut() {
+            fact.after
+                .retain(|predecessor| !emptied.contains(predecessor));
+        }
+    }
+    for (id, (is_current, original)) in before {
+        match after.get(&id) {
+            None => {
                 if is_current {
                     node.topology_authority
                         .current_barriers
-                        .push(before.clone());
-                    if after.members.is_empty() {
-                        node.topology_delta
-                            .remove_current_barriers
-                            .push(before.clone());
-                    } else {
-                        node.topology_delta.replace_current_barriers.push(
-                            TopologyBarrierReplacement {
-                                before: before.clone(),
-                                after: after.clone(),
-                            },
-                        );
-                    }
+                        .push(original.clone());
+                    node.topology_delta.remove_current_barriers.push(original);
                 } else {
                     node.topology_authority
                         .historical_barriers
-                        .push(before.clone());
-                    if after.members.is_empty() {
-                        node.topology_delta
-                            .remove_historical_barriers
-                            .push(before.clone());
-                    } else {
-                        node.topology_delta.replace_historical_barriers.push(
-                            TopologyBarrierReplacement {
-                                before: before.clone(),
-                                after: after.clone(),
-                            },
-                        );
-                    }
+                        .push(original.clone());
+                    node.topology_delta
+                        .remove_historical_barriers
+                        .push(original);
                 }
-                before = after;
             }
+            Some((_, next)) if next != &original => {
+                let replacement = TopologyBarrierReplacement::new(original.clone(), next.clone())
+                    .expect("stale action only removes its member or emptied predecessors");
+                if is_current {
+                    node.topology_authority.current_barriers.push(original);
+                    node.topology_delta
+                        .replace_current_barriers
+                        .push(replacement);
+                } else {
+                    node.topology_authority.historical_barriers.push(original);
+                    node.topology_delta
+                        .replace_historical_barriers
+                        .push(replacement);
+                }
+            }
+            Some(_) => {}
         }
     }
 }
@@ -496,7 +965,11 @@ fn topological_schedule(
             .or_default()
             .push(to.as_str().to_owned());
     }
-    for barrier in barriers.iter().chain(stale_barriers) {
+    for barrier in barriers
+        .iter()
+        .chain(stale_barriers)
+        .filter(|barrier| !barrier.input.is_empty())
+    {
         barrier_remaining.insert(barrier.id.clone(), barrier.input.len());
         barrier_outputs.insert(barrier.id.clone(), barrier.output.clone());
         for input in &barrier.input {
@@ -511,14 +984,77 @@ fn topological_schedule(
                 .expect("barriers name actions") += 1;
         }
     }
+    let phase_barriers = barriers
+        .iter()
+        .filter(|barrier| !barrier.id.starts_with("stale/"))
+        .map(|barrier| (barrier.id.clone(), barrier))
+        .collect::<BTreeMap<_, _>>();
+    let mut phase_of_action = BTreeMap::<String, String>::new();
+    let mut phase_remaining = BTreeMap::<String, usize>::new();
+    let mut predecessor_remaining = BTreeMap::<String, usize>::new();
+    let mut phase_successors = BTreeMap::<String, Vec<String>>::new();
+    for (id, barrier) in &phase_barriers {
+        phase_remaining.insert(id.clone(), barrier.output.len());
+        predecessor_remaining.insert(id.clone(), barrier.after.len());
+        for predecessor in &barrier.after {
+            phase_successors
+                .entry(predecessor.clone())
+                .or_default()
+                .push(id.clone());
+        }
+        for output in &barrier.output {
+            phase_of_action.insert(output.clone(), id.clone());
+            *incoming
+                .get_mut(&FullyQualifiedResourceId::parse(output).expect("canonical action ID"))
+                .expect("phase members name actions") += 1;
+        }
+    }
     let mut ready = incoming
         .iter()
         .filter(|(_, count)| **count == 0)
         .map(|(id, _)| id.clone())
         .collect::<BTreeSet<_>>();
+    let mut ready_phases = predecessor_remaining
+        .iter()
+        .filter(|(_, count)| **count == 0)
+        .map(|(id, _)| id.clone())
+        .collect::<std::collections::VecDeque<_>>();
+    release_ready_phases(
+        &mut ready_phases,
+        &phase_barriers,
+        &phase_remaining,
+        &mut predecessor_remaining,
+        &phase_successors,
+        &mut incoming,
+        &mut ready,
+    );
     let mut schedule = Vec::new();
     while let Some(id) = ready.pop_first() {
         schedule.push(id.as_str().to_owned());
+        if let Some(phase) = phase_of_action.get(id.as_str()) {
+            let remaining = phase_remaining.get_mut(phase).expect("known phase");
+            *remaining -= 1;
+            if *remaining == 0 {
+                for successor in phase_successors.get(phase).into_iter().flatten() {
+                    let count = predecessor_remaining
+                        .get_mut(successor)
+                        .expect("known phase");
+                    *count -= 1;
+                    if *count == 0 {
+                        ready_phases.push_back(successor.clone());
+                    }
+                }
+                release_ready_phases(
+                    &mut ready_phases,
+                    &phase_barriers,
+                    &phase_remaining,
+                    &mut predecessor_remaining,
+                    &phase_successors,
+                    &mut incoming,
+                    &mut ready,
+                );
+            }
+        }
         for successor in outgoing.get(id.as_str()).into_iter().flatten() {
             if let Some(remaining) = barrier_remaining.get_mut(successor) {
                 *remaining -= 1;
@@ -549,6 +1085,39 @@ fn topological_schedule(
     schedule
 }
 
+fn release_ready_phases(
+    queue: &mut std::collections::VecDeque<String>,
+    phases: &BTreeMap<String, &GraphBarrier>,
+    remaining_actions: &BTreeMap<String, usize>,
+    remaining_predecessors: &mut BTreeMap<String, usize>,
+    successors: &BTreeMap<String, Vec<String>>,
+    incoming: &mut BTreeMap<FullyQualifiedResourceId, usize>,
+    ready: &mut BTreeSet<FullyQualifiedResourceId>,
+) {
+    while let Some(phase) = queue.pop_front() {
+        let barrier = phases[&phase];
+        for output in &barrier.output {
+            let id = FullyQualifiedResourceId::parse(output).expect("canonical phase action");
+            let count = incoming.get_mut(&id).expect("phase action exists");
+            *count -= 1;
+            if *count == 0 {
+                ready.insert(id);
+            }
+        }
+        if remaining_actions[&phase] == 0 {
+            for successor in successors.get(&phase).into_iter().flatten() {
+                let count = remaining_predecessors
+                    .get_mut(successor)
+                    .expect("known phase");
+                *count -= 1;
+                if *count == 0 {
+                    queue.push_back(successor.clone());
+                }
+            }
+        }
+    }
+}
+
 fn stale_snapshot(
     known: &KnownState,
     roles: &BTreeMap<FullyQualifiedResourceId, ActionRole>,
@@ -566,27 +1135,39 @@ fn stale_snapshot(
             .cloned()
             .collect()
     };
-    let select_barriers = |facts: &[AppliedBarrier]| {
-        let mut selected = facts
-            .iter()
-            .filter(|fact| fact.members.iter().any(stale))
-            .cloned()
-            .collect::<Vec<_>>();
-        loop {
-            let additions = selected
-                .iter()
-                .flat_map(|barrier| barrier.after.iter())
-                .filter_map(|id| facts.iter().find(|candidate| candidate.id == *id))
-                .filter(|candidate| !selected.iter().any(|existing| existing.id == candidate.id))
-                .cloned()
-                .collect::<Vec<_>>();
-            if additions.is_empty() {
-                break;
+    let all_barriers = known
+        .topology()
+        .current_barriers()
+        .iter()
+        .chain(known.topology().historical_barriers())
+        .map(|fact| (fact.id.clone(), fact))
+        .collect::<BTreeMap<_, _>>();
+    let mut selected = all_barriers
+        .values()
+        .filter(|fact| fact.members.iter().any(stale))
+        .map(|fact| fact.id.clone())
+        .collect::<BTreeSet<_>>();
+    loop {
+        let mut additions = BTreeSet::new();
+        for fact in all_barriers.values() {
+            if selected.contains(&fact.id) {
+                additions.extend(fact.after.iter().cloned());
+            } else if fact.after.iter().any(|after| selected.contains(after)) {
+                additions.insert(fact.id.clone());
             }
-            selected.extend(additions);
         }
-        selected.sort_by(|left, right| left.id.cmp(&right.id));
-        selected
+        let previous_len = selected.len();
+        selected.extend(additions);
+        if selected.len() == previous_len {
+            break;
+        }
+    }
+    let select_barriers = |facts: &[AppliedBarrier]| {
+        facts
+            .iter()
+            .filter(|fact| selected.contains(&fact.id))
+            .cloned()
+            .collect::<Vec<_>>()
     };
     StaleTopologySnapshot {
         current_direct: select_direct(known.topology().current_direct()),
@@ -671,7 +1252,9 @@ fn stale_constraints(
                 .first()
                 .and_then(|id| FullyQualifiedResourceId::parse(id).ok())
             {
-                result.diagnostics.push(blocking(&id));
+                result
+                    .diagnostics
+                    .push(blocking(&id, OrderingBlockReason::Cycle));
             }
         }
     }
@@ -690,12 +1273,10 @@ fn stale_barrier_constraint_id(barrier_id: &str, after: &str) -> String {
     )
 }
 
-// W3 cannot widen CLI diagnostics, which W4 owns. This existing blocking envelope
-// preserves fail-closed behavior until schema-5 diagnostics are serialized there.
-fn blocking(resource_id: &FullyQualifiedResourceId) -> Diagnostic {
-    Diagnostic::UnsupportedPlatform {
+fn blocking(resource_id: &FullyQualifiedResourceId, reason: OrderingBlockReason) -> Diagnostic {
+    Diagnostic::OrderingBlocked {
         resource_id: resource_id.clone(),
-        action_kind: ActionKind::Noop,
+        reason,
     }
 }
 
@@ -717,6 +1298,35 @@ mod tests {
             ResolvedPath::new(root.join("home").join(id.replace('/', "-"))).unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn missing_direct_predecessor_reports_ordering_proof_failure() {
+        let successor = resource("root/successor");
+        let predecessor = FullyQualifiedResourceId::parse("root/predecessor").unwrap();
+        let desired = desired(
+            vec![successor.clone()],
+            ResolvedOrchestration::new(
+                vec![],
+                vec![ResolvedResourceOrchestration::new(
+                    successor.resource_id().clone(),
+                    None,
+                    vec![predecessor],
+                )],
+            ),
+        );
+        let result = schedule(
+            &desired,
+            &KnownState::empty(),
+            &[PlannedAction::create_link(successor).into()],
+        );
+        assert!(matches!(
+            result.diagnostics(),
+            [Diagnostic::OrderingBlocked {
+                reason: OrderingBlockReason::UnprovedPredecessor,
+                ..
+            }]
+        ));
     }
     fn desired(
         resources: Vec<ResolvedFileLink>,
@@ -795,9 +1405,14 @@ mod tests {
             PlannedAction::create_link(alpha).into(),
         ];
         let compact = schedule(&desired, &KnownState::empty(), &actions).plan_graph();
-        assert_eq!(compact.barriers.len(), 1);
-        assert_eq!(compact.barriers[0].input, ["root/alpha", "root/beta"]);
-        assert_eq!(compact.barriers[0].output, ["root/gamma"]);
+        assert_eq!(compact.barriers.len(), 2);
+        let second = compact
+            .barriers
+            .iter()
+            .find(|barrier| barrier.id == "root/second")
+            .unwrap();
+        assert_eq!(second.input, ["root/alpha", "root/beta"]);
+        assert_eq!(second.output, ["root/gamma"]);
         assert!(compact.direct_edges.is_empty());
         assert_eq!(compact.schedule, ["root/alpha", "root/beta", "root/gamma"]);
     }
@@ -838,7 +1453,12 @@ mod tests {
         )
         .plan_graph();
 
-        assert_eq!(graph.barriers[0].provenance, ["root/a", "root/z"]);
+        let late = graph
+            .barriers
+            .iter()
+            .find(|barrier| barrier.id == "root/z")
+            .unwrap();
+        assert_eq!(late.provenance, ["root/a", "root/z"]);
     }
 
     #[test]
@@ -914,16 +1534,11 @@ mod tests {
                 .iter()
                 .any(|barrier| barrier.id.starts_with("stale/"))
         );
-        assert!(
-            graph
-                .barriers
-                .iter()
-                .any(|barrier| barrier.id == "stage/root/z")
-        );
+        assert!(graph.barriers.iter().any(|barrier| barrier.id == "root/z"));
     }
 
     #[test]
-    fn forward_barrier_is_published_only_by_its_final_output_after_all_inputs() {
+    fn each_successful_output_advances_exact_barrier_membership() {
         let input_a = resource("root/input-a");
         let input_b = resource("root/input-b");
         let output_a = resource("root/output-a");
@@ -991,7 +1606,27 @@ mod tests {
             .filter(|action| !action.topology_delta.add_current_barriers.is_empty())
             .map(|action| action.id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(publishers, ["root/input-b", "root/output-b"]);
+        assert_eq!(publishers, ["root/input-a", "root/output-a"]);
+        let advancers = graph
+            .actions
+            .iter()
+            .filter(|action| !action.topology_delta.advance_current_barriers.is_empty())
+            .map(|action| action.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(advancers, ["root/input-b", "root/output-b"]);
+        let mut topology = crate::domain::known::AppliedLifecycleTopology::default();
+        for id in &graph.schedule {
+            let node = graph
+                .actions
+                .iter()
+                .find(|action| action.id == *id)
+                .unwrap();
+            topology = topology
+                .transition(&node.topology_authority, &node.topology_delta)
+                .unwrap();
+        }
+        assert_eq!(topology.current_barriers().len(), 2);
+        assert_eq!(topology.current_barriers()[1].members.len(), 2);
     }
 
     #[test]
@@ -1312,11 +1947,1140 @@ mod tests {
             .collect::<Vec<_>>();
         let graph = schedule(&desired, &KnownState::empty(), &actions).plan_graph();
         assert_eq!(graph.direct_edges.len(), 0);
-        assert_eq!(graph.barriers.len(), 1);
-        assert_eq!(
-            graph.barriers[0].input.len() + graph.barriers[0].output.len(),
-            64
-        );
+        assert_eq!(graph.barriers.len(), 2);
+        let second = graph
+            .barriers
+            .iter()
+            .find(|barrier| barrier.id == "root/second")
+            .unwrap();
+        assert_eq!(second.input.len() + second.output.len(), 64);
         assert_eq!(graph.schedule.len(), 64);
+    }
+
+    #[test]
+    fn empty_intermediate_phase_preserves_compact_schedule_reachability() {
+        let a = resource("root/a");
+        let c = resource("root/c");
+        let desired = desired(
+            vec![a.clone(), c.clone()],
+            ResolvedOrchestration::new(
+                vec![
+                    ResolvedStage::new("stage/root/a".into(), vec![]),
+                    ResolvedStage::new("stage/root/b".into(), vec!["stage/root/a".into()]),
+                    ResolvedStage::new("stage/root/c".into(), vec!["stage/root/b".into()]),
+                ],
+                vec![
+                    ResolvedResourceOrchestration::new(
+                        a.resource_id().clone(),
+                        Some("stage/root/a".into()),
+                        vec![],
+                    ),
+                    ResolvedResourceOrchestration::new(
+                        c.resource_id().clone(),
+                        Some("stage/root/c".into()),
+                        vec![],
+                    ),
+                ],
+            ),
+        );
+        let graph = schedule(
+            &desired,
+            &KnownState::empty(),
+            &[
+                PlannedAction::create_link(c).into(),
+                PlannedAction::create_link(a).into(),
+            ],
+        );
+        assert!(graph.diagnostics().is_empty());
+        let graph = graph.plan_graph();
+        assert_eq!(graph.schedule, ["root/a", "root/c"]);
+        assert!(graph.direct_edges.is_empty());
+        assert_eq!(graph.barriers.len(), 3);
+        let middle = graph
+            .barriers
+            .iter()
+            .find(|barrier| barrier.id == "stage/root/b")
+            .unwrap();
+        assert!(middle.output.is_empty());
+        assert_eq!(middle.after, ["stage/root/a"]);
+        let late = graph
+            .actions
+            .iter()
+            .find(|action| action.id == "root/c")
+            .unwrap();
+        assert_eq!(
+            late.topology_delta.add_current_barriers[0].after,
+            ["stage/root/a"]
+        );
+        assert!(graph.actions.iter().all(|action| {
+            action
+                .topology_delta
+                .add_current_barriers
+                .iter()
+                .all(|fact| fact.id != "stage/root/b")
+        }));
+        let mut topology = crate::domain::known::AppliedLifecycleTopology::default();
+        for id in &graph.schedule {
+            let node = graph
+                .actions
+                .iter()
+                .find(|action| action.id == *id)
+                .unwrap();
+            topology = topology
+                .transition(&node.topology_authority, &node.topology_delta)
+                .unwrap();
+        }
+        assert_eq!(topology.current_barriers().len(), 2);
+    }
+
+    #[test]
+    fn branching_phases_join_after_both_outputs_without_pair_edges() {
+        let left = resource("root/left");
+        let right = resource("root/right");
+        let join = resource("root/join");
+        let desired = desired(
+            vec![join.clone(), right.clone(), left.clone()],
+            ResolvedOrchestration::new(
+                vec![
+                    ResolvedStage::new("stage/root/left".into(), vec![]),
+                    ResolvedStage::new("stage/root/right".into(), vec![]),
+                    ResolvedStage::new(
+                        "stage/root/join".into(),
+                        vec!["stage/root/left".into(), "stage/root/right".into()],
+                    ),
+                ],
+                vec![
+                    ResolvedResourceOrchestration::new(
+                        left.resource_id().clone(),
+                        Some("stage/root/left".into()),
+                        vec![],
+                    ),
+                    ResolvedResourceOrchestration::new(
+                        right.resource_id().clone(),
+                        Some("stage/root/right".into()),
+                        vec![],
+                    ),
+                    ResolvedResourceOrchestration::new(
+                        join.resource_id().clone(),
+                        Some("stage/root/join".into()),
+                        vec![],
+                    ),
+                ],
+            ),
+        );
+        let graph = schedule(
+            &desired,
+            &KnownState::empty(),
+            &[
+                PlannedAction::create_link(join).into(),
+                PlannedAction::create_link(right).into(),
+                PlannedAction::create_link(left).into(),
+            ],
+        )
+        .plan_graph();
+        assert_eq!(graph.schedule, ["root/left", "root/right", "root/join"]);
+        assert!(graph.direct_edges.is_empty());
+        let joined = graph
+            .actions
+            .iter()
+            .find(|node| node.id == "root/join")
+            .unwrap();
+        assert_eq!(
+            joined.topology_delta.add_current_barriers[0].after,
+            ["stage/root/left", "stage/root/right"]
+        );
+    }
+
+    #[test]
+    fn unchanged_recorded_middle_keeps_both_independently_proved_predecessors() {
+        let a = resource("root/a");
+        let b = resource("root/b");
+        let c = resource("root/c");
+        let known = KnownState::new([crate::domain::known::KnownFileLink::from_resolved(&b)])
+            .unwrap()
+            .with_topology(crate::domain::known::AppliedLifecycleTopology::new(
+                vec![],
+                vec![],
+                vec![AppliedBarrier {
+                    id: "stage/root/b".into(),
+                    after: vec![],
+                    members: vec![b.resource_id().clone()],
+                    origin: "stage",
+                }],
+                vec![],
+            ));
+        let desired = desired(
+            vec![a.clone(), b.clone(), c.clone()],
+            ResolvedOrchestration::new(
+                vec![
+                    ResolvedStage::new("stage/root/a".into(), vec![]),
+                    ResolvedStage::new("stage/root/b".into(), vec!["stage/root/a".into()]),
+                    ResolvedStage::new("stage/root/c".into(), vec!["stage/root/b".into()]),
+                ],
+                vec![
+                    ResolvedResourceOrchestration::new(
+                        a.resource_id().clone(),
+                        Some("stage/root/a".into()),
+                        vec![],
+                    ),
+                    ResolvedResourceOrchestration::new(
+                        b.resource_id().clone(),
+                        Some("stage/root/b".into()),
+                        vec![],
+                    ),
+                    ResolvedResourceOrchestration::new(
+                        c.resource_id().clone(),
+                        Some("stage/root/c".into()),
+                        vec![],
+                    ),
+                ],
+            ),
+        );
+        let graph = schedule(
+            &desired,
+            &known,
+            &[
+                PlannedAction::create_link(c).into(),
+                PlannedAction::create_link(a).into(),
+            ],
+        );
+        assert!(graph.diagnostics().is_empty());
+        let graph = graph.plan_graph();
+        let late = graph
+            .actions
+            .iter()
+            .find(|action| action.id == "root/c")
+            .unwrap();
+        assert_eq!(
+            late.topology_delta.add_current_barriers[0].after,
+            ["stage/root/a", "stage/root/b"]
+        );
+        assert!(graph.actions.iter().all(|action| {
+            action
+                .topology_delta
+                .add_current_barriers
+                .iter()
+                .all(|fact| fact.id != "stage/root/b")
+        }));
+        let mut topology = known.topology().clone();
+        for id in &graph.schedule {
+            let node = graph
+                .actions
+                .iter()
+                .find(|action| action.id == *id)
+                .unwrap();
+            topology = topology
+                .transition(&node.topology_authority, &node.topology_delta)
+                .unwrap();
+        }
+        assert_eq!(
+            topology.current_barriers()[2].after,
+            ["stage/root/a", "stage/root/b"]
+        );
+    }
+
+    #[test]
+    fn successful_middle_action_proves_chain_without_shortcut() {
+        let a = resource("root/a");
+        let b = resource("root/b");
+        let c = resource("root/c");
+        let desired = desired(
+            vec![a.clone(), b.clone(), c.clone()],
+            ResolvedOrchestration::new(
+                vec![
+                    ResolvedStage::new("stage/root/a".into(), vec![]),
+                    ResolvedStage::new("stage/root/b".into(), vec!["stage/root/a".into()]),
+                    ResolvedStage::new("stage/root/c".into(), vec!["stage/root/b".into()]),
+                ],
+                vec![
+                    ResolvedResourceOrchestration::new(
+                        a.resource_id().clone(),
+                        Some("stage/root/a".into()),
+                        vec![],
+                    ),
+                    ResolvedResourceOrchestration::new(
+                        b.resource_id().clone(),
+                        Some("stage/root/b".into()),
+                        vec![],
+                    ),
+                    ResolvedResourceOrchestration::new(
+                        c.resource_id().clone(),
+                        Some("stage/root/c".into()),
+                        vec![],
+                    ),
+                ],
+            ),
+        );
+        let graph = schedule(
+            &desired,
+            &KnownState::empty(),
+            &[
+                PlannedAction::create_link(c).into(),
+                PlannedAction::create_link(b).into(),
+                PlannedAction::create_link(a).into(),
+            ],
+        )
+        .plan_graph();
+        assert_eq!(graph.schedule, ["root/a", "root/b", "root/c"]);
+        let late = graph
+            .actions
+            .iter()
+            .find(|action| action.id == "root/c")
+            .unwrap();
+        assert_eq!(
+            late.topology_delta.add_current_barriers[0].after,
+            ["stage/root/b"]
+        );
+    }
+
+    #[test]
+    fn acted_on_recorded_member_advances_only_proved_relation() {
+        let a = resource("root/a");
+        let b = resource("root/b");
+        let old_b = ResolvedFileLink::new(
+            b.resource_id().clone(),
+            ResolvedPath::new(std::env::temp_dir().join("loadout-action-graph/old-b")).unwrap(),
+            b.target_path().clone(),
+        )
+        .unwrap();
+        let known_b = crate::domain::known::KnownFileLink::from_resolved(&old_b);
+        let known = KnownState::new([known_b.clone()]).unwrap().with_topology(
+            crate::domain::known::AppliedLifecycleTopology::new(
+                vec![],
+                vec![],
+                vec![AppliedBarrier {
+                    id: "stage/root/b".into(),
+                    after: vec![],
+                    members: vec![b.resource_id().clone()],
+                    origin: "stage",
+                }],
+                vec![],
+            ),
+        );
+        let desired = desired(
+            vec![a.clone(), b.clone()],
+            ResolvedOrchestration::new(
+                vec![
+                    ResolvedStage::new("stage/root/a".into(), vec![]),
+                    ResolvedStage::new("stage/root/b".into(), vec!["stage/root/a".into()]),
+                ],
+                vec![
+                    ResolvedResourceOrchestration::new(
+                        a.resource_id().clone(),
+                        Some("stage/root/a".into()),
+                        vec![],
+                    ),
+                    ResolvedResourceOrchestration::new(
+                        b.resource_id().clone(),
+                        Some("stage/root/b".into()),
+                        vec![],
+                    ),
+                ],
+            ),
+        );
+        let action_b = PlannedAction::replace_link(b, known_b).unwrap();
+        let graph = schedule(
+            &desired,
+            &known,
+            &[action_b.into(), PlannedAction::create_link(a).into()],
+        );
+        assert!(graph.diagnostics().is_empty());
+        let graph = graph.plan_graph();
+        let output = graph
+            .actions
+            .iter()
+            .find(|node| node.id == "root/b")
+            .unwrap();
+        let advance = &output.topology_delta.advance_current_barriers[0];
+        assert_eq!(advance.before.members, advance.after.members);
+        assert!(advance.before.after.is_empty());
+        assert_eq!(advance.after.after, ["stage/root/a"]);
+        assert_eq!(
+            output.topology_authority.current_barriers.as_slice(),
+            std::slice::from_ref(&advance.before)
+        );
+    }
+
+    #[test]
+    fn stale_final_member_removes_surviving_successor_reference_atomically() {
+        let a = resource("root/a");
+        let c = resource("root/c");
+        let known = KnownState::new([
+            crate::domain::known::KnownFileLink::from_resolved(&a),
+            crate::domain::known::KnownFileLink::from_resolved(&c),
+        ])
+        .unwrap()
+        .with_topology(crate::domain::known::AppliedLifecycleTopology::new(
+            vec![],
+            vec![],
+            vec![
+                AppliedBarrier {
+                    id: "stage/root/a".into(),
+                    after: vec![],
+                    members: vec![a.resource_id().clone()],
+                    origin: "stage",
+                },
+                AppliedBarrier {
+                    id: "stage/root/c".into(),
+                    after: vec!["stage/root/a".into()],
+                    members: vec![c.resource_id().clone()],
+                    origin: "stage",
+                },
+            ],
+            vec![],
+        ));
+        let desired = desired(vec![c], ResolvedOrchestration::default());
+        let graph = schedule(
+            &desired,
+            &known,
+            &[
+                PlannedAction::remove_link(crate::domain::known::KnownFileLink::from_resolved(&a))
+                    .into(),
+            ],
+        );
+        assert!(graph.diagnostics().is_empty());
+        let graph = graph.plan_graph();
+        let action = &graph.actions[0];
+        assert_eq!(action.topology_delta.remove_current_barriers.len(), 1);
+        assert_eq!(action.topology_delta.replace_current_barriers.len(), 1);
+        let cleanup = &action.topology_delta.replace_current_barriers[0];
+        assert_eq!(cleanup.before.id, "stage/root/c");
+        assert_eq!(cleanup.before.members, cleanup.after.members);
+        assert!(cleanup.after.after.is_empty());
+        let after = known
+            .topology()
+            .transition(&action.topology_authority, &action.topology_delta)
+            .unwrap();
+        assert_eq!(after.current_barriers().len(), 1);
+        assert_eq!(after.current_barriers()[0].id, "stage/root/c");
+    }
+
+    #[test]
+    fn mixed_current_and_stale_actions_use_exact_projected_barrier_facts() {
+        let new = resource("root/a");
+        let old = resource("root/x");
+        let known = KnownState::new([crate::domain::known::KnownFileLink::from_resolved(&old)])
+            .unwrap()
+            .with_topology(crate::domain::known::AppliedLifecycleTopology::new(
+                vec![],
+                vec![],
+                vec![AppliedBarrier {
+                    id: "stage/root/p".into(),
+                    after: vec![],
+                    members: vec![old.resource_id().clone()],
+                    origin: "stage",
+                }],
+                vec![],
+            ));
+        let desired = desired(
+            vec![new.clone()],
+            ResolvedOrchestration::new(
+                vec![ResolvedStage::new("stage/root/p".into(), vec![])],
+                vec![ResolvedResourceOrchestration::new(
+                    new.resource_id().clone(),
+                    Some("stage/root/p".into()),
+                    vec![],
+                )],
+            ),
+        );
+        let graph = schedule(
+            &desired,
+            &known,
+            &[
+                PlannedAction::create_link(new).into(),
+                PlannedAction::remove_link(crate::domain::known::KnownFileLink::from_resolved(
+                    &old,
+                ))
+                .into(),
+            ],
+        );
+        assert!(graph.diagnostics().is_empty());
+        let graph = graph.plan_graph();
+        assert_eq!(graph.schedule, ["root/a", "root/x"]);
+        let add = graph
+            .actions
+            .iter()
+            .find(|node| node.id == "root/a")
+            .unwrap();
+        let remove = graph
+            .actions
+            .iter()
+            .find(|node| node.id == "root/x")
+            .unwrap();
+        assert_eq!(
+            remove.topology_delta.replace_current_barriers[0].before,
+            add.topology_delta.advance_current_barriers[0].after
+        );
+        let mut topology = known.topology().clone();
+        for id in &graph.schedule {
+            let node = graph.actions.iter().find(|node| node.id == *id).unwrap();
+            topology = topology
+                .transition(&node.topology_authority, &node.topology_delta)
+                .unwrap();
+        }
+        assert_eq!(topology.current_barriers()[0].members.len(), 1);
+        assert_eq!(topology.current_barriers()[0].members[0].as_str(), "root/a");
+    }
+
+    #[test]
+    fn stale_snapshot_and_cleanup_follow_cross_array_barrier_reference() {
+        let a = resource("root/a");
+        let c = resource("root/c");
+        let known = KnownState::new([
+            crate::domain::known::KnownFileLink::from_resolved(&a),
+            crate::domain::known::KnownFileLink::from_resolved(&c),
+        ])
+        .unwrap()
+        .with_topology(crate::domain::known::AppliedLifecycleTopology::new(
+            vec![],
+            vec![],
+            vec![AppliedBarrier {
+                id: "stage/root/a".into(),
+                after: vec![],
+                members: vec![a.resource_id().clone()],
+                origin: "stage",
+            }],
+            vec![AppliedBarrier {
+                id: "stage/root/c".into(),
+                after: vec!["stage/root/a".into()],
+                members: vec![c.resource_id().clone()],
+                origin: "stage",
+            }],
+        ));
+        let desired = desired(vec![c], ResolvedOrchestration::default());
+        let graph = schedule(
+            &desired,
+            &known,
+            &[
+                PlannedAction::remove_link(crate::domain::known::KnownFileLink::from_resolved(&a))
+                    .into(),
+            ],
+        );
+        assert!(graph.diagnostics().is_empty());
+        let graph = graph.plan_graph();
+        assert_eq!(graph.stale_topology_snapshot.historical_barriers.len(), 1);
+        let stale = &graph.actions[0];
+        assert_eq!(stale.topology_delta.remove_current_barriers.len(), 1);
+        assert_eq!(stale.topology_delta.replace_historical_barriers.len(), 1);
+        let after = known
+            .topology()
+            .transition(&stale.topology_authority, &stale.topology_delta)
+            .unwrap();
+        assert!(after.current_barriers().is_empty());
+        assert!(after.historical_barriers()[0].after.is_empty());
+    }
+
+    #[test]
+    fn mixed_stale_then_current_recreates_phase_from_exact_empty_projection() {
+        let old = resource("root/a");
+        let new = resource("root/z");
+        let known = KnownState::new([crate::domain::known::KnownFileLink::from_resolved(&old)])
+            .unwrap()
+            .with_topology(crate::domain::known::AppliedLifecycleTopology::new(
+                vec![],
+                vec![],
+                vec![AppliedBarrier {
+                    id: "stage/root/p".into(),
+                    after: vec![],
+                    members: vec![old.resource_id().clone()],
+                    origin: "stage",
+                }],
+                vec![],
+            ));
+        let desired = desired(
+            vec![new.clone()],
+            ResolvedOrchestration::new(
+                vec![ResolvedStage::new("stage/root/p".into(), vec![])],
+                vec![ResolvedResourceOrchestration::new(
+                    new.resource_id().clone(),
+                    Some("stage/root/p".into()),
+                    vec![],
+                )],
+            ),
+        );
+        let graph = schedule(
+            &desired,
+            &known,
+            &[
+                PlannedAction::remove_link(crate::domain::known::KnownFileLink::from_resolved(
+                    &old,
+                ))
+                .into(),
+                PlannedAction::create_link(new).into(),
+            ],
+        );
+        assert!(graph.diagnostics().is_empty());
+        let graph = graph.plan_graph();
+        assert_eq!(graph.schedule, ["root/a", "root/z"]);
+        assert_eq!(
+            graph.actions[0]
+                .topology_delta
+                .remove_current_barriers
+                .len(),
+            1
+        );
+        assert_eq!(
+            graph.actions[1].topology_delta.add_current_barriers.len(),
+            1
+        );
+        let mut topology = known.topology().clone();
+        for id in &graph.schedule {
+            let node = graph.actions.iter().find(|node| node.id == *id).unwrap();
+            topology = topology
+                .transition(&node.topology_authority, &node.topology_delta)
+                .unwrap();
+        }
+        assert_eq!(topology.current_barriers()[0].members[0].as_str(), "root/z");
+    }
+
+    #[test]
+    fn stale_recorded_predecessor_cannot_authorize_a_new_current_relation() {
+        let stale = resource("root/x");
+        let current = resource("root/c");
+        let known = KnownState::new([crate::domain::known::KnownFileLink::from_resolved(&stale)])
+            .unwrap()
+            .with_topology(crate::domain::known::AppliedLifecycleTopology::new(
+                vec![],
+                vec![],
+                vec![AppliedBarrier {
+                    id: "stage/root/a".into(),
+                    after: vec![],
+                    members: vec![stale.resource_id().clone()],
+                    origin: "stage",
+                }],
+                vec![],
+            ));
+        let desired = desired(
+            vec![current.clone()],
+            ResolvedOrchestration::new(
+                vec![
+                    ResolvedStage::new("stage/root/a".into(), vec![]),
+                    ResolvedStage::new("stage/root/c".into(), vec!["stage/root/a".into()]),
+                ],
+                vec![ResolvedResourceOrchestration::new(
+                    current.resource_id().clone(),
+                    Some("stage/root/c".into()),
+                    vec![],
+                )],
+            ),
+        );
+        let result = schedule(
+            &desired,
+            &known,
+            &[
+                PlannedAction::create_link(current).into(),
+                PlannedAction::remove_link(crate::domain::known::KnownFileLink::from_resolved(
+                    &stale,
+                ))
+                .into(),
+            ],
+        );
+        assert!(result.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            Diagnostic::OrderingBlocked {
+                reason: OrderingBlockReason::UnprovedTopologyPublication,
+                ..
+            }
+        )));
+        assert!(result.into_actions(vec![]).is_empty());
+    }
+
+    #[test]
+    fn stale_recorded_predecessor_reports_its_unproved_order() {
+        let early = resource("root/early");
+        let existing = resource("root/existing");
+        let joining = resource("root/joining");
+        let known = KnownState::new([
+            crate::domain::known::KnownFileLink::from_resolved(&early),
+            crate::domain::known::KnownFileLink::from_resolved(&existing),
+        ])
+        .unwrap()
+        .with_topology(crate::domain::known::AppliedLifecycleTopology::new(
+            vec![],
+            vec![],
+            vec![
+                AppliedBarrier {
+                    id: "stage/root/early".into(),
+                    after: vec![],
+                    members: vec![early.resource_id().clone()],
+                    origin: "stage",
+                },
+                AppliedBarrier {
+                    id: "stage/root/late".into(),
+                    after: vec!["stage/root/early".into()],
+                    members: vec![existing.resource_id().clone()],
+                    origin: "stage",
+                },
+            ],
+            vec![],
+        ));
+        let desired = desired(
+            vec![existing.clone(), joining.clone()],
+            ResolvedOrchestration::new(
+                vec![ResolvedStage::new("stage/root/late".into(), vec![])],
+                vec![ResolvedResourceOrchestration::new(
+                    joining.resource_id().clone(),
+                    Some("stage/root/late".into()),
+                    vec![],
+                )],
+            ),
+        );
+        let result = schedule(
+            &desired,
+            &known,
+            &[
+                PlannedAction::remove_link(crate::domain::known::KnownFileLink::from_resolved(
+                    &early,
+                ))
+                .into(),
+                PlannedAction::create_link(joining).into(),
+            ],
+        );
+        assert!(result.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            Diagnostic::OrderingBlocked {
+                reason: OrderingBlockReason::UnprovedRecordedPredecessor,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn unchanged_recorded_predecessor_proves_inherited_relation_for_new_member() {
+        let early = resource("root/early");
+        let late = resource("root/late");
+        let new = resource("root/new");
+        let known = KnownState::new([
+            crate::domain::known::KnownFileLink::from_resolved(&early),
+            crate::domain::known::KnownFileLink::from_resolved(&late),
+        ])
+        .unwrap()
+        .with_topology(crate::domain::known::AppliedLifecycleTopology::new(
+            vec![],
+            vec![],
+            vec![
+                AppliedBarrier {
+                    id: "stage/root/early".into(),
+                    after: vec![],
+                    members: vec![early.resource_id().clone()],
+                    origin: "stage",
+                },
+                AppliedBarrier {
+                    id: "stage/root/late".into(),
+                    after: vec!["stage/root/early".into()],
+                    members: vec![late.resource_id().clone()],
+                    origin: "stage",
+                },
+            ],
+            vec![],
+        ));
+        let desired = desired(
+            vec![early.clone(), late.clone(), new.clone()],
+            ResolvedOrchestration::new(
+                vec![
+                    ResolvedStage::new("stage/root/early".into(), vec![]),
+                    ResolvedStage::new("stage/root/late".into(), vec![]),
+                ],
+                vec![
+                    ResolvedResourceOrchestration::new(
+                        early.resource_id().clone(),
+                        Some("stage/root/early".into()),
+                        vec![],
+                    ),
+                    ResolvedResourceOrchestration::new(
+                        late.resource_id().clone(),
+                        Some("stage/root/late".into()),
+                        vec![],
+                    ),
+                    ResolvedResourceOrchestration::new(
+                        new.resource_id().clone(),
+                        Some("stage/root/late".into()),
+                        vec![],
+                    ),
+                ],
+            ),
+        );
+        let result = schedule(&desired, &known, &[PlannedAction::create_link(new).into()]);
+        assert!(result.diagnostics().is_empty());
+        let graph = result.plan_graph();
+        assert_eq!(graph.schedule, ["root/new"]);
+        let advance = &graph.actions[0].topology_delta.advance_current_barriers[0];
+        assert_eq!(advance.after.after, ["stage/root/early"]);
+        assert_eq!(advance.after.members.len(), 2);
+        assert!(graph.direct_edges.is_empty());
+    }
+
+    #[test]
+    fn current_recorded_predecessor_action_runs_before_new_member_even_without_desired_after() {
+        let early = resource("root/z-early");
+        let late = resource("root/l-late");
+        let new = resource("root/a-new");
+        let old_early = ResolvedFileLink::new(
+            early.resource_id().clone(),
+            ResolvedPath::new(std::env::temp_dir().join("loadout-action-graph/old-early")).unwrap(),
+            early.target_path().clone(),
+        )
+        .unwrap();
+        let known_early = crate::domain::known::KnownFileLink::from_resolved(&old_early);
+        let known = KnownState::new([
+            known_early.clone(),
+            crate::domain::known::KnownFileLink::from_resolved(&late),
+        ])
+        .unwrap()
+        .with_topology(crate::domain::known::AppliedLifecycleTopology::new(
+            vec![],
+            vec![],
+            vec![
+                AppliedBarrier {
+                    id: "stage/root/early".into(),
+                    after: vec![],
+                    members: vec![early.resource_id().clone()],
+                    origin: "stage",
+                },
+                AppliedBarrier {
+                    id: "stage/root/late".into(),
+                    after: vec!["stage/root/early".into()],
+                    members: vec![late.resource_id().clone()],
+                    origin: "stage",
+                },
+            ],
+            vec![],
+        ));
+        let desired = desired(
+            vec![early.clone(), late.clone(), new.clone()],
+            ResolvedOrchestration::new(
+                vec![
+                    ResolvedStage::new("stage/root/early".into(), vec![]),
+                    ResolvedStage::new("stage/root/late".into(), vec![]),
+                ],
+                vec![
+                    ResolvedResourceOrchestration::new(
+                        early.resource_id().clone(),
+                        Some("stage/root/early".into()),
+                        vec![],
+                    ),
+                    ResolvedResourceOrchestration::new(
+                        late.resource_id().clone(),
+                        Some("stage/root/late".into()),
+                        vec![],
+                    ),
+                    ResolvedResourceOrchestration::new(
+                        new.resource_id().clone(),
+                        Some("stage/root/late".into()),
+                        vec![],
+                    ),
+                ],
+            ),
+        );
+        let replace = PlannedAction::replace_link(early, known_early).unwrap();
+        let graph = schedule(
+            &desired,
+            &known,
+            &[PlannedAction::create_link(new).into(), replace.into()],
+        );
+        assert!(graph.diagnostics().is_empty());
+        let graph = graph.plan_graph();
+        assert_eq!(graph.schedule, ["root/z-early", "root/a-new"]);
+        let late_barrier = graph
+            .barriers
+            .iter()
+            .find(|barrier| barrier.id == "stage/root/late")
+            .unwrap();
+        assert_eq!(late_barrier.after, Vec::<String>::new());
+        assert_eq!(late_barrier.input, ["root/z-early"]);
+        assert!(late_barrier.provenance.contains(&"stage/root/early".into()));
+        let output = graph
+            .actions
+            .iter()
+            .find(|node| node.id == "root/a-new")
+            .unwrap();
+        assert_eq!(
+            output.topology_delta.advance_current_barriers[0]
+                .after
+                .after,
+            ["stage/root/early"]
+        );
+    }
+
+    #[test]
+    fn inherited_order_traverses_recorded_intermediate_phase() {
+        let early = resource("root/z-early");
+        let middle = resource("root/m-middle");
+        let late = resource("root/l-late");
+        let new = resource("root/a-new");
+        let old_early = ResolvedFileLink::new(
+            early.resource_id().clone(),
+            ResolvedPath::new(
+                std::env::temp_dir().join("loadout-action-graph/old-transitive-early"),
+            )
+            .unwrap(),
+            early.target_path().clone(),
+        )
+        .unwrap();
+        let known_early = crate::domain::known::KnownFileLink::from_resolved(&old_early);
+        let known = KnownState::new([
+            known_early.clone(),
+            crate::domain::known::KnownFileLink::from_resolved(&middle),
+            crate::domain::known::KnownFileLink::from_resolved(&late),
+        ])
+        .unwrap()
+        .with_topology(crate::domain::known::AppliedLifecycleTopology::new(
+            vec![],
+            vec![],
+            vec![
+                AppliedBarrier {
+                    id: "stage/root/early".into(),
+                    after: vec![],
+                    members: vec![early.resource_id().clone()],
+                    origin: "stage",
+                },
+                AppliedBarrier {
+                    id: "stage/root/late".into(),
+                    after: vec!["stage/root/middle".into()],
+                    members: vec![late.resource_id().clone()],
+                    origin: "stage",
+                },
+                AppliedBarrier {
+                    id: "stage/root/middle".into(),
+                    after: vec!["stage/root/early".into()],
+                    members: vec![middle.resource_id().clone()],
+                    origin: "stage",
+                },
+            ],
+            vec![],
+        ));
+        let desired = desired(
+            vec![early.clone(), middle.clone(), late.clone(), new.clone()],
+            ResolvedOrchestration::new(
+                vec![
+                    ResolvedStage::new("stage/root/early".into(), vec![]),
+                    ResolvedStage::new("stage/root/late".into(), vec![]),
+                    ResolvedStage::new("stage/root/middle".into(), vec![]),
+                ],
+                vec![
+                    ResolvedResourceOrchestration::new(
+                        early.resource_id().clone(),
+                        Some("stage/root/early".into()),
+                        vec![],
+                    ),
+                    ResolvedResourceOrchestration::new(
+                        middle.resource_id().clone(),
+                        Some("stage/root/middle".into()),
+                        vec![],
+                    ),
+                    ResolvedResourceOrchestration::new(
+                        late.resource_id().clone(),
+                        Some("stage/root/late".into()),
+                        vec![],
+                    ),
+                    ResolvedResourceOrchestration::new(
+                        new.resource_id().clone(),
+                        Some("stage/root/late".into()),
+                        vec![],
+                    ),
+                ],
+            ),
+        );
+        let replace = PlannedAction::replace_link(early, known_early).unwrap();
+        let graph = schedule(
+            &desired,
+            &known,
+            &[PlannedAction::create_link(new).into(), replace.into()],
+        );
+        assert!(graph.diagnostics().is_empty());
+        let graph = graph.plan_graph();
+        assert_eq!(graph.schedule, ["root/z-early", "root/a-new"]);
+        let late_barrier = graph
+            .barriers
+            .iter()
+            .find(|barrier| barrier.id == "stage/root/late")
+            .unwrap();
+        assert_eq!(late_barrier.input, ["root/z-early"]);
+        assert!(
+            late_barrier
+                .provenance
+                .contains(&"stage/root/middle".into())
+        );
+        assert_eq!(
+            graph
+                .actions
+                .iter()
+                .find(|node| node.id == "root/a-new")
+                .unwrap()
+                .topology_delta
+                .advance_current_barriers[0]
+                .after
+                .after,
+            ["stage/root/middle"]
+        );
+    }
+
+    #[test]
+    fn opposite_recorded_direct_order_blocks_even_when_both_resources_are_unchanged() {
+        let a = resource("root/a");
+        let b = resource("root/b");
+        let c = resource("root/c");
+        let known = KnownState::new([
+            crate::domain::known::KnownFileLink::from_resolved(&a),
+            crate::domain::known::KnownFileLink::from_resolved(&b),
+            crate::domain::known::KnownFileLink::from_resolved(&c),
+        ])
+        .unwrap()
+        .with_topology(crate::domain::known::AppliedLifecycleTopology::new(
+            vec![
+                AppliedDirectEdge {
+                    from: a.resource_id().clone(),
+                    to: b.resource_id().clone(),
+                    origin: "depends_on",
+                },
+                AppliedDirectEdge {
+                    from: c.resource_id().clone(),
+                    to: a.resource_id().clone(),
+                    origin: "depends_on",
+                },
+            ],
+            vec![],
+            vec![],
+            vec![],
+        ));
+        let desired = desired(
+            vec![a.clone(), b.clone(), c.clone()],
+            ResolvedOrchestration::new(
+                vec![],
+                vec![
+                    ResolvedResourceOrchestration::new(
+                        a.resource_id().clone(),
+                        None,
+                        vec![b.resource_id().clone()],
+                    )
+                    .with_provenance(
+                        None,
+                        vec![(
+                            b.resource_id().clone(),
+                            "profile=root; resource=a; field=depends_on".into(),
+                        )],
+                    ),
+                    ResolvedResourceOrchestration::new(b.resource_id().clone(), None, vec![]),
+                    ResolvedResourceOrchestration::new(c.resource_id().clone(), None, vec![]),
+                ],
+            ),
+        );
+        let result = schedule(&desired, &known, &[]);
+        assert!(
+            matches!(result.diagnostics(), [Diagnostic::RecordedOrderConflict {
+            old_before, old_after, proposed_before, proposed_after, old_sources, proposed_sources, rebuild_set,
+        }] if old_before.as_str() == "root/a" && old_after.as_str() == "root/b"
+            && proposed_before.as_str() == "root/b" && proposed_after.as_str() == "root/a"
+            && old_sources[0].contains("recorded current direct")
+            && proposed_sources[0].contains("field=depends_on")
+            && rebuild_set.iter().map(|id| id.as_str()).collect::<Vec<_>>() == ["root/a", "root/b", "root/c"])
+        );
+        assert!(result.into_actions(vec![]).is_empty());
+    }
+
+    #[test]
+    fn renamed_phases_still_conflict_with_recorded_resource_order() {
+        let a = resource("root/a");
+        let b = resource("root/b");
+        let known = KnownState::new([
+            crate::domain::known::KnownFileLink::from_resolved(&a),
+            crate::domain::known::KnownFileLink::from_resolved(&b),
+        ])
+        .unwrap()
+        .with_topology(crate::domain::known::AppliedLifecycleTopology::new(
+            vec![],
+            vec![],
+            vec![
+                AppliedBarrier {
+                    id: "stage/root/old-a".into(),
+                    after: vec![],
+                    members: vec![a.resource_id().clone()],
+                    origin: "stage",
+                },
+                AppliedBarrier {
+                    id: "stage/root/old-b".into(),
+                    after: vec!["stage/root/old-a".into()],
+                    members: vec![b.resource_id().clone()],
+                    origin: "stage",
+                },
+            ],
+            vec![],
+        ));
+        let desired = desired(
+            vec![a.clone(), b.clone()],
+            ResolvedOrchestration::new(
+                vec![
+                    ResolvedStage::new("stage/root/new-a".into(), vec!["stage/root/new-b".into()]),
+                    ResolvedStage::new("stage/root/new-b".into(), vec![]),
+                ],
+                vec![
+                    ResolvedResourceOrchestration::new(
+                        a.resource_id().clone(),
+                        Some("stage/root/new-a".into()),
+                        vec![],
+                    ),
+                    ResolvedResourceOrchestration::new(
+                        b.resource_id().clone(),
+                        Some("stage/root/new-b".into()),
+                        vec![],
+                    ),
+                ],
+            ),
+        );
+        let result = schedule(&desired, &known, &[]);
+        assert!(
+            matches!(result.diagnostics(), [Diagnostic::RecordedOrderConflict { old_sources, proposed_sources, rebuild_set, .. }]
+            if old_sources[0].contains("old-a") && proposed_sources[0].contains("new-b")
+            && rebuild_set.iter().map(|id| id.as_str()).collect::<Vec<_>>() == ["root/a", "root/b"])
+        );
+    }
+
+    #[test]
+    fn empty_declared_phase_exposes_conflict_with_historical_order() {
+        let a = resource("root/a");
+        let c = resource("root/c");
+        let known = KnownState::new([
+            crate::domain::known::KnownFileLink::from_resolved(&a),
+            crate::domain::known::KnownFileLink::from_resolved(&c),
+        ])
+        .unwrap()
+        .with_topology(crate::domain::known::AppliedLifecycleTopology::new(
+            vec![],
+            vec![AppliedDirectEdge {
+                from: c.resource_id().clone(),
+                to: a.resource_id().clone(),
+                origin: "depends_on",
+            }],
+            vec![],
+            vec![],
+        ));
+        let desired = desired(
+            vec![a.clone(), c.clone()],
+            ResolvedOrchestration::new(
+                vec![
+                    ResolvedStage::new("stage/root/a".into(), vec![]),
+                    ResolvedStage::new("stage/root/b".into(), vec!["stage/root/a".into()]),
+                    ResolvedStage::new("stage/root/c".into(), vec!["stage/root/b".into()]),
+                ],
+                vec![
+                    ResolvedResourceOrchestration::new(
+                        a.resource_id().clone(),
+                        Some("stage/root/a".into()),
+                        vec![],
+                    ),
+                    ResolvedResourceOrchestration::new(
+                        c.resource_id().clone(),
+                        Some("stage/root/c".into()),
+                        vec![],
+                    ),
+                ],
+            ),
+        );
+        let result = schedule(&desired, &known, &[]);
+        assert!(
+            matches!(result.diagnostics(), [Diagnostic::RecordedOrderConflict { old_sources, proposed_sources, .. }]
+            if old_sources[0].contains("historical direct")
+            && proposed_sources[0].contains("stage/root/a -> stage/root/b -> stage/root/c"))
+        );
     }
 }

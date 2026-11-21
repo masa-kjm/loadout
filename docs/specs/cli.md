@@ -196,6 +196,7 @@ For `plan` and `apply`, output identifies:
 - every blocking diagnostic with the affected resource or path when available.
 
 The report also identifies each Desired resource's effective phase and whether its source is its own declaration or the winning include path, and each normalized direct dependency with its declaration source. A recorded-order conflict identifies both directions and sources, the conservative rebuild set, and the full stale-removal and reapply procedure. This applies when the Plan has no resource actions.
+When ordering blocks a plan, the diagnostic identifies the affected resource and distinguishes unsupported action roles, an unproved direct predecessor, an unproved recorded predecessor, an unproved topology publication, and a dependency cycle. It does not describe these conditions as an unsupported resource action.
 
 For `validate`, output identifies the selected root and its checked closure and every diagnostic.
 

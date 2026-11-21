@@ -6,7 +6,7 @@ use crate::application::queries::{
 };
 use crate::domain::{
     actual::{ActualResource, CopyTargetObservation, TargetObservation},
-    diagnostic::Diagnostic,
+    diagnostic::{Diagnostic, OrderingBlockReason},
     plan::{ActionKind, ActionReason, Plan},
 };
 use crate::state::operation::ActionStatus;
@@ -586,6 +586,27 @@ pub(super) fn planned(out: &mut impl Write, err: &mut impl Write, plan: &Plan) -
                 "blocked: {resource_id}: unsupported {}",
                 action_name(*action_kind)
             )?,
+            Diagnostic::OrderingBlocked {
+                resource_id,
+                reason,
+            } => {
+                let detail = match reason {
+                    OrderingBlockReason::UnsupportedActionRoles => {
+                        "unsupported ordering action roles"
+                    }
+                    OrderingBlockReason::UnprovedPredecessor => {
+                        "ordering predecessor is not in Known"
+                    }
+                    OrderingBlockReason::UnprovedRecordedPredecessor => {
+                        "recorded ordering predecessor cannot be proved"
+                    }
+                    OrderingBlockReason::UnprovedTopologyPublication => {
+                        "ordering topology publication cannot be proved"
+                    }
+                    OrderingBlockReason::Cycle => "ordering dependencies contain a cycle",
+                };
+                writeln!(err, "blocked: {resource_id}: {detail}")?;
+            }
             Diagnostic::UnsupportedResourceEffect {
                 resource_id,
                 target_path,
@@ -604,6 +625,35 @@ pub(super) fn planned(out: &mut impl Write, err: &mut impl Write, plan: &Plan) -
                 "conflict: {old_resource_id} -> {new_resource_id}: {target_path}: {}",
                 link_observation(actual)
             )?,
+            Diagnostic::RecordedOrderConflict {
+                old_before,
+                old_after,
+                old_sources,
+                proposed_before,
+                proposed_after,
+                proposed_sources,
+                rebuild_set,
+            } => {
+                writeln!(
+                    err,
+                    "conflict: recorded order {old_before} -> {old_after} ({}) opposes proposed order {proposed_before} -> {proposed_after} ({})",
+                    old_sources.join(", "),
+                    proposed_sources.join(", ")
+                )?;
+                writeln!(
+                    err,
+                    "rebuild set: {}",
+                    rebuild_set
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )?;
+                writeln!(
+                    err,
+                    "remove the entire rebuild set from Desired, apply stale removal under recorded order until every member and old ordering fact is gone, then restore the new declarations and replan"
+                )?;
+            }
         }
     }
     Ok(if plan.is_executable() { 0 } else { 2 })
@@ -611,7 +661,6 @@ pub(super) fn planned(out: &mut impl Write, err: &mut impl Write, plan: &Plan) -
 
 pub(super) fn query_error(error: &QueryError) -> String {
     match error {
-        QueryError::ProfileStateGenerationMismatch => "profile and state schema generations differ; lifecycle commands are unavailable until schema-6 state support is complete".to_owned(),
         QueryError::ConfigurationRead { path, source } => {
             format!("cannot read configuration {path}: {source}")
         }
@@ -672,6 +721,47 @@ mod tests {
             paths::ResolvedPath,
         },
     };
+
+    #[test]
+    fn ordering_proof_failure_renders_without_unsupported_noop() {
+        let plan = Plan::new(
+            [],
+            [Diagnostic::OrderingBlocked {
+                resource_id: FullyQualifiedResourceId::parse("root/item").unwrap(),
+                reason: OrderingBlockReason::UnprovedRecordedPredecessor,
+            }],
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+        assert_eq!(planned(&mut output, &mut errors, &plan).unwrap(), 2);
+        let errors = String::from_utf8(errors).unwrap();
+        assert!(errors.contains("root/item: recorded ordering predecessor cannot be proved"));
+        assert!(!errors.contains("unsupported noop"));
+    }
+
+    #[test]
+    fn recorded_order_conflict_renders_both_sources_and_complete_rebuild_procedure() {
+        let id = |value| FullyQualifiedResourceId::parse(value).unwrap();
+        let conflict = Diagnostic::RecordedOrderConflict {
+            old_before: id("root/a"),
+            old_after: id("root/b"),
+            old_sources: vec!["recorded direct root/a -> root/b".to_owned()],
+            proposed_before: id("root/b"),
+            proposed_after: id("root/a"),
+            proposed_sources: vec!["profile=root; resource=a".to_owned()],
+            rebuild_set: vec![id("root/a"), id("root/b"), id("root/c")],
+        };
+        let plan = Plan::new([], [conflict]).unwrap();
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+        assert_eq!(planned(&mut output, &mut errors, &plan).unwrap(), 2);
+        let errors = String::from_utf8(errors).unwrap();
+        assert!(errors.contains("recorded order root/a -> root/b (recorded direct"));
+        assert!(errors.contains("proposed order root/b -> root/a (profile=root"));
+        assert!(errors.contains("rebuild set: root/a, root/b, root/c"));
+        assert!(errors.contains("until every member and old ordering fact is gone"));
+    }
 
     #[test]
     fn status_renders_a_desired_only_unavailable_observation_without_claiming_known_drift() {

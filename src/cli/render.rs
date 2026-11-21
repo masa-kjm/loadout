@@ -29,6 +29,7 @@ pub(super) fn migration_presentation(
     documents: &[MigrationRenderDocument],
     normal_commands_available: bool,
     ownership_invariant: &str,
+    broadened_ordering: &[String],
 ) -> io::Result<()> {
     writeln!(out, "migration: state and profiles")?;
     writeln!(out, "configuration: {configuration_path}")?;
@@ -62,6 +63,9 @@ pub(super) fn migration_presentation(
             .count()
     )?;
     writeln!(out, "ownership guarantee: {ownership_invariant}")?;
+    for change in broadened_ordering {
+        writeln!(out, "broadened ordering: {change}")?;
+    }
     migration_availability(out, normal_commands_available)
 }
 
@@ -85,7 +89,7 @@ fn migration_availability(out: &mut impl Write, available: bool) -> io::Result<(
     } else {
         writeln!(
             out,
-            "normal commands after migration: unavailable; schema-5-only readers cannot read schema-4 documents"
+            "normal commands after migration: unavailable; schema-6-only readers cannot read older documents"
         )
     }
 }

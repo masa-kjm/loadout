@@ -1,6 +1,6 @@
 //! State-specific validation before migration publication.
 
-use super::super::{schema_3_to_4, schema_4_to_5};
+use super::super::{schema_3_to_4, schema_4_to_5, schema_5_to_6};
 use super::{MigrationPlan, PlanError, PlannedDocument, Route, select_routes};
 use crate::resolver::ResolverContext;
 use crate::state::repository::StateRepository;
@@ -78,7 +78,9 @@ pub(super) fn validate_state(version: u32, source: &[u8]) -> Result<(), PlanErro
             .map_err(|error| PlanError::Invalid(error.to_string())),
         4 => schema_4_to_5::validate_schema_four_state(source)
             .map_err(|error| PlanError::Invalid(error.to_string())),
-        5 => {
+        5 => schema_5_to_6::state::validate_schema_five_state(source)
+            .map_err(|error| PlanError::Invalid(error.to_string())),
+        6 => {
             validate_current_state_bytes(source)
                 .map_err(|error| PlanError::Invalid(error.to_string()))?;
             let value: JsonValue = serde_json::from_slice(source)
@@ -92,7 +94,7 @@ pub(super) fn validate_state(version: u32, source: &[u8]) -> Result<(), PlanErro
         }
         _ => Err(PlanError::UnsupportedGeneration {
             from: version,
-            target: 5,
+            target: 6,
         }),
     }
 }

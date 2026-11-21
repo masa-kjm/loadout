@@ -1,6 +1,6 @@
 //! Profile-specific validation and in-memory route composition.
 
-use super::super::{schema_3_to_4, schema_4_to_5};
+use super::super::{schema_3_to_4, schema_4_to_5, schema_5_to_6};
 use super::{PlanError, PlannedDocument, Route, routes, select_routes};
 use crate::declaration::environment_config::EnvironmentConfig;
 use crate::declaration::profile::{
@@ -13,6 +13,7 @@ use serde_yaml::Value as YamlValue;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+mod legacy_validation;
 pub(super) mod publication;
 
 pub(super) use publication::publish;
@@ -38,6 +39,9 @@ pub(super) fn plan_document(
     let route = select_routes(registry, from, target)?;
     let mut candidate = text.to_owned();
     for edge in &route {
+        if edge.to == 6 {
+            continue;
+        }
         candidate = (edge.profile)(&candidate).map_err(PlanError::Invalid)?;
         profile_facts(edge.to, &candidate)?;
     }
@@ -91,18 +95,22 @@ pub(super) fn validate_completed_inventory(
     default_profile: Option<&str>,
     context: &ResolverContext,
 ) -> Result<(), PlanError> {
+    let validation_documents = if target < 6 {
+        Some(legacy_validation::project(documents, target)?)
+    } else {
+        None
+    };
     let mut declarations = BTreeMap::<ProfileId, ProfileDeclaration>::new();
     let mut resolved_declarations = BTreeMap::new();
     let mut source_generations = BTreeMap::new();
     for document in documents {
         let candidate = std::str::from_utf8(&document.candidate)
             .map_err(|_| PlanError::Invalid("converted profile is not UTF-8".to_owned()))?;
-        let current = if target == 4 {
-            schema_4_to_5::convert_profile_continuous(candidate)
-                .map_err(|error| PlanError::Invalid(error.to_string()))?
-        } else {
-            candidate.to_owned()
-        };
+        let id = profile_facts(profile_version(candidate)?, candidate)?.0;
+        let current = validation_documents
+            .as_ref()
+            .map(|documents| documents[&id].clone())
+            .unwrap_or_else(|| candidate.to_owned());
         let declaration = ProfileDeclaration::parse(&current)
             .map_err(|error| PlanError::Invalid(error.to_string()))?;
         let id = ProfileId::parse(declaration.id().to_owned())
@@ -191,13 +199,6 @@ pub(super) fn validate_completed_inventory(
                     }
                 }
             }
-            if let Some(stage) = resource.stage() {
-                if !declaration.stages().any(|(id, _)| id == stage) {
-                    return Err(PlanError::Invalid(format!(
-                        "resource refers to undeclared local stage {stage}"
-                    )));
-                }
-            }
             for reference in resource.depends_on() {
                 if !reference.contains('/')
                     && !declaration.resources().any(|(id, _)| id == reference)
@@ -219,7 +220,7 @@ pub(super) fn validate_completed_inventory(
             }
         }
     }
-    validate_migration_inventory(context, &resolved_declarations)
+    validate_migration_inventory(context, &resolved_declarations, target, default_profile)
         .map_err(|error| PlanError::Invalid(error.to_string()))?;
     Ok(())
 }
@@ -244,7 +245,8 @@ pub(super) fn profile_facts(
             .map_err(|error| PlanError::Invalid(error.to_string())),
         4 => schema_4_to_5::profile_facts_continuous(source)
             .map_err(|error| PlanError::Invalid(error.to_string())),
-        5 => {
+        5 => schema_5_to_6::profile::profile_facts(source).map_err(PlanError::Invalid),
+        6 => {
             let profile = ProfileDeclaration::parse(source)
                 .map_err(|error| PlanError::Invalid(error.to_string()))?;
             let id = ProfileId::parse(profile.id().to_owned())

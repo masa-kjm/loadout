@@ -14,7 +14,7 @@ use crate::filesystem::is_link_or_reparse_point;
 use crate::resolver::ResolverContext;
 use crate::schema_generation::CURRENT_MANAGED_GENERATION;
 
-use super::{schema_3_to_4, schema_4_to_5};
+use super::{schema_3_to_4, schema_4_to_5, schema_5_to_6};
 
 mod profiles;
 mod state;
@@ -30,7 +30,7 @@ struct Route {
     state: StateRoute,
 }
 
-fn routes() -> [Route; 2] {
+fn routes() -> [Route; 3] {
     [
         Route {
             from: 3,
@@ -45,6 +45,12 @@ fn routes() -> [Route; 2] {
                 schema_4_to_5::convert_profile_continuous(source).map_err(|e| e.to_string())
             },
             state: |source| schema_4_to_5::convert_state(source).map_err(|e| e.to_string()),
+        },
+        Route {
+            from: 5,
+            to: 6,
+            profile: schema_5_to_6::profile::convert_profile,
+            state: |source| schema_5_to_6::state::convert_state(source).map_err(|e| e.to_string()),
         },
     ]
 }
@@ -114,6 +120,7 @@ pub(super) struct MigrationPlan {
     discovery: Vec<DiscoverySnapshot>,
     pub(super) state: Option<PlannedDocument>,
     pub(super) profiles: Vec<PlannedDocument>,
+    broadening: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,6 +137,7 @@ pub(super) struct PlanPresentation {
     pub(super) configuration_path: PathBuf,
     pub(super) documents: Vec<PresentedDocument>,
     pub(super) normal_commands_available: bool,
+    pub(super) broadening: Vec<String>,
 }
 
 impl MigrationPlan {
@@ -200,6 +208,7 @@ impl MigrationPlan {
         }));
         PlanPresentation {
             configuration_path: self.configuration_path.clone(),
+            broadening: self.broadening.clone(),
             normal_commands_available: self.target_generation == CURRENT_MANAGED_GENERATION
                 || documents
                     .iter()
@@ -320,6 +329,30 @@ impl MigrationPlan {
             profiles.push(document);
         }
         validate_composition(&profile_ids, &includes)?;
+        let broadening = if target == 6 {
+            let inventory = profiles
+                .iter()
+                .map(|document| {
+                    let source = std::str::from_utf8(&document.candidate).map_err(|_| {
+                        PlanError::Invalid("converted profile is not UTF-8".to_owned())
+                    })?;
+                    let id = profiles::profile_facts(profiles::profile_version(source)?, source)?.0;
+                    Ok((id, (profiles::profile_version(source)?, source.to_owned())))
+                })
+                .collect::<Result<BTreeMap<_, _>, PlanError>>()?;
+            let conversion = schema_5_to_6::profile::convert_inventory(&inventory)
+                .map_err(PlanError::Invalid)?;
+            for document in &mut profiles {
+                let source = std::str::from_utf8(&document.candidate)
+                    .map_err(|_| PlanError::Invalid("converted profile is not UTF-8".to_owned()))?;
+                let id = profiles::profile_facts(profiles::profile_version(source)?, source)?.0;
+                document.candidate = conversion.documents[&id].as_bytes().to_vec();
+                profiles::profile_facts(6, &conversion.documents[&id])?;
+            }
+            conversion.broadening
+        } else {
+            Vec::new()
+        };
         profiles::validate_completed_inventory(
             &profiles,
             target,
@@ -341,6 +374,23 @@ impl MigrationPlan {
                 state::plan_document(state_path, source, from, target, &registry)
             })
             .transpose()?;
+        let mut depths = profile_ids
+            .keys()
+            .map(|id| (id.clone(), 0_usize))
+            .collect::<BTreeMap<_, _>>();
+        for _ in 0..profile_ids.len() {
+            for (parent, child) in &includes {
+                let next = depths[parent] + 1;
+                if depths[child] < next {
+                    depths.insert(child.clone(), next);
+                }
+            }
+        }
+        let depth_by_path = profile_ids
+            .iter()
+            .map(|(id, path)| (path, depths[id]))
+            .collect::<BTreeMap<_, _>>();
+        profiles.sort_by_key(|document| (depth_by_path[&document.path], document.path.clone()));
         Ok(Self {
             target_generation: target,
             configuration_path: config_path.to_path_buf(),
@@ -349,12 +399,17 @@ impl MigrationPlan {
             discovery,
             state,
             profiles,
+            broadening,
         })
     }
 
     pub(super) fn compare_confirmed(&self, context: &ResolverContext) -> Result<(), PlanError> {
         let refreshed = Self::build(context, self.target_generation)?;
-        if self != &refreshed {
+        let mut expected = self.clone();
+        let mut actual = refreshed;
+        expected.broadening.clear();
+        actual.broadening.clear();
+        if expected != actual {
             return Err(PlanError::ConfirmedSnapshotChanged);
         }
         Ok(())
@@ -616,6 +671,7 @@ mod tests {
                     "{{\"schema_version\":{generation},\"resources\":{{}},\"active_operation\":null}}"
                 ),
                 5 => "{\"schema_version\":5,\"resources\":{},\"applied_lifecycle_topology\":{\"current\":[],\"historical\":[]},\"active_operation\":null}".to_owned(),
+                6 => "{\"schema_version\":6,\"resources\":{},\"applied_lifecycle_topology\":{\"current\":[],\"historical\":[]},\"active_operation\":null}".to_owned(),
                 _ => panic!("unsupported fixture generation"),
             };
             fs::write(self.root.join("state/state.json"), state).unwrap();
@@ -675,6 +731,95 @@ mod tests {
     }
 
     #[test]
+    fn parent_profile_publishes_before_child_and_partial_inventory_resumes() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.root.join("profiles/a-child.yaml"),
+            "schema_version: 5\nid: child\nparameters: { slot: string }\nstages: { early: { after: [] } }\nresources: {}\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.root.join("profiles/z-root.yaml"),
+            "schema_version: 5\nid: root\nincludes: [{ id: child, with: { slot: a } }]\nresources: {}\n",
+        )
+        .unwrap();
+        let plan = super::super::MigrationFacade::plan_continuous(&fixture.context, 6).unwrap();
+        assert!(plan.profiles[0].path.ends_with("z-root.yaml"));
+        assert!(plan.profiles[1].path.ends_with("a-child.yaml"));
+        profiles::publish(&plan.profiles[0]).unwrap();
+        let root_bytes = fs::read(fixture.root.join("profiles/z-root.yaml")).unwrap();
+        let mut resumed =
+            super::super::MigrationFacade::plan_continuous(&fixture.context, 6).unwrap();
+        assert!(!resumed.profiles[0].needs_publication());
+        assert!(resumed.profiles[1].needs_publication());
+        resumed.execute_confirmed(&fixture.context).unwrap();
+        assert_eq!(
+            fs::read(fixture.root.join("profiles/z-root.yaml")).unwrap(),
+            root_bytes
+        );
+        assert!(
+            fs::read_to_string(fixture.root.join("profiles/a-child.yaml"))
+                .unwrap()
+                .contains("schema_version: 6")
+        );
+    }
+
+    #[test]
+    fn explicit_target_five_accepts_valid_ordering_that_schema_six_cannot_merge() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.root.join("profiles/first.yaml"),
+            "schema_version: 5\nid: first\nparameters: { slot: string }\nstages: { early: { after: [] }, late: { after: [early] } }\nresources: {}\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.root.join("profiles/second.yaml"),
+            "schema_version: 5\nid: second\nparameters: { slot: string }\nstages: { early: { after: [] }, late: { after: [] } }\nresources: {}\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.root.join("profiles/root.yaml"),
+            "schema_version: 5\nid: root\nincludes: [{ id: first, with: { slot: a } }, { id: second, with: { slot: b } }]\nresources: {}\n",
+        )
+        .unwrap();
+        let before = fs::read(fixture.root.join("profiles/root.yaml")).unwrap();
+        let plan = super::super::MigrationFacade::plan_continuous(&fixture.context, 5).unwrap();
+        assert!(
+            plan.profiles
+                .iter()
+                .all(|profile| !profile.needs_publication())
+        );
+        assert_eq!(
+            fs::read(fixture.root.join("profiles/root.yaml")).unwrap(),
+            before
+        );
+        assert!(super::super::MigrationFacade::plan_continuous(&fixture.context, 6).is_err());
+    }
+
+    #[test]
+    fn schema_six_state_advances_only_older_profiles_and_reverse_checks_newer_profiles() {
+        let fixture = Fixture::new();
+        fixture.state(6);
+        fixture.profile("old", 4);
+        let plan = super::super::MigrationFacade::plan_continuous(&fixture.context, 6).unwrap();
+        assert!(!plan.state.as_ref().unwrap().needs_publication());
+        assert_eq!(plan.profiles[0].route, vec![(4, 5), (5, 6)]);
+        fixture.state(5);
+        fs::write(
+            fixture.root.join("profiles/new.yaml"),
+            "schema_version: 6\nid: new\nstages: { early: { after: [] } }\nresources: {}\n",
+        )
+        .unwrap();
+        let error =
+            super::super::MigrationFacade::plan_continuous(&fixture.context, 6).unwrap_err();
+        assert!(
+            error.to_string().contains("newer profile")
+                || error.to_string().contains("schema-5 ordering"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn facade_plans_mixed_inventory_and_sequences_state_first() {
         let fixture = Fixture::new();
         fixture.state(3);
@@ -692,7 +837,7 @@ mod tests {
         );
         let presentation = plan.presentation();
         assert_eq!(presentation.documents.len(), 4);
-        assert!(presentation.normal_commands_available);
+        assert!(!presentation.normal_commands_available);
         assert_eq!(
             presentation
                 .documents
@@ -1211,7 +1356,7 @@ mod tests {
         for (body, expected) in [
             (
                 "stages: { build: { after: [missing] } }\nresources: {}\n".to_owned(),
-                "undeclared local stage",
+                "names no declared stage",
             ),
             (
                 format!("resources:\n  item:\n    stage: missing\n{resource}"),
@@ -1219,7 +1364,7 @@ mod tests {
             ),
             (
                 format!("resources:\n  item:\n    depends_on: [missing]\n{resource}"),
-                "undeclared local resource",
+                "names no declared resource",
             ),
             (
                 format!("resources:\n  first:\n{resource}  second:\n{resource}"),
@@ -1263,9 +1408,8 @@ mod tests {
         let error =
             super::super::MigrationFacade::plan_continuous(&fixture.context, 5).unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("does not name a resolved stage instance")
+            error.to_string().contains("names no declared stage"),
+            "{error}"
         );
         fs::write(
             &root,

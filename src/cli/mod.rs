@@ -219,6 +219,7 @@ fn run_migration_with_confirmation(
         &documents,
         presentation.normal_commands_available,
         presentation.ownership_invariant,
+        &presentation.broadened_ordering,
     )?;
     out.flush()?;
     if !command.yes {

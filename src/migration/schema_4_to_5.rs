@@ -6,11 +6,9 @@ use serde_json::Value as JsonValue;
 use serde_yaml::{Mapping as YamlMapping, Value as YamlValue};
 
 use crate::declaration::profile::{
-    FileKind, FileOperation, ProfileDeclaration, ValueOrReference, parse_kind, parse_operation,
+    FileKind, FileOperation, FileResourceDeclaration, ValueOrReference, parse_kind, parse_operation,
 };
 use crate::domain::ids::{ProfileId, ResourceId};
-use crate::state::repository::StateDecodeError;
-use crate::state::validate_current_state_bytes;
 
 const LEGACY_SCHEMA_VERSION: u64 = 4;
 const TARGET_SCHEMA_VERSION: u64 = 5;
@@ -80,15 +78,33 @@ pub(super) fn profile_facts_continuous(
         }
     }
     let candidate = replace_root_schema_version(source, '4', '5')?;
-    let parsed = ProfileDeclaration::parse(&candidate).map_err(MigrationError::Profile)?;
-    let id = ProfileId::parse(parsed.id().to_owned())
+    let (id, includes) = super::schema_5_to_6::profile::profile_facts(&candidate)
         .map_err(|_| MigrationError::InvalidLegacyProfile)?;
-    for parameter in parsed.parameters().keys() {
-        ProfileId::parse(parameter.to_owned()).map_err(|_| MigrationError::InvalidLegacyProfile)?;
-    }
-    for (resource_id, resource) in parsed.resources() {
-        ResourceId::parse(resource_id.to_owned())
+    if let Some(parameters) = mapping.get(YamlValue::String("parameters".to_owned())) {
+        for parameter in parameters
+            .as_mapping()
+            .ok_or(MigrationError::InvalidLegacyProfile)?
+            .keys()
+        {
+            ProfileId::parse(
+                parameter
+                    .as_str()
+                    .ok_or(MigrationError::InvalidLegacyProfile)?
+                    .to_owned(),
+            )
             .map_err(|_| MigrationError::InvalidLegacyProfile)?;
+        }
+    }
+    for (resource_id, resource) in resources {
+        ResourceId::parse(
+            resource_id
+                .as_str()
+                .ok_or(MigrationError::InvalidLegacyProfile)?
+                .to_owned(),
+        )
+        .map_err(|_| MigrationError::InvalidLegacyProfile)?;
+        let resource: FileResourceDeclaration =
+            serde_yaml::from_value(resource.clone()).map_err(MigrationError::Profile)?;
         let properties = resource.properties();
         let kind = match properties.kind() {
             ValueOrReference::Value(value) => value.as_string().and_then(parse_kind),
@@ -105,14 +121,6 @@ pub(super) fn profile_facts_continuous(
             return Err(MigrationError::InvalidLegacyProfile);
         }
     }
-    let includes = parsed
-        .includes()
-        .iter()
-        .map(|include| {
-            ProfileId::parse(include.id().to_owned())
-                .map_err(|_| MigrationError::InvalidLegacyProfile)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     Ok((id, includes))
 }
 
@@ -146,7 +154,8 @@ pub(super) fn convert_state(source: &[u8]) -> Result<Vec<u8>, MigrationError> {
         "active_operation": null,
     }))
     .map_err(MigrationError::State)?;
-    validate_current_state_bytes(&candidate).map_err(MigrationError::InvalidConvertedState)?;
+    super::schema_5_to_6::state::validate_schema_five_state(&candidate)
+        .map_err(|error| MigrationError::InvalidConvertedState(error.to_string()))?;
     Ok(candidate)
 }
 
@@ -370,7 +379,7 @@ pub(crate) enum MigrationError {
     UnsupportedSchemaVersion { document: &'static str, actual: u64 },
     InvalidLegacyProfile,
     ActiveOperationPresent,
-    InvalidConvertedState(StateDecodeError),
+    InvalidConvertedState(String),
 }
 
 impl fmt::Display for MigrationError {
@@ -417,7 +426,7 @@ mod tests {
             converted,
             PROFILE.replacen("schema_version: 4", "schema_version: 5", 1)
         );
-        assert!(ProfileDeclaration::parse(&converted).is_ok());
+        assert!(super::super::schema_5_to_6::profile::profile_facts(&converted).is_ok());
         assert!(
             convert_profile_continuous(&PROFILE.replace("schema_version: 4", "schema_version: 2"))
                 .is_err()
@@ -479,7 +488,7 @@ mod tests {
         ] {
             let converted = convert_profile_continuous(&source).unwrap();
             assert_eq!(converted.replace('5', "4"), source);
-            assert!(ProfileDeclaration::parse(&converted).is_ok());
+            assert!(super::super::schema_5_to_6::profile::profile_facts(&converted).is_ok());
         }
     }
 

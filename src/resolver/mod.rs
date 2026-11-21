@@ -323,6 +323,8 @@ pub(crate) fn validate_current_profile_schemas(
 pub(crate) fn validate_migration_inventory(
     context: &ResolverContext,
     declarations: &BTreeMap<ProfileId, (ProfileDeclaration, PathBuf)>,
+    target_generation: u32,
+    default_profile: Option<&str>,
 ) -> Result<(), ResolverError> {
     let profiles = declarations
         .iter()
@@ -337,80 +339,166 @@ pub(crate) fn validate_migration_inventory(
             ))
         })
         .collect::<Result<BTreeMap<_, _>, ResolverError>>()?;
+    let mut covered = BTreeSet::new();
+    let mut valid_roots = BTreeSet::new();
     for (root, profile) in &profiles {
         if !profile.declaration.parameters().is_empty() {
             continue;
         }
-        let instances = compose_instances(root, &profiles)?;
-        resolve_orchestration(&instances, &profiles)?;
-        let mut targets = BTreeMap::new();
-        for instance in &instances {
-            for (local_id, resource) in profiles[&instance.definition].declaration.resources() {
-                let local_id = ResourceId::parse(local_id.to_owned()).map_err(|source| {
-                    ResolverError::InvalidIdentifier {
-                        role: "resource ID",
-                        value: local_id.to_owned(),
-                        source,
-                    }
-                })?;
-                let resource_id = FullyQualifiedResourceId::in_instance(&instance.name, &local_id);
-                let properties = resource.properties();
-                let kind = parse_kind(&resolve_string(
-                    properties.kind(),
-                    instance,
-                    profiles[&instance.definition].declaration.id(),
-                    "kind",
-                )?)
-                .ok_or_else(|| ResolverError::InvalidPropertyValue {
-                    defining_profile: profiles[&instance.definition].declaration.id().to_owned(),
-                    instance: instance.name.to_string(),
-                    property: "kind",
-                    reason: "must be file or directory",
-                })?;
-                let operation = parse_operation(&resolve_string(
-                    properties.operation(),
-                    instance,
-                    profiles[&instance.definition].declaration.id(),
-                    "operation",
-                )?)
-                .ok_or_else(|| ResolverError::InvalidPropertyValue {
-                    defining_profile: profiles[&instance.definition].declaration.id().to_owned(),
-                    instance: instance.name.to_string(),
-                    property: "operation",
-                    reason: "must be link or copy",
-                })?;
-                if kind == FileKind::Directory && operation == FileOperation::Copy {
-                    return Err(ResolverError::InvalidPropertyValue {
+        if target_generation == 6 && !can_be_migration_root(&profile.declaration) {
+            if default_profile == Some(root.as_str()) {
+                return Err(ResolverError::InvalidMigrationCandidate {
+                    root: root.clone(),
+                    reason: "its own phase references require a parent root phase mapping"
+                        .to_owned(),
+                });
+            }
+            continue;
+        }
+        let result = (|| -> Result<Vec<ResolvedInstance>, ResolverError> {
+            let instances = compose_instances(root, &profiles)?;
+            resolve_orchestration(&instances, &profiles)?;
+            let mut targets = BTreeMap::new();
+            for instance in &instances {
+                for (local_id, resource) in profiles[&instance.definition].declaration.resources() {
+                    let local_id = ResourceId::parse(local_id.to_owned()).map_err(|source| {
+                        ResolverError::InvalidIdentifier {
+                            role: "resource ID",
+                            value: local_id.to_owned(),
+                            source,
+                        }
+                    })?;
+                    let resource_id =
+                        FullyQualifiedResourceId::in_instance(&instance.name, &local_id);
+                    let properties = resource.properties();
+                    let kind = parse_kind(&resolve_string(
+                        properties.kind(),
+                        instance,
+                        profiles[&instance.definition].declaration.id(),
+                        "kind",
+                    )?)
+                    .ok_or_else(|| ResolverError::InvalidPropertyValue {
+                        defining_profile: profiles[&instance.definition]
+                            .declaration
+                            .id()
+                            .to_owned(),
+                        instance: instance.name.to_string(),
+                        property: "kind",
+                        reason: "must be file or directory",
+                    })?;
+                    let operation = parse_operation(&resolve_string(
+                        properties.operation(),
+                        instance,
+                        profiles[&instance.definition].declaration.id(),
+                        "operation",
+                    )?)
+                    .ok_or_else(|| ResolverError::InvalidPropertyValue {
                         defining_profile: profiles[&instance.definition]
                             .declaration
                             .id()
                             .to_owned(),
                         instance: instance.name.to_string(),
                         property: "operation",
-                        reason: "directory resources support only operation: link",
-                    });
-                }
-                let raw_target = resolve_string(
-                    properties.target(),
-                    instance,
-                    profiles[&instance.definition].declaration.id(),
-                    "target",
-                )?;
-                let target = bind_target_path(&raw_target, context)?;
-                if let Some(first_resource_id) = targets.insert(target.clone(), resource_id.clone())
-                {
-                    return Err(ResolverError::InvalidDesired(
-                        ResolvedDesiredError::DuplicateTarget {
-                            target_path: target,
-                            first_resource_id,
-                            duplicate_resource_id: resource_id,
-                        },
-                    ));
+                        reason: "must be link or copy",
+                    })?;
+                    if kind == FileKind::Directory && operation == FileOperation::Copy {
+                        return Err(ResolverError::InvalidPropertyValue {
+                            defining_profile: profiles[&instance.definition]
+                                .declaration
+                                .id()
+                                .to_owned(),
+                            instance: instance.name.to_string(),
+                            property: "operation",
+                            reason: "directory resources support only operation: link",
+                        });
+                    }
+                    let raw_target = resolve_string(
+                        properties.target(),
+                        instance,
+                        profiles[&instance.definition].declaration.id(),
+                        "target",
+                    )?;
+                    let target = bind_target_path(&raw_target, context)?;
+                    if let Some(first_resource_id) =
+                        targets.insert(target.clone(), resource_id.clone())
+                    {
+                        return Err(ResolverError::InvalidDesired(
+                            ResolvedDesiredError::DuplicateTarget {
+                                target_path: target,
+                                first_resource_id,
+                                duplicate_resource_id: resource_id,
+                            },
+                        ));
+                    }
                 }
             }
+            Ok(instances)
+        })();
+        match result {
+            Ok(instances) => {
+                valid_roots.insert(root.clone());
+                covered.extend(instances.into_iter().map(|instance| instance.definition));
+            }
+            Err(ResolverError::InvalidOrchestrationReference {
+                relation: "resource stage",
+                reason: "does not name a root phase",
+                ..
+            }) if target_generation == 6 && default_profile != Some(root.as_str()) => {
+                // This profile needs a phase supplied by an enclosing root.
+                continue;
+            }
+            Err(error) if target_generation == 6 => {
+                return Err(ResolverError::InvalidMigrationCandidate {
+                    root: root.clone(),
+                    reason: error.to_string(),
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if target_generation == 6 {
+        if let Some(default) = default_profile {
+            let id = ProfileId::parse(default.to_owned()).map_err(|source| {
+                ResolverError::InvalidIdentifier {
+                    role: "default profile ID",
+                    value: default.to_owned(),
+                    source,
+                }
+            })?;
+            if !valid_roots.contains(&id) {
+                return Err(ResolverError::InvalidMigrationCandidate {
+                    root: id,
+                    reason: "the default profile is not a valid selected root".to_owned(),
+                });
+            }
+        }
+        let uncovered = profiles
+            .keys()
+            .filter(|id| !covered.contains(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !uncovered.is_empty() {
+            return Err(ResolverError::UncoveredMigrationProfiles {
+                profiles: uncovered,
+            });
         }
     }
     Ok(())
+}
+
+/// A child may rely on a phase supplied by an including root, so it is not a root candidate.
+fn can_be_migration_root(profile: &ProfileDeclaration) -> bool {
+    let phases = profile
+        .stages()
+        .map(|(name, _)| name)
+        .collect::<BTreeSet<_>>();
+    profile
+        .includes()
+        .iter()
+        .all(|include| include.stage().is_none_or(|stage| phases.contains(stage)))
+        && profile
+            .resources()
+            .all(|(_, resource)| resource.stage().is_none_or(|stage| phases.contains(stage)))
 }
 
 /// Resolves every declared local-store root for a read-only configuration view.
@@ -1847,6 +1935,13 @@ pub(crate) enum ResolverError {
     ParameterizedRoot {
         root_profile: ProfileId,
     },
+    InvalidMigrationCandidate {
+        root: ProfileId,
+        reason: String,
+    },
+    UncoveredMigrationProfiles {
+        profiles: Vec<ProfileId>,
+    },
     ConflictingInstance {
         instance: InstanceNamespace,
     },
@@ -2023,6 +2118,19 @@ impl fmt::Display for ResolverError {
                 formatter,
                 "selected root profile {root_profile} must not declare parameters"
             ),
+            Self::InvalidMigrationCandidate { root, reason } => write!(
+                formatter,
+                "migration candidate root {root} cannot be fully resolved: {reason}"
+            ),
+            Self::UncoveredMigrationProfiles { profiles } => write!(
+                formatter,
+                "migration profiles are not covered by any valid root closure: {}",
+                profiles
+                    .iter()
+                    .map(ProfileId::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Self::ConflictingInstance { instance } => write!(
                 formatter,
                 "instance {instance} is reached with conflicting definition or bindings"
@@ -2180,6 +2288,8 @@ impl std::error::Error for ResolverError {
             | Self::MissingRootProfile
             | Self::RootProfileNotDiscovered { .. }
             | Self::ParameterizedRoot { .. }
+            | Self::InvalidMigrationCandidate { .. }
+            | Self::UncoveredMigrationProfiles { .. }
             | Self::ConflictingInstance { .. }
             | Self::MissingParameterBinding { .. }
             | Self::UnknownParameterBinding { .. }
@@ -2297,6 +2407,104 @@ mod tests {
             "schema_version: 2\ndefault_profile: {default_profile}\nprofile_discovery:\n  paths:\n{discovery_paths}stores: {{}}\n"
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn migration_inventory_uses_valid_root_closures_and_rejects_invalid_defaults() {
+        let workspace = TestWorkspace::new();
+        let context = workspace.context();
+        let mut profiles = BTreeMap::new();
+        let root = ProfileId::parse("root".to_owned()).unwrap();
+        let child = ProfileId::parse("child".to_owned()).unwrap();
+        profiles.insert(
+            root.clone(),
+            (
+                ProfileDeclaration::parse("schema_version: 6\nid: root\nstages: { early: { after: [] } }\nincludes: [{ id: child, stage: early }]\nresources: {}\n").unwrap(),
+                workspace.path("root.yaml"),
+            ),
+        );
+        profiles.insert(
+            child.clone(),
+            (
+                ProfileDeclaration::parse("schema_version: 6\nid: child\nresources:\n  item:\n    type: file\n    stage: early\n    properties: { kind: file, source: { store: dotfiles, path: item }, target: ~/.item, operation: link }\n").unwrap(),
+                workspace.path("child.yaml"),
+            ),
+        );
+        assert!(validate_migration_inventory(&context, &profiles, 6, Some("root")).is_ok());
+        assert!(matches!(
+            validate_migration_inventory(&context, &profiles, 6, Some("child")),
+            Err(ResolverError::InvalidMigrationCandidate { root, .. }) if root == child
+        ));
+        profiles.remove(&root);
+        assert!(matches!(
+            validate_migration_inventory(&context, &profiles, 6, None),
+            Err(ResolverError::UncoveredMigrationProfiles { profiles }) if profiles == vec![child]
+        ));
+    }
+
+    #[test]
+    fn migration_inventory_names_the_failing_candidate_root() {
+        let workspace = TestWorkspace::new();
+        let context = workspace.context();
+        let root = ProfileId::parse("root".to_owned()).unwrap();
+        let child = ProfileId::parse("child".to_owned()).unwrap();
+        let profiles = BTreeMap::from([
+            (
+                root.clone(),
+                (
+                    ProfileDeclaration::parse("schema_version: 6\nid: root\nincludes: [{ id: child }]\nresources: {}\n").unwrap(),
+                    workspace.path("root.yaml"),
+                ),
+            ),
+            (
+                child,
+                (
+                    ProfileDeclaration::parse("schema_version: 6\nid: child\nstages: { early: { after: [] } }\nresources: {}\n").unwrap(),
+                    workspace.path("child.yaml"),
+                ),
+            ),
+        ]);
+        assert!(matches!(
+            validate_migration_inventory(&context, &profiles, 6, Some("root")),
+            Err(ResolverError::InvalidMigrationCandidate { root: failed, reason }) if failed == root && reason.contains("stages")
+        ));
+    }
+
+    #[test]
+    fn migration_inventory_skips_branch_with_descendant_phase_requirement() {
+        let workspace = TestWorkspace::new();
+        let context = workspace.context();
+        let root = ProfileId::parse("root".to_owned()).unwrap();
+        let branch = ProfileId::parse("branch".to_owned()).unwrap();
+        let leaf = ProfileId::parse("leaf".to_owned()).unwrap();
+        let profiles = BTreeMap::from([
+            (
+                root.clone(),
+                (
+                    ProfileDeclaration::parse("schema_version: 6\nid: root\nstages: { early: { after: [] } }\nincludes: [{ id: branch, stage: early }]\nresources: {}\n").unwrap(),
+                    workspace.path("root.yaml"),
+                ),
+            ),
+            (
+                branch.clone(),
+                (
+                    ProfileDeclaration::parse("schema_version: 6\nid: branch\nincludes: [{ id: leaf }]\nresources: {}\n").unwrap(),
+                    workspace.path("branch.yaml"),
+                ),
+            ),
+            (
+                leaf,
+                (
+                    ProfileDeclaration::parse("schema_version: 6\nid: leaf\nresources:\n  item:\n    type: file\n    stage: early\n    properties: { kind: file, source: { store: dotfiles, path: item }, target: ~/.item, operation: link }\n").unwrap(),
+                    workspace.path("leaf.yaml"),
+                ),
+            ),
+        ]);
+        assert!(validate_migration_inventory(&context, &profiles, 6, Some("root")).is_ok());
+        assert!(matches!(
+            validate_migration_inventory(&context, &profiles, 6, Some("branch")),
+            Err(ResolverError::InvalidMigrationCandidate { root: failed, .. }) if failed == branch
+        ));
     }
 
     fn profile(id: &str, includes: &[&str], resources: &str) -> String {

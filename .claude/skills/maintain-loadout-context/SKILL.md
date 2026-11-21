@@ -16,6 +16,8 @@ Keep guidance derived from the current authoritative contracts. Do not decide un
 
 - Change the canonical document first, then affected summaries and navigation. Keep user-facing documentation in English with relative links and durable headings.
 - Check claims about commands, schemas, platforms, releases, and installed capabilities against the owning documents and implementation.
+- When changing from A to B, avoid redundant phrasing such as "B instead of A"; simply state "B." However, this does not apply if the information is expected to remain necessary in the future.
+- Determine which document should contain the information—and whether it truly needs to be documented at all—to prevent unnecessary document bloat.
 
 ## Update project skills
 

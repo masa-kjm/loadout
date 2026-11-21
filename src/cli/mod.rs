@@ -584,7 +584,9 @@ fn query_exit_code(error: &QueryError) -> u8 {
             1
         }
         QueryError::Resolution(error) => resolver_exit_code(error),
-        QueryError::Configuration(_) | QueryError::ConfigField(_) => 2,
+        QueryError::Configuration(_)
+        | QueryError::ConfigField(_)
+        | QueryError::ProfileStateGenerationMismatch => 2,
         QueryError::DirectoryLinkPlanningNotImplemented { .. } => 2,
     }
 }

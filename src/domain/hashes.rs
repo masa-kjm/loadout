@@ -503,20 +503,44 @@ mod tests {
         let plain =
             ResolvedDesired::new(ProfileId::parse("workstation").unwrap(), [resource.clone()])
                 .unwrap();
-        let ordered = ResolvedDesired::new(ProfileId::parse("workstation").unwrap(), [resource])
+        let ordered = ResolvedDesired::new(ProfileId::parse("workstation").unwrap(), [resource.clone()])
             .unwrap()
             .with_orchestration(ResolvedOrchestration::new(
-                vec![ResolvedStage::new("base/prepare".to_owned(), Vec::new())],
+                vec![ResolvedStage::new("stage/workstation/prepare".to_owned(), Vec::new())],
                 vec![ResolvedResourceOrchestration::new(
                     FullyQualifiedResourceId::parse("base/git-config").unwrap(),
-                    Some("base/prepare".to_owned()),
-                    Vec::new(),
+                    Some("stage/workstation/prepare".to_owned()),
+                    vec![FullyQualifiedResourceId::parse("workstation/prerequisite").unwrap()],
+                ).with_provenance(
+                    Some("profile=base; include_path=workstation/base; resource=git-config; field=stage".to_owned()),
+                    vec![(FullyQualifiedResourceId::parse("workstation/prerequisite").unwrap(), "profile=workstation; include_path=workstation; resource=prerequisite -> base/git-config; field=resource_dependencies".to_owned())],
+                )],
+            ));
+        let edited = ResolvedDesired::new(ProfileId::parse("workstation").unwrap(), [resource.clone()])
+            .unwrap()
+            .with_orchestration(ResolvedOrchestration::new(
+                vec![ResolvedStage::new("stage/workstation/later".to_owned(), Vec::new())],
+                vec![ResolvedResourceOrchestration::new(
+                    FullyQualifiedResourceId::parse("base/git-config").unwrap(),
+                    Some("stage/workstation/later".to_owned()),
+                    vec![FullyQualifiedResourceId::parse("workstation/changed").unwrap()],
+                ).with_provenance(
+                    Some("profile=workstation; include_path=workstation/base; resource=git-config; field=includes.stage".to_owned()),
+                    vec![(FullyQualifiedResourceId::parse("workstation/changed").unwrap(), "profile=workstation; include_path=workstation; resource=changed -> base/git-config; field=resource_dependencies".to_owned())],
                 )],
             ));
 
         assert_eq!(
             desired_hash(&plain).unwrap(),
             desired_hash(&ordered).unwrap()
+        );
+        assert_eq!(
+            desired_hash(&ordered).unwrap(),
+            desired_hash(&edited).unwrap()
+        );
+        assert_eq!(
+            definition_hash(&resource).unwrap(),
+            definition_hash(&file_link("base/git-config")).unwrap()
         );
     }
 

@@ -3,7 +3,7 @@
 use serde::Deserialize;
 use serde::de::Error as _;
 
-use crate::schema_generation::CURRENT_MANAGED_GENERATION;
+use crate::schema_generation::CURRENT_PROFILE_GENERATION;
 
 const DECLARATION_SCHEMA_VERSION_V1: u32 = 1;
 const V0_3_ENVIRONMENT_SCHEMA_VERSION: u32 = 2;
@@ -12,21 +12,21 @@ const V0_3_ENVIRONMENT_SCHEMA_VERSION: u32 = 2;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SchemaVersionV1;
 
-/// The supported profile schema version for v0.8.0.
+/// The supported profile schema version for v0.9.0.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ProfileSchemaVersionV5;
+pub(crate) struct ProfileSchemaVersionV6;
 
-impl<'de> Deserialize<'de> for ProfileSchemaVersionV5 {
+impl<'de> Deserialize<'de> for ProfileSchemaVersionV6 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let version = u32::deserialize(deserializer)?;
-        if version == CURRENT_MANAGED_GENERATION {
+        if version == CURRENT_PROFILE_GENERATION {
             Ok(Self)
         } else {
             Err(D::Error::custom(format!(
-                "unsupported schema_version {version}; expected {CURRENT_MANAGED_GENERATION}"
+                "unsupported schema_version {version}; expected {CURRENT_PROFILE_GENERATION}"
             )))
         }
     }

@@ -1045,194 +1045,420 @@ fn resolve_orchestration(
     instances: &[ResolvedInstance],
     profiles: &BTreeMap<ProfileId, DiscoveredProfile>,
 ) -> Result<ResolvedOrchestration, ResolverError> {
-    let mut resource_ids = BTreeSet::new();
-    let mut stage_ids = BTreeSet::new();
-
-    for instance in instances {
-        let declaration = &profiles[&instance.definition].declaration;
-        for (local_id, _) in declaration.resources() {
-            let local_id = ResourceId::parse(local_id.to_owned()).map_err(|source| {
-                ResolverError::InvalidIdentifier {
-                    role: "resource ID",
-                    value: local_id.to_owned(),
-                    source,
-                }
-            })?;
-            resource_ids.insert(FullyQualifiedResourceId::in_instance(
-                &instance.name,
-                &local_id,
-            ));
-        }
-        for (local_id, _) in declaration.stages() {
-            let local_id = ResourceId::parse(local_id.to_owned()).map_err(|source| {
-                ResolverError::InvalidIdentifier {
-                    role: "stage ID",
-                    value: local_id.to_owned(),
-                    source,
-                }
-            })?;
-            stage_ids.insert(
-                FullyQualifiedResourceId::in_instance(&instance.name, &local_id).to_string(),
-            );
-        }
+    let root = &instances[0].name;
+    let root_id = root.to_string();
+    let root_profile = &profiles[&instances[0].definition].declaration;
+    let by_name = instances
+        .iter()
+        .map(|i| (i.name.to_string(), i))
+        .collect::<BTreeMap<_, _>>();
+    let phase_id = |name: &str| format!("stage/{root_id}/{name}");
+    let phase_names = root_profile
+        .stages()
+        .map(|(name, _)| name.to_owned())
+        .collect::<BTreeSet<_>>();
+    for name in &phase_names {
+        valid_orchestration_name(name, "stage")?;
     }
-
     let mut stages = Vec::new();
-    let mut resources = Vec::new();
+    for (name, declaration) in root_profile.stages() {
+        let mut after = BTreeSet::new();
+        for predecessor in declaration.after() {
+            valid_orchestration_name(predecessor, "stage after")?;
+            if !phase_names.contains(predecessor) {
+                return Err(ResolverError::InvalidOrchestrationReference {
+                    reference: predecessor.clone(),
+                    relation: "stage after",
+                    reason: "does not name a root phase",
+                });
+            }
+            if predecessor == name || !after.insert(predecessor.clone()) {
+                return Err(ResolverError::InvalidOrchestrationRelation {
+                    owner: phase_id(name),
+                    reference: phase_id(predecessor),
+                    relation: "stage after",
+                    reason: if predecessor == name {
+                        "must not reference itself"
+                    } else {
+                        "must not contain duplicates"
+                    },
+                });
+            }
+        }
+        stages.push(ResolvedStage::new(
+            phase_id(name),
+            after.into_iter().map(|n| phase_id(&n)).collect(),
+        ));
+    }
+    reject_stage_cycle(&stages)?;
+    let mut memberships = BTreeMap::new();
+    walk_memberships(
+        &root_id,
+        &root_id,
+        None,
+        &by_name,
+        profiles,
+        &phase_names,
+        &mut memberships,
+    )?;
+    let resource_ids = instances
+        .iter()
+        .flat_map(|instance| {
+            profiles[&instance.definition]
+                .declaration
+                .resources()
+                .map(move |(local, _)| format!("{}/{local}", instance.name))
+        })
+        .collect::<BTreeSet<_>>();
+    let mut edges: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut canonical_edges = BTreeSet::new();
     for instance in instances {
         let declaration = &profiles[&instance.definition].declaration;
-        for (local_id, stage) in declaration.stages() {
-            let stage_id = canonical_stage_id(local_id, &instance.name, &stage_ids, "stage")?;
-            let mut after = BTreeSet::new();
-            for reference in stage.after() {
-                let resolved =
-                    canonical_stage_id(reference, &instance.name, &stage_ids, "stage after")?;
-                if resolved == stage_id {
-                    return Err(ResolverError::InvalidOrchestrationRelation {
-                        owner: stage_id.clone(),
-                        reference: resolved,
-                        relation: "stage after",
-                        reason: "must not reference itself",
-                    });
-                }
-                if !after.insert(resolved.clone()) {
-                    return Err(ResolverError::InvalidOrchestrationRelation {
-                        owner: stage_id.clone(),
-                        reference: resolved,
-                        relation: "stage after",
-                        reason: "must not contain duplicates",
-                    });
-                }
-            }
-            stages.push(ResolvedStage::new(stage_id, after.into_iter().collect()));
-        }
-        for (local_id, resource) in declaration.resources() {
-            let local_id = ResourceId::parse(local_id.to_owned()).map_err(|source| {
-                ResolverError::InvalidIdentifier {
-                    role: "resource ID",
-                    value: local_id.to_owned(),
-                    source,
-                }
-            })?;
-            let resource_id = FullyQualifiedResourceId::in_instance(&instance.name, &local_id);
-            let stage = resource
-                .stage()
-                .map(|reference| canonical_local_stage_id(reference, &instance.name, &stage_ids))
-                .transpose()?;
-            let mut depends_on = BTreeSet::new();
+        let owner = instance.name.to_string();
+        for (local, resource) in declaration.resources() {
+            let after = format!("{owner}/{local}");
             for reference in resource.depends_on() {
-                let resolved =
-                    canonical_resource_id(reference, &instance.name, &resource_ids, "depends_on")?;
-                if resolved == resource_id {
-                    return Err(ResolverError::InvalidOrchestrationRelation {
-                        owner: resource_id.to_string(),
-                        reference: resolved.to_string(),
-                        relation: "depends_on",
-                        reason: "must not reference itself",
-                    });
-                }
-                if !depends_on.insert(resolved.clone()) {
-                    return Err(ResolverError::InvalidOrchestrationRelation {
-                        owner: resource_id.to_string(),
-                        reference: resolved.to_string(),
-                        relation: "depends_on",
-                        reason: "must not contain duplicates",
-                    });
-                }
+                valid_orchestration_name(reference, "depends_on")?;
+                let before = format!("{owner}/{reference}");
+                insert_dependency(
+                    &before,
+                    &after,
+                    &format!(
+                        "profile={}; include_path={}; resource={local}; field=depends_on",
+                        instance.definition, owner
+                    ),
+                    &resource_ids,
+                    &mut canonical_edges,
+                    &mut edges,
+                )?;
             }
-            resources.push(ResolvedResourceOrchestration::new(
-                resource_id,
-                stage,
-                depends_on.into_iter().collect(),
-            ));
+        }
+        for dependency in declaration.resource_dependencies() {
+            let before = resolve_parent_endpoint(
+                dependency.before(),
+                instance,
+                &by_name,
+                profiles,
+                &resource_ids,
+            )?;
+            let after = resolve_parent_endpoint(
+                dependency.after(),
+                instance,
+                &by_name,
+                profiles,
+                &resource_ids,
+            )?;
+            if before.rsplit_once('/').unwrap().0 == after.rsplit_once('/').unwrap().0 {
+                return Err(ResolverError::InvalidOrchestrationRelation {
+                    owner,
+                    reference: format!("{before} -> {after}"),
+                    relation: "resource_dependencies",
+                    reason: "endpoints must be in different instances",
+                });
+            }
+            let source = format!(
+                "profile={}; include_path={}; resource={} -> {}; field=resource_dependencies",
+                instance.definition,
+                instance.name,
+                dependency.before(),
+                dependency.after()
+            );
+            insert_dependency(
+                &before,
+                &after,
+                &source,
+                &resource_ids,
+                &mut canonical_edges,
+                &mut edges,
+            )?;
         }
     }
-
+    let mut resources = Vec::new();
+    for resource in resource_ids {
+        let (phase, source) = memberships
+            .remove(&resource)
+            .expect("every resource is visited");
+        let dependencies = edges.remove(&resource).unwrap_or_default();
+        let ids = dependencies
+            .keys()
+            .map(|id| FullyQualifiedResourceId::parse(id).expect("canonical resource"))
+            .collect();
+        let sources = dependencies
+            .into_iter()
+            .map(|(id, source)| {
+                (
+                    FullyQualifiedResourceId::parse(&id).expect("canonical resource"),
+                    source,
+                )
+            })
+            .collect();
+        resources.push(
+            ResolvedResourceOrchestration::new(
+                FullyQualifiedResourceId::parse(&resource).expect("canonical resource"),
+                phase.map(|name| phase_id(&name)),
+                ids,
+            )
+            .with_provenance(source, sources),
+        );
+    }
     Ok(ResolvedOrchestration::new(stages, resources))
 }
 
-fn canonical_resource_id(
-    reference: &str,
-    local_instance: &InstanceNamespace,
-    declared: &BTreeSet<FullyQualifiedResourceId>,
-    relation: &'static str,
-) -> Result<FullyQualifiedResourceId, ResolverError> {
-    let resolved = if reference.contains('/') {
-        FullyQualifiedResourceId::parse(reference).map_err(|_| {
-            ResolverError::InvalidOrchestrationReference {
-                reference: reference.to_owned(),
-                relation,
-                reason: "is not a fully-qualified resource ID",
-            }
-        })?
-    } else {
-        let local = ResourceId::parse(reference.to_owned()).map_err(|_| {
-            ResolverError::InvalidOrchestrationReference {
-                reference: reference.to_owned(),
-                relation,
-                reason: "is not a local resource ID",
-            }
-        })?;
-        FullyQualifiedResourceId::in_instance(local_instance, &local)
-    };
-    if !declared.contains(&resolved) {
-        return Err(ResolverError::InvalidOrchestrationReference {
-            reference: resolved.to_string(),
+fn valid_orchestration_name(value: &str, relation: &'static str) -> Result<(), ResolverError> {
+    ResourceId::parse(value.to_owned())
+        .map(|_| ())
+        .map_err(|_| ResolverError::InvalidOrchestrationReference {
+            reference: value.to_owned(),
             relation,
+            reason: "must be a local identifier",
+        })
+}
+
+fn reject_stage_cycle(stages: &[ResolvedStage]) -> Result<(), ResolverError> {
+    fn visit<'a>(
+        id: &'a str,
+        lookup: &BTreeMap<&'a str, &'a ResolvedStage>,
+        active: &mut BTreeSet<&'a str>,
+        done: &mut BTreeSet<&'a str>,
+    ) -> Result<(), ResolverError> {
+        if done.contains(id) {
+            return Ok(());
+        }
+        if !active.insert(id) {
+            return Err(ResolverError::InvalidOrchestrationRelation {
+                owner: id.to_owned(),
+                reference: id.to_owned(),
+                relation: "stage after",
+                reason: "contains a cycle",
+            });
+        }
+        for predecessor in lookup[id].after() {
+            visit(predecessor, lookup, active, done)?;
+        }
+        active.remove(id);
+        done.insert(id);
+        Ok(())
+    }
+    let lookup = stages
+        .iter()
+        .map(|s| (s.id(), s))
+        .collect::<BTreeMap<_, _>>();
+    let mut done = BTreeSet::new();
+    for stage in stages {
+        visit(stage.id(), &lookup, &mut BTreeSet::new(), &mut done)?;
+    }
+    Ok(())
+}
+
+type Memberships = BTreeMap<String, (Option<String>, Option<String>)>;
+
+fn membership_source_rank(source: &str) -> (u8, &str, &str) {
+    let include = source.contains("field=includes.stage");
+    let path = source
+        .split("include_path=")
+        .nth(1)
+        .and_then(|suffix| suffix.split(';').next())
+        .unwrap_or("");
+    (u8::from(!include), path, source)
+}
+
+fn walk_memberships(
+    root: &str,
+    current: &str,
+    inherited: Option<(String, String)>,
+    instances: &BTreeMap<String, &ResolvedInstance>,
+    profiles: &BTreeMap<ProfileId, DiscoveredProfile>,
+    phases: &BTreeSet<String>,
+    output: &mut Memberships,
+) -> Result<(), ResolverError> {
+    let instance = instances[current];
+    let declaration = &profiles[&instance.definition].declaration;
+    if current != root && declaration.declares_stages() {
+        return Err(ResolverError::InvalidOrchestrationRelation {
+            owner: current.to_owned(),
+            reference: "stages".to_owned(),
+            relation: "root phases",
+            reason: "included profiles must not declare stages",
+        });
+    }
+    for (local, resource) in declaration.resources() {
+        valid_orchestration_name(local, "resource ID")?;
+        if let Some(name) = resource.stage() {
+            valid_orchestration_name(name, "resource stage")?;
+        }
+        let effective = inherited
+            .as_ref()
+            .map(|(name, _)| name.clone())
+            .or_else(|| resource.stage().map(ToOwned::to_owned));
+        if let Some(name) = &effective {
+            if !phases.contains(name) {
+                return Err(ResolverError::InvalidOrchestrationReference {
+                    reference: name.clone(),
+                    relation: "resource stage",
+                    reason: "does not name a root phase",
+                });
+            }
+        }
+        let source = inherited
+            .as_ref()
+            .map(|(_, source)| format!("{source}; resource={local}"))
+            .or_else(|| {
+                resource.stage().map(|_| {
+                    format!(
+                        "profile={}; include_path={current}; resource={local}; field=stage",
+                        instance.definition
+                    )
+                })
+            });
+        let id = format!("{current}/{local}");
+        match output.entry(id.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((effective, source));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().0 != effective {
+                    return Err(ResolverError::InvalidOrchestrationRelation {
+                        owner: id,
+                        reference: format!("{:?} versus {:?}", entry.get().0, effective),
+                        relation: "effective stage",
+                        reason: "repeated instance has conflicting memberships",
+                    });
+                }
+                if let Some(candidate) = source {
+                    let incumbent = &entry.get().1;
+                    if incumbent.as_ref().is_none_or(|s| {
+                        membership_source_rank(&candidate) < membership_source_rank(s)
+                    }) {
+                        entry.get_mut().1 = Some(candidate);
+                    }
+                }
+            }
+        }
+    }
+    for include in declaration.includes() {
+        if let Some(name) = include.stage() {
+            valid_orchestration_name(name, "include stage")?;
+        }
+        let alias = include.as_name().unwrap_or(include.id());
+        let child = format!("{current}/{alias}");
+        if !instances.contains_key(&child) {
+            return Err(ResolverError::InvalidOrchestrationReference {
+                reference: child,
+                relation: "include",
+                reason: "does not name a resolved instance",
+            });
+        }
+        let next = inherited.clone().or_else(|| {
+            include.stage().map(|name| {
+                (
+                    name.to_owned(),
+                    format!(
+                        "profile={}; include_path={child}; field=includes.stage",
+                        instance.definition
+                    ),
+                )
+            })
+        });
+        walk_memberships(root, &child, next, instances, profiles, phases, output)?;
+    }
+    Ok(())
+}
+
+fn resolve_parent_endpoint(
+    reference: &str,
+    declaring: &ResolvedInstance,
+    instances: &BTreeMap<String, &ResolvedInstance>,
+    profiles: &BTreeMap<ProfileId, DiscoveredProfile>,
+    resources: &BTreeSet<String>,
+) -> Result<String, ResolverError> {
+    let parts = reference.split('/').collect::<Vec<_>>();
+    if parts.is_empty()
+        || parts
+            .iter()
+            .any(|part| valid_orchestration_name(part, "resource_dependencies").is_err())
+    {
+        return Err(ResolverError::InvalidOrchestrationReference {
+            reference: reference.to_owned(),
+            relation: "resource_dependencies",
+            reason: "must be a local resource or include-alias path",
+        });
+    }
+    if parts.len() > 1 && parts[0] == instances.keys().next().expect("root instance") {
+        return Err(ResolverError::InvalidOrchestrationReference {
+            reference: reference.to_owned(),
+            relation: "resource_dependencies",
+            reason: "must not contain the selected root prefix",
+        });
+    }
+    let mut current = declaring.name.to_string();
+    for alias in &parts[..parts.len() - 1] {
+        let profile = &profiles[&instances[&current].definition].declaration;
+        let count = profile
+            .includes()
+            .iter()
+            .filter(|include| include.as_name().unwrap_or(include.id()) == *alias)
+            .count();
+        if count != 1 {
+            return Err(ResolverError::InvalidOrchestrationReference {
+                reference: reference.to_owned(),
+                relation: "resource_dependencies",
+                reason: if count == 0 {
+                    "does not follow an include edge"
+                } else {
+                    "has an ambiguous include alias"
+                },
+            });
+        }
+        current = format!("{current}/{alias}");
+    }
+    let id = format!("{current}/{}", parts[parts.len() - 1]);
+    if !resources.contains(&id) {
+        return Err(ResolverError::InvalidOrchestrationReference {
+            reference: reference.to_owned(),
+            relation: "resource_dependencies",
+            reason: "does not name a resource in the declaring closure",
+        });
+    }
+    Ok(id)
+}
+
+fn insert_dependency(
+    before: &str,
+    after: &str,
+    source: &str,
+    resources: &BTreeSet<String>,
+    seen: &mut BTreeSet<(String, String)>,
+    edges: &mut BTreeMap<String, BTreeMap<String, String>>,
+) -> Result<(), ResolverError> {
+    if !resources.contains(before) || !resources.contains(after) {
+        return Err(ResolverError::InvalidOrchestrationReference {
+            reference: if !resources.contains(before) {
+                before
+            } else {
+                after
+            }
+            .to_owned(),
+            relation: "dependency",
             reason: "does not name a resolved resource instance",
         });
     }
-    Ok(resolved)
-}
-
-fn canonical_stage_id(
-    reference: &str,
-    local_instance: &InstanceNamespace,
-    declared: &BTreeSet<String>,
-    relation: &'static str,
-) -> Result<String, ResolverError> {
-    let resolved = if reference.contains('/') {
-        FullyQualifiedResourceId::parse(reference)
-            .map_err(|_| ResolverError::InvalidOrchestrationReference {
-                reference: reference.to_owned(),
-                relation,
-                reason: "is not a fully-qualified stage ID",
-            })?
-            .to_string()
-    } else {
-        let local = ResourceId::parse(reference.to_owned()).map_err(|_| {
-            ResolverError::InvalidOrchestrationReference {
-                reference: reference.to_owned(),
-                relation,
-                reason: "is not a local stage ID",
-            }
-        })?;
-        FullyQualifiedResourceId::in_instance(local_instance, &local).to_string()
-    };
-    if !declared.contains(&resolved) {
-        return Err(ResolverError::InvalidOrchestrationReference {
-            reference: resolved,
-            relation,
-            reason: "does not name a resolved stage instance",
+    if before == after || !seen.insert((before.to_owned(), after.to_owned())) {
+        return Err(ResolverError::InvalidOrchestrationRelation {
+            owner: after.to_owned(),
+            reference: before.to_owned(),
+            relation: "dependency",
+            reason: if before == after {
+                "must not reference itself"
+            } else {
+                "must not contain duplicate canonical edges"
+            },
         });
     }
-    Ok(resolved)
-}
-
-/// Resolves the resource `stage` field, which is deliberately local-only.
-fn canonical_local_stage_id(
-    reference: &str,
-    local_instance: &InstanceNamespace,
-    declared: &BTreeSet<String>,
-) -> Result<String, ResolverError> {
-    if reference.contains('/') {
-        return Err(ResolverError::InvalidOrchestrationReference {
-            reference: reference.to_owned(),
-            relation: "resource stage",
-            reason: "is not a local stage ID",
-        });
-    }
-    canonical_stage_id(reference, local_instance, declared, "resource stage")
+    edges
+        .entry(after.to_owned())
+        .or_default()
+        .insert(before.to_owned(), source.to_owned());
+    Ok(())
 }
 
 fn compose_profiles(
@@ -2090,6 +2316,382 @@ mod tests {
         format!(
             "  {resource_id}:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: {source}\n      target: {target}\n      operation: link\n"
         )
+    }
+
+    fn schema_six_resource(id: &str, stage: Option<&str>, depends_on: &[&str]) -> String {
+        let phase = stage
+            .map(|value| format!("    stage: {value}\n"))
+            .unwrap_or_default();
+        let dependencies = if depends_on.is_empty() {
+            String::new()
+        } else {
+            format!("    depends_on: [{}]\n", depends_on.join(", "))
+        };
+        format!(
+            "  {id}:\n    type: file\n{phase}{dependencies}    properties:\n      kind: file\n      source: {{ store: dotfiles, path: file }}\n      target: ~/.{id}\n      operation: link\n"
+        )
+    }
+
+    fn schema_six_orchestration(
+        root: &str,
+        docs: &[(&str, String)],
+    ) -> Result<ResolvedOrchestration, ResolverError> {
+        let profiles = docs
+            .iter()
+            .map(|(name, yaml)| {
+                let id = ProfileId::parse(*name).unwrap();
+                let declaration = ProfileDeclaration::parse(yaml).unwrap();
+                (
+                    id,
+                    DiscoveredProfile {
+                        declaration,
+                        file_path: ResolvedPath::new(
+                            std::env::temp_dir().join(format!("{name}.yaml")),
+                        )
+                        .unwrap(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let root = ProfileId::parse(root).unwrap();
+        let instances = compose_instances(&root, &profiles)?;
+        resolve_orchestration(&instances, &profiles)
+    }
+
+    #[test]
+    fn schema_six_root_phases_override_nested_subtrees_and_local_fallback() {
+        let root = format!(
+            "schema_version: 6\nid: root\nstages:\n  early: {{ after: [] }}\n  late: {{ after: [early] }}\nincludes:\n  - {{ id: child, as: child, stage: early }}\nresources:\n{}",
+            schema_six_resource("own", Some("late"), &[])
+        );
+        let child = format!(
+            "schema_version: 6\nid: child\nincludes:\n  - {{ id: leaf, as: leaf, stage: late }}\nresources:\n{}",
+            schema_six_resource("item", Some("late"), &[])
+        );
+        let leaf = format!(
+            "schema_version: 6\nid: leaf\nresources:\n{}",
+            schema_six_resource("item", Some("late"), &[])
+        );
+        let result =
+            schema_six_orchestration("root", &[("root", root), ("child", child), ("leaf", leaf)])
+                .unwrap();
+        assert_eq!(
+            result.stages().iter().map(|s| s.id()).collect::<Vec<_>>(),
+            ["stage/root/early", "stage/root/late"]
+        );
+        for id in ["root/child/item", "root/child/leaf/item"] {
+            let item = result
+                .resources()
+                .iter()
+                .find(|r| r.resource_id().as_str() == id)
+                .unwrap();
+            assert_eq!(item.stage(), Some("stage/root/early"));
+            assert_eq!(
+                item.stage_source(),
+                Some("profile=root; include_path=root/child; field=includes.stage; resource=item")
+            );
+        }
+        assert_eq!(
+            result
+                .resources()
+                .iter()
+                .find(|r| r.resource_id().as_str() == "root/own")
+                .unwrap()
+                .stage(),
+            Some("stage/root/late")
+        );
+    }
+
+    #[test]
+    fn schema_six_rejects_child_phases_and_missing_root_phases() {
+        let root =
+            "schema_version: 6\nid: root\nincludes: [{ id: child }]\nresources: {}\n".to_owned();
+        let child = format!(
+            "schema_version: 6\nid: child\nstages:\n  early: {{ after: [] }}\nresources:\n{}",
+            schema_six_resource("item", Some("early"), &[])
+        );
+        assert!(
+            schema_six_orchestration("root", &[("root", root.clone()), ("child", child.clone())])
+                .is_err()
+        );
+        assert!(schema_six_orchestration("child", &[("child", child)]).is_ok());
+        let empty_stage_child =
+            "schema_version: 6\nid: child\nstages: {}\nresources: {}\n".to_owned();
+        assert!(
+            schema_six_orchestration(
+                "root",
+                &[
+                    (
+                        "root",
+                        "schema_version: 6\nid: root\nincludes: [{ id: child }]\nresources: {}\n"
+                            .to_owned()
+                    ),
+                    ("child", empty_stage_child)
+                ]
+            )
+            .is_err()
+        );
+        let child = format!(
+            "schema_version: 6\nid: child\nresources:\n{}",
+            schema_six_resource("item", Some("early"), &[])
+        );
+        assert!(
+            schema_six_orchestration("root", &[("root", root), ("child", child.clone())]).is_err()
+        );
+        assert!(schema_six_orchestration("child", &[("child", child)]).is_err());
+    }
+
+    #[test]
+    fn schema_six_repeated_paths_check_membership_and_stable_provenance() {
+        let leaf = format!(
+            "schema_version: 6\nid: leaf\nresources:\n{}",
+            schema_six_resource("item", Some("early"), &[])
+        );
+        let root = "schema_version: 6\nid: root\nstages:\n  early: { after: [] }\n  late: { after: [] }\nincludes:\n  - { id: leaf, as: shared, stage: early }\n  - { id: leaf, as: shared }\nresources: {}\n".to_owned();
+        let result =
+            schema_six_orchestration("root", &[("root", root), ("leaf", leaf.clone())]).unwrap();
+        let item = &result.resources()[0];
+        assert_eq!(item.stage(), Some("stage/root/early"));
+        assert_eq!(
+            item.stage_source(),
+            Some("profile=root; include_path=root/shared; field=includes.stage; resource=item")
+        );
+        let conflict = "schema_version: 6\nid: root\nstages:\n  early: { after: [] }\n  late: { after: [] }\nincludes:\n  - { id: leaf, as: shared, stage: early }\n  - { id: leaf, as: shared, stage: late }\nresources: {}\n".to_owned();
+        assert!(matches!(
+            schema_six_orchestration("root", &[("root", conflict), ("leaf", leaf)]),
+            Err(ResolverError::InvalidOrchestrationRelation {
+                relation: "effective stage",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn schema_six_equal_nested_assignment_prefers_lexical_alias_path() {
+        let leaf = format!(
+            "schema_version: 6\nid: leaf\nresources:\n{}",
+            schema_six_resource("item", Some("early"), &[])
+        );
+        let branch = "schema_version: 6\nid: branch\nincludes: [{ id: leaf, as: nested, stage: early }]\nresources: {}\n".to_owned();
+        let root = |reverse: bool| {
+            let includes = if reverse {
+                "  - { id: branch, as: branch }\n  - { id: branch, as: branch, stage: early }"
+            } else {
+                "  - { id: branch, as: branch, stage: early }\n  - { id: branch, as: branch }"
+            };
+            format!(
+                "schema_version: 6\nid: root\nstages:\n  early: {{ after: [] }}\nincludes:\n{includes}\nresources: {{}}\n"
+            )
+        };
+        for reverse in [false, true] {
+            let result = schema_six_orchestration(
+                "root",
+                &[
+                    ("root", root(reverse)),
+                    ("branch", branch.clone()),
+                    ("leaf", leaf.clone()),
+                ],
+            )
+            .unwrap();
+            let item = result
+                .resources()
+                .iter()
+                .find(|r| r.resource_id().as_str() == "root/branch/nested/item")
+                .unwrap();
+            assert_eq!(
+                item.stage_source(),
+                Some("profile=root; include_path=root/branch; field=includes.stage; resource=item")
+            );
+        }
+    }
+
+    #[test]
+    fn schema_six_rejects_invalid_overridden_stage_and_parent_alias_ambiguity() {
+        let child = format!(
+            "schema_version: 6\nid: child\nresources:\n{}",
+            schema_six_resource("item", Some("bad/name"), &[])
+        );
+        let root = "schema_version: 6\nid: root\nstages:\n  early: { after: [] }\nincludes: [{ id: child, stage: early }]\nresources: {}\n".to_owned();
+        assert!(schema_six_orchestration("root", &[("root", root), ("child", child)]).is_err());
+        let child = format!(
+            "schema_version: 6\nid: child\nresources:\n{}",
+            schema_six_resource("item", None, &[])
+        );
+        let root = format!(
+            "schema_version: 6\nid: root\nincludes:\n  - {{ id: child, as: same }}\n  - {{ id: child, as: same }}\nresource_dependencies:\n  - {{ before: same/item, after: own }}\nresources:\n{}",
+            schema_six_resource("own", None, &[])
+        );
+        assert!(matches!(
+            schema_six_orchestration("root", &[("root", root), ("child", child)]),
+            Err(ResolverError::InvalidOrchestrationReference {
+                reason: "has an ambiguous include alias",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn schema_six_parent_dependencies_are_canonical_and_duplicates_reject() {
+        let child = format!(
+            "schema_version: 6\nid: child\nresources:\n{}",
+            schema_six_resource("item", None, &[])
+        );
+        let root = format!(
+            "schema_version: 6\nid: root\nincludes: [{{ id: child, as: one }}]\nresource_dependencies:\n  - {{ before: one/item, after: own }}\nresources:\n{}",
+            schema_six_resource("own", None, &[])
+        );
+        let result =
+            schema_six_orchestration("root", &[("root", root.clone()), ("child", child.clone())])
+                .unwrap();
+        let own = result
+            .resources()
+            .iter()
+            .find(|r| r.resource_id().as_str() == "root/own")
+            .unwrap();
+        assert_eq!(
+            own.depends_on()
+                .iter()
+                .map(|i| i.as_str())
+                .collect::<Vec<_>>(),
+            ["root/one/item"]
+        );
+        assert!(own.dependency_sources()[0].1.contains("one/item -> own"));
+        let duplicate = root.replace(
+            "  - { before: one/item, after: own }",
+            "  - { before: one/item, after: own }\n  - { before: one/item, after: own }",
+        );
+        assert!(
+            schema_six_orchestration("root", &[("root", duplicate), ("child", child.clone())])
+                .is_err()
+        );
+        let qualified = format!(
+            "schema_version: 6\nid: root\nincludes: [{{ id: child, as: one }}]\nresources:\n{}",
+            schema_six_resource("own", None, &["one/item"])
+        );
+        assert!(
+            schema_six_orchestration("root", &[("root", qualified), ("child", child)]).is_err()
+        );
+    }
+
+    #[test]
+    fn schema_six_stage_graph_and_parent_reference_rejections() {
+        for stages in [
+            "stages:\n  a: { after: [a] }\n",
+            "stages:\n  a: { after: [b] }\n  b: { after: [a] }\n",
+            "stages:\n  a: { after: [b, b] }\n  b: { after: [] }\n",
+            "stages:\n  a: { after: [missing] }\n",
+        ] {
+            let root = format!("schema_version: 6\nid: root\n{stages}resources: {{}}\n");
+            assert!(schema_six_orchestration("root", &[("root", root)]).is_err());
+        }
+        let child = format!(
+            "schema_version: 6\nid: child\nresources:\n{}",
+            schema_six_resource("item", None, &[])
+        );
+        for before in [
+            "root/one/item",
+            "missing/item",
+            "one/missing",
+            "../one/item",
+            "one/item/extra",
+        ] {
+            let root = format!(
+                "schema_version: 6\nid: root\nincludes: [{{ id: child, as: one }}]\nresource_dependencies: [{{ before: {before}, after: own }}]\nresources:\n{}",
+                schema_six_resource("own", None, &[])
+            );
+            assert!(
+                schema_six_orchestration("root", &[("root", root), ("child", child.clone())])
+                    .is_err(),
+                "{before}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_six_permutations_keep_canonical_order_and_sources() {
+        let child = format!(
+            "schema_version: 6\nid: child\nresources:\n{}",
+            schema_six_resource("item", None, &[])
+        );
+        let make_root = |reverse: bool| {
+            let includes = if reverse {
+                "  - { id: child, as: second }\n  - { id: child, as: first }"
+            } else {
+                "  - { id: child, as: first }\n  - { id: child, as: second }"
+            };
+            let stages = if reverse {
+                "  late: { after: [early] }\n  early: { after: [] }"
+            } else {
+                "  early: { after: [] }\n  late: { after: [early] }"
+            };
+            format!(
+                "schema_version: 6\nid: root\nstages:\n{stages}\nincludes:\n{includes}\nresource_dependencies:\n  - {{ before: first/item, after: second/item }}\nresources:\n{}",
+                schema_six_resource("own", Some("late"), &[])
+            )
+        };
+        let left = schema_six_orchestration(
+            "root",
+            &[("root", make_root(false)), ("child", child.clone())],
+        )
+        .unwrap();
+        let right =
+            schema_six_orchestration("root", &[("root", make_root(true)), ("child", child)])
+                .unwrap();
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn schema_six_parent_paths_follow_nested_edges_and_reject_sibling_capture() {
+        let leaf = format!(
+            "schema_version: 6\nid: leaf\nresources:\n{}",
+            schema_six_resource("item", None, &[])
+        );
+        let branch = format!(
+            "schema_version: 6\nid: branch\nincludes: [{{ id: leaf, as: nested }}]\nresources:\n{}",
+            schema_six_resource("own", None, &[])
+        );
+        let root = "schema_version: 6\nid: root\nincludes: [{ id: branch, as: branch }]\nresource_dependencies: [{ before: branch/nested/item, after: branch/own }]\nresources: {}\n".to_owned();
+        let resolved = schema_six_orchestration(
+            "root",
+            &[
+                ("root", root),
+                ("branch", branch.clone()),
+                ("leaf", leaf.clone()),
+            ],
+        )
+        .unwrap();
+        let own = resolved
+            .resources()
+            .iter()
+            .find(|r| r.resource_id().as_str() == "root/branch/own")
+            .unwrap();
+        assert_eq!(
+            own.depends_on()
+                .iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>(),
+            ["root/branch/nested/item"]
+        );
+        let sibling = format!(
+            "schema_version: 6\nid: branch\nincludes: [{{ id: leaf, as: nested }}]\nresource_dependencies: [{{ before: root/other/item, after: own }}]\nresources:\n{}",
+            schema_six_resource("own", None, &[])
+        );
+        let root = "schema_version: 6\nid: root\nincludes: [{ id: branch, as: branch }, { id: leaf, as: other }]\nresources: {}\n".to_owned();
+        assert!(
+            schema_six_orchestration(
+                "root",
+                &[("root", root), ("branch", sibling), ("leaf", leaf.clone())]
+            )
+            .is_err()
+        );
+        let same_instance = format!(
+            "schema_version: 6\nid: root\nresource_dependencies: [{{ before: first, after: second }}]\nresources:\n{}{}",
+            schema_six_resource("first", None, &[]),
+            schema_six_resource("second", None, &[])
+        );
+        assert!(schema_six_orchestration("root", &[("root", same_instance)]).is_err());
+        let root_alias = "schema_version: 6\nid: root\nincludes: [{ id: leaf, as: root }]\nresource_dependencies: [{ before: root/item, after: own }]\nresources:\n  own:\n    type: file\n    properties:\n      kind: file\n      source: { store: dotfiles, path: file }\n      target: ~/.own\n      operation: link\n".to_owned();
+        assert!(schema_six_orchestration("root", &[("root", root_alias), ("leaf", leaf)]).is_err());
     }
 
     #[test]

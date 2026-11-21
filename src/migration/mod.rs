@@ -27,6 +27,7 @@ pub(crate) struct MigrationPresentation {
     pub(crate) documents: Vec<MigrationDocument>,
     pub(crate) normal_commands_available: bool,
     pub(crate) ownership_invariant: &'static str,
+    pub(crate) broadened_ordering: Vec<String>,
     snapshot_fingerprint: [u8; 32],
 }
 
@@ -80,6 +81,7 @@ impl MigrationFacade {
                 .collect(),
             normal_commands_available: summary.normal_commands_available,
             ownership_invariant: "resource IDs, effects, and Known ownership do not change",
+            broadened_ordering: summary.broadening,
             snapshot_fingerprint: plan.confirmation_fingerprint(),
         })
     }
@@ -127,3 +129,4 @@ impl std::error::Error for MigrationFacadeError {}
 mod continuous;
 mod schema_3_to_4;
 mod schema_4_to_5;
+mod schema_5_to_6;

@@ -85,12 +85,39 @@ pub(crate) struct PersistedState {
 }
 
 impl PersistedState {
-    /// Accepts decoded facts only after checking operation/Known consistency.
+    /// Accepts decoded facts only after checking applied topology, operation, and Known consistency.
     pub(super) fn from_parts(
         known: KnownState,
         active_operation: Option<OperationRecord>,
     ) -> Result<Self, StateDecodeError> {
+        let resource_ids = known
+            .resources()
+            .map(|resource| resource.resource_id())
+            .collect::<BTreeSet<_>>();
+        let topology = known.topology();
+        if topology
+            .current_direct()
+            .iter()
+            .chain(topology.historical_direct())
+            .any(|fact| !resource_ids.contains(&fact.from) || !resource_ids.contains(&fact.to))
+            || topology
+                .current_barriers()
+                .iter()
+                .chain(topology.historical_barriers())
+                .flat_map(|fact| &fact.members)
+                .any(|member| !resource_ids.contains(member))
+        {
+            return Err(StateDecodeError::InvalidTopology(
+                "applied topology references an absent Known resource",
+            ));
+        }
         if let Some(operation) = &active_operation {
+            operation
+                .validate_loaded_direct_predecessors(&known)
+                .map_err(StateDecodeError::InvalidOperation)?;
+            operation
+                .validate_loaded_topology(known.topology())
+                .map_err(StateDecodeError::InvalidOperation)?;
             for (_, action) in operation.actions() {
                 if let Some(temporary_path) = action.temporary_path() {
                     if known
@@ -820,10 +847,14 @@ impl LockedStateRepository {
         for node in &mut graph.actions {
             node.id = action_id(node.resource_id.as_str())?;
         }
+        graph.actions.sort_by(|left, right| left.id.cmp(&right.id));
         for edge in &mut graph.direct_edges {
             edge.from = action_id(&edge.from)?;
             edge.to = action_id(&edge.to)?;
         }
+        graph.direct_edges.sort_by(|left, right| {
+            (&left.from, &left.to, left.origin).cmp(&(&right.from, &right.to, right.origin))
+        });
         for barrier in &mut graph.barriers {
             barrier.input = barrier
                 .input
@@ -835,6 +866,8 @@ impl LockedStateRepository {
                 .iter()
                 .map(|id| action_id(id))
                 .collect::<Result<_, _>>()?;
+            barrier.input.sort();
+            barrier.output.sort();
         }
         graph.schedule = graph
             .schedule
@@ -1979,9 +2012,14 @@ mod tests {
     use crate::domain::hashes::definition_hash;
     use crate::domain::ids::FullyQualifiedResourceId;
     use crate::domain::known::{
-        KnownDirectoryLink, KnownFileCopy, KnownFileLink, KnownResource, KnownState,
+        AppliedBarrier, AppliedLifecycleTopology, KnownDirectoryLink, KnownFileCopy, KnownFileLink,
+        KnownResource, KnownState, StaleTopologySnapshot, TopologyAuthority,
+        TopologyBarrierAdvance, TopologyBarrierReplacement, TopologyDelta,
     };
-    use crate::domain::plan::{PlannedFileCopyAction, PlannedResourceAction, TargetCondition};
+    use crate::domain::plan::{
+        ActionRole, GraphAction, GraphBarrier, PlannedActionGraph, PlannedFileCopyAction,
+        PlannedResourceAction, TargetCondition,
+    };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -2418,6 +2456,265 @@ mod tests {
     }
 
     #[test]
+    fn uncertain_action_retains_barrier_until_recorded_advance_is_recovered() {
+        for terminal in [ActionStatus::Failed, ActionStatus::Uncertain] {
+            let workspace = TestStateDirectory::new();
+            let repository = workspace.repository();
+            let existing = ResolvedFileLink::new(
+                FullyQualifiedResourceId::parse("base/a").unwrap(),
+                ResolvedPath::new(workspace.root.join("store/a")).unwrap(),
+                ResolvedPath::new(workspace.root.join("home/.a")).unwrap(),
+            )
+            .unwrap();
+            let before = AppliedBarrier {
+                id: "stage/base/phase".to_owned(),
+                after: Vec::new(),
+                members: vec![existing.resource_id().clone()],
+                origin: "stage",
+            };
+            let initial = KnownState::new([KnownFileLink::from_resolved(&existing)])
+                .unwrap()
+                .with_topology(
+                    AppliedLifecycleTopology::try_new(
+                        Vec::new(),
+                        Vec::new(),
+                        vec![before.clone()],
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                );
+            let desired = ResolvedFileLink::new(
+                FullyQualifiedResourceId::parse("base/b").unwrap(),
+                ResolvedPath::new(workspace.root.join("store/b")).unwrap(),
+                ResolvedPath::new(workspace.root.join("home/.b")).unwrap(),
+            )
+            .unwrap();
+            let action = PlannedAction::create_link(desired.clone());
+            let mut after = before.clone();
+            after.members.push(desired.resource_id().clone());
+            let graph = PlannedActionGraph {
+                actions: vec![GraphAction {
+                    id: desired.resource_id().as_str().to_owned(),
+                    resource_id: desired.resource_id().clone(),
+                    role: ActionRole::CurrentCreate,
+                    topology_authority: TopologyAuthority {
+                        current_barriers: vec![before.clone()],
+                        ..Default::default()
+                    },
+                    topology_delta: TopologyDelta {
+                        advance_current_barriers: vec![
+                            TopologyBarrierAdvance::new(before.clone(), after.clone()).unwrap(),
+                        ],
+                        ..Default::default()
+                    },
+                }],
+                direct_edges: Vec::new(),
+                barriers: vec![GraphBarrier {
+                    id: before.id.clone(),
+                    after: Vec::new(),
+                    input: Vec::new(),
+                    output: vec![desired.resource_id().as_str().to_owned()],
+                    provenance: vec![before.id.clone()],
+                }],
+                schedule: vec![desired.resource_id().as_str().to_owned()],
+                stale_topology_snapshot: Default::default(),
+            };
+            let action_id = {
+                let mut locked = repository.acquire_exclusive().unwrap();
+                locked
+                    .commit_candidate(PersistedState::from_parts(initial, None).unwrap())
+                    .unwrap();
+                let id = locked
+                    .begin_resource_actions_with_graph(
+                        desired_hash(),
+                        &[PlannedResourceAction::from(action)],
+                        graph,
+                    )
+                    .unwrap()
+                    .remove(0);
+                locked.mark_running(&id).unwrap();
+                locked.mark_without_known(&id, terminal).unwrap();
+                id
+            };
+            let uncertain = repository.load().unwrap();
+            assert_eq!(
+                uncertain.known().topology().current_barriers(),
+                std::slice::from_ref(&before)
+            );
+            assert_eq!(
+                uncertain
+                    .active_operation()
+                    .unwrap()
+                    .action(&action_id)
+                    .unwrap()
+                    .status(),
+                terminal
+            );
+            let original = fs::read(workspace.state_file()).unwrap();
+            let mut corrupted: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            corrupted["applied_lifecycle_topology"]["current"] = serde_json::json!([]);
+            fs::write(
+                workspace.state_file(),
+                serde_json::to_vec(&corrupted).unwrap(),
+            )
+            .unwrap();
+            assert!(repository.load().is_err());
+            fs::write(workspace.state_file(), original).unwrap();
+            let mut locked = repository.acquire_exclusive().unwrap();
+            if terminal == ActionStatus::Failed {
+                assert!(locked.commit_succeeded(&action_id).is_err());
+                assert_eq!(
+                    repository
+                        .load()
+                        .unwrap()
+                        .known()
+                        .topology()
+                        .current_barriers(),
+                    [before]
+                );
+                continue;
+            }
+            locked.commit_succeeded(&action_id).unwrap();
+            let recovered = repository.load().unwrap();
+            assert_eq!(recovered.known().topology().current_barriers(), [after]);
+            assert_eq!(
+                recovered
+                    .active_operation()
+                    .unwrap()
+                    .action(&action_id)
+                    .unwrap()
+                    .status(),
+                ActionStatus::Succeeded
+            );
+        }
+    }
+
+    #[test]
+    fn uncertain_stale_action_recovers_exact_successor_reference_cleanup() {
+        let workspace = TestStateDirectory::new();
+        let repository = workspace.repository();
+        let predecessor = ResolvedFileLink::new(
+            FullyQualifiedResourceId::parse("base/a").unwrap(),
+            ResolvedPath::new(workspace.root.join("store/a")).unwrap(),
+            ResolvedPath::new(workspace.root.join("home/.a")).unwrap(),
+        )
+        .unwrap();
+        let successor = ResolvedFileLink::new(
+            FullyQualifiedResourceId::parse("base/b").unwrap(),
+            ResolvedPath::new(workspace.root.join("store/b")).unwrap(),
+            ResolvedPath::new(workspace.root.join("home/.b")).unwrap(),
+        )
+        .unwrap();
+        let early = AppliedBarrier {
+            id: "stage/base/early".to_owned(),
+            after: Vec::new(),
+            members: vec![predecessor.resource_id().clone()],
+            origin: "stage",
+        };
+        let late = AppliedBarrier {
+            id: "stage/base/late".to_owned(),
+            after: vec![early.id.clone()],
+            members: vec![successor.resource_id().clone()],
+            origin: "stage",
+        };
+        let mut cleaned_late = late.clone();
+        cleaned_late.after.clear();
+        let initial = KnownState::new([
+            KnownFileLink::from_resolved(&predecessor),
+            KnownFileLink::from_resolved(&successor),
+        ])
+        .unwrap()
+        .with_topology(
+            AppliedLifecycleTopology::try_new(
+                Vec::new(),
+                Vec::new(),
+                vec![early.clone(), late.clone()],
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        let action = PlannedAction::remove_link(KnownFileLink::from_resolved(&predecessor));
+        let graph = PlannedActionGraph {
+            actions: vec![GraphAction {
+                id: predecessor.resource_id().as_str().to_owned(),
+                resource_id: predecessor.resource_id().clone(),
+                role: ActionRole::StaleRemove,
+                topology_authority: TopologyAuthority {
+                    current_barriers: vec![early.clone(), late.clone()],
+                    ..Default::default()
+                },
+                topology_delta: TopologyDelta {
+                    remove_current_barriers: vec![early.clone()],
+                    replace_current_barriers: vec![
+                        TopologyBarrierReplacement::new(late.clone(), cleaned_late.clone())
+                            .unwrap(),
+                    ],
+                    ..Default::default()
+                },
+            }],
+            direct_edges: Vec::new(),
+            barriers: Vec::new(),
+            schedule: vec![predecessor.resource_id().as_str().to_owned()],
+            stale_topology_snapshot: StaleTopologySnapshot {
+                current_barriers: vec![early.clone(), late.clone()],
+                ..Default::default()
+            },
+        };
+        let action_id = {
+            let mut locked = repository.acquire_exclusive().unwrap();
+            locked
+                .commit_candidate(PersistedState::from_parts(initial, None).unwrap())
+                .unwrap();
+            let id = locked
+                .begin_resource_actions_with_graph(
+                    desired_hash(),
+                    &[PlannedResourceAction::from(action)],
+                    graph,
+                )
+                .unwrap()
+                .remove(0);
+            locked.mark_running(&id).unwrap();
+            locked
+                .mark_without_known(&id, ActionStatus::Uncertain)
+                .unwrap();
+            id
+        };
+        let uncertain = repository.load().unwrap();
+        assert_eq!(
+            uncertain.known().topology().current_barriers(),
+            [early, late]
+        );
+        assert!(
+            uncertain
+                .known()
+                .get_variant(predecessor.resource_id())
+                .is_some()
+        );
+        let mut locked = repository.acquire_exclusive().unwrap();
+        locked.commit_succeeded(&action_id).unwrap();
+        let recovered = repository.load().unwrap();
+        assert_eq!(
+            recovered.known().topology().current_barriers(),
+            [cleaned_late]
+        );
+        assert!(
+            recovered
+                .known()
+                .get_variant(predecessor.resource_id())
+                .is_none()
+        );
+        assert_eq!(
+            recovered
+                .active_operation()
+                .unwrap()
+                .action(&action_id)
+                .unwrap()
+                .status(),
+            ActionStatus::Succeeded
+        );
+    }
+
+    #[test]
     fn copy_removal_record_round_trips_and_requires_the_exact_known_copy() {
         let workspace = TestStateDirectory::new();
         let repository = workspace.repository();
@@ -2782,7 +3079,10 @@ mod tests {
 
         let json: serde_json::Value =
             serde_json::from_slice(&fs::read(directory.state_file()).unwrap()).unwrap();
-        assert_eq!(json["schema_version"], 5);
+        assert_eq!(
+            json["schema_version"],
+            crate::schema_generation::CURRENT_MANAGED_GENERATION
+        );
         assert!(
             json["resources"]["base/git"]["definition_hash"]
                 .as_str()

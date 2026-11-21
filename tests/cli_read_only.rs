@@ -162,7 +162,7 @@ impl Fixture {
                                     "resource_id": action["resource_id"],
                                     "role": role,
                                     "topology_authority": { "current": [], "historical": [] },
-                                    "topology_delta": { "add_current_direct": [], "remove_current_direct": [], "add_historical_direct": [], "remove_historical_direct": [], "add_current_barriers": [], "remove_current_barriers": [], "add_historical_barriers": [], "remove_historical_barriers": [], "replace_current_barriers": [], "replace_historical_barriers": [] },
+                                    "topology_delta": { "add_current_direct": [], "remove_current_direct": [], "add_historical_direct": [], "remove_historical_direct": [], "add_current_barriers": [], "remove_current_barriers": [], "add_historical_barriers": [], "remove_historical_barriers": [], "advance_current_barriers": [], "advance_historical_barriers": [], "replace_current_barriers": [], "replace_historical_barriers": [] },
                                 })
                             })
                             .collect::<Vec<_>>()

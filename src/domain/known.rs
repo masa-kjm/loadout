@@ -54,6 +54,13 @@ pub(crate) struct TopologyBarrierReplacement {
     pub(crate) after: AppliedBarrier,
 }
 
+/// An exact successful-output update to an already recorded barrier.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TopologyBarrierAdvance {
+    pub(crate) before: AppliedBarrier,
+    pub(crate) after: AppliedBarrier,
+}
+
 /// Exact topology facts an action is permitted to publish or remove after verification.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct TopologyAuthority {
@@ -74,6 +81,8 @@ pub(crate) struct TopologyDelta {
     pub(crate) remove_current_barriers: Vec<AppliedBarrier>,
     pub(crate) add_historical_barriers: Vec<AppliedBarrier>,
     pub(crate) remove_historical_barriers: Vec<AppliedBarrier>,
+    pub(crate) advance_current_barriers: Vec<TopologyBarrierAdvance>,
+    pub(crate) advance_historical_barriers: Vec<TopologyBarrierAdvance>,
     pub(crate) replace_current_barriers: Vec<TopologyBarrierReplacement>,
     pub(crate) replace_historical_barriers: Vec<TopologyBarrierReplacement>,
 }
@@ -160,12 +169,14 @@ impl AppliedLifecycleTopology {
             &mut next.current_barriers,
             &delta.add_current_barriers,
             &delta.remove_current_barriers,
+            &delta.advance_current_barriers,
             &delta.replace_current_barriers,
         )?;
         apply_barrier_delta(
             &mut next.historical_barriers,
             &delta.add_historical_barriers,
             &delta.remove_historical_barriers,
+            &delta.advance_historical_barriers,
             &delta.replace_historical_barriers,
         )?;
         next.validate()?;
@@ -186,7 +197,7 @@ impl AppliedLifecycleTopology {
 }
 
 impl TopologyBarrierReplacement {
-    /// Creates one exact, shrinking barrier-membership projection.
+    /// Creates one exact stale projection that only shrinks members or predecessor references.
     pub(crate) fn new(
         before: AppliedBarrier,
         after: AppliedBarrier,
@@ -194,7 +205,7 @@ impl TopologyBarrierReplacement {
         if before.id != after.id {
             return Err(TopologyTransitionError::ReplacementChangesBarrierId);
         }
-        if before.after != after.after {
+        if !after.after.iter().all(|id| before.after.contains(id)) {
             return Err(TopologyTransitionError::ReplacementChangesBarrierAfter);
         }
         if before.origin != after.origin {
@@ -202,13 +213,46 @@ impl TopologyBarrierReplacement {
         }
         validate_barrier(&before)?;
         validate_barrier(&after)?;
-        if after.members.len() >= before.members.len()
-            || !after
-                .members
-                .iter()
-                .all(|member| before.members.contains(member))
+        if !after
+            .members
+            .iter()
+            .all(|member| before.members.contains(member))
+            || (after.members.len() == before.members.len()
+                && after.after.len() == before.after.len())
         {
             return Err(TopologyTransitionError::ReplacementDoesNotShrinkMembers);
+        }
+        Ok(Self { before, after })
+    }
+
+    fn validate(&self) -> Result<(), TopologyTransitionError> {
+        Self::new(self.before.clone(), self.after.clone()).map(|_| ())
+    }
+}
+
+impl TopologyBarrierAdvance {
+    /// Creates one exact current-output update that only grows members or predecessor references.
+    pub(crate) fn new(
+        before: AppliedBarrier,
+        after: AppliedBarrier,
+    ) -> Result<Self, TopologyTransitionError> {
+        if before.id != after.id {
+            return Err(TopologyTransitionError::ReplacementChangesBarrierId);
+        }
+        if before.origin != after.origin {
+            return Err(TopologyTransitionError::ReplacementChangesBarrierOrigin);
+        }
+        validate_barrier(&before)?;
+        validate_barrier(&after)?;
+        if !before
+            .members
+            .iter()
+            .all(|member| after.members.contains(member))
+            || !before.after.iter().all(|id| after.after.contains(id))
+            || (before.members.len() == after.members.len()
+                && before.after.len() == after.after.len())
+        {
+            return Err(TopologyTransitionError::AdvanceDoesNotGrow);
         }
         Ok(Self { before, after })
     }
@@ -257,6 +301,8 @@ impl TopologyDelta {
         validate_barrier_array(&self.remove_current_barriers)?;
         validate_barrier_array(&self.add_historical_barriers)?;
         validate_barrier_array(&self.remove_historical_barriers)?;
+        validate_advances(&self.advance_current_barriers)?;
+        validate_advances(&self.advance_historical_barriers)?;
         validate_replacements(&self.replace_current_barriers)?;
         validate_replacements(&self.replace_historical_barriers)?;
 
@@ -272,6 +318,22 @@ impl TopologyDelta {
         )?;
         require_authorized(
             &self.remove_historical_barriers,
+            &authority.historical_barriers,
+        )?;
+        require_authorized(
+            &self
+                .advance_current_barriers
+                .iter()
+                .map(|advance| advance.before.clone())
+                .collect::<Vec<_>>(),
+            &authority.current_barriers,
+        )?;
+        require_authorized(
+            &self
+                .advance_historical_barriers
+                .iter()
+                .map(|advance| advance.before.clone())
+                .collect::<Vec<_>>(),
             &authority.historical_barriers,
         )?;
         require_authorized(
@@ -312,6 +374,7 @@ pub(crate) enum TopologyTransitionError {
     ReplacementChangesBarrierAfter,
     ReplacementChangesBarrierOrigin,
     ReplacementDoesNotShrinkMembers,
+    AdvanceDoesNotGrow,
     UnauthorizedFact,
     OverlappingDeltaFact,
     AbsentBeforeFact,
@@ -352,7 +415,10 @@ impl fmt::Display for TopologyTransitionError {
                 "a topology barrier replacement must retain its origin"
             }
             Self::ReplacementDoesNotShrinkMembers => {
-                "a topology barrier replacement must retain a strict member subset"
+                "a topology barrier replacement must strictly shrink members or predecessors"
+            }
+            Self::AdvanceDoesNotGrow => {
+                "a topology barrier advance must strictly grow members or predecessors"
             }
             Self::UnauthorizedFact => "a topology delta names a fact outside its authority",
             Self::OverlappingDeltaFact => "a topology delta names one fact more than once",
@@ -405,7 +471,7 @@ fn validate_barrier(fact: &AppliedBarrier) -> Result<(), TopologyTransitionError
         return Err(TopologyTransitionError::NonCanonicalBarrierFacts);
     }
     for predecessor in &fact.after {
-        if !is_stage_id(predecessor) {
+        if !is_stage_id(predecessor) || stage_root(predecessor) != stage_root(&fact.id) {
             return Err(TopologyTransitionError::InvalidBarrierAfterId);
         }
         if predecessor == &fact.id {
@@ -467,8 +533,15 @@ fn validate_barrier_graph(
 }
 
 fn is_stage_id(id: &str) -> bool {
-    id.strip_prefix("stage/")
-        .is_some_and(|suffix| FullyQualifiedResourceId::parse(suffix).is_ok())
+    id.strip_prefix("stage/").is_some_and(|suffix| {
+        suffix.split('/').count() == 2 && FullyQualifiedResourceId::parse(suffix).is_ok()
+    })
+}
+
+fn stage_root(id: &str) -> Option<&str> {
+    id.strip_prefix("stage/")?
+        .split_once('/')
+        .map(|(root, _)| root)
 }
 
 fn validate_replacements(
@@ -483,6 +556,18 @@ fn validate_replacements(
     replacements
         .iter()
         .try_for_each(TopologyBarrierReplacement::validate)
+}
+
+fn validate_advances(advances: &[TopologyBarrierAdvance]) -> Result<(), TopologyTransitionError> {
+    if advances
+        .windows(2)
+        .any(|pair| pair[0].before.id >= pair[1].before.id)
+    {
+        return Err(TopologyTransitionError::NonCanonicalBarrierFacts);
+    }
+    advances
+        .iter()
+        .try_for_each(TopologyBarrierAdvance::validate)
 }
 
 fn require_authorized<T: PartialEq>(
@@ -518,6 +603,18 @@ fn reject_overlapping_delta_entries(delta: &TopologyDelta) -> Result<(), Topolog
         .chain(&delta.remove_historical_barriers)
         .chain(
             delta
+                .advance_current_barriers
+                .iter()
+                .map(|item| &item.before),
+        )
+        .chain(
+            delta
+                .advance_historical_barriers
+                .iter()
+                .map(|item| &item.before),
+        )
+        .chain(
+            delta
                 .replace_current_barriers
                 .iter()
                 .map(|item| &item.before),
@@ -551,7 +648,8 @@ fn apply_direct_delta(
         if facts.contains(fact) {
             return Err(TopologyTransitionError::ExistingAddedFact);
         }
-        facts.push(fact.clone());
+        let position = facts.binary_search(fact).unwrap_err();
+        facts.insert(position, fact.clone());
     }
     Ok(())
 }
@@ -560,6 +658,7 @@ fn apply_barrier_delta(
     facts: &mut Vec<AppliedBarrier>,
     additions: &[AppliedBarrier],
     removals: &[AppliedBarrier],
+    advances: &[TopologyBarrierAdvance],
     replacements: &[TopologyBarrierReplacement],
 ) -> Result<(), TopologyTransitionError> {
     for fact in removals {
@@ -577,11 +676,23 @@ fn apply_barrier_delta(
         };
         facts[position] = replacement.after.clone();
     }
+    for advance in advances {
+        let Some(position) = facts
+            .iter()
+            .position(|candidate| candidate == &advance.before)
+        else {
+            return Err(TopologyTransitionError::AbsentBeforeFact);
+        };
+        facts[position] = advance.after.clone();
+    }
     for fact in additions {
         if facts.iter().any(|candidate| candidate.id == fact.id) {
             return Err(TopologyTransitionError::ExistingAddedFact);
         }
-        facts.push(fact.clone());
+        let position = facts
+            .binary_search_by(|candidate| candidate.id.cmp(&fact.id))
+            .unwrap_err();
+        facts.insert(position, fact.clone());
     }
     Ok(())
 }
@@ -1487,7 +1598,7 @@ mod tests {
             &["stage/root/early"],
             &["root/alpha", "root/beta"],
         );
-        let changed_after = barrier("stage/root/late", &[], &["root/beta"]);
+        let changed_after = barrier("stage/root/late", &["stage/root/other"], &["root/beta"]);
         assert_eq!(
             TopologyBarrierReplacement::new(before.clone(), changed_after).unwrap_err(),
             TopologyTransitionError::ReplacementChangesBarrierAfter
@@ -1521,6 +1632,7 @@ mod tests {
             "stage/root/",
             "stage/root//late",
             "stage/root/Late",
+            "stage/root/nested/late",
             "stage/root/late/extra!",
         ] {
             assert_eq!(
@@ -1550,5 +1662,105 @@ mod tests {
             .unwrap_err(),
             TopologyTransitionError::InvalidBarrierAfterId
         );
+        assert_eq!(
+            AppliedLifecycleTopology::try_new(
+                vec![],
+                vec![],
+                vec![barrier(
+                    "stage/root/late",
+                    &["stage/other/early"],
+                    &["root/alpha"],
+                )],
+                vec![],
+            )
+            .unwrap_err(),
+            TopologyTransitionError::InvalidBarrierAfterId
+        );
+    }
+
+    #[test]
+    fn topology_advance_adds_member_or_relation_from_exact_before_fact() {
+        let first = barrier("stage/root/first", &[], &["root/a"]);
+        let second = barrier("stage/root/second", &[], &["root/b"]);
+        let topology = AppliedLifecycleTopology::try_new(
+            vec![],
+            vec![],
+            vec![first.clone(), second.clone()],
+            vec![],
+        )
+        .unwrap();
+        let expanded = barrier("stage/root/second", &[], &["root/b", "root/c"]);
+        let advanced = TopologyBarrierAdvance::new(second.clone(), expanded.clone()).unwrap();
+        let authority = TopologyAuthority {
+            current_barriers: vec![second.clone()],
+            ..Default::default()
+        };
+        let next = topology
+            .transition(
+                &authority,
+                &TopologyDelta {
+                    advance_current_barriers: vec![advanced],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(next.current_barriers()[1], expanded);
+
+        let relation = barrier("stage/root/second", &["stage/root/first"], &["root/b"]);
+        let next = topology
+            .transition(
+                &authority,
+                &TopologyDelta {
+                    advance_current_barriers: vec![
+                        TopologyBarrierAdvance::new(second, relation.clone()).unwrap(),
+                    ],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(next.current_barriers()[1], relation);
+    }
+
+    #[test]
+    fn stale_final_member_cleanup_removes_successor_reference_atomically() {
+        let first = barrier("stage/root/first", &[], &["root/a"]);
+        let second = barrier("stage/root/second", &["stage/root/first"], &["root/b"]);
+        let topology = AppliedLifecycleTopology::try_new(
+            vec![],
+            vec![],
+            vec![first.clone(), second.clone()],
+            vec![],
+        )
+        .unwrap();
+        let authority = TopologyAuthority {
+            current_barriers: vec![first.clone(), second.clone()],
+            ..Default::default()
+        };
+        assert_eq!(
+            topology
+                .transition(
+                    &authority,
+                    &TopologyDelta {
+                        remove_current_barriers: vec![first.clone()],
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err(),
+            TopologyTransitionError::MissingBarrierPredecessor
+        );
+        let cleaned = barrier("stage/root/second", &[], &["root/b"]);
+        let next = topology
+            .transition(
+                &authority,
+                &TopologyDelta {
+                    remove_current_barriers: vec![first],
+                    replace_current_barriers: vec![
+                        TopologyBarrierReplacement::new(second, cleaned.clone()).unwrap(),
+                    ],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(next.current_barriers(), [cleaned]);
     }
 }

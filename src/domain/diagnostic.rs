@@ -29,6 +29,10 @@ pub(crate) enum Diagnostic {
         resource_id: FullyQualifiedResourceId,
         action_kind: ActionKind,
     },
+    OrderingBlocked {
+        resource_id: FullyQualifiedResourceId,
+        reason: OrderingBlockReason,
+    },
     UnsupportedResourceEffect {
         resource_id: FullyQualifiedResourceId,
         target_path: ResolvedPath,
@@ -40,6 +44,25 @@ pub(crate) enum Diagnostic {
         target_path: ResolvedPath,
         observation: TargetObservation,
     },
+    RecordedOrderConflict {
+        old_before: FullyQualifiedResourceId,
+        old_after: FullyQualifiedResourceId,
+        old_sources: Vec<String>,
+        proposed_before: FullyQualifiedResourceId,
+        proposed_after: FullyQualifiedResourceId,
+        proposed_sources: Vec<String>,
+        rebuild_set: Vec<FullyQualifiedResourceId>,
+    },
+}
+
+/// The ordering condition that prevented a safe operation graph.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OrderingBlockReason {
+    UnsupportedActionRoles,
+    UnprovedPredecessor,
+    UnprovedRecordedPredecessor,
+    UnprovedTopologyPublication,
+    Cycle,
 }
 
 impl Diagnostic {

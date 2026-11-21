@@ -19,7 +19,7 @@ use crate::domain::known::{
     AppliedBarrier, AppliedDirectEdge, AppliedLifecycleTopology, KnownDirectoryLink,
     KnownDirectoryLinkError, KnownFileCopy, KnownFileCopyError, KnownFileLink, KnownFileLinkError,
     KnownResource, KnownState, KnownStateError, StaleTopologySnapshot, TopologyAuthority,
-    TopologyBarrierReplacement, TopologyDelta,
+    TopologyBarrierAdvance, TopologyBarrierReplacement, TopologyDelta,
 };
 use crate::domain::paths::{ResolvedPath, ResolvedPathError};
 use crate::domain::plan::{
@@ -90,7 +90,7 @@ impl StateDocument {
     }
 }
 
-/// Strict wire representation of schema-5 applied topology.
+/// Strict wire representation of current applied topology.
 ///
 /// Topology is state, not a reconstruction hint: all collections are canonical
 /// and source-array identity is preserved while decoding.
@@ -154,27 +154,31 @@ impl PersistedTopology {
     }
 
     fn into_topology(self) -> Result<AppliedLifecycleTopology, StateDecodeError> {
+        let authority = self.into_authority()?;
+        AppliedLifecycleTopology::try_new(
+            authority.current_direct,
+            authority.historical_direct,
+            authority.current_barriers,
+            authority.historical_barriers,
+        )
+        .map_err(|_| StateDecodeError::InvalidTopology("invalid applied lifecycle topology"))
+    }
+
+    /// Decodes an exact graph subset, which may omit a predecessor retained elsewhere in state.
+    fn into_authority(self) -> Result<TopologyAuthority, StateDecodeError> {
         let (current_direct, current_barriers) = decode_topology_facts(self.current, "current")?;
         let (historical_direct, historical_barriers) =
             decode_topology_facts(self.historical, "historical")?;
-        if current_direct
-            .iter()
-            .any(|fact| historical_direct.contains(fact))
-            || current_barriers
-                .iter()
-                .any(|fact| historical_barriers.contains(fact))
-        {
-            return Err(StateDecodeError::InvalidTopology(
-                "a topology fact occurs in both current and historical arrays",
-            ));
-        }
-        AppliedLifecycleTopology::try_new(
+        let authority = TopologyAuthority {
             current_direct,
             historical_direct,
             current_barriers,
             historical_barriers,
-        )
-        .map_err(|_| StateDecodeError::InvalidTopology("invalid applied lifecycle topology"))
+        };
+        authority.validate().map_err(|_| {
+            StateDecodeError::InvalidTopology("invalid operation topology authority")
+        })?;
+        Ok(authority)
     }
 }
 
@@ -184,10 +188,21 @@ fn decode_topology_facts(
 ) -> Result<(Vec<AppliedDirectEdge>, Vec<AppliedBarrier>), StateDecodeError> {
     let mut direct = Vec::new();
     let mut barriers = Vec::new();
+    let mut seen_barrier = false;
     for fact in facts {
         match fact {
-            PersistedTopologyFact::Direct(fact) => direct.push(AppliedDirectEdge::try_from(fact)?),
-            PersistedTopologyFact::Barrier(fact) => barriers.push(AppliedBarrier::try_from(fact)?),
+            PersistedTopologyFact::Direct(fact) => {
+                if seen_barrier {
+                    return Err(StateDecodeError::InvalidTopology(
+                        "direct topology facts must precede barriers",
+                    ));
+                }
+                direct.push(AppliedDirectEdge::try_from(fact)?);
+            }
+            PersistedTopologyFact::Barrier(fact) => {
+                seen_barrier = true;
+                barriers.push(AppliedBarrier::try_from(fact)?);
+            }
         }
     }
     if direct.windows(2).any(|pair| pair[0] >= pair[1])
@@ -561,6 +576,8 @@ struct PersistedTopologyDelta {
     remove_current_barriers: Vec<PersistedBarrier>,
     add_historical_barriers: Vec<PersistedBarrier>,
     remove_historical_barriers: Vec<PersistedBarrier>,
+    advance_current_barriers: Vec<PersistedBarrierReplacement>,
+    advance_historical_barriers: Vec<PersistedBarrierReplacement>,
     replace_current_barriers: Vec<PersistedBarrierReplacement>,
     replace_historical_barriers: Vec<PersistedBarrierReplacement>,
 }
@@ -615,7 +632,7 @@ impl PersistedOperationRecord {
             graph: PersistedOperationGraph::from_graph(
                 operation
                     .graph()
-                    .expect("schema-5 active operations always retain their graph"),
+                    .expect("current active operations always retain their graph"),
             ),
         })
     }
@@ -708,7 +725,7 @@ impl PersistedOperationGraph {
         }
     }
     fn into_graph(self) -> Result<PlannedActionGraph, StateDecodeError> {
-        let topology = self.stale_topology_snapshot.into_topology()?;
+        let topology = self.stale_topology_snapshot.into_authority()?;
         let actions = self
             .actions
             .into_iter()
@@ -749,10 +766,10 @@ impl PersistedOperationGraph {
             barriers,
             schedule: self.schedule,
             stale_topology_snapshot: StaleTopologySnapshot {
-                current_direct: topology.current_direct().to_vec(),
-                historical_direct: topology.historical_direct().to_vec(),
-                current_barriers: topology.current_barriers().to_vec(),
-                historical_barriers: topology.historical_barriers().to_vec(),
+                current_direct: topology.current_direct,
+                historical_direct: topology.historical_direct,
+                current_barriers: topology.current_barriers,
+                historical_barriers: topology.historical_barriers,
             },
         })
     }
@@ -774,7 +791,7 @@ impl PersistedGraphAction {
         }
     }
     fn into_action(self) -> Result<GraphAction, StateDecodeError> {
-        let topology = self.topology_authority.into_topology()?;
+        let topology = self.topology_authority.into_authority()?;
         let resource_id = FullyQualifiedResourceId::parse(&self.resource_id)
             .map_err(|_| StateDecodeError::InvalidOperation(OperationRecordError::InvalidGraph))?;
         Ok(GraphAction {
@@ -783,12 +800,7 @@ impl PersistedGraphAction {
             role: parse_role(&self.role).ok_or(StateDecodeError::InvalidOperation(
                 OperationRecordError::InvalidGraph,
             ))?,
-            topology_authority: TopologyAuthority {
-                current_direct: topology.current_direct().to_vec(),
-                historical_direct: topology.historical_direct().to_vec(),
-                current_barriers: topology.current_barriers().to_vec(),
-                historical_barriers: topology.historical_barriers().to_vec(),
-            },
+            topology_authority: topology,
             topology_delta: persisted_to_delta(self.topology_delta)?,
         })
     }
@@ -858,6 +870,22 @@ fn delta_to_persisted(delta: &TopologyDelta) -> PersistedTopologyDelta {
             .iter()
             .map(PersistedBarrier::from)
             .collect(),
+        advance_current_barriers: delta
+            .advance_current_barriers
+            .iter()
+            .map(|advance| PersistedBarrierReplacement {
+                before: PersistedBarrier::from(&advance.before),
+                after: PersistedBarrier::from(&advance.after),
+            })
+            .collect(),
+        advance_historical_barriers: delta
+            .advance_historical_barriers
+            .iter()
+            .map(|advance| PersistedBarrierReplacement {
+                before: PersistedBarrier::from(&advance.before),
+                after: PersistedBarrier::from(&advance.after),
+            })
+            .collect(),
         replace_current_barriers: delta
             .replace_current_barriers
             .iter()
@@ -900,6 +928,17 @@ fn persisted_to_delta(delta: PersistedTopologyDelta) -> Result<TopologyDelta, St
             })
             .collect::<Result<Vec<_>, _>>()
     };
+    let advance = |values: Vec<PersistedBarrierReplacement>| {
+        values
+            .into_iter()
+            .map(|value| {
+                TopologyBarrierAdvance::new(value.before.try_into()?, value.after.try_into()?)
+                    .map_err(|_| {
+                        StateDecodeError::InvalidOperation(OperationRecordError::InvalidGraph)
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
     Ok(TopologyDelta {
         add_current_direct: direct(delta.add_current_direct)?,
         remove_current_direct: direct(delta.remove_current_direct)?,
@@ -909,6 +948,8 @@ fn persisted_to_delta(delta: PersistedTopologyDelta) -> Result<TopologyDelta, St
         remove_current_barriers: barrier(delta.remove_current_barriers)?,
         add_historical_barriers: barrier(delta.add_historical_barriers)?,
         remove_historical_barriers: barrier(delta.remove_historical_barriers)?,
+        advance_current_barriers: advance(delta.advance_current_barriers)?,
+        advance_historical_barriers: advance(delta.advance_historical_barriers)?,
         replace_current_barriers: replacement(delta.replace_current_barriers)?,
         replace_historical_barriers: replacement(delta.replace_historical_barriers)?,
     })
@@ -2068,6 +2109,165 @@ mod tests {
     use serde_json::{Value, json};
 
     #[test]
+    fn topology_decoder_rejects_direct_facts_after_barriers() {
+        let direct = PersistedTopologyFact::Direct(PersistedDirectEdge {
+            from: "root/a".to_owned(),
+            to: "root/b".to_owned(),
+            origin: "depends_on".to_owned(),
+        });
+        let barrier = PersistedTopologyFact::Barrier(PersistedBarrier {
+            id: "stage/root/first".to_owned(),
+            after: Vec::new(),
+            members: vec!["root/a".to_owned()],
+            origin: "stage".to_owned(),
+        });
+        assert!(decode_topology_facts(vec![direct, barrier], "current").is_ok());
+        let direct = PersistedTopologyFact::Direct(PersistedDirectEdge {
+            from: "root/a".to_owned(),
+            to: "root/b".to_owned(),
+            origin: "depends_on".to_owned(),
+        });
+        let barrier = PersistedTopologyFact::Barrier(PersistedBarrier {
+            id: "stage/root/first".to_owned(),
+            after: Vec::new(),
+            members: vec!["root/a".to_owned()],
+            origin: "stage".to_owned(),
+        });
+        assert!(matches!(
+            decode_topology_facts(vec![barrier, direct], "current"),
+            Err(StateDecodeError::InvalidTopology(
+                "direct topology facts must precede barriers"
+            ))
+        ));
+    }
+
+    #[test]
+    fn applied_topology_rejects_members_and_endpoints_absent_from_known() {
+        let base = current_document(json!({
+            "schema_version": 6,
+            "resources": {},
+            "active_operation": null,
+        }));
+        for (array, fact) in [
+            (
+                "current",
+                json!({"from": "root/a", "to": "root/b", "origin": "depends_on"}),
+            ),
+            (
+                "historical",
+                json!({"from": "root/a", "to": "root/b", "origin": "depends_on"}),
+            ),
+            (
+                "current",
+                json!({"id": "stage/root/first", "after": [], "members": ["root/a"], "origin": "stage"}),
+            ),
+            (
+                "historical",
+                json!({"id": "stage/root/first", "after": [], "members": ["root/a"], "origin": "stage"}),
+            ),
+        ] {
+            let mut document = base.clone();
+            document["applied_lifecycle_topology"][array] = json!([fact]);
+            let decoded = serde_json::from_value::<StateDocument>(document).unwrap();
+            assert!(matches!(
+                decoded.into_state(),
+                Err(StateDecodeError::InvalidTopology(
+                    "applied topology references an absent Known resource"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn topology_delta_codec_round_trips_relation_only_advance() {
+        let before = AppliedBarrier {
+            id: "stage/root/late".to_owned(),
+            after: Vec::new(),
+            members: vec![FullyQualifiedResourceId::parse("root/b").unwrap()],
+            origin: "stage",
+        };
+        let mut after = before.clone();
+        after.after = vec!["stage/root/early".to_owned()];
+        let delta = TopologyDelta {
+            advance_current_barriers: vec![TopologyBarrierAdvance::new(before, after).unwrap()],
+            ..Default::default()
+        };
+        let wire = delta_to_persisted(&delta);
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(
+            json["advance_current_barriers"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(persisted_to_delta(wire).unwrap(), delta);
+        assert!(
+            serde_json::from_value::<PersistedTopologyDelta>(json!({
+                "add_current_direct": [], "remove_current_direct": [],
+                "add_historical_direct": [], "remove_historical_direct": [],
+                "add_current_barriers": [], "remove_current_barriers": [],
+                "add_historical_barriers": [], "remove_historical_barriers": [],
+                "replace_current_barriers": [], "replace_historical_barriers": []
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn state_decoder_rejects_invented_historical_barrier_addition() {
+        let mut document = document_fixture("create_link", "pending");
+        let fact = json!({
+            "id": "stage/base/phase", "after": [], "members": ["base/config"],
+            "origin": "stage"
+        });
+        document["active_operation"]["graph"]["actions"][0]["topology_authority"]["historical"] =
+            json!([fact.clone()]);
+        document["active_operation"]["graph"]["actions"][0]["topology_delta"]["add_historical_barriers"] =
+            json!([fact]);
+        document["active_operation"]["graph"]["barriers"] = json!([{
+            "id": "stage/base/phase", "after": [], "input": [], "output": ["a1"],
+            "provenance": ["stage/base/phase"]
+        }]);
+        let decoded: StateDocument = serde_json::from_value(document).unwrap();
+        assert!(matches!(
+            decoded.into_state(),
+            Err(StateDecodeError::InvalidOperation(
+                OperationRecordError::InvalidGraph
+            ))
+        ));
+    }
+
+    #[test]
+    fn state_decoder_rejects_predecessor_only_and_extra_member_additions() {
+        for members in [json!(["base/other"]), json!(["base/config", "base/other"])] {
+            let mut document = document_fixture("create_link", "pending");
+            let predecessor = json!({
+                "id": "stage/base/early", "after": [], "members": members,
+                "origin": "stage"
+            });
+            let successor = json!({
+                "id": "stage/base/late", "after": ["stage/base/early"],
+                "members": ["base/config"], "origin": "stage"
+            });
+            document["active_operation"]["graph"]["actions"][0]["topology_authority"]["current"] =
+                json!([predecessor.clone(), successor.clone()]);
+            document["active_operation"]["graph"]["actions"][0]["topology_delta"]["add_current_barriers"] =
+                json!([predecessor, successor]);
+            document["active_operation"]["graph"]["barriers"] = json!([
+                {"id": "stage/base/early", "after": [], "input": [], "output": [],
+                 "provenance": ["stage/base/early"]},
+                {"id": "stage/base/late", "after": ["stage/base/early"],
+                 "input": [], "output": ["a1"], "provenance": ["stage/base/late"]}
+            ]);
+            let decoded: StateDocument = serde_json::from_value(document).unwrap();
+            assert!(matches!(
+                decoded.into_state(),
+                Err(StateDecodeError::InvalidOperation(
+                    OperationRecordError::InvalidGraph
+                ))
+            ));
+        }
+    }
+
+    #[test]
     fn directory_replacement_round_trips_its_temporary_and_exact_predicates() {
         let root = std::env::temp_dir().join("loadout-directory-replacement-codec");
         let old_source = root.join("store/old");
@@ -2080,8 +2280,8 @@ mod tests {
             ResolvedPath::new(target.clone()).unwrap(),
         )
         .unwrap();
-        let document = schema5_document(json!({
-            "schema_version": 5,
+        let document = current_document(json!({
+            "schema_version": 6,
             "resources": { "base/nvim": { "definition_hash": directory_link_definition_hash(&old).unwrap().as_str(), "effect": { "kind": "directory_link", "source_path": old.source_path().as_ref(), "target_path": old.target_path().as_ref(), "link_target": old.source_path().as_ref() } } },
             "active_operation": { "id": "op-directory", "desired_hash": format!("sha256:{}", "a".repeat(64)), "actions": { "a1": {
                 "kind": "replace_directory_link", "resource_id": "base/nvim",
@@ -2269,8 +2469,8 @@ mod tests {
 
     // Construct the existing wire format directly, independently of the DTO encoder.
     // Paths are platform-local values only; these tests never access the filesystem.
-    fn schema5_document(mut document: Value) -> Value {
-        document["schema_version"] = json!(5);
+    fn current_document(mut document: Value) -> Value {
+        document["schema_version"] = json!(CURRENT_MANAGED_GENERATION);
         document["applied_lifecycle_topology"] = json!({
             "current": [], "historical": [],
         });
@@ -2325,6 +2525,7 @@ mod tests {
                             "add_historical_direct": [], "remove_historical_direct": [],
                             "add_current_barriers": [], "remove_current_barriers": [],
                             "add_historical_barriers": [], "remove_historical_barriers": [],
+                            "advance_current_barriers": [], "advance_historical_barriers": [],
                             "replace_current_barriers": [], "replace_historical_barriers": [],
                         },
                     })
@@ -2376,8 +2577,8 @@ mod tests {
                 },
             });
         }
-        schema5_document(json!({
-            "schema_version": 5,
+        current_document(json!({
+            "schema_version": 6,
             "resources": resources,
             "active_operation": {
                 "id": "op-fixture",
@@ -2410,7 +2611,7 @@ mod tests {
 
         let document = StateDocument::from_state(&state).unwrap();
         let encoded = serde_json::to_value(&document).unwrap();
-        assert_eq!(encoded["schema_version"], 5);
+        assert_eq!(encoded["schema_version"], CURRENT_MANAGED_GENERATION);
         assert_eq!(
             encoded["resources"]["base/nvim"]["effect"]["kind"],
             "directory_link"
@@ -2438,8 +2639,8 @@ mod tests {
         )
         .unwrap();
         let definition_hash = definition_hash_for_copy_known(&old_copy).unwrap();
-        let document = schema5_document(json!({
-            "schema_version": 5,
+        let document = current_document(json!({
+            "schema_version": 6,
             "resources": {"base/config": {
                 "definition_hash": definition_hash.as_str(),
                 "effect": {
@@ -2528,8 +2729,8 @@ mod tests {
         let source = root.join("store").join("config");
         let target = root.join("home").join(".config");
         let fingerprint = format!("sha256:{}", "b".repeat(64));
-        let document = schema5_document(json!({
-            "schema_version": 5,
+        let document = current_document(json!({
+            "schema_version": 6,
             "resources": {},
             "active_operation": {
                 "id": "op-copy",
@@ -2585,8 +2786,8 @@ mod tests {
     #[test]
     fn active_copy_without_its_recorded_temporary_is_rejected() {
         let root = std::env::temp_dir().join("loadout-codec-copy-operation-missing-temp");
-        let document = schema5_document(json!({
-            "schema_version": 5,
+        let document = current_document(json!({
+            "schema_version": 6,
             "resources": {},
             "active_operation": {
                 "id": "op-copy",
@@ -2645,8 +2846,8 @@ mod tests {
         )
         .unwrap();
         let definition = definition_hash_for_copy_known(&copy).unwrap();
-        let fixture = schema5_document(json!({
-            "schema_version": 5,
+        let fixture = current_document(json!({
+            "schema_version": 6,
             "resources": {"base/config": {
                 "definition_hash": definition.as_str(),
                 "effect": {"kind": "file_copy", "source_path": source.as_ref(), "target_path": target.as_ref(), "content_fingerprint": fingerprint.as_str()}
@@ -2700,7 +2901,7 @@ mod tests {
     }
 
     #[test]
-    fn schema5_active_operation_requires_a_complete_matching_graph() {
+    fn current_active_operation_requires_a_complete_matching_graph() {
         let fixture = document_fixture("create_link", "pending");
 
         let mut absent_graph = fixture.clone();

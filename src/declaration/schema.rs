@@ -3,7 +3,7 @@
 use serde::Deserialize;
 use serde::de::Error as _;
 
-use crate::schema_generation::CURRENT_PROFILE_GENERATION;
+use crate::schema_generation::CURRENT_MANAGED_GENERATION;
 
 const DECLARATION_SCHEMA_VERSION_V1: u32 = 1;
 const V0_3_ENVIRONMENT_SCHEMA_VERSION: u32 = 2;
@@ -22,11 +22,11 @@ impl<'de> Deserialize<'de> for ProfileSchemaVersionV6 {
         D: serde::Deserializer<'de>,
     {
         let version = u32::deserialize(deserializer)?;
-        if version == CURRENT_PROFILE_GENERATION {
+        if version == CURRENT_MANAGED_GENERATION {
             Ok(Self)
         } else {
             Err(D::Error::custom(format!(
-                "unsupported schema_version {version}; expected {CURRENT_PROFILE_GENERATION}"
+                "unsupported schema_version {version}; expected {CURRENT_MANAGED_GENERATION}"
             )))
         }
     }

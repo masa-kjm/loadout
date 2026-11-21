@@ -120,7 +120,6 @@ fn apply_request_with_hooks_and_after_planning(
     let mut affected_action = None;
     let mut locked_session = None;
     let result = (|| -> Result<ApplyReport, ApplyFailureCause> {
-        super::queries::ensure_matching_generations().map_err(ApplyFailureCause::Input)?;
         let lifecycle = ApplyFailureCause::Lifecycle;
         let state_error = |error| lifecycle(ApplyError::State(error));
         // This is deliberately narrower than full resolution: it reads only the profile inventory and rejects non-current declarations before state creation, locking, recovery, or resource access.
@@ -2101,7 +2100,7 @@ mod tests {
         );
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 5\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: nvim\n      target: ~/.config/nvim\n",
+            "schema_version: 6\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: nvim\n      target: ~/.config/nvim\n",
         );
         let request = super::super::queries::DeclarationRequest {
             context: ResolverContext::new(
@@ -2307,7 +2306,7 @@ mod tests {
         );
         let profile = |source| {
             format!(
-                "schema_version: 5\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: {source}\n      target: ~/.config/nvim\n"
+                "schema_version: 6\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: {source}\n      target: ~/.config/nvim\n"
             )
         };
         workspace.write("profiles/base.yaml", &profile("old"));
@@ -2549,7 +2548,7 @@ mod tests {
 
         fn request(&self, resources: &[(&str, &str)]) -> super::super::queries::DeclarationRequest {
             self.write("config/environment.yaml", "schema_version: 2\ndefault_profile: base\nprofile_discovery:\n  paths: [../profiles]\nstores:\n  dotfiles:\n    type: local\n    properties:\n      path: ../store\n");
-            let mut profile = String::from("schema_version: 5\nid: base\nresources:");
+            let mut profile = String::from("schema_version: 6\nid: base\nresources:");
             if resources.is_empty() {
                 profile.push_str(" {}\n");
             } else {
@@ -2676,7 +2675,7 @@ mod tests {
             self.write("config/environment.yaml", "schema_version: 1\n");
             self.write(
                 "profiles/workstation.yaml",
-                "schema_version: 5\nid: workstation\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/.gitconfig\n      operation: link\n",
+                "schema_version: 6\nid: workstation\nresources:\n  git-config:\n    type: file\n    properties:\n      kind: file\n      source:\n        store: dotfiles\n        path: git/config\n      target: ~/.gitconfig\n      operation: link\n",
             );
             let context = ResolverContext::new(
                 self.path("home"),
@@ -3054,19 +3053,337 @@ mod tests {
         let request = workspace.request(&[]);
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 5\nid: base\nstages:\n  first: { after: [] }\n  second: { after: [first] }\nresources:\n  first:\n    type: file\n    stage: first\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.first\n  second:\n    type: file\n    stage: second\n    depends_on: [first]\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.second\n",
+            "schema_version: 6\nid: base\nstages:\n  first: { after: [] }\n  second: { after: [first] }\nresources:\n  first:\n    type: file\n    stage: first\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.first\n  second:\n    type: file\n    stage: second\n    depends_on: [first]\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.second\n",
         );
         apply_request(&request, |_| true).unwrap();
         let before = workspace.target_and_state_snapshot();
 
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 5\nid: base\nstages:\n  first: { after: [] }\n  second: { after: [] }\nresources:\n  first:\n    type: file\n    stage: first\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.first\n  second:\n    type: file\n    stage: second\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.second\n",
+            "schema_version: 6\nid: base\nstages:\n  first: { after: [] }\n  second: { after: [] }\nresources:\n  first:\n    type: file\n    stage: first\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.first\n  second:\n    type: file\n    stage: second\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.second\n",
         );
         let report = apply_request(&request, |_| true).unwrap();
 
         assert!(matches!(report, ApplyReport::Applied { committed, .. } if committed.is_empty()));
         assert_eq!(workspace.target_and_state_snapshot(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_final_predecessor_removal_cleans_current_successor_reference() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let request = workspace.request(&[]);
+        let profile = |include_early: bool| {
+            let early = if include_early {
+                "  early-item:\n    type: file\n    stage: early\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.early\n"
+            } else {
+                ""
+            };
+            format!(
+                "schema_version: 6\nid: base\nstages:\n  early: {{ after: [] }}\n  empty: {{ after: [early] }}\n  late: {{ after: [empty] }}\nresources:\n{early}  late-item:\n    type: file\n    stage: late\n    properties:\n      kind: file\n      operation: link\n      source: {{ store: dotfiles, path: git/config }}\n      target: ~/.late\n"
+            )
+        };
+        workspace.write("profiles/base.yaml", &profile(true));
+        apply_request(&request, |_| true).unwrap();
+        let before = workspace.repository().load().unwrap();
+        let late = before
+            .known()
+            .topology()
+            .current_barriers()
+            .iter()
+            .find(|barrier| barrier.id == "stage/base/late")
+            .unwrap();
+        assert_eq!(late.after, ["stage/base/early"]);
+
+        workspace.write("profiles/base.yaml", &profile(false));
+        apply_request(&request, |_| true).unwrap();
+        let after = workspace.repository().load().unwrap();
+        assert!(after.active_operation().is_none());
+        assert!(
+            after
+                .known()
+                .get_variant(&FullyQualifiedResourceId::parse("base/early-item").unwrap())
+                .is_none()
+        );
+        assert!(
+            after
+                .known()
+                .topology()
+                .current_barriers()
+                .iter()
+                .all(|barrier| barrier.id != "stage/base/early")
+        );
+        let late = after
+            .known()
+            .topology()
+            .current_barriers()
+            .iter()
+            .find(|barrier| barrier.id == "stage/base/late")
+            .unwrap();
+        assert!(late.after.is_empty());
+        assert!(workspace.path("home/.late").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_output_action_advances_relation_for_an_existing_member() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "original\n");
+        workspace.write("store/git/alternate", "replacement\n");
+        let request = workspace.request(&[]);
+        let profile = |late_after: &str, late_source: &str| {
+            format!(
+                "schema_version: 6\nid: base\nstages:\n  early: {{ after: [] }}\n  late: {{ after: [{late_after}] }}\nresources:\n  early-item:\n    type: file\n    stage: early\n    properties:\n      kind: file\n      operation: link\n      source: {{ store: dotfiles, path: git/config }}\n      target: ~/.early\n  late-item:\n    type: file\n    stage: late\n    properties:\n      kind: file\n      operation: link\n      source: {{ store: dotfiles, path: {late_source} }}\n      target: ~/.late\n"
+            )
+        };
+        workspace.write("profiles/base.yaml", &profile("", "git/config"));
+        apply_request(&request, |_| true).unwrap();
+        let before = workspace.repository().load().unwrap();
+        let late = before
+            .known()
+            .topology()
+            .current_barriers()
+            .iter()
+            .find(|barrier| barrier.id == "stage/base/late")
+            .unwrap();
+        assert!(late.after.is_empty());
+        assert_eq!(
+            late.members,
+            [FullyQualifiedResourceId::parse("base/late-item").unwrap()]
+        );
+
+        workspace.write("profiles/base.yaml", &profile("early", "git/alternate"));
+        apply_request(&request, |_| true).unwrap();
+        let after = workspace.repository().load().unwrap();
+        let late = after
+            .known()
+            .topology()
+            .current_barriers()
+            .iter()
+            .find(|barrier| barrier.id == "stage/base/late")
+            .unwrap();
+        assert_eq!(
+            late.members,
+            [FullyQualifiedResourceId::parse("base/late-item").unwrap()]
+        );
+        assert_eq!(late.after, ["stage/base/early"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_advance_then_stale_shrink_uses_exact_projected_barrier() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let request = workspace.request(&[]);
+        let profile = |include_new: bool, include_old: bool| {
+            let resource = |id: &str, target: &str| {
+                format!(
+                    "  {id}:\n    type: file\n    stage: shared\n    properties:\n      kind: file\n      operation: link\n      source: {{ store: dotfiles, path: git/config }}\n      target: {target}\n"
+                )
+            };
+            format!(
+                "schema_version: 6\nid: base\nstages:\n  shared: {{ after: [] }}\nresources:\n{}{}",
+                if include_new {
+                    resource("a-new", "~/.new")
+                } else {
+                    String::new()
+                },
+                if include_old {
+                    resource("z-old", "~/.old")
+                } else {
+                    String::new()
+                }
+            )
+        };
+        workspace.write("profiles/base.yaml", &profile(false, true));
+        apply_request(&request, |_| true).unwrap();
+        workspace.write("profiles/base.yaml", &profile(true, false));
+        let report = apply_request(&request, |_| true).unwrap();
+        assert!(matches!(report, ApplyReport::Applied { committed, .. } if committed.len() == 2));
+        let state = workspace.repository().load().unwrap();
+        assert!(state.active_operation().is_none());
+        assert!(
+            state
+                .known()
+                .get_variant(&FullyQualifiedResourceId::parse("base/z-old").unwrap())
+                .is_none()
+        );
+        let barrier = state
+            .known()
+            .topology()
+            .current_barriers()
+            .iter()
+            .find(|barrier| barrier.id == "stage/base/shared")
+            .unwrap();
+        assert_eq!(
+            barrier.members,
+            [FullyQualifiedResourceId::parse("base/a-new").unwrap()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_success_through_empty_phase_publishes_only_verified_membership() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let request = workspace.request(&[]);
+        workspace.write(
+            "profiles/base.yaml",
+            "schema_version: 6\nid: base\nstages:\n  early: { after: [] }\n  empty: { after: [early] }\n  late: { after: [empty] }\nresources:\n  early-item:\n    type: file\n    stage: early\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.early\n  late-item:\n    type: file\n    stage: late\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.late\n",
+        );
+        let failure = apply_request_with_hooks(
+            &request,
+            |_| true,
+            |index, locked| {
+                if index == 1 {
+                    locked.fail_next_commit_at(CommitStage::ReplaceState);
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(failure.stage, ApplyStage::Execution);
+        assert_eq!(
+            failure.committed,
+            [FullyQualifiedResourceId::parse("base/early-item").unwrap()]
+        );
+        let state = workspace.repository().load().unwrap();
+        assert!(
+            state
+                .known()
+                .get_variant(&FullyQualifiedResourceId::parse("base/late-item").unwrap())
+                .is_none()
+        );
+        assert_eq!(state.known().topology().current_barriers().len(), 1);
+        assert_eq!(
+            state.known().topology().current_barriers()[0].id,
+            "stage/base/early"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opposite_recorded_order_blocks_without_a_new_operation_or_target_change() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "source\n");
+        let request = workspace.request(&[]);
+        let profile = |a_after: &str, b_after: &str| {
+            format!(
+                "schema_version: 6\nid: base\nstages:\n  a: {{ after: [{a_after}] }}\n  b: {{ after: [{b_after}] }}\nresources:\n  a-item:\n    type: file\n    stage: a\n    properties:\n      kind: file\n      operation: link\n      source: {{ store: dotfiles, path: git/config }}\n      target: ~/.a\n  b-item:\n    type: file\n    stage: b\n    properties:\n      kind: file\n      operation: link\n      source: {{ store: dotfiles, path: git/config }}\n      target: ~/.b\n"
+            )
+        };
+        workspace.write("profiles/base.yaml", &profile("", "a"));
+        apply_request(&request, |_| true).unwrap();
+        let before = workspace.target_and_state_snapshot();
+
+        workspace.write("profiles/base.yaml", &profile("b", ""));
+        let plan = crate::application::queries::plan_request(&request).unwrap();
+        assert!(!plan.plan.is_executable());
+        assert!(plan.plan.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            crate::domain::diagnostic::Diagnostic::RecordedOrderConflict { rebuild_set, .. }
+                if rebuild_set == &[FullyQualifiedResourceId::parse("base/a-item").unwrap(), FullyQualifiedResourceId::parse("base/b-item").unwrap()]
+        )));
+        assert!(matches!(
+            apply_request(&request, |_| true).unwrap(),
+            ApplyReport::Blocked { .. }
+        ));
+        assert_eq!(workspace.target_and_state_snapshot(), before);
+        assert!(
+            workspace
+                .repository()
+                .load()
+                .unwrap()
+                .active_operation()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_recorded_order_schedules_current_predecessor_before_new_member() {
+        let workspace = TestWorkspace::new();
+        workspace.write("store/git/config", "original\n");
+        workspace.write("store/git/alternate", "replacement\n");
+        let request = workspace.request(&[]);
+        let profile = |late_after: &str, early_source: &str, new_member: bool| {
+            let new_member = if new_member {
+                "  a-new:\n    type: file\n    stage: late\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.new\n"
+            } else {
+                ""
+            };
+            format!(
+                "schema_version: 6\nid: base\nstages:\n  early: {{ after: [] }}\n  late: {{ after: [{late_after}] }}\nresources:\n{new_member}  z-early:\n    type: file\n    stage: early\n    properties:\n      kind: file\n      operation: link\n      source: {{ store: dotfiles, path: {early_source} }}\n      target: ~/.early\n  z-late:\n    type: file\n    stage: late\n    properties:\n      kind: file\n      operation: link\n      source: {{ store: dotfiles, path: git/config }}\n      target: ~/.late\n"
+            )
+        };
+        workspace.write("profiles/base.yaml", &profile("early", "git/config", false));
+        apply_request(&request, |_| true).unwrap();
+        workspace.write("profiles/base.yaml", &profile("", "git/alternate", true));
+        let report = apply_request(&request, |_| true).unwrap();
+        let ApplyReport::Applied { committed, .. } = report else {
+            panic!("recorded predecessor should be scheduled before the new member");
+        };
+        assert_eq!(
+            committed,
+            [
+                FullyQualifiedResourceId::parse("base/z-early").unwrap(),
+                FullyQualifiedResourceId::parse("base/a-new").unwrap()
+            ]
+        );
+        let state = workspace.repository().load().unwrap();
+        let late = state
+            .known()
+            .topology()
+            .current_barriers()
+            .iter()
+            .find(|barrier| barrier.id == "stage/base/late")
+            .unwrap();
+        assert_eq!(late.after, ["stage/base/early"]);
+        assert_eq!(
+            late.members,
+            [
+                FullyQualifiedResourceId::parse("base/a-new").unwrap(),
+                FullyQualifiedResourceId::parse("base/z-late").unwrap()
+            ]
+        );
+
+        let failed_workspace = TestWorkspace::new();
+        failed_workspace.write("store/git/config", "original\n");
+        failed_workspace.write("store/git/alternate", "replacement\n");
+        let failed_request = failed_workspace.request(&[]);
+        failed_workspace.write("profiles/base.yaml", &profile("early", "git/config", false));
+        apply_request(&failed_request, |_| true).unwrap();
+        failed_workspace.write("profiles/base.yaml", &profile("", "git/alternate", true));
+        let failure = apply_request_with_hooks(
+            &failed_request,
+            |_| true,
+            |index, _| {
+                if index == 0 {
+                    fs::remove_file(failed_workspace.path("home/.early")).unwrap();
+                    failed_workspace.write("home/.early", "unmanaged");
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(failure.stage, ApplyStage::Execution);
+        let failed_state = failed_workspace.repository().load().unwrap();
+        let operation = failed_state.active_operation().unwrap();
+        let (new_action_id, new_action) = operation
+            .actions()
+            .find(|(_, action)| action.resource_id().as_str() == "base/a-new")
+            .unwrap();
+        assert_eq!(new_action.status(), ActionStatus::Skipped);
+        assert!(matches!(
+            operation.skip_reason(new_action_id),
+            Some(crate::state::operation::SkipReason::Dependency { .. })
+        ));
+        assert!(
+            failed_state
+                .known()
+                .get_variant(&FullyQualifiedResourceId::parse("base/a-new").unwrap())
+                .is_none()
+        );
+        assert!(!failed_workspace.path("home/.new").exists());
     }
 
     #[cfg(unix)]
@@ -3077,7 +3394,7 @@ mod tests {
         let request = workspace.request(&[]);
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 5\nid: base\nstages:\n  first: { after: [] }\n  second: { after: [first] }\nresources:\n  first:\n    type: file\n    stage: first\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.first\n  second:\n    type: file\n    stage: second\n    depends_on: [first]\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.second\n",
+            "schema_version: 6\nid: base\nstages:\n  first: { after: [] }\n  second: { after: [first] }\nresources:\n  first:\n    type: file\n    stage: first\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.first\n  second:\n    type: file\n    stage: second\n    depends_on: [first]\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.second\n",
         );
         let mut observed = Vec::new();
         let failure = apply_request_with_hooks(
@@ -3129,7 +3446,7 @@ mod tests {
         let request = workspace.request(&[]);
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 5\nid: base\nstages:\n  staged: { after: [] }\nresources:\n  staged:\n    type: file\n    stage: staged\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.staged\n  unstaged:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.unstaged\n",
+            "schema_version: 6\nid: base\nstages:\n  staged: { after: [] }\nresources:\n  staged:\n    type: file\n    stage: staged\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.staged\n  unstaged:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.unstaged\n",
         );
         apply_request(&request, |_| true).unwrap();
 
@@ -3149,12 +3466,12 @@ mod tests {
         let request = workspace.request(&[]);
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 5\nid: base\nresources:\n  predecessor:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.predecessor\n",
+            "schema_version: 6\nid: base\nresources:\n  predecessor:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.predecessor\n",
         );
         apply_request(&request, |_| true).unwrap();
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 5\nid: base\nresources:\n  predecessor:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.predecessor\n  successor:\n    type: file\n    depends_on: [predecessor]\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.successor\n",
+            "schema_version: 6\nid: base\nresources:\n  predecessor:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.predecessor\n  successor:\n    type: file\n    depends_on: [predecessor]\n    properties:\n      kind: file\n      operation: link\n      source: { store: dotfiles, path: git/config }\n      target: ~/.successor\n",
         );
         let mut action_count = None;
         let report = apply_request_with_hooks(
@@ -4019,7 +4336,7 @@ mod tests {
         let request = workspace.request(&[("a", "a")]);
         workspace.write(
             "profiles/other.yaml",
-            "schema_version: 5\nid: other\nincludes: [{id: missing}]\nresources: {}\n",
+            "schema_version: 6\nid: other\nincludes: [{id: missing}]\nresources: {}\n",
         );
         let before = workspace.snapshot();
         let _read_only = crate::test_support::forbid_mutation();
@@ -5533,7 +5850,7 @@ mod tests {
         );
         let profile = |source: &str| {
             format!(
-                "schema_version: 5\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: {source}\n      target: ~/.config/nvim\n"
+                "schema_version: 6\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: {source}\n      target: ~/.config/nvim\n"
             )
         };
         workspace.write("profiles/base.yaml", &profile("old"));
@@ -5616,7 +5933,7 @@ mod tests {
         );
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 5\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: nvim\n      target: ~/.config/nvim\n",
+            "schema_version: 6\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: nvim\n      target: ~/.config/nvim\n",
         );
         let request = super::super::queries::DeclarationRequest {
             context: ResolverContext::new(
@@ -5631,7 +5948,7 @@ mod tests {
         apply_request(&request, |_| true).unwrap();
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 5\nid: base\nresources: {}\n",
+            "schema_version: 6\nid: base\nresources: {}\n",
         );
 
         let target = workspace.path("home/.config/nvim");
@@ -5675,7 +5992,7 @@ mod tests {
         );
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 5\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: nvim\n      target: ~/.config/nvim\n",
+            "schema_version: 6\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: dotfiles\n        path: nvim\n      target: ~/.config/nvim\n",
         );
         let request = super::super::queries::DeclarationRequest {
             context: ResolverContext::new(

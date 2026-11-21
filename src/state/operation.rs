@@ -11,7 +11,7 @@ use crate::domain::known::KnownResource;
 use crate::domain::known::{KnownDirectoryLink, KnownFileLink, KnownFileLinkError};
 use crate::domain::paths::ResolvedPath;
 use crate::domain::plan::{
-    ActionKind, ActionRole, GraphAction, PlannedAction, PlannedActionGraph,
+    ActionKind, ActionRole, GraphAction, GraphBarrier, PlannedAction, PlannedActionGraph,
     PlannedDirectoryLinkAction, PlannedEffectHandoff, PlannedFileCopyAction, TargetCondition,
 };
 
@@ -2171,7 +2171,7 @@ impl OperationRecord {
         record
             .graph
             .as_mut()
-            .expect("schema-5 operations retain their graph")
+            .expect("current operations retain their graph")
             .schedule = record
             .schedule
             .iter()
@@ -2199,7 +2199,11 @@ impl OperationRecord {
             .iter()
             .map(|node| (node.id.as_str(), node))
             .collect::<BTreeMap<_, _>>();
-        if nodes.len() != graph.actions.len()
+        if graph
+            .actions
+            .windows(2)
+            .any(|pair| pair[0].id >= pair[1].id)
+            || nodes.len() != graph.actions.len()
             || nodes.len() != self.actions.len()
             || graph.schedule.len() != nodes.len()
             || graph.schedule.iter().collect::<BTreeSet<_>>().len() != graph.schedule.len()
@@ -2226,7 +2230,17 @@ impl OperationRecord {
             {
                 return false;
             }
-            if !topology_belongs_to_node(node, &graph.stale_topology_snapshot) {
+            if node
+                .topology_delta
+                .advance_current_barriers
+                .iter()
+                .chain(&node.topology_delta.advance_historical_barriers)
+                .any(|advance| {
+                    !graph.barriers.iter().any(|barrier| {
+                        barrier.id == advance.after.id && barrier.output.contains(&node.id)
+                    })
+                })
+            {
                 return false;
             }
         }
@@ -2236,6 +2250,14 @@ impl OperationRecord {
             .any(|id| !nodes.contains_key(id.as_str()))
         {
             return false;
+        }
+        let mut available = graph.stale_topology_snapshot.clone();
+        for action_id in &graph.schedule {
+            let node = nodes[action_id.as_str()];
+            if !topology_belongs_to_node(node, &available) {
+                return false;
+            }
+            apply_projected_facts(&mut available, &node.topology_delta);
         }
         if graph.direct_edges.windows(2).any(|pair| {
             (&pair[0].from, &pair[0].to, pair[0].origin)
@@ -2262,28 +2284,85 @@ impl OperationRecord {
                 return false;
             }
         }
+        let actions_by_resource = graph
+            .actions
+            .iter()
+            .map(|node| (&node.resource_id, node))
+            .collect::<BTreeMap<_, _>>();
+        for node in &graph.actions {
+            for fact in &node.topology_delta.add_current_direct {
+                if let Some(predecessor) = actions_by_resource.get(&fact.from) {
+                    if !is_current_role(predecessor.role)
+                        || !graph.direct_edges.iter().any(|edge| {
+                            edge.from == predecessor.id
+                                && edge.to == node.id
+                                && edge.origin == fact.origin
+                        })
+                    {
+                        return false;
+                    }
+                }
+            }
+            for fact in node
+                .topology_delta
+                .remove_current_direct
+                .iter()
+                .chain(&node.topology_delta.remove_historical_direct)
+            {
+                let stale_role = |resource_id: &FullyQualifiedResourceId| {
+                    actions_by_resource.get(resource_id).is_some_and(|action| {
+                        matches!(
+                            action.role,
+                            ActionRole::StaleRemove | ActionRole::ForgetMissing
+                        )
+                    })
+                };
+                let owner = if stale_role(&fact.to) {
+                    &fact.to
+                } else if stale_role(&fact.from) {
+                    &fact.from
+                } else {
+                    return false;
+                };
+                if owner != &node.resource_id {
+                    return false;
+                }
+            }
+        }
         let mut barriers = BTreeSet::new();
+        let mut current_outputs = BTreeSet::new();
         for barrier in &graph.barriers {
             if !(stage_id_is_canonical(&barrier.id) || barrier.id.starts_with("stale/"))
                 || !is_sorted_unique(&barrier.after)
                 || !is_sorted_unique(&barrier.input)
                 || !is_sorted_unique(&barrier.output)
                 || !is_sorted_unique(&barrier.provenance)
-                || barrier.output.is_empty()
-                || (barrier.input.is_empty() && !barrier.after.is_empty())
                 || !barriers.insert(&barrier.id)
                 || barrier
                     .after
                     .iter()
                     .any(|id| !(stage_id_is_canonical(id) || id.starts_with("stale/")))
-                || barrier
-                    .provenance
-                    .iter()
-                    .any(|id| FullyQualifiedResourceId::parse(id).is_err())
+                || barrier.provenance.iter().any(|id| {
+                    FullyQualifiedResourceId::parse(id).is_err() && !stage_id_is_canonical(id)
+                })
             {
                 return false;
             }
             let stale_constraint = barrier.id.starts_with("stale/");
+            if (stale_constraint && !barrier.after.is_empty())
+                || (!stale_constraint
+                    && barrier
+                        .after
+                        .iter()
+                        .any(|predecessor| stage_root(predecessor) != stage_root(&barrier.id)))
+                || (!stale_constraint
+                    && barrier
+                        .output
+                        .iter()
+                        .any(|output| !current_outputs.insert(output)))
+            {
+                return false;
+            }
             for id in barrier.input.iter().chain(&barrier.output) {
                 let Some(node) = nodes.get(id.as_str()) else {
                     return false;
@@ -2307,6 +2386,65 @@ impl OperationRecord {
         {
             return false;
         }
+        let barrier_by_id = graph
+            .barriers
+            .iter()
+            .map(|barrier| (barrier.id.as_str(), barrier))
+            .collect::<BTreeMap<_, _>>();
+        let mut barrier_ancestors = BTreeMap::new();
+        for barrier in &graph.barriers {
+            if collect_barrier_ancestors(
+                barrier.id.as_str(),
+                &barrier_by_id,
+                &mut BTreeSet::new(),
+                &mut barrier_ancestors,
+            )
+            .is_none()
+            {
+                return false;
+            }
+        }
+        for node in &graph.actions {
+            for added in node
+                .topology_delta
+                .add_current_barriers
+                .iter()
+                .chain(&node.topology_delta.add_historical_barriers)
+            {
+                let Some(ancestors) = barrier_ancestors.get(added.id.as_str()) else {
+                    return false;
+                };
+                if !is_current_role(node.role)
+                    || added.members.as_slice() != [node.resource_id.clone()]
+                    || !graph
+                        .barriers
+                        .iter()
+                        .any(|barrier| barrier.id == added.id && barrier.output.contains(&node.id))
+                    || added.after.iter().any(|id| !ancestors.contains(id))
+                {
+                    return false;
+                }
+            }
+            for advance in node
+                .topology_delta
+                .advance_current_barriers
+                .iter()
+                .chain(&node.topology_delta.advance_historical_barriers)
+            {
+                let Some(ancestors) = barrier_ancestors.get(advance.after.id.as_str()) else {
+                    return false;
+                };
+                if advance
+                    .after
+                    .after
+                    .iter()
+                    .filter(|id| !advance.before.after.contains(id))
+                    .any(|id| !ancestors.contains(id))
+                {
+                    return false;
+                }
+            }
+        }
         let positions = graph
             .schedule
             .iter()
@@ -2327,19 +2465,16 @@ impl OperationRecord {
                 })
             })
             || graph.barriers.iter().any(|barrier| {
-                barrier.after.iter().any(|predecessor_id| {
-                    let predecessor = graph
-                        .barriers
-                        .iter()
-                        .find(|candidate| candidate.id == *predecessor_id)
-                        .expect("validated barrier reference exists");
-                    predecessor.output.iter().any(|output| {
-                        barrier
-                            .output
-                            .iter()
-                            .any(|input| positions[output.as_str()] >= positions[input.as_str()])
+                barrier_ancestors[barrier.id.as_str()]
+                    .iter()
+                    .any(|predecessor_id| {
+                        let predecessor = barrier_by_id[predecessor_id.as_str()];
+                        predecessor.output.iter().any(|output| {
+                            barrier.output.iter().any(|input| {
+                                positions[output.as_str()] >= positions[input.as_str()]
+                            })
+                        })
                     })
-                })
             })
         {
             return false;
@@ -2357,15 +2492,11 @@ impl OperationRecord {
             }
         }
         for barrier in &graph.barriers {
-            for predecessor_id in &barrier.after {
-                let predecessor = graph
-                    .barriers
-                    .iter()
-                    .find(|candidate| candidate.id == *predecessor_id)
-                    .expect("validated barrier reference exists");
+            for predecessor_id in &barrier_ancestors[barrier.id.as_str()] {
+                let predecessor = barrier_by_id[predecessor_id.as_str()];
                 for output in &predecessor.output {
-                    for input in &barrier.input {
-                        outgoing.entry(output).or_default().push(input);
+                    for successor in &barrier.output {
+                        outgoing.entry(output).or_default().push(successor);
                     }
                 }
             }
@@ -2528,6 +2659,42 @@ impl OperationRecord {
                 }
             }
         }
+        let barrier_by_id = graph
+            .barriers
+            .iter()
+            .map(|barrier| (barrier.id.as_str(), barrier))
+            .collect::<BTreeMap<_, _>>();
+        let mut ancestors = BTreeMap::new();
+        for barrier in &graph.barriers {
+            let preceding = collect_barrier_ancestors(
+                barrier.id.as_str(),
+                &barrier_by_id,
+                &mut BTreeSet::new(),
+                &mut ancestors,
+            )
+            .ok_or(OperationRecordError::InvalidGraph)?;
+            for predecessor_id in preceding {
+                let predecessor = barrier_by_id[predecessor_id.as_str()];
+                for input in &predecessor.output {
+                    let source = graph
+                        .actions
+                        .iter()
+                        .find(|action| action.id == *input)
+                        .ok_or(OperationRecordError::InvalidGraph)?;
+                    for output in &barrier.output {
+                        let destination = graph
+                            .actions
+                            .iter()
+                            .find(|action| action.id == *output)
+                            .ok_or(OperationRecordError::InvalidGraph)?;
+                        edges
+                            .entry(&source.resource_id)
+                            .or_default()
+                            .insert(&destination.resource_id);
+                    }
+                }
+            }
+        }
         let mut pending = vec![from];
         let mut visited = BTreeSet::new();
         while let Some(resource) = pending.pop() {
@@ -2574,6 +2741,347 @@ impl OperationRecord {
             .find(|node| node.resource_id == *resource)
             .ok_or(OperationRecordError::InvalidGraph)?;
         Ok((&node.topology_authority, &node.topology_delta))
+    }
+
+    /// Checks recorded progress against the loaded topology before recovery can observe a target.
+    pub(crate) fn validate_loaded_topology(
+        &self,
+        loaded: &crate::domain::known::AppliedLifecycleTopology,
+    ) -> Result<(), OperationRecordError> {
+        let graph = self
+            .graph
+            .as_ref()
+            .ok_or(OperationRecordError::InvalidGraph)?;
+        let recorded_barriers = loaded
+            .current_barriers()
+            .iter()
+            .chain(loaded.historical_barriers())
+            .map(|barrier| (barrier.id.as_str(), barrier))
+            .collect::<BTreeMap<_, _>>();
+        for node in &graph.actions {
+            let output_id =
+                ActionId::parse(&node.id).map_err(|_| OperationRecordError::InvalidGraph)?;
+            let output_succeeded = self
+                .action(&output_id)
+                .is_some_and(|action| action.status() == ActionStatus::Succeeded);
+            let validate_predecessor =
+                |root: &str, require_recorded: bool| -> Result<(), OperationRecordError> {
+                    let mut pending = vec![root.to_owned()];
+                    let mut visited = BTreeSet::new();
+                    while let Some(id) = pending.pop() {
+                        if !visited.insert(id.clone()) {
+                            continue;
+                        }
+                        let Some(predecessor) = recorded_barriers.get(id.as_str()) else {
+                            if require_recorded || output_succeeded {
+                                return Err(OperationRecordError::InvalidGraph);
+                            }
+                            continue;
+                        };
+                        pending.extend(predecessor.after.iter().cloned());
+                        for member in &predecessor.members {
+                            let Some(prior_node) = graph
+                                .actions
+                                .iter()
+                                .find(|candidate| candidate.resource_id == *member)
+                            else {
+                                continue;
+                            };
+                            if !is_current_role(prior_node.role) {
+                                return Err(OperationRecordError::InvalidGraph);
+                            }
+                            let prior_id = ActionId::parse(&prior_node.id)
+                                .map_err(|_| OperationRecordError::InvalidGraph)?;
+                            if self.abort_skip_reason(&prior_id, &output_id)?
+                                != (SkipReason::Dependency {
+                                    blocking_action_id: prior_id.clone(),
+                                })
+                                || (output_succeeded
+                                    && !self.action(&prior_id).is_some_and(|action| {
+                                        action.status() == ActionStatus::Succeeded
+                                    }))
+                            {
+                                return Err(OperationRecordError::InvalidGraph);
+                            }
+                        }
+                    }
+                    Ok(())
+                };
+            for added in &node.topology_delta.add_current_barriers {
+                for predecessor in &added.after {
+                    validate_predecessor(predecessor, false)?;
+                }
+            }
+            for advance in node
+                .topology_delta
+                .advance_current_barriers
+                .iter()
+                .chain(&node.topology_delta.advance_historical_barriers)
+            {
+                for predecessor in &advance.after.after {
+                    validate_predecessor(predecessor, advance.before.after.contains(predecessor))?;
+                }
+            }
+        }
+        let mut projected_direct = graph
+            .stale_topology_snapshot
+            .current_direct
+            .iter()
+            .cloned()
+            .map(|fact| (true, fact))
+            .chain(
+                graph
+                    .stale_topology_snapshot
+                    .historical_direct
+                    .iter()
+                    .cloned()
+                    .map(|fact| (false, fact)),
+            )
+            .collect::<BTreeSet<_>>();
+        let mut projected_barriers = graph
+            .stale_topology_snapshot
+            .current_barriers
+            .iter()
+            .cloned()
+            .map(|fact| (true, fact))
+            .chain(
+                graph
+                    .stale_topology_snapshot
+                    .historical_barriers
+                    .iter()
+                    .cloned()
+                    .map(|fact| (false, fact)),
+            )
+            .collect::<BTreeSet<_>>();
+        let mut touched_direct = projected_direct.clone();
+        let mut touched_barrier_ids = projected_barriers
+            .iter()
+            .map(|(current, fact)| (*current, fact.id.clone()))
+            .collect::<BTreeSet<_>>();
+        let mut prior_direct_outputs = BTreeSet::new();
+        let mut prior_barrier_outputs = BTreeSet::new();
+        for action_id in &graph.schedule {
+            let node = graph
+                .actions
+                .iter()
+                .find(|node| node.id == *action_id)
+                .ok_or(OperationRecordError::InvalidGraph)?;
+            let status = self
+                .actions
+                .iter()
+                .find(|(id, _)| id.as_str() == action_id)
+                .map(|(_, action)| action.status())
+                .ok_or(OperationRecordError::InvalidGraph)?;
+            let delta = &node.topology_delta;
+            let before_direct = delta
+                .remove_current_direct
+                .iter()
+                .cloned()
+                .map(|fact| (true, fact))
+                .chain(
+                    delta
+                        .remove_historical_direct
+                        .iter()
+                        .cloned()
+                        .map(|fact| (false, fact)),
+                )
+                .collect::<Vec<_>>();
+            let before_barriers = delta
+                .remove_current_barriers
+                .iter()
+                .cloned()
+                .map(|fact| (true, fact))
+                .chain(
+                    delta
+                        .remove_historical_barriers
+                        .iter()
+                        .cloned()
+                        .map(|fact| (false, fact)),
+                )
+                .chain(
+                    delta
+                        .advance_current_barriers
+                        .iter()
+                        .map(|item| (true, item.before.clone())),
+                )
+                .chain(
+                    delta
+                        .advance_historical_barriers
+                        .iter()
+                        .map(|item| (false, item.before.clone())),
+                )
+                .chain(
+                    delta
+                        .replace_current_barriers
+                        .iter()
+                        .map(|item| (true, item.before.clone())),
+                )
+                .chain(
+                    delta
+                        .replace_historical_barriers
+                        .iter()
+                        .map(|item| (false, item.before.clone())),
+                )
+                .collect::<Vec<_>>();
+            let after_direct = delta
+                .add_current_direct
+                .iter()
+                .cloned()
+                .map(|fact| (true, fact))
+                .chain(
+                    delta
+                        .add_historical_direct
+                        .iter()
+                        .cloned()
+                        .map(|fact| (false, fact)),
+                )
+                .collect::<Vec<_>>();
+            let after_barriers = delta
+                .add_current_barriers
+                .iter()
+                .cloned()
+                .map(|fact| (true, fact))
+                .chain(
+                    delta
+                        .add_historical_barriers
+                        .iter()
+                        .cloned()
+                        .map(|fact| (false, fact)),
+                )
+                .chain(
+                    delta
+                        .advance_current_barriers
+                        .iter()
+                        .map(|item| (true, item.after.clone())),
+                )
+                .chain(
+                    delta
+                        .advance_historical_barriers
+                        .iter()
+                        .map(|item| (false, item.after.clone())),
+                )
+                .chain(
+                    delta
+                        .replace_current_barriers
+                        .iter()
+                        .map(|item| (true, item.after.clone())),
+                )
+                .chain(
+                    delta
+                        .replace_historical_barriers
+                        .iter()
+                        .map(|item| (false, item.after.clone())),
+                )
+                .collect::<Vec<_>>();
+            for fact in &before_direct {
+                touched_direct.insert(fact.clone());
+                if !projected_direct.contains(fact) && !prior_direct_outputs.contains(fact) {
+                    projected_direct.insert(fact.clone());
+                }
+            }
+            for fact in &before_barriers {
+                touched_barrier_ids.insert((fact.0, fact.1.id.clone()));
+                if !projected_barriers.contains(fact) && !prior_barrier_outputs.contains(fact) {
+                    projected_barriers.insert(fact.clone());
+                }
+            }
+            if matches!(
+                status,
+                ActionStatus::Running | ActionStatus::Uncertain | ActionStatus::Succeeded
+            ) && (before_direct
+                .iter()
+                .any(|fact| !projected_direct.contains(fact))
+                || before_barriers
+                    .iter()
+                    .any(|fact| !projected_barriers.contains(fact)))
+            {
+                return Err(OperationRecordError::InvalidGraph);
+            }
+            if status == ActionStatus::Succeeded {
+                for fact in &before_direct {
+                    projected_direct.remove(fact);
+                }
+                for fact in &before_barriers {
+                    projected_barriers.remove(fact);
+                }
+                projected_direct.extend(after_direct.iter().cloned());
+                projected_barriers.extend(after_barriers.iter().cloned());
+            }
+            touched_direct.extend(after_direct.iter().cloned());
+            touched_barrier_ids.extend(
+                after_barriers
+                    .iter()
+                    .map(|(current, fact)| (*current, fact.id.clone())),
+            );
+            prior_direct_outputs.extend(after_direct);
+            prior_barrier_outputs.extend(after_barriers);
+        }
+        for (current, fact) in touched_direct {
+            let actual = if current {
+                loaded.current_direct()
+            } else {
+                loaded.historical_direct()
+            };
+            if actual.contains(&fact) != projected_direct.contains(&(current, fact)) {
+                return Err(OperationRecordError::InvalidGraph);
+            }
+        }
+        for (current, id) in touched_barrier_ids {
+            let actual = if current {
+                loaded.current_barriers()
+            } else {
+                loaded.historical_barriers()
+            }
+            .iter()
+            .find(|fact| fact.id == id);
+            let expected = projected_barriers
+                .iter()
+                .find(|(source, fact)| *source == current && fact.id == id)
+                .map(|(_, fact)| fact);
+            if actual != expected {
+                return Err(OperationRecordError::InvalidGraph);
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks that every selected direct predecessor was proved before recovery.
+    pub(crate) fn validate_loaded_direct_predecessors(
+        &self,
+        known: &crate::domain::known::KnownState,
+    ) -> Result<(), OperationRecordError> {
+        let graph = self
+            .graph
+            .as_ref()
+            .ok_or(OperationRecordError::InvalidGraph)?;
+        let actions_by_resource = graph
+            .actions
+            .iter()
+            .map(|node| (&node.resource_id, node))
+            .collect::<BTreeMap<_, _>>();
+        for node in &graph.actions {
+            let output_id =
+                ActionId::parse(&node.id).map_err(|_| OperationRecordError::InvalidGraph)?;
+            let output_succeeded = self
+                .action(&output_id)
+                .is_some_and(|action| action.status() == ActionStatus::Succeeded);
+            for fact in &node.topology_delta.add_current_direct {
+                if let Some(predecessor) = actions_by_resource.get(&fact.from) {
+                    let predecessor_id = ActionId::parse(&predecessor.id)
+                        .map_err(|_| OperationRecordError::InvalidGraph)?;
+                    if output_succeeded
+                        && !self
+                            .action(&predecessor_id)
+                            .is_some_and(|action| action.status() == ActionStatus::Succeeded)
+                    {
+                        return Err(OperationRecordError::InvalidGraph);
+                    }
+                } else if known.get_variant(&fact.from).is_none() {
+                    return Err(OperationRecordError::InvalidGraph);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The recorded skip cause, if this action was skipped after an abort.
@@ -2700,6 +3208,49 @@ fn topology_belongs_to_node(
         .iter()
         .chain(&authority.historical_barriers)
         .collect::<Vec<_>>();
+    let delta = &node.topology_delta;
+    let removed_barrier_ids = delta
+        .remove_current_barriers
+        .iter()
+        .chain(&delta.remove_historical_barriers)
+        .filter(|fact| fact.members.as_slice() == [node.resource_id.clone()])
+        .map(|fact| fact.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let stale_cleanup = |fact: &crate::domain::known::AppliedBarrier| {
+        delta
+            .replace_current_barriers
+            .iter()
+            .chain(&delta.replace_historical_barriers)
+            .any(|replacement| {
+                replacement.before == *fact
+                    && replacement.after.members == fact.members
+                    && fact
+                        .after
+                        .iter()
+                        .any(|id| !replacement.after.after.contains(id))
+                    && fact
+                        .after
+                        .iter()
+                        .filter(|id| !replacement.after.after.contains(id))
+                        .all(|id| removed_barrier_ids.contains(id.as_str()))
+            })
+    };
+    let advanced_by_node = |fact: &crate::domain::known::AppliedBarrier| {
+        delta
+            .advance_current_barriers
+            .iter()
+            .chain(&delta.advance_historical_barriers)
+            .any(|advance| {
+                advance.before == *fact && advance.after.members.contains(&node.resource_id)
+            })
+    };
+    let advance_predecessor = |fact: &crate::domain::known::AppliedBarrier| {
+        delta
+            .advance_current_barriers
+            .iter()
+            .chain(&delta.advance_historical_barriers)
+            .any(|advance| advance.after.after.contains(&fact.id))
+    };
     let owns_barrier = |fact: &crate::domain::known::AppliedBarrier| {
         let mut reachable = barrier_facts
             .iter()
@@ -2728,11 +3279,72 @@ fn topology_belongs_to_node(
             .current_barriers
             .iter()
             .chain(&authority.historical_barriers)
-            .any(|fact| !owns_barrier(fact))
+            .any(|fact| {
+                !owns_barrier(fact)
+                    && !stale_cleanup(fact)
+                    && !advanced_by_node(fact)
+                    && !advance_predecessor(fact)
+            })
     {
         return false;
     }
-    let delta = &node.topology_delta;
+    let current = is_current_role(node.role);
+    if !delta.add_historical_direct.is_empty()
+        || !delta.add_historical_barriers.is_empty()
+        || (current
+            && (!delta.remove_current_direct.is_empty()
+                || !delta.remove_historical_direct.is_empty()
+                || !delta.remove_current_barriers.is_empty()
+                || !delta.remove_historical_barriers.is_empty()))
+        || (!current
+            && (!delta.add_current_direct.is_empty() || !delta.add_current_barriers.is_empty()))
+        || (!current
+            && (!delta.advance_current_barriers.is_empty()
+                || !delta.advance_historical_barriers.is_empty()))
+        || (current
+            && (!delta.replace_current_barriers.is_empty()
+                || !delta.replace_historical_barriers.is_empty()))
+    {
+        return false;
+    }
+    for advance in delta
+        .advance_current_barriers
+        .iter()
+        .chain(&delta.advance_historical_barriers)
+    {
+        if !owns_barrier(&advance.before) && !advanced_by_node(&advance.before)
+            || !advance.after.members.contains(&node.resource_id)
+            || advance
+                .after
+                .members
+                .iter()
+                .filter(|id| !advance.before.members.contains(id))
+                .any(|id| id != &node.resource_id)
+        {
+            return false;
+        }
+    }
+    for replacement in delta
+        .replace_current_barriers
+        .iter()
+        .chain(&delta.replace_historical_barriers)
+    {
+        if replacement
+            .before
+            .members
+            .iter()
+            .filter(|id| !replacement.after.members.contains(id))
+            .any(|id| id != &node.resource_id)
+            || replacement
+                .before
+                .after
+                .iter()
+                .filter(|id| !replacement.after.after.contains(id))
+                .any(|id| !removed_barrier_ids.contains(id.as_str()))
+        {
+            return false;
+        }
+    }
     if delta
         .add_current_direct
         .iter()
@@ -2747,10 +3359,7 @@ fn topology_belongs_to_node(
             .chain(&delta.remove_historical_direct)
             .any(|fact| !owns_direct(fact))
         || delta.add_current_barriers.iter().any(|fact| {
-            !owns_barrier(fact)
-                && !delta.add_current_barriers.iter().any(|successor| {
-                    owns_barrier(successor) && successor.after.iter().any(|after| after == &fact.id)
-                })
+            fact.members.as_slice() != [node.resource_id.clone()] || !owns_barrier(fact)
         })
         || delta
             .add_historical_barriers
@@ -2766,7 +3375,8 @@ fn topology_belongs_to_node(
             .iter()
             .chain(&delta.replace_historical_barriers)
             .any(|replacement| {
-                !owns_barrier(&replacement.before) || !owns_barrier(&replacement.after)
+                (!owns_barrier(&replacement.before) || !owns_barrier(&replacement.after))
+                    && !stale_cleanup(&replacement.before)
             })
     {
         return false;
@@ -2797,6 +3407,66 @@ fn topology_belongs_to_node(
             .iter()
             .chain(&delta.replace_historical_barriers)
             .all(|replacement| stale_barriers.contains(&&replacement.before))
+}
+
+fn apply_projected_facts(
+    projected: &mut crate::domain::known::StaleTopologySnapshot,
+    delta: &crate::domain::known::TopologyDelta,
+) {
+    fn update_direct(
+        facts: &mut Vec<crate::domain::known::AppliedDirectEdge>,
+        additions: &[crate::domain::known::AppliedDirectEdge],
+        removals: &[crate::domain::known::AppliedDirectEdge],
+    ) {
+        facts.retain(|fact| !removals.contains(fact));
+        facts.extend(additions.iter().cloned());
+    }
+    fn update_barriers(
+        facts: &mut Vec<crate::domain::known::AppliedBarrier>,
+        additions: &[crate::domain::known::AppliedBarrier],
+        removals: &[crate::domain::known::AppliedBarrier],
+        advances: &[crate::domain::known::TopologyBarrierAdvance],
+        replacements: &[crate::domain::known::TopologyBarrierReplacement],
+    ) {
+        facts.retain(|fact| {
+            !removals.contains(fact)
+                && !advances.iter().any(|advance| advance.before == *fact)
+                && !replacements
+                    .iter()
+                    .any(|replacement| replacement.before == *fact)
+        });
+        facts.extend(additions.iter().cloned());
+        facts.extend(advances.iter().map(|advance| advance.after.clone()));
+        facts.extend(
+            replacements
+                .iter()
+                .map(|replacement| replacement.after.clone()),
+        );
+    }
+    update_direct(
+        &mut projected.current_direct,
+        &delta.add_current_direct,
+        &delta.remove_current_direct,
+    );
+    update_direct(
+        &mut projected.historical_direct,
+        &delta.add_historical_direct,
+        &delta.remove_historical_direct,
+    );
+    update_barriers(
+        &mut projected.current_barriers,
+        &delta.add_current_barriers,
+        &delta.remove_current_barriers,
+        &delta.advance_current_barriers,
+        &delta.replace_current_barriers,
+    );
+    update_barriers(
+        &mut projected.historical_barriers,
+        &delta.add_historical_barriers,
+        &delta.remove_historical_barriers,
+        &delta.advance_historical_barriers,
+        &delta.replace_historical_barriers,
+    );
 }
 
 fn is_current_role(role: ActionRole) -> bool {
@@ -2855,8 +3525,42 @@ fn is_sorted_unique(values: &[String]) -> bool {
 }
 
 fn stage_id_is_canonical(id: &str) -> bool {
-    id.strip_prefix("stage/")
-        .is_some_and(|suffix| FullyQualifiedResourceId::parse(suffix).is_ok())
+    id.strip_prefix("stage/").is_some_and(|suffix| {
+        suffix.split('/').count() == 2 && FullyQualifiedResourceId::parse(suffix).is_ok()
+    })
+}
+
+fn stage_root(id: &str) -> Option<&str> {
+    let suffix = id.strip_prefix("stage/")?;
+    let (root, phase) = suffix.split_once('/')?;
+    (!root.is_empty() && !phase.is_empty() && !phase.contains('/')).then_some(root)
+}
+
+fn collect_barrier_ancestors<'a>(
+    id: &'a str,
+    barriers: &BTreeMap<&'a str, &'a GraphBarrier>,
+    visiting: &mut BTreeSet<&'a str>,
+    cache: &mut BTreeMap<&'a str, BTreeSet<String>>,
+) -> Option<BTreeSet<String>> {
+    if let Some(cached) = cache.get(id) {
+        return Some(cached.clone());
+    }
+    if !visiting.insert(id) {
+        return None;
+    }
+    let mut ancestors = BTreeSet::new();
+    for predecessor in &barriers.get(id)?.after {
+        ancestors.insert(predecessor.clone());
+        ancestors.extend(collect_barrier_ancestors(
+            predecessor,
+            barriers,
+            visiting,
+            cache,
+        )?);
+    }
+    visiting.remove(id);
+    cache.insert(id, ancestors.clone());
+    Some(ancestors)
 }
 
 fn graph_cycle<'a>(start: &'a str, outgoing: &BTreeMap<&'a str, Vec<&'a str>>) -> bool {
@@ -3088,6 +3792,601 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn recorded_direct_addition_requires_the_predecessor_action_edge() {
+        use crate::domain::known::{AppliedDirectEdge, TopologyAuthority, TopologyDelta};
+
+        let first = create_action();
+        let second = PlannedAction::create_link(
+            ResolvedFileLink::new(
+                FullyQualifiedResourceId::parse("base/second").unwrap(),
+                path("store/second"),
+                path("home/.second"),
+            )
+            .unwrap(),
+        );
+        let fact = AppliedDirectEdge {
+            from: first.resource_id().clone(),
+            to: second.resource_id().clone(),
+            origin: "depends_on",
+        };
+        let operation = OperationRecord::from_actions_with_schedule(
+            OperationId::parse("op").unwrap(),
+            desired_hash(),
+            [
+                (
+                    ActionId::parse("a1").unwrap(),
+                    RecordedAction::from_action(&first).unwrap(),
+                ),
+                (
+                    ActionId::parse("a2").unwrap(),
+                    RecordedAction::from_action(&second).unwrap(),
+                ),
+            ],
+            vec![
+                ActionId::parse("a1").unwrap(),
+                ActionId::parse("a2").unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut graph = PlannedActionGraph {
+            actions: vec![
+                GraphAction {
+                    id: "a1".to_owned(),
+                    resource_id: first.resource_id().clone(),
+                    role: ActionRole::CurrentCreate,
+                    topology_authority: Default::default(),
+                    topology_delta: Default::default(),
+                },
+                GraphAction {
+                    id: "a2".to_owned(),
+                    resource_id: second.resource_id().clone(),
+                    role: ActionRole::CurrentCreate,
+                    topology_authority: TopologyAuthority {
+                        current_direct: vec![fact.clone()],
+                        ..Default::default()
+                    },
+                    topology_delta: TopologyDelta {
+                        add_current_direct: vec![fact],
+                        ..Default::default()
+                    },
+                },
+            ],
+            direct_edges: vec![crate::domain::plan::GraphDirectEdge {
+                from: "a1".to_owned(),
+                to: "a2".to_owned(),
+                origin: "depends_on",
+            }],
+            barriers: Vec::new(),
+            schedule: vec!["a1".to_owned(), "a2".to_owned()],
+            stale_topology_snapshot: Default::default(),
+        };
+        let valid = operation.clone().with_graph(graph.clone()).unwrap();
+        let mut failed_predecessor = valid.clone();
+        let first_id = ActionId::parse("a1").unwrap();
+        let second_id = ActionId::parse("a2").unwrap();
+        failed_predecessor
+            .mark_without_known(&first_id, ActionStatus::Failed)
+            .unwrap();
+        failed_predecessor.mark_running(&second_id).unwrap();
+        failed_predecessor.mark_succeeded(&second_id).unwrap();
+        assert!(matches!(
+            failed_predecessor
+                .validate_loaded_direct_predecessors(&crate::domain::known::KnownState::empty()),
+            Err(OperationRecordError::InvalidGraph)
+        ));
+        let mut proved_predecessor = valid;
+        proved_predecessor.mark_running(&first_id).unwrap();
+        proved_predecessor.mark_succeeded(&first_id).unwrap();
+        proved_predecessor.mark_running(&second_id).unwrap();
+        proved_predecessor.mark_succeeded(&second_id).unwrap();
+        assert!(
+            proved_predecessor
+                .validate_loaded_direct_predecessors(&crate::domain::known::KnownState::empty())
+                .is_ok()
+        );
+
+        let no_predecessor_action = OperationRecord::from_actions_with_schedule(
+            OperationId::parse("op-known").unwrap(),
+            desired_hash(),
+            [(
+                second_id.clone(),
+                RecordedAction::from_action(&second).unwrap(),
+            )],
+            vec![second_id],
+        )
+        .unwrap();
+        let mut known_graph = graph.clone();
+        known_graph.actions.remove(0);
+        known_graph.direct_edges.clear();
+        known_graph.schedule.remove(0);
+        let no_predecessor_action = no_predecessor_action.with_graph(known_graph).unwrap();
+        assert!(matches!(
+            no_predecessor_action
+                .validate_loaded_direct_predecessors(&crate::domain::known::KnownState::empty()),
+            Err(OperationRecordError::InvalidGraph)
+        ));
+        let prior_known = crate::domain::known::KnownState::new([
+            crate::domain::known::KnownFileLink::from_resolved(
+                &ResolvedFileLink::new(
+                    first.resource_id().clone(),
+                    path("store/git/config"),
+                    path("home/.gitconfig"),
+                )
+                .unwrap(),
+            ),
+        ])
+        .unwrap();
+        assert!(
+            no_predecessor_action
+                .validate_loaded_direct_predecessors(&prior_known)
+                .is_ok()
+        );
+        graph.direct_edges.clear();
+        assert!(matches!(
+            operation.with_graph(graph),
+            Err(OperationRecordError::InvalidGraph)
+        ));
+    }
+
+    #[test]
+    fn recorded_all_stale_direct_removal_belongs_to_successor() {
+        use crate::domain::known::{
+            AppliedDirectEdge, KnownFileLink, StaleTopologySnapshot, TopologyAuthority,
+            TopologyDelta,
+        };
+
+        let stale_action = |id, source, target| {
+            PlannedAction::remove_link(KnownFileLink::from_resolved(
+                &ResolvedFileLink::new(
+                    FullyQualifiedResourceId::parse(id).unwrap(),
+                    path(source),
+                    path(target),
+                )
+                .unwrap(),
+            ))
+        };
+        let first = stale_action("base/first", "store/first", "home/.first");
+        let second = stale_action("base/second", "store/second", "home/.second");
+        let fact = AppliedDirectEdge {
+            from: first.resource_id().clone(),
+            to: second.resource_id().clone(),
+            origin: "depends_on",
+        };
+        let operation = OperationRecord::from_actions_with_schedule(
+            OperationId::parse("op").unwrap(),
+            desired_hash(),
+            [
+                (
+                    ActionId::parse("a1").unwrap(),
+                    RecordedAction::from_action(&first).unwrap(),
+                ),
+                (
+                    ActionId::parse("a2").unwrap(),
+                    RecordedAction::from_action(&second).unwrap(),
+                ),
+            ],
+            vec![
+                ActionId::parse("a2").unwrap(),
+                ActionId::parse("a1").unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut graph = PlannedActionGraph {
+            actions: vec![
+                GraphAction {
+                    id: "a1".to_owned(),
+                    resource_id: first.resource_id().clone(),
+                    role: ActionRole::StaleRemove,
+                    topology_authority: Default::default(),
+                    topology_delta: Default::default(),
+                },
+                GraphAction {
+                    id: "a2".to_owned(),
+                    resource_id: second.resource_id().clone(),
+                    role: ActionRole::StaleRemove,
+                    topology_authority: TopologyAuthority {
+                        current_direct: vec![fact.clone()],
+                        ..Default::default()
+                    },
+                    topology_delta: TopologyDelta {
+                        remove_current_direct: vec![fact.clone()],
+                        ..Default::default()
+                    },
+                },
+            ],
+            direct_edges: Vec::new(),
+            barriers: Vec::new(),
+            schedule: vec!["a2".to_owned(), "a1".to_owned()],
+            stale_topology_snapshot: StaleTopologySnapshot {
+                current_direct: vec![fact],
+                ..Default::default()
+            },
+        };
+        assert!(operation.clone().with_graph(graph.clone()).is_ok());
+        graph.actions[0].topology_authority = graph.actions[1].topology_authority.clone();
+        graph.actions[0].topology_delta = graph.actions[1].topology_delta.clone();
+        graph.actions[1].topology_authority = Default::default();
+        graph.actions[1].topology_delta = Default::default();
+        assert!(matches!(
+            operation.with_graph(graph),
+            Err(OperationRecordError::InvalidGraph)
+        ));
+    }
+
+    #[test]
+    fn empty_phase_keeps_transitive_schedule_and_abort_dependency() {
+        let first = create_action();
+        let last = PlannedAction::create_link(
+            ResolvedFileLink::new(
+                FullyQualifiedResourceId::parse("base/last").unwrap(),
+                path("store/last"),
+                path("home/.last"),
+            )
+            .unwrap(),
+        );
+        let first_id = ActionId::parse("a1").unwrap();
+        let last_id = ActionId::parse("a2").unwrap();
+        let actions = [
+            (
+                first_id.clone(),
+                RecordedAction::from_action(&first).unwrap(),
+            ),
+            (last_id.clone(), RecordedAction::from_action(&last).unwrap()),
+        ];
+        let operation = OperationRecord::from_actions_with_schedule(
+            OperationId::parse("op").unwrap(),
+            desired_hash(),
+            actions,
+            vec![first_id.clone(), last_id.clone()],
+        )
+        .unwrap();
+        let graph = PlannedActionGraph {
+            actions: vec![
+                GraphAction {
+                    id: "a1".to_owned(),
+                    resource_id: first.resource_id().clone(),
+                    role: ActionRole::CurrentCreate,
+                    topology_authority: Default::default(),
+                    topology_delta: Default::default(),
+                },
+                GraphAction {
+                    id: "a2".to_owned(),
+                    resource_id: last.resource_id().clone(),
+                    role: ActionRole::CurrentCreate,
+                    topology_authority: Default::default(),
+                    topology_delta: Default::default(),
+                },
+            ],
+            direct_edges: Vec::new(),
+            barriers: vec![
+                GraphBarrier {
+                    id: "stage/base/a".to_owned(),
+                    after: Vec::new(),
+                    input: Vec::new(),
+                    output: vec!["a1".to_owned()],
+                    provenance: vec!["stage/base/a".to_owned()],
+                },
+                GraphBarrier {
+                    id: "stage/base/b".to_owned(),
+                    after: vec!["stage/base/a".to_owned()],
+                    input: Vec::new(),
+                    output: Vec::new(),
+                    provenance: vec!["stage/base/b".to_owned()],
+                },
+                GraphBarrier {
+                    id: "stage/base/c".to_owned(),
+                    after: vec!["stage/base/b".to_owned()],
+                    input: Vec::new(),
+                    output: vec!["a2".to_owned()],
+                    provenance: vec!["stage/base/c".to_owned()],
+                },
+            ],
+            schedule: vec!["a1".to_owned(), "a2".to_owned()],
+            stale_topology_snapshot: Default::default(),
+        };
+        let operation = operation.with_graph(graph.clone()).unwrap();
+        let mut duplicate_membership = graph.clone();
+        duplicate_membership.barriers[1]
+            .output
+            .push("a1".to_owned());
+        assert!(matches!(
+            operation.clone().with_graph(duplicate_membership),
+            Err(OperationRecordError::InvalidGraph)
+        ));
+        let mut cross_root = graph.clone();
+        cross_root.barriers[1].after = vec!["stage/other/a".to_owned()];
+        assert!(matches!(
+            operation.clone().with_graph(cross_root),
+            Err(OperationRecordError::InvalidGraph)
+        ));
+        let mut phase_cycle = graph.clone();
+        phase_cycle.barriers[0].after = vec!["stage/base/c".to_owned()];
+        assert!(matches!(
+            operation.clone().with_graph(phase_cycle),
+            Err(OperationRecordError::InvalidGraph)
+        ));
+        let mut unproved_barrier = graph.clone();
+        let forged = crate::domain::known::AppliedBarrier {
+            id: "stage/base/c".to_owned(),
+            after: vec!["stage/base/other".to_owned()],
+            members: vec![last.resource_id().clone()],
+            origin: "stage",
+        };
+        unproved_barrier.actions[1]
+            .topology_authority
+            .current_barriers = vec![forged.clone()];
+        unproved_barrier.actions[1]
+            .topology_delta
+            .add_current_barriers = vec![forged];
+        assert!(matches!(
+            operation.clone().with_graph(unproved_barrier),
+            Err(OperationRecordError::InvalidGraph)
+        ));
+        assert_eq!(
+            operation.abort_skip_reason(&first_id, &last_id).unwrap(),
+            SkipReason::Dependency {
+                blocking_action_id: first_id,
+            }
+        );
+        let reversed = OperationRecord::from_actions_with_schedule(
+            OperationId::parse("op").unwrap(),
+            desired_hash(),
+            operation
+                .actions()
+                .map(|(id, action)| (id.clone(), action.clone())),
+            vec![last_id, ActionId::parse("a1").unwrap()],
+        )
+        .unwrap();
+        let mut wrong_graph = graph;
+        wrong_graph.schedule.reverse();
+        assert!(matches!(
+            reversed.with_graph(wrong_graph),
+            Err(OperationRecordError::InvalidGraph)
+        ));
+    }
+
+    #[test]
+    fn recorded_output_member_can_advance_only_its_proved_relation() {
+        use crate::domain::known::{AppliedBarrier, TopologyBarrierAdvance};
+
+        let action = create_action();
+        let (operation, _) = OperationRecord::new_single_action(
+            OperationId::parse("op").unwrap(),
+            desired_hash(),
+            &action,
+        )
+        .unwrap();
+        let predecessor = AppliedBarrier {
+            id: "stage/base/early".to_owned(),
+            after: Vec::new(),
+            members: vec![FullyQualifiedResourceId::parse("base/earlier").unwrap()],
+            origin: "stage",
+        };
+        let before = AppliedBarrier {
+            id: "stage/base/late".to_owned(),
+            after: Vec::new(),
+            members: vec![action.resource_id().clone()],
+            origin: "stage",
+        };
+        let mut after = before.clone();
+        after.after = vec![predecessor.id.clone()];
+        let graph = PlannedActionGraph {
+            actions: vec![GraphAction {
+                id: "a1".to_owned(),
+                resource_id: action.resource_id().clone(),
+                role: ActionRole::CurrentCreate,
+                topology_authority: crate::domain::known::TopologyAuthority {
+                    current_barriers: vec![predecessor.clone(), before.clone()],
+                    ..Default::default()
+                },
+                topology_delta: crate::domain::known::TopologyDelta {
+                    advance_current_barriers: vec![
+                        TopologyBarrierAdvance::new(before, after).unwrap(),
+                    ],
+                    ..Default::default()
+                },
+            }],
+            direct_edges: Vec::new(),
+            barriers: vec![
+                GraphBarrier {
+                    id: predecessor.id,
+                    after: Vec::new(),
+                    input: Vec::new(),
+                    output: Vec::new(),
+                    provenance: Vec::new(),
+                },
+                GraphBarrier {
+                    id: "stage/base/late".to_owned(),
+                    after: vec!["stage/base/early".to_owned()],
+                    input: Vec::new(),
+                    output: vec!["a1".to_owned()],
+                    provenance: Vec::new(),
+                },
+            ],
+            schedule: vec!["a1".to_owned()],
+            stale_topology_snapshot: Default::default(),
+        };
+        let mut unproved = graph.clone();
+        unproved.barriers[1].after.clear();
+        assert!(matches!(
+            operation.clone().with_graph(unproved),
+            Err(OperationRecordError::InvalidGraph)
+        ));
+        assert!(operation.with_graph(graph).is_ok());
+    }
+
+    #[test]
+    fn recorded_predecessor_requires_a_durable_gate_and_prior_success() {
+        use crate::domain::known::{
+            AppliedBarrier, AppliedLifecycleTopology, TopologyBarrierAdvance,
+        };
+
+        let early = create_action();
+        let new = PlannedAction::create_link(
+            ResolvedFileLink::new(
+                FullyQualifiedResourceId::parse("base/new").unwrap(),
+                path("store/new"),
+                path("home/.new"),
+            )
+            .unwrap(),
+        );
+        let early_id = ActionId::parse("a1").unwrap();
+        let new_id = ActionId::parse("a2").unwrap();
+        let operation = OperationRecord::from_actions_with_schedule(
+            OperationId::parse("inherited-order").unwrap(),
+            desired_hash(),
+            [
+                (early_id, RecordedAction::from_action(&early).unwrap()),
+                (new_id, RecordedAction::from_action(&new).unwrap()),
+            ],
+            vec![
+                ActionId::parse("a1").unwrap(),
+                ActionId::parse("a2").unwrap(),
+            ],
+        )
+        .unwrap();
+        let predecessor = AppliedBarrier {
+            id: "stage/base/early".to_owned(),
+            after: Vec::new(),
+            members: vec![early.resource_id().clone()],
+            origin: "stage",
+        };
+        let before = AppliedBarrier {
+            id: "stage/base/late".to_owned(),
+            after: vec![predecessor.id.clone()],
+            members: vec![FullyQualifiedResourceId::parse("base/late").unwrap()],
+            origin: "stage",
+        };
+        let mut after = before.clone();
+        after.members.push(new.resource_id().clone());
+        let graph = PlannedActionGraph {
+            actions: vec![
+                GraphAction {
+                    id: "a1".to_owned(),
+                    resource_id: early.resource_id().clone(),
+                    role: ActionRole::CurrentCreate,
+                    topology_authority: Default::default(),
+                    topology_delta: Default::default(),
+                },
+                GraphAction {
+                    id: "a2".to_owned(),
+                    resource_id: new.resource_id().clone(),
+                    role: ActionRole::CurrentCreate,
+                    topology_authority: crate::domain::known::TopologyAuthority {
+                        current_barriers: vec![before.clone()],
+                        ..Default::default()
+                    },
+                    topology_delta: crate::domain::known::TopologyDelta {
+                        advance_current_barriers: vec![
+                            TopologyBarrierAdvance::new(before.clone(), after.clone()).unwrap(),
+                        ],
+                        ..Default::default()
+                    },
+                },
+            ],
+            direct_edges: Vec::new(),
+            barriers: vec![
+                GraphBarrier {
+                    id: predecessor.id.clone(),
+                    after: Vec::new(),
+                    input: Vec::new(),
+                    output: vec!["a1".to_owned()],
+                    provenance: vec![predecessor.id.clone()],
+                },
+                GraphBarrier {
+                    id: before.id.clone(),
+                    after: Vec::new(),
+                    input: vec!["a1".to_owned()],
+                    output: vec!["a2".to_owned()],
+                    provenance: vec![predecessor.id.clone(), before.id.clone()],
+                },
+            ],
+            schedule: vec!["a1".to_owned(), "a2".to_owned()],
+            stale_topology_snapshot: Default::default(),
+        };
+        let loaded = AppliedLifecycleTopology::try_new(
+            Vec::new(),
+            Vec::new(),
+            vec![predecessor.clone(), before],
+            Vec::new(),
+        )
+        .unwrap();
+        let gated = operation.clone().with_graph(graph.clone()).unwrap();
+        assert!(gated.validate_loaded_topology(&loaded).is_ok());
+        let mut succeeded_without_predecessor = gated.clone();
+        let output_id = ActionId::parse("a2").unwrap();
+        succeeded_without_predecessor
+            .mark_running(&output_id)
+            .unwrap();
+        succeeded_without_predecessor
+            .mark_succeeded(&output_id)
+            .unwrap();
+        let advanced = AppliedLifecycleTopology::try_new(
+            Vec::new(),
+            Vec::new(),
+            vec![predecessor.clone(), after],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(matches!(
+            succeeded_without_predecessor.validate_loaded_topology(&advanced),
+            Err(OperationRecordError::InvalidGraph)
+        ));
+        let mut succeeded_in_order = succeeded_without_predecessor;
+        let predecessor_id = ActionId::parse("a1").unwrap();
+        succeeded_in_order.mark_running(&predecessor_id).unwrap();
+        succeeded_in_order.mark_succeeded(&predecessor_id).unwrap();
+        assert!(
+            succeeded_in_order
+                .validate_loaded_topology(&advanced)
+                .is_ok()
+        );
+        let added = AppliedBarrier {
+            id: "stage/base/late".to_owned(),
+            after: vec![predecessor.id.clone()],
+            members: vec![new.resource_id().clone()],
+            origin: "stage",
+        };
+        let mut add_graph = graph.clone();
+        add_graph.actions[1].topology_authority.current_barriers = vec![added.clone()];
+        add_graph.actions[1].topology_delta = crate::domain::known::TopologyDelta {
+            add_current_barriers: vec![added.clone()],
+            ..Default::default()
+        };
+        add_graph.barriers[1].after = vec![predecessor.id.clone()];
+        let pending_add = operation.clone().with_graph(add_graph).unwrap();
+        let before_add = AppliedLifecycleTopology::try_new(
+            Vec::new(),
+            Vec::new(),
+            vec![predecessor.clone()],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(pending_add.validate_loaded_topology(&before_add).is_ok());
+        let mut forged_success = pending_add;
+        forged_success.mark_running(&output_id).unwrap();
+        forged_success.mark_succeeded(&output_id).unwrap();
+        let after_add = AppliedLifecycleTopology::try_new(
+            Vec::new(),
+            Vec::new(),
+            vec![predecessor, added],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(matches!(
+            forged_success.validate_loaded_topology(&after_add),
+            Err(OperationRecordError::InvalidGraph)
+        ));
+        let mut ungated = graph;
+        ungated.barriers[1].input.clear();
+        let ungated = operation.with_graph(ungated).unwrap();
+        assert!(matches!(
+            ungated.validate_loaded_topology(&loaded),
+            Err(OperationRecordError::InvalidGraph)
+        ));
     }
 
     fn desired_hash() -> DesiredHash {

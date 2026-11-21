@@ -120,6 +120,7 @@ fn apply_request_with_hooks_and_after_planning(
     let mut affected_action = None;
     let mut locked_session = None;
     let result = (|| -> Result<ApplyReport, ApplyFailureCause> {
+        super::queries::ensure_matching_generations().map_err(ApplyFailureCause::Input)?;
         let lifecycle = ApplyFailureCause::Lifecycle;
         let state_error = |error| lifecycle(ApplyError::State(error));
         // This is deliberately narrower than full resolution: it reads only the profile inventory and rejects non-current declarations before state creation, locking, recovery, or resource access.

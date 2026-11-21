@@ -1,4 +1,4 @@
-//! Strict raw DTO for one discovered schema-5 profile declaration.
+//! Strict raw DTO for one discovered schema-6 profile declaration.
 
 use std::collections::BTreeMap;
 
@@ -6,21 +6,38 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer};
 use serde_yaml::Value;
 
-use crate::declaration::schema::{ProfileSchemaVersionV5, deserialize_optional_string};
+use crate::declaration::schema::{ProfileSchemaVersionV6, deserialize_optional_string};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProfileDeclaration {
     #[allow(dead_code)]
-    schema_version: ProfileSchemaVersionV5,
+    schema_version: ProfileSchemaVersionV6,
     id: String,
     #[serde(default)]
     parameters: BTreeMap<String, ParameterType>,
     #[serde(default)]
     includes: Vec<IncludeDeclaration>,
+    #[serde(default, deserialize_with = "deserialize_optional_stages")]
+    stages: Option<BTreeMap<String, StageDeclaration>>,
     #[serde(default)]
-    stages: BTreeMap<String, StageDeclaration>,
+    resource_dependencies: Vec<ResourceDependencyDeclaration>,
     resources: BTreeMap<String, FileResourceDeclaration>,
+}
+
+fn deserialize_optional_stages<'de, D>(
+    deserializer: D,
+) -> Result<Option<BTreeMap<String, StageDeclaration>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    if matches!(value, Value::Null) {
+        return Err(D::Error::custom("stages must be a mapping when present"));
+    }
+    BTreeMap::deserialize(value)
+        .map(Some)
+        .map_err(D::Error::custom)
 }
 
 impl ProfileDeclaration {
@@ -43,8 +60,17 @@ impl ProfileDeclaration {
             .iter()
             .map(|(id, resource)| (id.as_str(), resource))
     }
-    pub(crate) fn stages(&self) -> impl ExactSizeIterator<Item = (&str, &StageDeclaration)> {
-        self.stages.iter().map(|(id, stage)| (id.as_str(), stage))
+    pub(crate) fn stages(&self) -> impl Iterator<Item = (&str, &StageDeclaration)> {
+        self.stages
+            .iter()
+            .flat_map(|stages| stages.iter())
+            .map(|(id, stage)| (id.as_str(), stage))
+    }
+    pub(crate) fn declares_stages(&self) -> bool {
+        self.stages.is_some()
+    }
+    pub(crate) fn resource_dependencies(&self) -> &[ResourceDependencyDeclaration] {
+        &self.resource_dependencies
     }
 }
 
@@ -173,6 +199,8 @@ pub(crate) struct IncludeDeclaration {
     as_name: Option<String>,
     #[serde(default, rename = "with")]
     bindings: BTreeMap<String, ValueOrReference>,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    stage: Option<String>,
 }
 impl IncludeDeclaration {
     pub(crate) fn id(&self) -> &str {
@@ -183,6 +211,24 @@ impl IncludeDeclaration {
     }
     pub(crate) fn bindings(&self) -> &BTreeMap<String, ValueOrReference> {
         &self.bindings
+    }
+    pub(crate) fn stage(&self) -> Option<&str> {
+        self.stage.as_deref()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResourceDependencyDeclaration {
+    before: String,
+    after: String,
+}
+impl ResourceDependencyDeclaration {
+    pub(crate) fn before(&self) -> &str {
+        &self.before
+    }
+    pub(crate) fn after(&self) -> &str {
+        &self.after
     }
 }
 
@@ -294,7 +340,7 @@ mod tests {
     use super::*;
     #[test]
     fn strict_schema_four_parameters_and_references_parse() {
-        let profile = ProfileDeclaration::parse("schema_version: 5\nid: base\nparameters: { name: string, count: integer, enabled: boolean, values: list }\nincludes: [{ id: child, as: child, with: { name: { parameter: name } } }]\nresources: {}\n").unwrap();
+        let profile = ProfileDeclaration::parse("schema_version: 6\nid: base\nparameters: { name: string, count: integer, enabled: boolean, values: list }\nincludes: [{ id: child, as: child, with: { name: { parameter: name } } }]\nresources: {}\n").unwrap();
         assert_eq!(profile.parameters().len(), 4);
         assert!(matches!(
             profile.includes()[0].bindings()["name"],
@@ -304,8 +350,8 @@ mod tests {
     #[test]
     fn rejects_invalid_reference_and_recursive_list() {
         for yaml in [
-            "schema_version: 5\nid: base\nresources: { x: { type: file, properties: { kind: { parameter: x, extra: y }, source: { store: s, path: p }, target: /x, operation: link } } }\n",
-            "schema_version: 5\nid: base\nresources: {}\nincludes: [{ id: x, with: { p: [a, [b]] } }]\n",
+            "schema_version: 6\nid: base\nresources: { x: { type: file, properties: { kind: { parameter: x, extra: y }, source: { store: s, path: p }, target: /x, operation: link } } }\n",
+            "schema_version: 6\nid: base\nresources: {}\nincludes: [{ id: x, with: { p: [a, [b]] } }]\n",
         ] {
             assert!(ProfileDeclaration::parse(yaml).is_err());
         }
@@ -374,17 +420,36 @@ mod tests {
         for (name, yaml) in [
             (
                 "unknown parameter type",
-                "schema_version: 5\nid: base\nparameters: { value: path }\nresources: {}\n",
+                "schema_version: 6\nid: base\nparameters: { value: path }\nresources: {}\n",
             ),
             (
                 "null property",
-                "schema_version: 5\nid: base\nresources: { x: { type: file, properties: { kind: null, source: { store: s, path: p }, target: /x, operation: link } } }\n",
+                "schema_version: 6\nid: base\nresources: { x: { type: file, properties: { kind: null, source: { store: s, path: p }, target: /x, operation: link } } }\n",
             ),
         ] {
             assert!(
                 ProfileDeclaration::parse(yaml).is_err(),
                 "{name} must reject"
             );
+        }
+    }
+
+    #[test]
+    fn schema_six_orchestration_fields_are_closed_and_required() {
+        let valid = ProfileDeclaration::parse(
+            "schema_version: 6\nid: root\nstages: {}\nincludes: [{ id: child, stage: early }]\nresource_dependencies: [{ before: x, after: child/y }]\nresources: {}\n",
+        ).unwrap();
+        assert!(valid.declares_stages());
+        assert_eq!(valid.includes()[0].stage(), Some("early"));
+        assert_eq!(valid.resource_dependencies()[0].after(), "child/y");
+        for invalid in [
+            "schema_version: 5\nid: root\nresources: {}\n",
+            "schema_version: 6\nid: root\nstages: null\nresources: {}\n",
+            "schema_version: 6\nid: root\nincludes: [{ id: child, stage: null }]\nresources: {}\n",
+            "schema_version: 6\nid: root\nresource_dependencies: [{ before: a }]\nresources: {}\n",
+            "schema_version: 6\nid: root\nresource_dependencies: [{ before: a, after: b, extra: c }]\nresources: {}\n",
+        ] {
+            assert!(ProfileDeclaration::parse(invalid).is_err(), "{invalid}");
         }
     }
 }

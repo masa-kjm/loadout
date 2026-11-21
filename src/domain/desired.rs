@@ -35,7 +35,9 @@ pub(crate) struct ResolvedStage {
 pub(crate) struct ResolvedResourceOrchestration {
     resource_id: FullyQualifiedResourceId,
     stage: Option<String>,
+    stage_source: Option<String>,
     depends_on: Vec<FullyQualifiedResourceId>,
+    dependency_sources: Vec<(FullyQualifiedResourceId, String)>,
 }
 
 impl ResolvedStage {
@@ -59,8 +61,19 @@ impl ResolvedResourceOrchestration {
         Self {
             resource_id,
             stage,
+            stage_source: None,
             depends_on,
+            dependency_sources: Vec::new(),
         }
+    }
+    pub(crate) fn with_provenance(
+        mut self,
+        stage_source: Option<String>,
+        dependency_sources: Vec<(FullyQualifiedResourceId, String)>,
+    ) -> Self {
+        self.stage_source = stage_source;
+        self.dependency_sources = dependency_sources;
+        self
     }
     pub(crate) fn resource_id(&self) -> &FullyQualifiedResourceId {
         &self.resource_id
@@ -68,8 +81,14 @@ impl ResolvedResourceOrchestration {
     pub(crate) fn stage(&self) -> Option<&str> {
         self.stage.as_deref()
     }
+    pub(crate) fn stage_source(&self) -> Option<&str> {
+        self.stage_source.as_deref()
+    }
     pub(crate) fn depends_on(&self) -> &[FullyQualifiedResourceId] {
         &self.depends_on
+    }
+    pub(crate) fn dependency_sources(&self) -> &[(FullyQualifiedResourceId, String)] {
+        &self.dependency_sources
     }
 }
 

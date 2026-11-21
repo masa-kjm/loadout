@@ -177,6 +177,7 @@ pub(crate) struct ConfigurationValueReport {
 
 #[derive(Debug)]
 pub(crate) enum QueryError {
+    ProfileStateGenerationMismatch,
     ConfigurationRead {
         path: crate::domain::paths::ResolvedPath,
         source: io::Error,
@@ -355,6 +356,7 @@ fn status_with_inspector(
         &std::path::Path,
     ) -> Result<FileLinkInspector, TargetInspectionError>,
 ) -> Result<StatusReport, QueryError> {
+    ensure_matching_generations()?;
     let state = repository.load().map_err(QueryError::State)?;
     let active_operation = state.active_operation().cloned();
     let desired = match resolve_desired(request) {
@@ -523,6 +525,7 @@ pub(crate) fn diff(
 
 /// Shared plan/dry-run path: no exclusive lock, recovery, or mutation preflight.
 pub(crate) fn plan_request(request: &DeclarationRequest) -> Result<PlanReport, QueryError> {
+    ensure_matching_generations()?;
     let desired = resolve_desired(request)?;
     let state = StateRepository::new(request.context.state_directory().clone())
         .load()
@@ -544,6 +547,15 @@ pub(crate) fn plan_request(request: &DeclarationRequest) -> Result<PlanReport, Q
             &directory_actual,
         ),
     })
+}
+
+pub(crate) fn ensure_matching_generations() -> Result<(), QueryError> {
+    if crate::schema_generation::CURRENT_PROFILE_GENERATION
+        != crate::schema_generation::CURRENT_MANAGED_GENERATION
+    {
+        return Err(QueryError::ProfileStateGenerationMismatch);
+    }
+    Ok(())
 }
 
 /// Returns the first resource that requires DirectoryLink lifecycle support.
@@ -577,6 +589,41 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_WORKSPACE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn staged_profile_state_generation_mismatch_blocks_plan_status_and_apply_without_writes() {
+        let workspace = Workspace::new();
+        fs::write(
+            workspace.root.join("portable/profiles/base.yaml"),
+            "schema_version: 6\nid: base\nresources: {}\n",
+        )
+        .unwrap();
+        let request = DeclarationRequest {
+            context: workspace.context(),
+            root: None,
+        };
+        let state_entries_before = fs::read_dir(workspace.root.join("state")).unwrap().count();
+        assert!(matches!(
+            plan_request(&request),
+            Err(QueryError::ProfileStateGenerationMismatch)
+        ));
+        assert!(matches!(
+            status(&request, &workspace.repository()),
+            Err(QueryError::ProfileStateGenerationMismatch)
+        ));
+        let failure = crate::application::apply::apply_request(&request, |_| true).unwrap_err();
+        assert!(matches!(
+            failure.cause,
+            crate::application::apply::ApplyFailureCause::Input(
+                QueryError::ProfileStateGenerationMismatch
+            )
+        ));
+        assert_eq!(
+            fs::read_dir(workspace.root.join("state")).unwrap().count(),
+            state_entries_before
+        );
+        assert!(!workspace.root.join("home/.item").exists());
+    }
 
     struct Workspace {
         root: std::path::PathBuf,

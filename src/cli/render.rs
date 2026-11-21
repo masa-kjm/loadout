@@ -611,6 +611,7 @@ pub(super) fn planned(out: &mut impl Write, err: &mut impl Write, plan: &Plan) -
 
 pub(super) fn query_error(error: &QueryError) -> String {
     match error {
+        QueryError::ProfileStateGenerationMismatch => "profile and state schema generations differ; lifecycle commands are unavailable until schema-6 state support is complete".to_owned(),
         QueryError::ConfigurationRead { path, source } => {
             format!("cannot read configuration {path}: {source}")
         }

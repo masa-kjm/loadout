@@ -797,12 +797,14 @@ fn parse_file_symbolic_link_target(buffer: &[u8]) -> io::Result<ResolvedPath> {
     let end = start
         .checked_add(substitute_length)
         .ok_or_else(|| invalid("reparse substitute target overflows"))?;
-    if end > buffer.len() || substitute_length % 2 != 0 {
+    if end > buffer.len() || !substitute_length.is_multiple_of(2) {
         return Err(invalid("reparse substitute target is invalid"));
     }
     let units = buffer[start..end]
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes(pair.try_into().unwrap()))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
         .collect::<Vec<_>>();
     let target = String::from_utf16(&units)
         .map_err(|_| invalid("reparse substitute target is not UTF-16"))?;

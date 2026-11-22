@@ -358,6 +358,7 @@ impl MigrationPlan {
             target,
             environment.default_profile(),
             context,
+            &environment,
         )?;
         if let Some(default_profile) = environment.default_profile() {
             let id = ProfileId::parse(default_profile.to_owned())

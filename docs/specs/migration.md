@@ -80,6 +80,7 @@ Version replacement for this proof does not change any other field, value, comme
 No publication provenance is required: any document satisfying these observable checks is eligible.
 Profiles at or below the state generation need only valid forward conversions to the target.
 Across the mixed inventory, migration also rejects duplicate profile IDs, missing references, cycles, and an invalid completed target-generation inventory. For target 6 it first constructs the entire target inventory in memory, then completely resolves every parameterless candidate that can satisfy its own root phase requirements. It rejects an invalid default root, any candidate whose full resolution fails, and any non-root profile not covered by at least one valid candidate closure. It reports uncovered profiles and invalid candidates with their IDs and resolution cause. Document-only parsing is not this inventory proof.
+For target 6, candidate resolution checks bound source paths, configured store roots, and every target against the same protected control, profile, state, and local-store paths used by normal resolution before publishing a document. It does not inspect or mutate a resource target.
 An existing Known definition need not equal the current profile declaration; ordinary lifecycle rules handle that difference after migration.
 
 | Initial state | Profiles | Explicit target 5 outcome |

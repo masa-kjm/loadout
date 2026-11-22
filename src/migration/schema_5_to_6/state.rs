@@ -94,7 +94,7 @@ impl fmt::Display for StateMigrationError {
             }
             Self::NonemptyTopology(array) => write!(
                 formatter,
-                "state migration from schema 5 to 6 requires empty applied_lifecycle_topology.{array}"
+                "state migration from schema 5 to 6 requires empty applied_lifecycle_topology.{array}; use a schema-5 Loadout binary to complete recorded-order stale removal until both applied_lifecycle_topology.current and applied_lifecycle_topology.historical are empty, then retry migration"
             ),
             Self::InvalidState(error) => write!(
                 formatter,
@@ -155,6 +155,13 @@ mod tests {
                     .to_string()
                     .contains(expected)
             );
+        }
+        for array in ["current", "historical"] {
+            let source = EMPTY.replace(&format!("\"{array}\":[]"), &format!("\"{array}\":[{{}}]"));
+            let error = convert_state(source.as_bytes()).unwrap_err().to_string();
+            assert!(error.contains("schema-5 Loadout binary"), "{error}");
+            assert!(error.contains("both applied_lifecycle_topology.current and applied_lifecycle_topology.historical are empty"), "{error}");
+            assert!(error.contains("then retry migration"), "{error}");
         }
     }
 

@@ -63,6 +63,7 @@ The 3→4 state route is lossless only when the retained default instance name e
 The 4→5 route initializes `applied_lifecycle_topology.current` and `.historical` to empty arrays and invents no ordering facts.
 Every intermediate and final state candidate MUST pass its generation's complete validator.
 The 5→6 state route requires `active_operation: null` and both `applied_lifecycle_topology.current` and `.historical` empty. It preserves every Known ID, effect, definition hash, and ownership fact without inventing phase membership or direct edges. This check applies to any route passing through 5→6, including 3/4→6. A state already at schema 6 may retain valid recorded topology; the empty-topology condition is not reapplied.
+For a nonempty topology rejection, the diagnostic directs the operator to complete recorded-order stale removal with a schema-5 Loadout binary until both arrays are empty, then retry migration. It does not instruct direct state editing or require deleting unrelated Known resources.
 
 The 3→4 profile route changes only the root version and adds no parameters, bindings, aliases, resources, or instance mappings. The 4→5 route changes only the root version and adds no stages, dependencies, resources, aliases, bindings, or topology.
 The 5→6 profile route may relocate schema-5 ordering declarations only when their placement and normalized meaning are unique in every applicable selected-root context. It must prove the following against the complete discovered inventory in memory:

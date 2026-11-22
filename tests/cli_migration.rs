@@ -354,6 +354,9 @@ fn schema_five_state_with_recorded_topology_rejects_before_publication() {
     let output = fixture.run(&["migrate", "--config", "../portable/config.yaml", "--yes"]);
     assert_eq!(output.status.code(), Some(1), "{}", text(&output));
     assert!(text(&output).contains("applied_lifecycle_topology.current"));
+    assert!(text(&output).contains("applied_lifecycle_topology.historical"));
+    assert!(text(&output).contains("schema-5 Loadout binary"));
+    assert!(text(&output).contains("then retry migration"));
     assert_eq!(fixture.snapshot(), before);
 }
 

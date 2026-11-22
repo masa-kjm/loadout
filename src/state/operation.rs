@@ -2349,17 +2349,18 @@ impl OperationRecord {
                 return false;
             }
             let stale_constraint = barrier.id.starts_with("stale/");
-            if (stale_constraint && !barrier.after.is_empty())
-                || (!stale_constraint
-                    && barrier
-                        .after
-                        .iter()
-                        .any(|predecessor| stage_root(predecessor) != stage_root(&barrier.id)))
-                || (!stale_constraint
-                    && barrier
-                        .output
-                        .iter()
-                        .any(|output| !current_outputs.insert(output)))
+            if stale_constraint {
+                if !barrier.after.is_empty() {
+                    return false;
+                }
+            } else if barrier
+                .after
+                .iter()
+                .any(|predecessor| stage_root(predecessor) != stage_root(&barrier.id))
+                || barrier
+                    .output
+                    .iter()
+                    .any(|output| !current_outputs.insert(output))
             {
                 return false;
             }

@@ -38,6 +38,7 @@ use crate::inspection::source::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResolvedApplyInput {
     desired: ResolvedDesired,
+    checked_instances: Vec<String>,
     verified_sources: BTreeMap<FullyQualifiedResourceId, VerifiedSource>,
     verified_directory_sources:
         BTreeMap<FullyQualifiedResourceId, crate::inspection::source::VerifiedDirectorySource>,
@@ -47,6 +48,10 @@ impl ResolvedApplyInput {
     /// Returns the canonical Desired input for inspection and pure planning.
     pub(crate) fn desired(&self) -> &ResolvedDesired {
         &self.desired
+    }
+
+    pub(crate) fn checked_instances(&self) -> &[String] {
+        &self.checked_instances
     }
 
     /// Returns the source proofs keyed by the resource identities they support.
@@ -71,6 +76,7 @@ impl ResolvedApplyInput {
     ) -> Self {
         Self {
             desired,
+            checked_instances: Vec::new(),
             verified_sources,
             verified_directory_sources: BTreeMap::new(),
         }
@@ -520,7 +526,7 @@ pub(crate) fn resolve(
     environment: &EnvironmentConfig,
     selected_root_profile: Option<&str>,
 ) -> Result<ResolvedDesired, ResolverError> {
-    let (root_profile, resources, orchestration) =
+    let (root_profile, resources, orchestration, _) =
         resolve_resource_inputs(context, environment, selected_root_profile)?;
     let resources = resources
         .into_iter()
@@ -539,7 +545,7 @@ pub(crate) fn resolve_for_apply(
     environment: &EnvironmentConfig,
     selected_root_profile: Option<&str>,
 ) -> Result<ResolvedApplyInput, ResolverError> {
-    let (root_profile, resources, orchestration) =
+    let (root_profile, resources, orchestration, checked_instances) =
         resolve_resource_inputs(context, environment, selected_root_profile)?;
     let mut resolved_resources = Vec::new();
     let mut verified_sources = BTreeMap::new();
@@ -598,6 +604,7 @@ pub(crate) fn resolve_for_apply(
         .map_err(ResolverError::InvalidDesired)?;
     Ok(ResolvedApplyInput {
         desired,
+        checked_instances,
         verified_sources,
         verified_directory_sources,
     })
@@ -666,10 +673,22 @@ fn resolve_resource_inputs(
     context: &ResolverContext,
     environment: &EnvironmentConfig,
     selected_root_profile: Option<&str>,
-) -> Result<(ProfileId, Vec<ResolvedResourceInput>, ResolvedOrchestration), ResolverError> {
+) -> Result<
+    (
+        ProfileId,
+        Vec<ResolvedResourceInput>,
+        ResolvedOrchestration,
+        Vec<String>,
+    ),
+    ResolverError,
+> {
     let profiles = discover_profiles(context, environment)?;
     let root_profile = select_root_profile(environment, selected_root_profile, &profiles)?;
     let composed_profiles = compose_instances(&root_profile, &profiles)?;
+    let checked_instances = composed_profiles
+        .iter()
+        .map(|instance| instance.name.to_string())
+        .collect();
     let orchestration = resolve_orchestration(&composed_profiles, &profiles)?;
     let stores = resolve_stores(context, environment)?;
     let profile_paths = profiles
@@ -767,7 +786,7 @@ fn resolve_resource_inputs(
             });
         }
     }
-    Ok((root_profile, resources, orchestration))
+    Ok((root_profile, resources, orchestration, checked_instances))
 }
 
 #[derive(Debug)]
@@ -2517,7 +2536,7 @@ mod tests {
                 .collect::<String>();
             format!("includes:\n{entries}")
         };
-        format!("schema_version: 5\nid: {id}\n{includes}resources:\n{resources}")
+        format!("schema_version: 6\nid: {id}\n{includes}resources:\n{resources}")
     }
 
     fn file_resource(resource_id: &str, source: &str, target: &str) -> String {
@@ -2903,17 +2922,17 @@ mod tests {
     }
 
     #[test]
-    fn resolver_canonicalizes_instance_scoped_stages_and_dependencies() {
+    fn resolver_canonicalizes_root_phases_and_parent_dependencies() {
         let workspace = TestWorkspace::new();
         workspace.write("store/base", "base");
         workspace.write("store/root", "root");
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 5\nid: base\nstages:\n  prepare: { after: [] }\nresources:\n  config:\n    type: file\n    stage: prepare\n    properties:\n      kind: file\n      source: { store: dotfiles, path: base }\n      target: ~/.base\n      operation: link\n",
+            "schema_version: 6\nid: base\nresources:\n  config:\n    type: file\n    stage: prepare\n    properties:\n      kind: file\n      source: { store: dotfiles, path: base }\n      target: ~/.base\n      operation: link\n",
         );
         workspace.write(
             "profiles/root.yaml",
-            "schema_version: 5\nid: root\nincludes:\n  - { id: base, as: first }\nstages:\n  deploy: { after: [root/first/prepare] }\nresources:\n  managed:\n    type: file\n    stage: deploy\n    depends_on: [root/first/config]\n    properties:\n      kind: file\n      source: { store: dotfiles, path: root }\n      target: ~/.root\n      operation: link\n",
+            "schema_version: 6\nid: root\nincludes:\n  - { id: base, as: first }\nstages:\n  prepare: { after: [] }\n  deploy: { after: [prepare] }\nresource_dependencies: [{ before: first/config, after: managed }]\nresources:\n  managed:\n    type: file\n    stage: deploy\n    properties:\n      kind: file\n      source: { store: dotfiles, path: root }\n      target: ~/.root\n      operation: link\n",
         );
 
         let resolved = resolve(
@@ -2931,8 +2950,8 @@ mod tests {
                 .map(|stage| (stage.id(), stage.after()))
                 .collect::<Vec<_>>(),
             vec![
-                ("root/deploy", &["root/first/prepare".to_owned()][..]),
-                ("root/first/prepare", &[][..]),
+                ("stage/root/deploy", &["stage/root/prepare".to_owned()][..]),
+                ("stage/root/prepare", &[][..]),
             ]
         );
         let managed = resolved
@@ -2941,7 +2960,7 @@ mod tests {
             .iter()
             .find(|resource| resource.resource_id().as_str() == "root/managed")
             .unwrap();
-        assert_eq!(managed.stage(), Some("root/deploy"));
+        assert_eq!(managed.stage(), Some("stage/root/deploy"));
         assert_eq!(
             managed
                 .depends_on()
@@ -2959,15 +2978,15 @@ mod tests {
         workspace.write("store/root", "root");
         workspace.write(
             "profiles/theme.yaml",
-            "schema_version: 5\nid: theme\nstages:\n  prepare: { after: [] }\nresources:\n  config:\n    type: file\n    stage: prepare\n    properties:\n      kind: file\n      source: { store: dotfiles, path: theme }\n      target: ~/.theme\n      operation: link\n",
+            "schema_version: 6\nid: theme\nresources:\n  config:\n    type: file\n    stage: prepare\n    properties:\n      kind: file\n      source: { store: dotfiles, path: theme }\n      target: ~/.theme\n      operation: link\n",
         );
         workspace.write(
             "profiles/editor.yaml",
-            "schema_version: 5\nid: editor\nincludes:\n  - { id: theme, as: theme }\nresources: {}\n",
+            "schema_version: 6\nid: editor\nincludes:\n  - { id: theme, as: theme }\nresources: {}\n",
         );
         workspace.write(
             "profiles/root.yaml",
-            "schema_version: 5\nid: root\nincludes:\n  - { id: editor, as: editor }\nstages:\n  deploy: { after: [root/editor/theme/prepare] }\nresources:\n  managed:\n    type: file\n    stage: deploy\n    depends_on: [root/editor/theme/config]\n    properties:\n      kind: file\n      source: { store: dotfiles, path: root }\n      target: ~/.root\n      operation: link\n",
+            "schema_version: 6\nid: root\nincludes:\n  - { id: editor, as: editor }\nstages:\n  prepare: { after: [] }\n  deploy: { after: [prepare] }\nresource_dependencies: [{ before: editor/theme/config, after: managed }]\nresources:\n  managed:\n    type: file\n    stage: deploy\n    properties:\n      kind: file\n      source: { store: dotfiles, path: root }\n      target: ~/.root\n      operation: link\n",
         );
 
         let resolved = resolve(
@@ -2985,8 +3004,8 @@ mod tests {
                 .map(|stage| (stage.id(), stage.after()))
                 .collect::<Vec<_>>(),
             vec![
-                ("root/deploy", &["root/editor/theme/prepare".to_owned()][..]),
-                ("root/editor/theme/prepare", &[][..]),
+                ("stage/root/deploy", &["stage/root/prepare".to_owned()][..]),
+                ("stage/root/prepare", &[][..]),
             ]
         );
         let managed = resolved
@@ -3010,7 +3029,7 @@ mod tests {
         let workspace = TestWorkspace::new();
         workspace.write(
             "profiles/root.yaml",
-            "schema_version: 5\nid: root\nstages:\n  local: { after: [] }\nresources:\n  managed:\n    type: file\n    stage: root/local\n    properties:\n      kind: file\n      source: { store: dotfiles, path: missing }\n      target: ~/.root\n      operation: link\n",
+            "schema_version: 6\nid: root\nstages:\n  local: { after: [] }\nresources:\n  managed:\n    type: file\n    stage: root/local\n    properties:\n      kind: file\n      source: { store: dotfiles, path: missing }\n      target: ~/.root\n      operation: link\n",
         );
 
         let error = resolve(
@@ -3020,11 +3039,14 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(
-            error,
-            ResolverError::InvalidOrchestrationReference { relation, reason, .. }
-                if relation == "resource stage" && reason == "is not a local stage ID"
-        ));
+        assert!(
+            matches!(
+                error,
+                ResolverError::InvalidOrchestrationReference { relation, reason, .. }
+                    if relation == "resource stage" && reason == "must be a local identifier"
+            ),
+            "{error:?}"
+        );
     }
 
     #[test]
@@ -3032,7 +3054,7 @@ mod tests {
         let workspace = TestWorkspace::new();
         workspace.write(
             "profiles/root.yaml",
-            "schema_version: 5\nid: root\nstages:\n  first: { after: [missing] }\nresources: {}\n",
+            "schema_version: 6\nid: root\nstages:\n  first: { after: [missing] }\nresources: {}\n",
         );
 
         let error = resolve(
@@ -3042,11 +3064,14 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(
-            error,
-            ResolverError::InvalidOrchestrationReference { reference, relation, .. }
-                if reference == "root/missing" && relation == "stage after"
-        ));
+        assert!(
+            matches!(
+                &error,
+                ResolverError::InvalidOrchestrationReference { reference, relation, .. }
+                    if reference == "missing" && *relation == "stage after"
+            ),
+            "{error:?}"
+        );
     }
 
     #[test]
@@ -3127,15 +3152,15 @@ mod tests {
         workspace.write("store/git/config", "content");
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 5\nid: base\nparameters: { target: string }\nresources:\n  git:\n    type: file\n    properties:\n      kind: file\n      source: { store: dotfiles, path: git/config }\n      target: { parameter: target }\n      operation: link\n",
+            "schema_version: 6\nid: base\nparameters: { target: string }\nresources:\n  git:\n    type: file\n    properties:\n      kind: file\n      source: { store: dotfiles, path: git/config }\n      target: { parameter: target }\n      operation: link\n",
         );
         workspace.write(
             "profiles/parent.yaml",
-            "schema_version: 5\nid: parent\nparameters: { target: string }\nincludes:\n  - id: base\n    as: named-base\n    with: { target: { parameter: target } }\nresources: {}\n",
+            "schema_version: 6\nid: parent\nparameters: { target: string }\nincludes:\n  - id: base\n    as: named-base\n    with: { target: { parameter: target } }\nresources: {}\n",
         );
         workspace.write(
             "profiles/workstation.yaml",
-            "schema_version: 5\nid: workstation\nincludes:\n  - id: parent\n    as: named-parent\n    with: { target: ~/.gitconfig }\nresources: {}\n",
+            "schema_version: 6\nid: workstation\nincludes:\n  - id: parent\n    as: named-parent\n    with: { target: ~/.gitconfig }\nresources: {}\n",
         );
         let resolved = resolve(
             &workspace.context(),
@@ -3159,11 +3184,11 @@ mod tests {
         workspace.write("store/git/work", "content");
         workspace.write(
             "profiles/reusable.yaml",
-            "schema_version: 5\nid: reusable\nparameters: { source-path: string, target: string }\nresources:\n  config:\n    type: file\n    properties:\n      kind: file\n      source: { store: dotfiles, path: { parameter: source-path } }\n      target: { parameter: target }\n      operation: link\n",
+            "schema_version: 6\nid: reusable\nparameters: { source-path: string, target: string }\nresources:\n  config:\n    type: file\n    properties:\n      kind: file\n      source: { store: dotfiles, path: { parameter: source-path } }\n      target: { parameter: target }\n      operation: link\n",
         );
         workspace.write(
             "profiles/workstation.yaml",
-            "schema_version: 5\nid: workstation\nincludes:\n  - id: reusable\n    with: { source-path: git/work, target: ~/.gitconfig }\nresources: {}\n",
+            "schema_version: 6\nid: workstation\nincludes:\n  - id: reusable\n    with: { source-path: git/work, target: ~/.gitconfig }\nresources: {}\n",
         );
         let environment = environment(Some("workstation"), &["../profiles"], "../store");
         let resolved = resolve(&workspace.context(), &environment, None).unwrap();
@@ -3178,7 +3203,7 @@ mod tests {
 
         workspace.write(
             "profiles/workstation.yaml",
-            "schema_version: 5\nid: workstation\nincludes:\n  - id: reusable\n    with: { source-path: git/work, target: ~/.gitconfig }\n  - id: reusable\n    as: second\n    with: { source-path: git/work, target: ~/.gitconfig-second }\nresources: {}\n",
+            "schema_version: 6\nid: workstation\nincludes:\n  - id: reusable\n    with: { source-path: git/work, target: ~/.gitconfig }\n  - id: reusable\n    as: second\n    with: { source-path: git/work, target: ~/.gitconfig-second }\nresources: {}\n",
         );
         let resolved = resolve(&workspace.context(), &environment, None).unwrap();
         assert_eq!(resolved.resources().len(), 2);
@@ -3189,7 +3214,7 @@ mod tests {
 
         workspace.write(
             "profiles/workstation.yaml",
-            "schema_version: 5\nid: workstation\nincludes:\n  - id: reusable\n    with: { source-path: git/work, target: ~/.gitconfig }\n  - id: reusable\n    with: { source-path: git/work, target: ~/.gitconfig-second }\nresources: {}\n",
+            "schema_version: 6\nid: workstation\nincludes:\n  - id: reusable\n    with: { source-path: git/work, target: ~/.gitconfig }\n  - id: reusable\n    with: { source-path: git/work, target: ~/.gitconfig-second }\nresources: {}\n",
         );
         assert!(matches!(
             resolve(&workspace.context(), &environment, None),
@@ -3198,7 +3223,7 @@ mod tests {
 
         workspace.write(
             "profiles/workstation.yaml",
-            "schema_version: 5\nid: workstation\nincludes:\n  - id: reusable\n    with: { source-path: ../outside, target: ~/.gitconfig }\nresources: {}\n",
+            "schema_version: 6\nid: workstation\nincludes:\n  - id: reusable\n    with: { source-path: ../outside, target: ~/.gitconfig }\nresources: {}\n",
         );
         assert!(matches!(
             resolve(&workspace.context(), &environment, None),
@@ -3211,7 +3236,7 @@ mod tests {
         let workspace = TestWorkspace::new();
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 5\nid: base\nparameters: { kind: string, operation: string, target: string }\nresources:\n  config:\n    type: file\n    properties:\n      kind: { parameter: kind }\n      source: { store: dotfiles, path: config }\n      target: { parameter: target }\n      operation: { parameter: operation }\n",
+            "schema_version: 6\nid: base\nparameters: { kind: string, operation: string, target: string }\nresources:\n  config:\n    type: file\n    properties:\n      kind: { parameter: kind }\n      source: { store: dotfiles, path: config }\n      target: { parameter: target }\n      operation: { parameter: operation }\n",
         );
 
         let profiles = declared_profiles(
@@ -3248,7 +3273,7 @@ mod tests {
         workspace.write("store/git/config", "content");
         workspace.write(
             "profiles/base.yaml",
-            "schema_version: 5\nid: base\nparameters: { target: string }\nresources: {}\n",
+            "schema_version: 6\nid: base\nparameters: { target: string }\nresources: {}\n",
         );
         let base_environment = environment(Some("base"), &["../profiles"], "../store");
         assert!(matches!(
@@ -3258,7 +3283,7 @@ mod tests {
 
         workspace.write(
             "profiles/workstation.yaml",
-            "schema_version: 5\nid: workstation\nincludes:\n  - id: base\n    as: shared\n    with: { target: ~/.one }\n  - id: base\n    as: shared\n    with: { target: ~/.two }\nresources: {}\n",
+            "schema_version: 6\nid: workstation\nincludes:\n  - id: base\n    as: shared\n    with: { target: ~/.one }\n  - id: base\n    as: shared\n    with: { target: ~/.two }\nresources: {}\n",
         );
         let environment = environment(Some("workstation"), &["../profiles"], "../store");
         assert!(matches!(
@@ -3272,11 +3297,11 @@ mod tests {
         let workspace = TestWorkspace::new();
         workspace.write(
             "profiles/reusable.yaml",
-            "schema_version: 5\nid: reusable\nparameters: { target: string }\nresources: {}\n",
+            "schema_version: 6\nid: reusable\nparameters: { target: string }\nresources: {}\n",
         );
         workspace.write(
             "profiles/root.yaml",
-            "schema_version: 5\nid: root\nresources: {}\n",
+            "schema_version: 6\nid: root\nresources: {}\n",
         );
         let roots = discovered_roots(
             &workspace.context(),
@@ -3322,7 +3347,7 @@ mod tests {
         let environment = environment_without_stores("root", &["../profiles"]);
         workspace.write(
             "profiles/child.yaml",
-            "schema_version: 5\nid: child\nparameters: { text: string, count: integer, enabled: boolean, values: list }\nresources: {}\n",
+            "schema_version: 6\nid: child\nparameters: { text: string, count: integer, enabled: boolean, values: list }\nresources: {}\n",
         );
 
         for (name, include, expected) in [
@@ -3350,7 +3375,7 @@ mod tests {
             workspace.write(
                 "profiles/root.yaml",
                 &format!(
-                    "schema_version: 5\nid: root\nincludes:\n  - {include}\nresources: {{}}\n"
+                    "schema_version: 6\nid: root\nincludes:\n  - {include}\nresources: {{}}\n"
                 ),
             );
             let _no_targets = crate::test_support::forbid_target_inspection();
@@ -3418,11 +3443,11 @@ mod tests {
         let environment = environment_without_stores("root", &["../profiles"]);
         workspace.write(
             "profiles/child.yaml",
-            "schema_version: 5\nid: child\nparameters: { value: string }\nresources:\n  config:\n    type: file\n    properties:\n      kind: { parameter: missing }\n      source: { store: dotfiles, path: config }\n      target: { parameter: value }\n      operation: link\n",
+            "schema_version: 6\nid: child\nparameters: { value: string }\nresources:\n  config:\n    type: file\n    properties:\n      kind: { parameter: missing }\n      source: { store: dotfiles, path: config }\n      target: { parameter: value }\n      operation: link\n",
         );
         workspace.write(
             "profiles/root.yaml",
-            "schema_version: 5\nid: root\nincludes:\n  - id: child\n    as: child\n    with: { value: ~/.config }\nresources: {}\n",
+            "schema_version: 6\nid: root\nincludes:\n  - id: child\n    as: child\n    with: { value: ~/.config }\nresources: {}\n",
         );
         let _no_targets = crate::test_support::forbid_target_inspection();
         let _no_mutation = crate::test_support::forbid_mutation();
@@ -3435,7 +3460,7 @@ mod tests {
 
         workspace.write(
             "profiles/child.yaml",
-            "schema_version: 5\nid: child\nparameters: { value: string }\nresources:\n  config:\n    type: file\n    properties:\n      kind: { parameter: value }\n      source: { store: dotfiles, path: config }\n      target: ~/.config\n      operation: link\n",
+            "schema_version: 6\nid: child\nparameters: { value: string }\nresources:\n  config:\n    type: file\n    properties:\n      kind: { parameter: value }\n      source: { store: dotfiles, path: config }\n      target: ~/.config\n      operation: link\n",
         );
         let error = resolve(&context, &environment, None).unwrap_err();
         assert!(matches!(
@@ -3446,7 +3471,7 @@ mod tests {
 
         workspace.write(
             "profiles/child.yaml",
-            "schema_version: 5\nid: child\nparameters: { value: string }\nresources:\n  config:\n    type: file\n    properties:\n      kind: [file]\n      source: { store: dotfiles, path: config }\n      target: ~/.config\n      operation: link\n",
+            "schema_version: 6\nid: child\nparameters: { value: string }\nresources:\n  config:\n    type: file\n    properties:\n      kind: [file]\n      source: { store: dotfiles, path: config }\n      target: ~/.config\n      operation: link\n",
         );
         let error = resolve(&context, &environment, None).unwrap_err();
         assert!(matches!(
@@ -3462,11 +3487,11 @@ mod tests {
         workspace.write("store/config", "content");
         workspace.write(
             "profiles/child.yaml",
-            "schema_version: 5\nid: child\nparameters: { target: string, values: list }\nresources:\n  config:\n    type: file\n    properties:\n      kind: file\n      source: { store: dotfiles, path: config }\n      target: { parameter: target }\n      operation: link\n",
+            "schema_version: 6\nid: child\nparameters: { target: string, values: list }\nresources:\n  config:\n    type: file\n    properties:\n      kind: file\n      source: { store: dotfiles, path: config }\n      target: { parameter: target }\n      operation: link\n",
         );
         workspace.write(
             "profiles/root.yaml",
-            "schema_version: 5\nid: root\nincludes:\n  - id: child\n    as: first\n    with: { target: ~/.first, values: [one, 2, true] }\n  - id: child\n    as: first\n    with: { values: [one, 2, true], target: ~/.first }\n  - id: child\n    as: second\n    with: { target: ~/.second, values: [one, 2, true] }\nresources: {}\n",
+            "schema_version: 6\nid: root\nincludes:\n  - id: child\n    as: first\n    with: { target: ~/.first, values: [one, 2, true] }\n  - id: child\n    as: first\n    with: { values: [one, 2, true], target: ~/.first }\n  - id: child\n    as: second\n    with: { target: ~/.second, values: [one, 2, true] }\nresources: {}\n",
         );
 
         let resolved = resolve(
@@ -3892,13 +3917,16 @@ mod tests {
         );
         let store_environment = environment(Some("workstation"), &["../profiles"], "../store");
         let resource_error = resolve(&context, &store_environment, None).unwrap_err();
-        assert!(matches!(
-            resource_error,
-            ResolverError::InvalidIdentifier {
-                role: "resource ID",
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                resource_error,
+                ResolverError::InvalidOrchestrationReference {
+                    relation: "resource ID",
+                    ..
+                }
+            ),
+            "{resource_error:?}"
+        );
 
         workspace.write(
             "profiles/workstation.yaml",

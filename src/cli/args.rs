@@ -13,7 +13,6 @@ pub(super) enum Command {
     Validate {
         config: Option<OsString>,
         root: Option<String>,
-        all: bool,
     },
     Plan {
         config: Option<OsString>,
@@ -128,12 +127,6 @@ struct ConfigPathArgs {
 struct ValidateArgs {
     #[command(flatten)]
     profile: ProfileArgs,
-    #[arg(
-        long,
-        conflicts_with = "root",
-        help = "Validate every discovered profile as a root."
-    )]
-    all: bool,
 }
 
 #[derive(Args)]
@@ -161,8 +154,8 @@ struct MigrationArgs {
     #[arg(
         long,
         value_name = "N",
-        value_parser = clap::value_parser!(u32).range(4..=5),
-        help = "Select managed-document schema generation 4 or 5."
+        value_parser = clap::value_parser!(u32).range(4..=6),
+        help = "Select managed-document schema generation 4, 5, or 6."
     )]
     to_schema: Option<u32>,
     #[arg(long, help = "Proceed without an interactive confirmation prompt.")]
@@ -316,7 +309,6 @@ pub(super) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
         ParsedCommand::Validate(args) => Command::Validate {
             config: args.profile.config,
             root: args.profile.root,
-            all: args.all,
         },
         ParsedCommand::Plan(args) => Command::Plan {
             config: args.config,
@@ -484,7 +476,7 @@ mod tests {
             parse_strings(&["migrate", "--config", "config.yaml", "--yes"]).unwrap(),
             Command::Migrate(MigrationCommand {
                 config: OsString::from("config.yaml"),
-                target_schema: 5,
+                target_schema: 6,
                 yes: true,
             })
         );
@@ -501,7 +493,6 @@ mod tests {
             Command::Validate {
                 config: Some(OsString::from("config.yaml")),
                 root: Some("base".into()),
-                all: false,
             }
         );
         assert_eq!(
@@ -528,14 +519,6 @@ mod tests {
                 value: "work".into(),
                 yes: true,
             })
-        );
-        assert_eq!(
-            parse_strings(&["validate", "--all"]).unwrap(),
-            Command::Validate {
-                config: None,
-                root: None,
-                all: true,
-            }
         );
         assert_eq!(
             parse_strings(&["plan", "base", "--config", "config.yaml"]).unwrap(),
@@ -615,6 +598,7 @@ mod tests {
             vec!["config", "get"],
             vec!["config", "use", ""],
             vec!["validate", "--all", "base"],
+            vec!["validate", "--all"],
             vec!["validate", "--config"],
             vec!["validate", "--config", ""],
             vec!["plan", "first", "second"],
@@ -622,7 +606,7 @@ mod tests {
             vec!["migrate", "state", "--config", "config.yaml"],
             vec!["migrate", "profiles", "--config", "config.yaml"],
             vec!["migrate", "--config", "config.yaml", "--to-schema", "3"],
-            vec!["migrate", "--config", "config.yaml", "--to-schema", "6"],
+            vec!["migrate", "--config", "config.yaml", "--to-schema", "7"],
         ] {
             assert!(parse_strings(&args).is_err(), "{args:?} must reject");
         }

@@ -4,7 +4,7 @@ use std::{fs, io};
 
 use crate::declaration::environment_config::{EnvironmentConfig, EnvironmentConfigError};
 use crate::domain::actual::ActualResource;
-use crate::domain::desired::{ResolvedDesired, ResolvedResource};
+use crate::domain::desired::{ResolvedDesired, ResolvedResource, ResolvedResourceOrchestration};
 use crate::domain::ids::{FullyQualifiedResourceId, ProfileId};
 use crate::domain::known::KnownResource;
 use crate::domain::plan::Plan;
@@ -32,6 +32,7 @@ pub(crate) struct ValidationRequest {
 #[derive(Debug)]
 pub(crate) struct ValidationReport {
     pub(crate) profiles: Vec<(ProfileId, Result<(), ResolverError>)>,
+    pub(crate) checked_instances: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -44,6 +45,7 @@ pub(crate) struct DiffReport {
 pub(crate) struct PlanReport {
     pub(crate) profile: ProfileId,
     pub(crate) plan: Plan,
+    pub(crate) resources: Vec<ResolvedResourceOrchestration>,
 }
 
 /// Strictly parsed profile declarations for read-only presentation.
@@ -63,6 +65,7 @@ pub(crate) struct ProfileShowReport {
 pub(crate) struct DesiredResourcesReport {
     pub(crate) root_profile: ProfileId,
     pub(crate) resources: Vec<ResolvedResource>,
+    pub(crate) orchestration: Vec<ResolvedResourceOrchestration>,
 }
 
 /// Validated historical resource records without target observation.
@@ -327,6 +330,7 @@ pub(crate) fn desired_resources(
     Ok(DesiredResourcesReport {
         root_profile: desired.root_profile().clone(),
         resources: desired.variants().to_vec(),
+        orchestration: desired.orchestration().resources().to_vec(),
     })
 }
 
@@ -464,6 +468,7 @@ pub(crate) fn validate(request: &ValidationRequest) -> Result<ValidationReport, 
                     .map_err(QueryError::Resolution)?;
             return Ok(ValidationReport {
                 profiles: vec![(resolved.desired().root_profile().clone(), Ok(()))],
+                checked_instances: resolved.checked_instances().to_vec(),
             });
         }
         ValidationSelection::All => resolver::discovered_roots(&request.context, &environment)
@@ -478,7 +483,10 @@ pub(crate) fn validate(request: &ValidationRequest) -> Result<ValidationReport, 
             (root, result)
         })
         .collect();
-    Ok(ValidationReport { profiles })
+    Ok(ValidationReport {
+        profiles,
+        checked_instances: Vec::new(),
+    })
 }
 
 /// Has no declaration or source dependency and never reconciles operations.
@@ -537,6 +545,7 @@ pub(crate) fn plan_request(request: &DeclarationRequest) -> Result<PlanReport, Q
         .map_err(QueryError::Inspection)?;
     Ok(PlanReport {
         profile: desired.root_profile().clone(),
+        resources: desired.orchestration().resources().to_vec(),
         plan: crate::planner::plan_with_directory_links(
             &desired,
             state.known(),

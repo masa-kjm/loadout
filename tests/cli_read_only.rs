@@ -76,7 +76,7 @@ impl Fixture {
         self.write("portable/config.yaml", &format!("schema_version: 2\n{default}profile_discovery:\n  paths: [profiles]\nstores:\n  files:\n    type: local\n    properties:\n      path: ../store\n"));
     }
     fn profile(&self, id: &str, resource: &str, target: &str) {
-        self.write(&format!("portable/profiles/{id}.yaml"), &format!("schema_version: 5\nid: {id}\nresources:\n  {resource}:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: {target}\n"));
+        self.write(&format!("portable/profiles/{id}.yaml"), &format!("schema_version: 6\nid: {id}\nresources:\n  {resource}:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: {target}\n"));
     }
     fn command(&self) -> Command {
         self.command_with_home(&self.path("home"))
@@ -186,7 +186,7 @@ impl Fixture {
         };
         self.write(
             "state/loadout/state.json",
-            &json!({"schema_version": 5,"resources":resources,"applied_lifecycle_topology":{"current":[],"historical":[]},"active_operation":active})
+            &json!({"schema_version": 6,"resources":resources,"applied_lifecycle_topology":{"current":[],"historical":[]},"active_operation":active})
                 .to_string(),
         );
     }
@@ -387,7 +387,7 @@ fn runtime_selection_and_default_config_fallback_resolve_their_own_bases() {
 }
 
 #[test]
-fn defaults_all_roots_and_argument_rejections() {
+fn selected_root_validation_and_argument_rejections() {
     let f = Fixture::new();
     f.environment(None);
     for command in ["validate", "plan"] {
@@ -404,20 +404,26 @@ fn defaults_all_roots_and_argument_rejections() {
     }
     f.profile("work", "item", "~/another");
     expect(
-        f.run(&["validate", "--config", "../portable/config.yaml", "--all"]),
+        f.run(&["validate", "--config", "../portable/config.yaml", "work"]),
         0,
-        &["base", "work"],
+        &["work"],
     );
     f.write(
         "portable/profiles/work.yaml",
-        "schema_version: 5\nid: work\nincludes: [{id: missing}]\nresources: {}\n",
+        "schema_version: 6\nid: work\nincludes: [{id: missing}]\nresources: {}\n",
     );
     expect(
-        f.run(&["validate", "--config", "../portable/config.yaml", "--all"]),
+        f.run(&["validate", "--config", "../portable/config.yaml", "work"]),
         2,
-        &["valid profile: base", "invalid profile work", "missing"],
+        &["missing"],
+    );
+    expect(
+        f.run(&["validate", "--config", "../portable/config.yaml", "base"]),
+        0,
+        &["valid profile: base"],
     );
     for args in [
+        vec!["validate", "--all"],
         vec!["validate", "--all", "base"],
         vec!["plan", "base", "work"],
         vec!["validate", "base", "work"],
@@ -433,6 +439,54 @@ fn defaults_all_roots_and_argument_rejections() {
     ] {
         expect(f.run(&args), 2, &["input error"]);
     }
+}
+
+#[test]
+fn selected_root_reports_phase_and_dependency_provenance_without_mutation() {
+    let f = Fixture::new();
+    f.write(
+        "portable/profiles/child.yaml",
+        "schema_version: 6\nid: child\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source: {store: files, path: source}\n      target: ~/child-target\n",
+    );
+    f.write(
+        "portable/profiles/base.yaml",
+        "schema_version: 6\nid: base\nstages:\n  early: {after: []}\n  late: {after: [early]}\nincludes: [{id: child, as: child, stage: early}]\nresource_dependencies:\n  - {before: child/item, after: item}\nresources:\n  item:\n    type: file\n    stage: late\n    properties:\n      kind: file\n      operation: link\n      source: {store: files, path: source}\n      target: ~/target\n",
+    );
+    let config = "../portable/config.yaml";
+    let validate = f.run(&["validate", "--config", config]);
+    expect(
+        validate,
+        0,
+        &["valid profile: base", "checked closure: base, base/child"],
+    );
+    for args in [
+        vec!["resource", "list", "--config", config],
+        vec!["plan", "--config", config],
+        vec!["apply", "--config", config, "--dry-run"],
+    ] {
+        let output = f.run(&args);
+        expect(
+            output,
+            0,
+            &[
+                "stage/base/late",
+                "stage/base/early",
+                "base/child/item -> base/item",
+                "profile=base",
+                "include_path=base/child; field=includes.stage",
+                "field=resource_dependencies",
+            ],
+        );
+    }
+    expect(
+        f.run(&["resource", "show", "--config", config, "base/item"]),
+        0,
+        &[
+            "stage/base/late",
+            "base/child/item -> base/item",
+            "profile=base",
+        ],
+    );
 }
 
 #[test]
@@ -473,11 +527,11 @@ fn cli_accepts_parameterized_source_path_with_default_instance_name() {
     f.write("store/alternate", "alternate content\n");
     f.write(
         "portable/profiles/reusable.yaml",
-        "schema_version: 5\nid: reusable\nparameters: { source-path: string, target-path: string }\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source: { store: files, path: { parameter: source-path } }\n      target: { parameter: target-path }\n",
+        "schema_version: 6\nid: reusable\nparameters: { source-path: string, target-path: string }\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source: { store: files, path: { parameter: source-path } }\n      target: { parameter: target-path }\n",
     );
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 5\nid: base\nincludes:\n  - id: reusable\n    with: { source-path: alternate, target-path: ~/target }\nresources: {}\n",
+        "schema_version: 6\nid: base\nincludes:\n  - id: reusable\n    with: { source-path: alternate, target-path: ~/target }\nresources: {}\n",
     );
 
     expect(
@@ -500,7 +554,7 @@ fn cli_rejects_conflicting_default_alias_and_invalid_bound_source_without_mutati
     f.write("home/untouched", "unchanged\n");
     f.write(
         "portable/profiles/reusable.yaml",
-        "schema_version: 5\nid: reusable\nparameters: { source-path: string, target-path: string }\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source: { store: files, path: { parameter: source-path } }\n      target: { parameter: target-path }\n",
+        "schema_version: 6\nid: reusable\nparameters: { source-path: string, target-path: string }\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source: { store: files, path: { parameter: source-path } }\n      target: { parameter: target-path }\n",
     );
     for (name, includes, diagnostic) in [
         (
@@ -516,7 +570,7 @@ fn cli_rejects_conflicting_default_alias_and_invalid_bound_source_without_mutati
     ] {
         f.write(
             "portable/profiles/base.yaml",
-            &format!("schema_version: 5\nid: base\nincludes:\n{includes}resources: {{}}\n"),
+            &format!("schema_version: 6\nid: base\nincludes:\n{includes}resources: {{}}\n"),
         );
         for command in ["validate", "plan"] {
             expect(
@@ -699,7 +753,7 @@ fn noncurrent_profile_apply_rejects_before_lock_or_recovery_with_active_operatio
             output,
             2,
             &[&format!(
-                "unsupported schema_version {schema_version}; expected 5"
+                "unsupported schema_version {schema_version}; expected 6"
             )],
         );
         assert_eq!(
@@ -788,7 +842,7 @@ fn status_returns_partial_report_after_an_unavailable_desired_target_observation
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 5\nid: base\nresources:\n  available:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.available\n  unavailable:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.blocked/target\n",
+        "schema_version: 6\nid: base\nresources:\n  available:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.available\n  unavailable:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.blocked/target\n",
     );
     let blocked = f.path("home/.blocked");
     fs::create_dir(&blocked).unwrap();
@@ -1149,7 +1203,7 @@ fn copy_inspection_reports_typed_known_and_desired_only_facts_without_side_effec
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 5\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 6\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
     f.write("home/.copy-target", "content\n");
     f.state(
@@ -1174,7 +1228,7 @@ fn copy_inspection_reports_typed_known_and_desired_only_facts_without_side_effec
 
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 5\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 6\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
     expect(
         f.run(&["status", "--config", "../portable/config.yaml"]),
@@ -1189,7 +1243,7 @@ fn copy_inspection_reports_typed_known_and_desired_only_facts_without_side_effec
     let desired_only = Fixture::new();
     desired_only.write(
         "portable/profiles/base.yaml",
-        "schema_version: 5\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 6\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
     desired_only.write("home/.copy-target", "content\n");
     expect(
@@ -1204,7 +1258,7 @@ fn copy_inspection_reports_typed_known_and_desired_only_facts_without_side_effec
 
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 5\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 6\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
     f.write("home/.copy-target", "drifted\n");
     expect(f.run(&["diff"]), 0, &["base/copied", "other_regular_file"]);
@@ -1221,7 +1275,7 @@ fn copy_create_applies_exact_source_bytes_and_commits_known_state() {
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 5\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 6\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
     let target = f.path("home/.copy-target");
     assert!(fs::symlink_metadata(&target).is_err());
@@ -1256,7 +1310,7 @@ fn directory_link_create_applies_and_commits_known_only_after_verification() {
     fs::create_dir_all(f.path("home/.config")).unwrap();
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 5\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: files\n        path: nvim\n      target: ~/.config/nvim\n",
+        "schema_version: 6\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: files\n        path: nvim\n      target: ~/.config/nvim\n",
     );
     let target = f.path("home/.config/nvim");
     let output = f
@@ -1293,7 +1347,7 @@ fn directory_link_is_reported_by_read_only_commands_without_mutation() {
     symlink(f.path("store/nvim"), f.path("home/.config/nvim")).unwrap();
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 5\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: files\n        path: nvim\n      target: ~/.config/nvim\n",
+        "schema_version: 6\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: files\n        path: nvim\n      target: ~/.config/nvim\n",
     );
     f.state(
         json!({"base/nvim": f.known_directory_link("store/nvim", ".config/nvim")}),
@@ -1375,7 +1429,7 @@ fn directory_link_replace_relocate_handoff_and_remove_commit_the_verified_effect
     fs::create_dir_all(f.path("home/.config")).unwrap();
     let profile = |resource: &str, source: &str, target: &str| {
         format!(
-            "schema_version: 5\nid: base\nresources:\n  {resource}:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: files\n        path: {source}\n      target: ~/{target}\n"
+            "schema_version: 6\nid: base\nresources:\n  {resource}:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: files\n        path: {source}\n      target: ~/{target}\n"
         )
     };
     f.write(
@@ -1446,7 +1500,7 @@ fn directory_link_replace_relocate_handoff_and_remove_commit_the_verified_effect
 
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 5\nid: base\nresources: {}\n",
+        "schema_version: 6\nid: base\nresources: {}\n",
     );
     expect(
         f.command()
@@ -1465,7 +1519,7 @@ fn directory_link_replace_relocate_handoff_and_remove_commit_the_verified_effect
 fn directory_link_rejections_preserve_target_store_and_state() {
     use std::os::unix::fs::symlink;
 
-    let profile = "schema_version: 5\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: files\n        path: nvim\n      target: ~/.config/nvim\n";
+    let profile = "schema_version: 6\nid: base\nresources:\n  nvim:\n    type: file\n    properties:\n      kind: directory\n      operation: link\n      source:\n        store: files\n        path: nvim\n      target: ~/.config/nvim\n";
     for rejection in ["unmanaged-target", "unsafe-parent", "unsafe-source"] {
         let f = Fixture::new();
         fs::create_dir_all(f.path("store/nvim")).unwrap();
@@ -1519,7 +1573,7 @@ fn copy_capability_preflight_rejection_creates_no_operation_or_target() {
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 5\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 6\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
 
     expect(
@@ -1543,7 +1597,7 @@ fn copy_replace_relocate_and_remove_fail_preflight_without_mutating_target_or_st
     let replace = Fixture::new();
     replace.write(
         "portable/profiles/base.yaml",
-        "schema_version: 5\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 6\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
     replace.write("store/source", "new\n");
     replace.write("home/.copy-target", "old\n");
@@ -1577,7 +1631,7 @@ fn copy_replace_relocate_and_remove_fail_preflight_without_mutating_target_or_st
     let relocate = Fixture::new();
     relocate.write(
         "portable/profiles/base.yaml",
-        "schema_version: 5\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.new-target\n",
+        "schema_version: 6\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.new-target\n",
     );
     relocate.write("home/.old-target", "content\n");
     relocate.state(
@@ -1611,7 +1665,7 @@ fn copy_replace_relocate_and_remove_fail_preflight_without_mutating_target_or_st
     let remove = Fixture::new();
     remove.write(
         "portable/profiles/base.yaml",
-        "schema_version: 5\nid: base\nresources: {}\n",
+        "schema_version: 6\nid: base\nresources: {}\n",
     );
     remove.write("home/.copy-target", "content\n");
     remove.state(
@@ -1655,7 +1709,7 @@ fn copy_handoffs_fail_preflight_without_mutating_target_or_state() {
         json!({"base/item": link_to_copy.known(".handoff")}),
         Value::Null,
     );
-    link_to_copy.write("portable/profiles/base.yaml", "schema_version: 5\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.handoff\n");
+    link_to_copy.write("portable/profiles/base.yaml", "schema_version: 6\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.handoff\n");
     let before_target = fs::read_link(&target).unwrap();
     let before_state = fs::read(link_to_copy.path("state/loadout/state.json")).unwrap();
     expect(
@@ -1709,7 +1763,7 @@ fn copy_handoffs_fail_preflight_without_mutating_target_or_state() {
 #[test]
 fn sequential_copy_actions_apply_and_commit_known_state() {
     let create = Fixture::new();
-    create.write("portable/profiles/base.yaml", "schema_version: 5\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n");
+    create.write("portable/profiles/base.yaml", "schema_version: 6\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n");
     expect(
         create
             .command()
@@ -1735,7 +1789,7 @@ fn sequential_copy_actions_apply_and_commit_known_state() {
         json!({"base/item": replace.known_copy(".copy-target", b"old\n")}),
         Value::Null,
     );
-    replace.write("portable/profiles/base.yaml", "schema_version: 5\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n");
+    replace.write("portable/profiles/base.yaml", "schema_version: 6\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n");
     expect(
         replace
             .command()
@@ -1760,7 +1814,7 @@ fn sequential_copy_actions_apply_and_commit_known_state() {
         json!({"base/item": relocate.known_copy(".old-target", b"content\n")}),
         Value::Null,
     );
-    relocate.write("portable/profiles/base.yaml", "schema_version: 5\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.new-target\n");
+    relocate.write("portable/profiles/base.yaml", "schema_version: 6\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.new-target\n");
     expect(
         relocate
             .command()
@@ -1779,7 +1833,7 @@ fn sequential_copy_actions_apply_and_commit_known_state() {
     let remove = Fixture::new();
     remove.write(
         "portable/profiles/base.yaml",
-        "schema_version: 5\nid: base\nresources: {}\n",
+        "schema_version: 6\nid: base\nresources: {}\n",
     );
     remove.write("home/.copy-target", "content\n");
     remove.state(
@@ -1808,7 +1862,7 @@ fn sequential_copy_actions_apply_and_commit_known_state() {
         json!({"base/item": link_to_copy.known(".handoff")}),
         Value::Null,
     );
-    link_to_copy.write("portable/profiles/base.yaml", "schema_version: 5\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.handoff\n");
+    link_to_copy.write("portable/profiles/base.yaml", "schema_version: 6\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.handoff\n");
     expect(
         link_to_copy
             .command()
@@ -1857,7 +1911,7 @@ fn copy_recovery_closes_a_retained_create_before_applying_a_fresh_copy_on_apfs()
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 5\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 6\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
     let fingerprint = format!("sha256:{:x}", Sha256::digest(b"content\n"));
     f.state(
@@ -1915,7 +1969,7 @@ fn copy_recovery_keeps_matching_create_uncertain_and_blocks_a_fresh_plan() {
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 5\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 6\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
     let fingerprint = format!("sha256:{:x}", Sha256::digest(b"content\n"));
     f.state(
@@ -1970,7 +2024,7 @@ fn copy_replacement_recovery_closes_a_different_final_as_conflict() {
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 5\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 6\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
     let old_fingerprint = format!("sha256:{:x}", Sha256::digest(b"old\n"));
     let new_fingerprint = format!("sha256:{:x}", Sha256::digest(b"content\n"));
@@ -2031,7 +2085,7 @@ fn copy_lifecycle_commands_render_typed_actions_and_apply_on_apfs() {
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 5\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 6\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
 
     expect(
@@ -2076,7 +2130,7 @@ fn copy_lifecycle_commands_render_typed_actions_and_apply_on_apfs() {
     let conflict = Fixture::new();
     conflict.write(
         "portable/profiles/base.yaml",
-        "schema_version: 5\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/target\n",
+        "schema_version: 6\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/target\n",
     );
     conflict.write("home/target", "unmanaged");
     expect(
@@ -2108,7 +2162,7 @@ fn copy_schema_rejection_precedes_target_observation_or_lifecycle_mutation() {
     let state_fixture = Fixture::new();
     state_fixture.write(
         "portable/profiles/base.yaml",
-        "schema_version: 5\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 6\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
     state_fixture.write(
         "state/loadout/state.json",
@@ -2128,7 +2182,7 @@ fn copy_declarations_render_in_read_only_queries() {
     let f = Fixture::new();
     f.write(
         "portable/profiles/base.yaml",
-        "schema_version: 5\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
+        "schema_version: 6\nid: base\nresources:\n  copied:\n    type: file\n    properties:\n      kind: file\n      operation: copy\n      source:\n        store: files\n        path: source\n      target: ~/.copy-target\n",
     );
 
     expect(

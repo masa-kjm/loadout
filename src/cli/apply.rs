@@ -23,9 +23,13 @@ pub(super) fn run(
         );
     }
     let mut confirmation_error = None;
-    let result = apply::apply_request(request, |plan| {
+    let result = apply::apply_request_with_desired(request, |plan, desired| {
         let confirmation = (|| -> io::Result<bool> {
             writeln!(out, "executable plan")?;
+            for facts in desired.orchestration().resources() {
+                writeln!(out, "Desired resource: {}", facts.resource_id())?;
+                render::render_orchestration(out, facts)?;
+            }
             render::planned(out, err, plan)?;
             out.flush()?;
             if yes {
@@ -59,7 +63,12 @@ pub(super) fn run(
         return Err(error);
     }
     match result {
-        Ok(ApplyReport::Applied { committed, .. }) => {
+        Ok(ApplyReport::Applied {
+            committed,
+            recovery,
+            ..
+        }) => {
+            render_recovery(out, recovery.as_ref())?;
             writeln!(
                 out,
                 "apply completed: {} committed actions",
@@ -67,19 +76,56 @@ pub(super) fn run(
             )?;
             Ok(0)
         }
-        Ok(ApplyReport::Blocked { plan }) => {
+        Ok(ApplyReport::Blocked {
+            plan,
+            resources,
+            recovery,
+        }) => {
+            render_recovery(out, recovery.as_ref())?;
             writeln!(out, "blocked plan")?;
+            for facts in &resources {
+                writeln!(out, "Desired resource: {}", facts.resource_id())?;
+                render::render_orchestration(out, facts)?;
+            }
             render::planned(out, err, &plan)
         }
-        Ok(ApplyReport::Declined { .. }) => {
+        Ok(ApplyReport::Declined { recovery, .. }) => {
+            render_recovery(out, recovery.as_ref())?;
             writeln!(err, "apply cancelled: confirmation not granted")?;
             Ok(2)
         }
         Err(failure) => {
+            render_recovery(err, failure.recovery.as_ref())?;
             failure_output(err, &failure)?;
             Ok(failure_exit_code(&failure))
         }
     }
+}
+
+fn render_recovery(
+    out: &mut impl Write,
+    recovery: Option<&apply::RecoveryReport>,
+) -> io::Result<()> {
+    let Some(recovery) = recovery else {
+        return Ok(());
+    };
+    writeln!(out, "prior operation recovery: {}", recovery.operation_id)?;
+    for effect in &recovery.effects {
+        writeln!(
+            out,
+            "  {} {}: {:?} -> {:?}{}",
+            effect.action_id.as_str(),
+            effect.resource_id,
+            effect.from,
+            effect.to,
+            if effect.temporary_cleaned {
+                "; recorded temporary cleaned"
+            } else {
+                ""
+            }
+        )?;
+    }
+    Ok(())
 }
 
 fn failure_exit_code(failure: &ApplyFailure) -> u8 {
@@ -258,6 +304,7 @@ mod tests {
                     commit_failure: Some(effect),
                     committed: vec![FullyQualifiedResourceId::parse("base/earlier").unwrap()],
                     plan: None,
+                    recovery: None,
                 };
                 assert_eq!(failure_exit_code(&failure), 1);
                 let mut output = Vec::new();

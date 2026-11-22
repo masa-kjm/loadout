@@ -65,6 +65,22 @@ pub(crate) struct ApplyFailure {
     /// Only actions whose success commit returned successfully.
     pub(crate) committed: Vec<FullyQualifiedResourceId>,
     pub(crate) plan: Option<Plan>,
+    pub(crate) recovery: Option<RecoveryReport>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RecoveryReport {
+    pub(crate) operation_id: String,
+    pub(crate) effects: Vec<RecoveryEffect>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RecoveryEffect {
+    pub(crate) action_id: ActionId,
+    pub(crate) resource_id: FullyQualifiedResourceId,
+    pub(crate) from: ActionStatus,
+    pub(crate) to: ActionStatus,
+    pub(crate) temporary_cleaned: bool,
 }
 
 #[derive(Debug)]
@@ -72,12 +88,16 @@ pub(crate) enum ApplyReport {
     Applied {
         plan: Plan,
         committed: Vec<FullyQualifiedResourceId>,
+        recovery: Option<RecoveryReport>,
     },
     Blocked {
         plan: Plan,
+        resources: Vec<crate::domain::desired::ResolvedResourceOrchestration>,
+        recovery: Option<RecoveryReport>,
     },
     Declined {
         plan: Plan,
+        recovery: Option<RecoveryReport>,
     },
 }
 
@@ -89,13 +109,26 @@ pub(crate) fn apply_request(
     apply_request_with_hooks(request, confirm, |_, _| {})
 }
 
+/// Presents the exact resolved ordering facts belonging to the confirmed Plan.
+pub(crate) fn apply_request_with_desired(
+    request: &super::queries::DeclarationRequest,
+    confirm: impl FnOnce(&Plan, &crate::domain::desired::ResolvedDesired) -> bool,
+) -> Result<ApplyReport, Box<ApplyFailure>> {
+    apply_request_with_hooks_and_after_planning(request, confirm, |_| {}, |_, _| {})
+}
+
 #[allow(clippy::result_large_err)] // The closure error is immediately converted into the public boxed ApplyFailure.
 fn apply_request_with_hooks(
     request: &super::queries::DeclarationRequest,
     confirm: impl FnOnce(&Plan) -> bool,
     after_running: impl FnMut(usize, &mut LockedStateRepository),
 ) -> Result<ApplyReport, Box<ApplyFailure>> {
-    apply_request_with_hooks_and_after_planning(request, confirm, |_| {}, after_running)
+    apply_request_with_hooks_and_after_planning(
+        request,
+        |plan, _| confirm(plan),
+        |_| {},
+        after_running,
+    )
 }
 
 #[cfg(test)]
@@ -104,13 +137,18 @@ fn apply_request_with_after_planning_hook(
     confirm: impl FnOnce(&Plan) -> bool,
     after_planning: impl FnOnce(&Plan),
 ) -> Result<ApplyReport, Box<ApplyFailure>> {
-    apply_request_with_hooks_and_after_planning(request, confirm, after_planning, |_, _| {})
+    apply_request_with_hooks_and_after_planning(
+        request,
+        |plan, _| confirm(plan),
+        after_planning,
+        |_, _| {},
+    )
 }
 
 #[allow(clippy::result_large_err)] // The closure error is immediately converted into the public boxed ApplyFailure.
 fn apply_request_with_hooks_and_after_planning(
     request: &super::queries::DeclarationRequest,
-    confirm: impl FnOnce(&Plan) -> bool,
+    confirm: impl FnOnce(&Plan, &crate::domain::desired::ResolvedDesired) -> bool,
     after_planning: impl FnOnce(&Plan),
     after_running: impl FnMut(usize, &mut LockedStateRepository),
 ) -> Result<ApplyReport, Box<ApplyFailure>> {
@@ -119,6 +157,7 @@ fn apply_request_with_hooks_and_after_planning(
     let mut committed = Vec::new();
     let mut affected_action = None;
     let mut locked_session = None;
+    let mut recovery = None;
     let result = (|| -> Result<ApplyReport, ApplyFailureCause> {
         let lifecycle = ApplyFailureCause::Lifecycle;
         let state_error = |error| lifecycle(ApplyError::State(error));
@@ -142,10 +181,18 @@ fn apply_request_with_hooks_and_after_planning(
             .as_mut()
             .expect("exclusive session was acquired");
         stage = ApplyStage::Recovery;
-        if reconcile_active_operation_with_action(
+        recovery = locked
+            .state()
+            .active_operation()
+            .map(|operation| RecoveryReport {
+                operation_id: operation.id().as_str().to_owned(),
+                effects: Vec::new(),
+            });
+        if reconcile_active_operation_with_report(
             locked,
             request.context.home_directory().as_ref(),
             &mut affected_action,
+            recovery.as_mut().map(|report| &mut report.effects),
         )
         .map_err(lifecycle)?
         {
@@ -172,7 +219,11 @@ fn apply_request_with_hooks_and_after_planning(
         visible_plan = Some(fresh_plan.clone());
         after_planning(&fresh_plan);
         if !fresh_plan.is_executable() {
-            return Ok(ApplyReport::Blocked { plan: fresh_plan });
+            return Ok(ApplyReport::Blocked {
+                plan: fresh_plan,
+                resources: resolved.desired().orchestration().resources().to_vec(),
+                recovery: recovery.clone(),
+            });
         }
         stage = ApplyStage::Preflight;
         let executor = FileLinkExecutor::new(request.context.home_directory().as_ref())
@@ -204,8 +255,11 @@ fn apply_request_with_hooks_and_after_planning(
             .map_err(|error| lifecycle(ApplyError::StatePreflight(error)))?;
         let hash = desired_hash(resolved.desired())
             .map_err(|error| lifecycle(ApplyError::DesiredHash(error)))?;
-        if !confirm(&fresh_plan) {
-            return Ok(ApplyReport::Declined { plan: fresh_plan });
+        if !confirm(&fresh_plan, resolved.desired()) {
+            return Ok(ApplyReport::Declined {
+                plan: fresh_plan,
+                recovery: recovery.clone(),
+            });
         }
         // Noop is a report, without an executor phase or a Known transition.
         let resource_actions = fresh_plan
@@ -259,6 +313,7 @@ fn apply_request_with_hooks_and_after_planning(
         Ok(ApplyReport::Applied {
             plan: fresh_plan,
             committed: committed.clone(),
+            recovery: recovery.clone(),
         })
     })();
     result.map_err(|cause| {
@@ -280,6 +335,7 @@ fn apply_request_with_hooks_and_after_planning(
             commit_failure,
             committed,
             plan: visible_plan,
+            recovery,
         })
     })
 }
@@ -1449,10 +1505,20 @@ fn reconcile_active_operation_with_action(
     home_directory: &std::path::Path,
     affected_action: &mut Option<ApplyAction>,
 ) -> Result<bool, ApplyError> {
+    reconcile_active_operation_with_report(locked, home_directory, affected_action, None)
+}
+
+fn reconcile_active_operation_with_report(
+    locked: &mut LockedStateRepository,
+    home_directory: &std::path::Path,
+    affected_action: &mut Option<ApplyAction>,
+    effects: Option<&mut Vec<RecoveryEffect>>,
+) -> Result<bool, ApplyError> {
     reconcile_active_operation_with_action_and_cleanup(
         locked,
         home_directory,
         affected_action,
+        effects,
         || FileLinkExecutor::new(home_directory).ok(),
     )
 }
@@ -1463,6 +1529,7 @@ fn reconcile_active_operation_with_action_and_cleanup<F>(
     locked: &mut LockedStateRepository,
     home_directory: &std::path::Path,
     affected_action: &mut Option<ApplyAction>,
+    mut effects: Option<&mut Vec<RecoveryEffect>>,
     cleanup_executor: F,
 ) -> Result<bool, ApplyError>
 where
@@ -1491,6 +1558,7 @@ where
         .flatten();
 
     for (action_id, action) in actions {
+        let mut temporary_cleaned = false;
         if !action.status().closes_operation() {
             *affected_action = Some(ApplyAction {
                 action_id: Some(action_id.clone()),
@@ -1566,6 +1634,7 @@ where
                             executor.cleanup_recorded_temporary(&action).is_ok()
                         })
                     };
+                    temporary_cleaned = cleaned;
                     decision = if cleaned {
                         inspector
                             .as_ref()
@@ -1591,6 +1660,23 @@ where
                 }
             }
             ActionStatus::Succeeded | ActionStatus::Failed | ActionStatus::Skipped => {}
+        }
+        let next_status = locked
+            .state()
+            .active_operation()
+            .and_then(|operation| operation.action(&action_id))
+            .expect("recovery retains the operation until every action is classified")
+            .status();
+        if (next_status != action.status() || temporary_cleaned)
+            && let Some(effects) = effects.as_deref_mut()
+        {
+            effects.push(RecoveryEffect {
+                action_id,
+                resource_id: action.resource_id().clone(),
+                from: action.status(),
+                to: next_status,
+                temporary_cleaned,
+            });
         }
     }
 
@@ -1625,11 +1711,17 @@ fn reconcile_active_operation_with_retained_token_capability_for_test(
     locked: &mut LockedStateRepository,
     home_directory: &std::path::Path,
 ) -> Result<bool, ApplyError> {
-    reconcile_active_operation_with_action_and_cleanup(locked, home_directory, &mut None, || {
-        FileLinkExecutor::new(home_directory)
-            .ok()
-            .map(FileLinkExecutor::with_forced_capability_success_for_test)
-    })
+    reconcile_active_operation_with_action_and_cleanup(
+        locked,
+        home_directory,
+        &mut None,
+        None,
+        || {
+            FileLinkExecutor::new(home_directory)
+                .ok()
+                .map(FileLinkExecutor::with_forced_capability_success_for_test)
+        },
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2433,6 +2525,7 @@ mod tests {
                     &mut locked,
                     workspace.path("home").as_path(),
                     &mut None,
+                    None,
                     || {
                         FileLinkExecutor::new(workspace.path("home").as_path())
                             .ok()

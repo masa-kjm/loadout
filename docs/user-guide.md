@@ -119,6 +119,16 @@ resources: {}
 
 Create both source files in the store before validating. Each parameter reference occupies the whole YAML value. `as` defaults to the included profile ID; give instances different names when their bindings differ. Only the selected root declares `stages`. Each include's `stage` places its whole subtree in that phase, overriding a phase declared deeper in that subtree. Here, `resource_dependencies` also requires `personal/config` to follow `shared-file/config`; its references follow include aliases relative to `base`. See [Parameters and References](specs/profiles.md#parameters-and-references), [Includes](specs/profiles.md#includes), and [Orchestration](specs/profiles.md#schema-6-orchestration).
 
+| Setting | What it controls |
+| --- | --- |
+| `stages.<name>.after` | The selected root orders phases across its include closure. |
+| `includes[].stage` | An including profile places the included subtree in one phase; an outer assignment wins over an inner assignment. |
+| `resources.<id>.stage` | A resource joins a phase unless an enclosing include assignment overrides it. |
+| `depends_on` | A resource requires another resource in the same resolved instance. |
+| `resource_dependencies` | An including profile requires one resource in its subtree to precede another resource in a different instance. |
+
+To use a child that names phases on its own, create a dedicated root profile that includes it and declares the phases it needs.
+
 As a separate example, use `depends_on` for one resource that must follow another. Use stages when a group must follow another group. This profile applies `git-ignore` after `git-config`, then applies `editor-config` after the `files` stage:
 
 ```yaml
@@ -155,7 +165,7 @@ resources:
       operation: copy
 ```
 
-`depends_on` names a resource in the same resolved instance. For a dependency between included instances, declare `resource_dependencies` in a parent whose include closure contains both endpoints. Loadout orders applicable actions according to these relationships; YAML declaration order does not control execution order. `plan`, dry-run apply, and Desired-resource inspection show each resource's effective phase and its source, plus normalized direct dependencies and their declaration sources. Ordering-only changes do not create resource actions or rewrite state. See [Orchestration](specs/profiles.md#schema-6-orchestration) and [Execution Order](specs/lifecycle.md#execution-order).
+`depends_on` names a resource in the same resolved instance. For a dependency between included instances, declare `resource_dependencies` in a parent whose include closure contains both endpoints. Loadout orders applicable actions according to these relationships; YAML declaration order does not control execution order. A prerequisite that is already satisfied needs no synthetic action, and stale removal follows only recorded ordering. `plan`, dry-run apply, and Desired-resource inspection show each resource's effective phase and its source, plus normalized direct dependencies and their declaration sources. Ordering-only changes do not create resource actions or rewrite state. See [Orchestration](specs/profiles.md#schema-6-orchestration) and [Execution Order](specs/lifecycle.md#execution-order).
 
 If `plan` reports that new ordering contradicts recorded ordering, read its old and proposed relations and the complete rebuild set. Remove every resource in that set from Desired, apply the stale-removal plan until every member and its old ordering facts are gone, then restore the new declarations and run `plan` and `apply` again. Finish any failed or uncertain operation through the recorded-state recovery or retry path before treating the rebuild as complete. A read-only `plan` or dry run does not recover an operation; a normal `apply` may first recover an earlier operation and reports those effects separately. See [Recorded-order Conflicts](specs/lifecycle.md#recorded-order-conflicts).
 
@@ -171,4 +181,4 @@ loadout resource list --known
 
 `status` compares desired, recorded, and observed resources. `diff` reports drift for recorded resources without reading the selected profile. The list commands show profile declarations, desired resources, or recorded resources. These commands do not repair targets; review a fresh `plan` before applying changes. See [Inspection](specs/inspection.md).
 
-If your existing profile or state files use an older supported schema, run `loadout migrate --config <path>` before normal lifecycle commands. Migration previews the complete document inventory and any broader phase ordering before confirmation. A schema-5 state can advance to schema 6 only without an active operation or recorded topology; see [Migration](specs/migration.md).
+If your existing profile or state files use an older supported schema, run `loadout migrate --config <path>` before normal lifecycle commands. Migration previews the complete document inventory and any broader phase ordering before confirmation. A schema-5 state can advance to schema 6 only without an active operation or recorded topology. If it rejects nonempty topology, finish old-schema removal and recovery until both recorded topology arrays are empty; do not edit state by hand. If it rejects ambiguous child phases or qualified dependencies, reorganize the affected root phases or parent dependency declarations, then rerun migration. See [Migration](specs/migration.md).

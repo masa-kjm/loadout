@@ -2,10 +2,13 @@
 name = "loadout"
 version = "0.9.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.100.0"
 description = "A local environment manager with explicit desired state"
 license = "MIT"
 repository = "https://github.com/masa-kjm/loadout"
+
+[lints.clippy]
+collapsible_if = "allow"
 
 [lib]
 name = "loadout"

@@ -148,12 +148,12 @@ pub(super) fn project(
         let mut instances = BTreeMap::<String, ProfileId>::new();
         let mut pending = vec![(root.to_string(), root.clone())];
         while let Some((path, id)) = pending.pop() {
-            if let Some(previous) = instances.insert(path.clone(), id.clone()) {
-                if previous != id {
-                    return Err(PlanError::Invalid(format!(
-                        "ambiguous schema-5 instance {path}"
-                    )));
-                }
+            if let Some(previous) = instances.insert(path.clone(), id.clone())
+                && previous != id
+            {
+                return Err(PlanError::Invalid(format!(
+                    "ambiguous schema-5 instance {path}"
+                )));
             }
             for (child, alias) in &profiles[&id].includes {
                 let child_id = ProfileId::parse(child.clone())

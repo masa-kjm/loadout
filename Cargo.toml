@@ -7,9 +7,6 @@ description = "A local environment manager with explicit desired state"
 license = "MIT"
 repository = "https://github.com/masa-kjm/loadout"
 
-[lints.clippy]
-collapsible_if = "allow"
-
 [lib]
 name = "loadout"
 path = "src/lib.rs"

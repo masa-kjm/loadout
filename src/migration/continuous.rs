@@ -160,12 +160,11 @@ impl MigrationPlan {
             self.record_verified_publication(&document.path)?;
             after_publication(&document.path);
         }
-        if let Some(state) = &self.state {
-            if state.source_generation != self.target_generation
-                || read_regular(&state.path)? != state.candidate
-            {
-                return Err(PlanError::ConfirmedSnapshotChanged);
-            }
+        if let Some(state) = &self.state
+            && (state.source_generation != self.target_generation
+                || read_regular(&state.path)? != state.candidate)
+        {
+            return Err(PlanError::ConfirmedSnapshotChanged);
         }
         for document in self
             .profiles

@@ -31,10 +31,10 @@ pub(super) fn plan_document(
     let from = profile_version(text)?;
     let (id, referenced) = profile_facts(from, text)?;
     validate_store_references(text, environment)?;
-    if let Some(state_generation) = state_generation {
-        if from > state_generation {
-            prove_older_compatibility(text, from, state_generation)?;
-        }
+    if let Some(state_generation) = state_generation
+        && from > state_generation
+    {
+        prove_older_compatibility(text, from, state_generation)?;
     }
     let route = select_routes(registry, from, target)?;
     let mut candidate = text.to_owned();
@@ -189,15 +189,15 @@ pub(super) fn validate_completed_inventory(
                 resource.properties().target(),
                 resource.properties().source().path(),
             ] {
-                if let ValueOrReference::Reference(parameter) = value {
-                    if !matches!(
+                if let ValueOrReference::Reference(parameter) = value
+                    && !matches!(
                         declaration.parameters().get(parameter),
                         Some(crate::declaration::profile::ParameterType::String)
-                    ) {
-                        return Err(PlanError::Invalid(format!(
-                            "resource refers to an undeclared or non-string parameter {parameter}"
-                        )));
-                    }
+                    )
+                {
+                    return Err(PlanError::Invalid(format!(
+                        "resource refers to an undeclared or non-string parameter {parameter}"
+                    )));
                 }
             }
             for reference in resource.depends_on() {
@@ -273,12 +273,12 @@ pub(super) fn profile_facts(
                         "directory/copy is not supported".to_owned(),
                     ));
                 }
-                if let ValueOrReference::Value(value) = properties.target() {
-                    if value.as_string().is_none() {
-                        return Err(PlanError::Invalid(
-                            "profile target must be a string".to_owned(),
-                        ));
-                    }
+                if let ValueOrReference::Value(value) = properties.target()
+                    && value.as_string().is_none()
+                {
+                    return Err(PlanError::Invalid(
+                        "profile target must be a string".to_owned(),
+                    ));
                 }
                 StoreId::parse(properties.source().store().to_owned())
                     .map_err(|error| PlanError::Invalid(error.to_string()))?;

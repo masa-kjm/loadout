@@ -243,25 +243,23 @@ fn replace_root_schema_version(source: &str) -> Result<String, Schema3To4Error> 
     let mut replaced = false;
 
     for line in source.split_inclusive('\n') {
-        if !replaced {
-            if let Some(value_start) = root_schema_version_value_start(line)
+        if !replaced
+            && let Some(value_start) = root_schema_version_value_start(line)
                 .or_else(|| flow_root_schema_version_value_start(line))
+        {
+            let value = &line[value_start..];
+            if let Some(suffix) = value.strip_prefix('3')
+                && (suffix.is_empty()
+                    || suffix.chars().next().is_some_and(char::is_whitespace)
+                    || suffix.starts_with('#')
+                    || suffix.starts_with(',')
+                    || suffix.starts_with('}'))
             {
-                let value = &line[value_start..];
-                if let Some(suffix) = value.strip_prefix('3') {
-                    if suffix.is_empty()
-                        || suffix.chars().next().is_some_and(char::is_whitespace)
-                        || suffix.starts_with('#')
-                        || suffix.starts_with(',')
-                        || suffix.starts_with('}')
-                    {
-                        result.push_str(&line[..value_start]);
-                        result.push('4');
-                        result.push_str(suffix);
-                        replaced = true;
-                        continue;
-                    }
-                }
+                result.push_str(&line[..value_start]);
+                result.push('4');
+                result.push_str(suffix);
+                replaced = true;
+                continue;
             }
         }
         result.push_str(line);

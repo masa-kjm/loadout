@@ -167,12 +167,12 @@ impl<'de> Deserialize<'de> for ValueOrReference {
         D: Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        if let Value::String(value) = &value {
-            if value.contains("{ parameter:") {
-                return Err(D::Error::custom(
-                    "parameter references must occupy the complete YAML value",
-                ));
-            }
+        if let Value::String(value) = &value
+            && value.contains("{ parameter:")
+        {
+            return Err(D::Error::custom(
+                "parameter references must occupy the complete YAML value",
+            ));
         }
         if let Value::Mapping(mapping) = &value {
             if mapping.len() == 1 {

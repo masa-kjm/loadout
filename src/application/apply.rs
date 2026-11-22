@@ -162,15 +162,15 @@ fn apply_request_with_hooks_and_after_planning(
         let lifecycle = ApplyFailureCause::Lifecycle;
         let state_error = |error| lifecycle(ApplyError::State(error));
         // This is deliberately narrower than full resolution: it reads only the profile inventory and rejects non-current declarations before state creation, locking, recovery, or resource access.
-        if let Err(error) = super::queries::validate_current_profile_schemas(request) {
-            if matches!(
+        if let Err(error) = super::queries::validate_current_profile_schemas(request)
+            && matches!(
                 error,
                 super::queries::QueryError::Resolution(
                     crate::resolver::ResolverError::InvalidProfileSchema { .. }
                 )
-            ) {
-                return Err(ApplyFailureCause::Input(error));
-            }
+            )
+        {
+            return Err(ApplyFailureCause::Input(error));
         }
         let repository = StateRepository::new(request.context.state_directory().clone());
         // A normal lifecycle path must reject an incompatible state before it can create or contend on the exclusive lock.
@@ -1758,28 +1758,28 @@ fn recovery_decision(
         return Ok(RecoveryDecision::Uncertain);
     }
 
-    if action.kind() == ActionKind::ForgetMissing {
-        if let Some(facts) = action.directory_link_facts() {
-            let Some(previous) = facts.old_effect() else {
-                return Ok(RecoveryDecision::Uncertain);
-            };
-            return Ok(
-                match inspector
-                    .inspect_target_for_expected_directory_link(
-                        previous.target_path(),
-                        previous.link_target(),
-                    )?
-                    .observation()
-                {
-                    TargetObservation::Missing => RecoveryDecision::Succeeded,
-                    TargetObservation::UnsafePath { .. } => RecoveryDecision::Uncertain,
-                    TargetObservation::ExpectedLink { .. }
-                    | TargetObservation::MatchingUnmanagedLink { .. }
-                    | TargetObservation::OtherLink { .. }
-                    | TargetObservation::OtherEntry { .. } => RecoveryDecision::Failed,
-                },
-            );
-        }
+    if action.kind() == ActionKind::ForgetMissing
+        && let Some(facts) = action.directory_link_facts()
+    {
+        let Some(previous) = facts.old_effect() else {
+            return Ok(RecoveryDecision::Uncertain);
+        };
+        return Ok(
+            match inspector
+                .inspect_target_for_expected_directory_link(
+                    previous.target_path(),
+                    previous.link_target(),
+                )?
+                .observation()
+            {
+                TargetObservation::Missing => RecoveryDecision::Succeeded,
+                TargetObservation::UnsafePath { .. } => RecoveryDecision::Uncertain,
+                TargetObservation::ExpectedLink { .. }
+                | TargetObservation::MatchingUnmanagedLink { .. }
+                | TargetObservation::OtherLink { .. }
+                | TargetObservation::OtherEntry { .. } => RecoveryDecision::Failed,
+            },
+        );
     }
 
     if action.kind() == ActionKind::RelocateLink {

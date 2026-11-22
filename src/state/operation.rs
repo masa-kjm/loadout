@@ -636,12 +636,12 @@ impl RecordedAction {
                 kind: action.kind(),
             });
         }
-        if let Some(path) = &temporary_path {
-            if path == target_path || path.as_ref().parent() != target_path.as_ref().parent() {
-                return Err(OperationRecordError::InvalidActionConditions {
-                    kind: action.kind(),
-                });
-            }
+        if let Some(path) = &temporary_path
+            && (path == target_path || path.as_ref().parent() != target_path.as_ref().parent())
+        {
+            return Err(OperationRecordError::InvalidActionConditions {
+                kind: action.kind(),
+            });
         }
         Ok(Self {
             facts: ActionFacts::ReplaceOwnership {
@@ -773,12 +773,12 @@ impl RecordedAction {
                 kind: ActionKind::ReplaceOwnership,
             });
         }
-        if let Some(path) = &temporary_path {
-            if path == &target_path || path.as_ref().parent() != target_path.as_ref().parent() {
-                return Err(OperationRecordError::InvalidActionConditions {
-                    kind: ActionKind::ReplaceOwnership,
-                });
-            }
+        if let Some(path) = &temporary_path
+            && (path == &target_path || path.as_ref().parent() != target_path.as_ref().parent())
+        {
+            return Err(OperationRecordError::InvalidActionConditions {
+                kind: ActionKind::ReplaceOwnership,
+            });
         }
         Ok(Self {
             facts: ActionFacts::ReplaceOwnership {
@@ -2117,12 +2117,12 @@ impl OperationRecord {
 
         // Temporary siblings are action-local and may never alias another recorded target or another replacement's temporary entry.
         for action in actions.values() {
-            if let Some(facts) = action.replacement_facts() {
-                if !target_paths.insert(facts.temporary_path().clone()) {
-                    return Err(OperationRecordError::DuplicateTargetPath {
-                        target_path: facts.temporary_path().clone(),
-                    });
-                }
+            if let Some(facts) = action.replacement_facts()
+                && !target_paths.insert(facts.temporary_path().clone())
+            {
+                return Err(OperationRecordError::DuplicateTargetPath {
+                    target_path: facts.temporary_path().clone(),
+                });
             }
         }
 
@@ -2291,16 +2291,15 @@ impl OperationRecord {
             .collect::<BTreeMap<_, _>>();
         for node in &graph.actions {
             for fact in &node.topology_delta.add_current_direct {
-                if let Some(predecessor) = actions_by_resource.get(&fact.from) {
-                    if !is_current_role(predecessor.role)
+                if let Some(predecessor) = actions_by_resource.get(&fact.from)
+                    && (!is_current_role(predecessor.role)
                         || !graph.direct_edges.iter().any(|edge| {
                             edge.from == predecessor.id
                                 && edge.to == node.id
                                 && edge.origin == fact.origin
-                        })
-                    {
-                        return false;
-                    }
+                        }))
+                {
+                    return false;
                 }
             }
             for fact in node

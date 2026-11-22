@@ -119,17 +119,16 @@ impl PersistedState {
                 .validate_loaded_topology(known.topology())
                 .map_err(StateDecodeError::InvalidOperation)?;
             for (_, action) in operation.actions() {
-                if let Some(temporary_path) = action.temporary_path() {
-                    if known
+                if let Some(temporary_path) = action.temporary_path()
+                    && known
                         .resources()
                         .any(|resource| resource.target_path() == temporary_path)
-                    {
-                        return Err(StateDecodeError::InvalidOperation(
-                            OperationRecordError::DuplicateTargetPath {
-                                target_path: temporary_path.clone(),
-                            },
-                        ));
-                    }
+                {
+                    return Err(StateDecodeError::InvalidOperation(
+                        OperationRecordError::DuplicateTargetPath {
+                            target_path: temporary_path.clone(),
+                        },
+                    ));
                 }
             }
             validate_succeeded_actions(&known, operation)?;
@@ -1124,20 +1123,18 @@ impl LockedStateRepository {
                 .with_directory_identity_replaced_by_id(&old_resource_id, new_resource)
                 .map_err(StateRepositoryError::KnownState)?,
         };
-        if let Some(operation) = candidate.active_operation.as_ref() {
-            if operation.graph().is_some() {
-                let (authority, delta) = operation
-                    .topology_for_action(action_id)
-                    .map_err(StateRepositoryError::Operation)?;
-                let topology = candidate
-                    .known
-                    .topology()
-                    .transition(authority, delta)
-                    .map_err(|_| {
-                        StateRepositoryError::Operation(OperationRecordError::InvalidGraph)
-                    })?;
-                candidate.known = candidate.known.clone().with_topology(topology);
-            }
+        if let Some(operation) = candidate.active_operation.as_ref()
+            && operation.graph().is_some()
+        {
+            let (authority, delta) = operation
+                .topology_for_action(action_id)
+                .map_err(StateRepositoryError::Operation)?;
+            let topology = candidate
+                .known
+                .topology()
+                .transition(authority, delta)
+                .map_err(|_| StateRepositoryError::Operation(OperationRecordError::InvalidGraph))?;
+            candidate.known = candidate.known.clone().with_topology(topology);
         }
         self.commit_candidate(candidate)
     }

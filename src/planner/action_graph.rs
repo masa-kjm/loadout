@@ -124,13 +124,13 @@ pub(crate) fn schedule(
 
     let mut stage_members = BTreeMap::<String, Vec<FullyQualifiedResourceId>>::new();
     for (id, fact) in &resources {
-        if let Some(stage) = fact.stage() {
-            if action_ids.contains(id) {
-                stage_members
-                    .entry(stage.to_owned())
-                    .or_default()
-                    .push(id.clone());
-            }
+        if let Some(stage) = fact.stage()
+            && action_ids.contains(id)
+        {
+            stage_members
+                .entry(stage.to_owned())
+                .or_default()
+                .push(id.clone());
         }
     }
     for members in stage_members.values_mut() {
@@ -398,10 +398,10 @@ fn recorded_order_conflicts(desired: &ResolvedDesired, known: &KnownState) -> Ve
         let mut ancestors = BTreeSet::new();
         let mut pending = phase.after().to_vec();
         while let Some(id) = pending.pop() {
-            if ancestors.insert(id.clone()) {
-                if let Some(predecessor) = phases.get(id.as_str()) {
-                    pending.extend(predecessor.after().iter().cloned());
-                }
+            if ancestors.insert(id.clone())
+                && let Some(predecessor) = phases.get(id.as_str())
+            {
+                pending.extend(predecessor.after().iter().cloned());
             }
         }
         for ancestor in ancestors {
@@ -694,25 +694,25 @@ fn select_stage_topology_publication(
     let mut ancestors = BTreeSet::new();
     let mut pending = stage.after().to_vec();
     while let Some(ancestor) = pending.pop() {
-        if ancestors.insert(canonical_phase_id(&ancestor)) {
-            if let Some(predecessor) = stages.get(&ancestor) {
-                pending.extend(predecessor.after().iter().cloned());
-            }
+        if ancestors.insert(canonical_phase_id(&ancestor))
+            && let Some(predecessor) = stages.get(&ancestor)
+        {
+            pending.extend(predecessor.after().iter().cloned());
         }
     }
     let mut proved = ancestors.clone();
-    if let Some((_, fact)) = &before {
-        if !fact.members.contains(resource_id) {
-            let mut pending = fact.after.clone();
-            while let Some(predecessor) = pending.pop() {
-                if !proved.insert(predecessor.clone()) {
-                    continue;
-                }
-                let Some((_, recorded)) = facts.get(&predecessor) else {
-                    return false;
-                };
-                pending.extend(recorded.after.iter().cloned());
+    if let Some((_, fact)) = &before
+        && !fact.members.contains(resource_id)
+    {
+        let mut pending = fact.after.clone();
+        while let Some(predecessor) = pending.pop() {
+            if !proved.insert(predecessor.clone()) {
+                continue;
             }
+            let Some((_, recorded)) = facts.get(&predecessor) else {
+                return false;
+            };
+            pending.extend(recorded.after.iter().cloned());
         }
     }
     if proved.iter().any(|ancestor| {
@@ -1255,16 +1255,14 @@ fn stale_constraints(
             .input
             .iter()
             .any(|input| constraint.output.contains(input))
-        {
-            if let Some(id) = constraint
+            && let Some(id) = constraint
                 .input
                 .first()
                 .and_then(|id| FullyQualifiedResourceId::parse(id).ok())
-            {
-                result
-                    .diagnostics
-                    .push(blocking(&id, OrderingBlockReason::Cycle));
-            }
+        {
+            result
+                .diagnostics
+                .push(blocking(&id, OrderingBlockReason::Cycle));
         }
     }
     constraints

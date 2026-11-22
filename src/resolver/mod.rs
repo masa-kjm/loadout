@@ -1434,14 +1434,14 @@ fn walk_memberships(
             .as_ref()
             .map(|(name, _)| name.clone())
             .or_else(|| resource.stage().map(ToOwned::to_owned));
-        if let Some(name) = &effective {
-            if !phases.contains(name) {
-                return Err(ResolverError::InvalidOrchestrationReference {
-                    reference: name.clone(),
-                    relation: "resource stage",
-                    reason: "does not name a root phase",
-                });
-            }
+        if let Some(name) = &effective
+            && !phases.contains(name)
+        {
+            return Err(ResolverError::InvalidOrchestrationReference {
+                reference: name.clone(),
+                relation: "resource stage",
+                reason: "does not name a root phase",
+            });
         }
         let source = inherited
             .as_ref()

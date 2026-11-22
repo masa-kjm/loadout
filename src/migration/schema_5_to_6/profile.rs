@@ -187,10 +187,9 @@ fn contexts(
                 profile: id.clone(),
                 path: path.clone(),
             },
-        ) {
-            if existing.profile != *id {
-                return Err(format!("instance {path} has conflicting definitions"));
-            }
+        ) && existing.profile != *id
+        {
+            return Err(format!("instance {path} has conflicting definitions"));
         }
         for include in &old[id].includes {
             let child = ProfileId::parse(include.id.clone()).map_err(|e| e.to_string())?;
@@ -442,13 +441,13 @@ pub(crate) fn convert_inventory(
                         ));
                     }
                 }
-                if let Some(previous) = phases.insert(name.clone(), after.clone()) {
-                    if previous != after {
-                        return Err(format!(
-                            "root {root} merges stage {name} with different after relations from {} and {}",
-                            phase_origin[name], instance.profile
-                        ));
-                    }
+                if let Some(previous) = phases.insert(name.clone(), after.clone())
+                    && previous != after
+                {
+                    return Err(format!(
+                        "root {root} merges stage {name} with different after relations from {} and {}",
+                        phase_origin[name], instance.profile
+                    ));
                 }
                 phase_origin.insert(name.clone(), instance.profile.to_string());
             }
@@ -616,13 +615,13 @@ pub(crate) fn convert_inventory(
                     if pre_path == instance.path {
                         if reference.contains('/') {
                             let key = (instance.profile.clone(), name.clone(), reference.clone());
-                            if let Some(previous) = local_rewrites.insert(key, pre_name.clone()) {
-                                if previous != pre_name {
-                                    return Err(format!(
-                                        "profile {} resource {name} depends_on {reference} has different local meanings in root {root}",
-                                        instance.profile
-                                    ));
-                                }
+                            if let Some(previous) = local_rewrites.insert(key, pre_name.clone())
+                                && previous != pre_name
+                            {
+                                return Err(format!(
+                                    "profile {} resource {name} depends_on {reference} has different local meanings in root {root}",
+                                    instance.profile
+                                ));
                             }
                         }
                         continue;
@@ -645,13 +644,12 @@ pub(crate) fn convert_inventory(
                     let placement = (owner.clone(), before.clone(), after.clone());
                     if let Some(previous) =
                         dependency_placements.insert(declaration.clone(), placement.clone())
+                        && previous != placement
                     {
-                        if previous != placement {
-                            return Err(format!(
-                                "profile {} resource {name} depends_on {reference} has different placements in root {root}: {:?} and {:?}; edit the declaration manually",
-                                instance.profile, previous, placement
-                            ));
-                        }
+                        return Err(format!(
+                            "profile {} resource {name} depends_on {reference} has different placements in root {root}: {:?} and {:?}; edit the declaration manually",
+                            instance.profile, previous, placement
+                        ));
                     }
                     dependencies
                         .entry(owner.clone())
@@ -663,13 +661,13 @@ pub(crate) fn convert_inventory(
     }
     for (id, value) in &mut values {
         let stages = additions.remove(id).unwrap_or_default();
-        if stages.is_empty() && !dependencies.contains_key(id) {
-            if let Some((_, source)) = profiles.get(id) {
-                if let Ok(converted) = convert_profile(source) {
-                    result.documents.insert(id.clone(), converted);
-                    continue;
-                }
-            }
+        if stages.is_empty()
+            && !dependencies.contains_key(id)
+            && let Some((_, source)) = profiles.get(id)
+            && let Ok(converted) = convert_profile(source)
+        {
+            result.documents.insert(id.clone(), converted);
+            continue;
         }
         set_stages(value, &stages)?;
         let root = root_mapping(value)?;

@@ -313,20 +313,16 @@ fn existing(
                 previous: old.clone(),
             });
         }
-        if !old_ok {
-            if let Some(observation) = old_observation {
-                unexpected(value.resource_id(), old.target_path(), observation, result);
-            }
+        if !old_ok && let Some(observation) = old_observation {
+            unexpected(value.resource_id(), old.target_path(), observation, result);
         }
-        if !new_missing {
-            if let Some(observation) = new_observation {
-                unexpected(
-                    value.resource_id(),
-                    value.target_path(),
-                    observation,
-                    result,
-                );
-            }
+        if !new_missing && let Some(observation) = new_observation {
+            unexpected(
+                value.resource_id(),
+                value.target_path(),
+                observation,
+                result,
+            );
         }
         return;
     }

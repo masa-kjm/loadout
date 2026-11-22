@@ -72,10 +72,10 @@ impl FileCopyExecutor {
             if reverified.path() != expected_path {
                 return Err(CopyPreflightError::SourceDoesNotMatchAction);
             }
-            if let Some(expected_fingerprint) = expected_fingerprint {
-                if fingerprint_regular_file(reverified.path())? != *expected_fingerprint {
-                    return Err(CopyPreflightError::SourceFingerprintChanged);
-                }
+            if let Some(expected_fingerprint) = expected_fingerprint
+                && fingerprint_regular_file(reverified.path())? != *expected_fingerprint
+            {
+                return Err(CopyPreflightError::SourceFingerprintChanged);
             }
         }
         for condition in action.preconditions() {

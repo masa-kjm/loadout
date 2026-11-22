@@ -176,23 +176,19 @@ fn plan_existing_identity(
         return;
     }
 
-    if !old_is_expected {
-        if let Some(observation) = old_observation {
-            diagnostics.push(Diagnostic::UnexpectedTarget {
-                resource_id: desired.resource_id().clone(),
-                target_path: previous.target_path().clone(),
-                observation: observation.clone(),
-            });
-        }
+    if !old_is_expected && let Some(observation) = old_observation {
+        diagnostics.push(Diagnostic::UnexpectedTarget {
+            resource_id: desired.resource_id().clone(),
+            target_path: previous.target_path().clone(),
+            observation: observation.clone(),
+        });
     }
-    if !new_is_missing {
-        if let Some(observation) = new_observation {
-            diagnostics.push(Diagnostic::UnexpectedTarget {
-                resource_id: desired.resource_id().clone(),
-                target_path: desired.target_path().clone(),
-                observation: observation.clone(),
-            });
-        }
+    if !new_is_missing && let Some(observation) = new_observation {
+        diagnostics.push(Diagnostic::UnexpectedTarget {
+            resource_id: desired.resource_id().clone(),
+            target_path: desired.target_path().clone(),
+            observation: observation.clone(),
+        });
     }
 }
 

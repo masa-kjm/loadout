@@ -94,6 +94,7 @@ pub(super) fn validate_completed_inventory(
     target: u32,
     default_profile: Option<&str>,
     context: &ResolverContext,
+    environment: &EnvironmentConfig,
 ) -> Result<(), PlanError> {
     let validation_documents = if target < 6 {
         Some(legacy_validation::project(documents, target)?)
@@ -220,8 +221,14 @@ pub(super) fn validate_completed_inventory(
             }
         }
     }
-    validate_migration_inventory(context, &resolved_declarations, target, default_profile)
-        .map_err(|error| PlanError::Invalid(error.to_string()))?;
+    validate_migration_inventory(
+        context,
+        environment,
+        &resolved_declarations,
+        target,
+        default_profile,
+    )
+    .map_err(|error| PlanError::Invalid(error.to_string()))?;
     Ok(())
 }
 

@@ -361,6 +361,91 @@ fn schema_five_state_with_recorded_topology_rejects_before_publication() {
 }
 
 #[test]
+fn bound_source_path_escape_rejects_the_complete_inventory_before_publication() {
+    let fixture = Fixture::new();
+    fixture.state(5);
+    fs::create_dir(fixture.root.join("store")).unwrap();
+    fs::write(fixture.root.join("store/ok"), "source\n").unwrap();
+    fs::write(
+        fixture.root.join("portable/config.yaml"),
+        "schema_version: 2\ndefault_profile: base\nprofile_discovery:\n  paths: [profiles]\nstores:\n  files:\n    type: local\n    properties: { path: ../store }\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.root.join("portable/profiles/child.yaml"),
+        "schema_version: 5\nid: child\nparameters: { bad: string }\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source: { store: files, path: { parameter: bad } }\n      target: ~/migrated\n",
+    )
+    .unwrap();
+    let parent_path = fixture.root.join("portable/profiles/base.yaml");
+    let parent = |binding: &str| {
+        format!(
+            "schema_version: 5\nid: base\nincludes: [{{ id: child, with: {{ bad: {binding} }} }}]\nresources: {{}}\n"
+        )
+    };
+    fs::write(&parent_path, parent("../escape")).unwrap();
+
+    let before = fixture.snapshot();
+    let output = fixture.run(&["migrate", "--config", "../portable/config.yaml", "--yes"]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(
+        text(&output).contains("invalid source path: ../escape"),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(
+        fixture.snapshot(),
+        before,
+        "migration published an invalid inventory"
+    );
+
+    fs::write(&parent_path, parent("ok")).unwrap();
+    let output = fixture.run(&["migrate", "--config", "../portable/config.yaml", "--yes"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    let output = fixture.run(&["validate", "--config", "../portable/config.yaml"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+}
+
+#[test]
+fn protected_local_store_target_rejects_before_inventory_publication() {
+    let fixture = Fixture::new();
+    fixture.state(5);
+    fs::create_dir(fixture.root.join("home/store")).unwrap();
+    fs::write(fixture.root.join("home/store/source"), "source\n").unwrap();
+    fs::write(
+        fixture.root.join("portable/config.yaml"),
+        "schema_version: 2\ndefault_profile: base\nprofile_discovery:\n  paths: [profiles]\nstores:\n  files:\n    type: local\n    properties: { path: ../home/store }\n",
+    )
+    .unwrap();
+    let profile_path = fixture.root.join("portable/profiles/base.yaml");
+    let profile = |target: &str| {
+        format!(
+            "schema_version: 5\nid: base\nresources:\n  item:\n    type: file\n    properties:\n      kind: file\n      operation: link\n      source: {{ store: files, path: source }}\n      target: {target}\n"
+        )
+    };
+    fs::write(&profile_path, profile("~/store/managed")).unwrap();
+
+    let before = fixture.snapshot();
+    let output = fixture.run(&["migrate", "--config", "../portable/config.yaml", "--yes"]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(
+        text(&output).contains("protected local store root"),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(
+        fixture.snapshot(),
+        before,
+        "migration published an unsafe inventory"
+    );
+
+    fs::write(&profile_path, profile("~/managed")).unwrap();
+    let output = fixture.run(&["migrate", "--config", "../portable/config.yaml", "--yes"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    let output = fixture.run(&["validate", "--config", "../portable/config.yaml"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+}
+
+#[test]
 fn presentation_identifies_broadened_order_through_empty_phase_before_confirmation() {
     let fixture = Fixture::new();
     fs::remove_file(fixture.root.join("state/loadout/state.json")).unwrap();

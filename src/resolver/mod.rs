@@ -325,9 +325,10 @@ pub(crate) fn validate_current_profile_schemas(
     discover_profiles(context, environment).map(|_| ())
 }
 
-/// Validates a migration candidate inventory through normal composition and target binding without reading sources or targets.
+/// Validates a migration candidate inventory through normal composition and safe path binding without reading final sources or targets.
 pub(crate) fn validate_migration_inventory(
     context: &ResolverContext,
+    environment: &EnvironmentConfig,
     declarations: &BTreeMap<ProfileId, (ProfileDeclaration, PathBuf)>,
     target_generation: u32,
     default_profile: Option<&str>,
@@ -364,6 +365,19 @@ pub(crate) fn validate_migration_inventory(
         let result = (|| -> Result<Vec<ResolvedInstance>, ResolverError> {
             let instances = compose_instances(root, &profiles)?;
             resolve_orchestration(&instances, &profiles)?;
+            let protected_store_paths = if target_generation == 6 {
+                let stores = resolve_stores(context, environment)?;
+                let protected_paths = ProtectedPaths::new(
+                    context,
+                    profiles
+                        .values()
+                        .map(|profile| profile.file_path.clone())
+                        .collect(),
+                )?;
+                Some((stores, protected_paths))
+            } else {
+                None
+            };
             let mut targets = BTreeMap::new();
             for instance in &instances {
                 for (local_id, resource) in profiles[&instance.definition].declaration.resources() {
@@ -418,6 +432,12 @@ pub(crate) fn validate_migration_inventory(
                             reason: "directory resources support only operation: link",
                         });
                     }
+                    let source_path = parse_source_path(&resolve_string(
+                        properties.source().path(),
+                        instance,
+                        profiles[&instance.definition].declaration.id(),
+                        "source.path",
+                    )?)?;
                     let raw_target = resolve_string(
                         properties.target(),
                         instance,
@@ -425,6 +445,23 @@ pub(crate) fn validate_migration_inventory(
                         "target",
                     )?;
                     let target = bind_target_path(&raw_target, context)?;
+                    if let Some((stores, protected_paths)) = &protected_store_paths {
+                        let store_id = StoreId::parse(properties.source().store().to_owned())
+                            .map_err(|source| ResolverError::InvalidIdentifier {
+                                role: "store ID",
+                                value: properties.source().store().to_owned(),
+                                source,
+                            })?;
+                        let store =
+                            stores
+                                .get(&store_id)
+                                .ok_or_else(|| ResolverError::MissingStore {
+                                    resource_id: resource_id.clone(),
+                                    store_id,
+                                })?;
+                        bind_source_path(&store.root, &source_path)?;
+                        protected_paths.ensure_target_allowed(&target, stores)?;
+                    }
                     if let Some(first_resource_id) =
                         targets.insert(target.clone(), resource_id.clone())
                     {
@@ -2432,6 +2469,8 @@ mod tests {
     fn migration_inventory_uses_valid_root_closures_and_rejects_invalid_defaults() {
         let workspace = TestWorkspace::new();
         let context = workspace.context();
+        workspace.create_dir("store");
+        let environment = environment(Some("root"), &["../profiles"], "../store");
         let mut profiles = BTreeMap::new();
         let root = ProfileId::parse("root".to_owned()).unwrap();
         let child = ProfileId::parse("child".to_owned()).unwrap();
@@ -2449,14 +2488,17 @@ mod tests {
                 workspace.path("child.yaml"),
             ),
         );
-        assert!(validate_migration_inventory(&context, &profiles, 6, Some("root")).is_ok());
+        assert!(
+            validate_migration_inventory(&context, &environment, &profiles, 6, Some("root"))
+                .is_ok()
+        );
         assert!(matches!(
-            validate_migration_inventory(&context, &profiles, 6, Some("child")),
+            validate_migration_inventory(&context, &environment, &profiles, 6, Some("child")),
             Err(ResolverError::InvalidMigrationCandidate { root, .. }) if root == child
         ));
         profiles.remove(&root);
         assert!(matches!(
-            validate_migration_inventory(&context, &profiles, 6, None),
+            validate_migration_inventory(&context, &environment, &profiles, 6, None),
             Err(ResolverError::UncoveredMigrationProfiles { profiles }) if profiles == vec![child]
         ));
     }
@@ -2465,6 +2507,8 @@ mod tests {
     fn migration_inventory_names_the_failing_candidate_root() {
         let workspace = TestWorkspace::new();
         let context = workspace.context();
+        workspace.create_dir("store");
+        let environment = environment(Some("root"), &["../profiles"], "../store");
         let root = ProfileId::parse("root".to_owned()).unwrap();
         let child = ProfileId::parse("child".to_owned()).unwrap();
         let profiles = BTreeMap::from([
@@ -2484,7 +2528,7 @@ mod tests {
             ),
         ]);
         assert!(matches!(
-            validate_migration_inventory(&context, &profiles, 6, Some("root")),
+            validate_migration_inventory(&context, &environment, &profiles, 6, Some("root")),
             Err(ResolverError::InvalidMigrationCandidate { root: failed, reason }) if failed == root && reason.contains("stages")
         ));
     }
@@ -2493,6 +2537,8 @@ mod tests {
     fn migration_inventory_skips_branch_with_descendant_phase_requirement() {
         let workspace = TestWorkspace::new();
         let context = workspace.context();
+        workspace.create_dir("store");
+        let environment = environment(Some("root"), &["../profiles"], "../store");
         let root = ProfileId::parse("root".to_owned()).unwrap();
         let branch = ProfileId::parse("branch".to_owned()).unwrap();
         let leaf = ProfileId::parse("leaf".to_owned()).unwrap();
@@ -2519,9 +2565,12 @@ mod tests {
                 ),
             ),
         ]);
-        assert!(validate_migration_inventory(&context, &profiles, 6, Some("root")).is_ok());
+        assert!(
+            validate_migration_inventory(&context, &environment, &profiles, 6, Some("root"))
+                .is_ok()
+        );
         assert!(matches!(
-            validate_migration_inventory(&context, &profiles, 6, Some("branch")),
+            validate_migration_inventory(&context, &environment, &profiles, 6, Some("branch")),
             Err(ResolverError::InvalidMigrationCandidate { root: failed, .. }) if failed == branch
         ));
     }

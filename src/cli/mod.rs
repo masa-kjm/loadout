@@ -104,18 +104,16 @@ fn run_command(
             &StateRepository::new(machine.state_directory.clone()),
         )
         .map(|report| render::diff(out, &report)),
-        Command::Validate { config, root, all } => {
+        Command::Validate { config, root } => {
             let context = match machine.select(config.as_deref()) {
                 Ok(context) => context,
                 Err(error) => return load_error(err, error),
             };
-            let selection = if all {
-                ValidationSelection::All
-            } else {
-                ValidationSelection::Root(root)
-            };
-            queries::validate(&ValidationRequest { context, selection })
-                .map(|report| render::validation(out, err, &report))
+            queries::validate(&ValidationRequest {
+                context,
+                selection: ValidationSelection::Root(root),
+            })
+            .map(|report| render::validation(out, err, &report))
         }
         Command::Apply {
             config,
@@ -352,7 +350,12 @@ fn run_resource(
                     .find(|resource| resource.resource_id() == &resource_id)
                 {
                     Some(resource) => {
-                        render::desired_resource(out, &report.root_profile, resource).map(|()| 0)
+                        let facts = report
+                            .orchestration
+                            .iter()
+                            .find(|facts| facts.resource_id() == &resource_id);
+                        render::desired_resource(out, &report.root_profile, resource, facts)
+                            .map(|()| 0)
                     }
                     None => input_error(err, format!("unknown resource ID: {resource_id}")),
                 },
@@ -752,7 +755,6 @@ mod tests {
             Command::Validate {
                 config: Some(fixture.root.join("config.yaml").into_os_string()),
                 root: None,
-                all: false,
             },
             &fixture.machine(),
             &mut Vec::new(),

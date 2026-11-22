@@ -1200,7 +1200,12 @@ fn stale_constraints(
                 after: vec![],
                 input: vec![edge.to.as_str().to_owned()],
                 output: vec![edge.from.as_str().to_owned()],
-                provenance: vec![edge.from.as_str().to_owned(), edge.to.as_str().to_owned()],
+                provenance: {
+                    let mut provenance =
+                        vec![edge.from.as_str().to_owned(), edge.to.as_str().to_owned()];
+                    provenance.sort();
+                    provenance
+                },
             });
         }
     }
@@ -1237,7 +1242,11 @@ fn stale_constraints(
                     .iter()
                     .map(|id| id.as_str().to_owned())
                     .collect(),
-                provenance: vec![barrier.id.clone(), after.clone()],
+                provenance: {
+                    let mut provenance = vec![barrier.id.clone(), after.clone()];
+                    provenance.sort();
+                    provenance
+                },
             });
         }
     }

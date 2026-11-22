@@ -318,7 +318,12 @@ mod unix {
         expect(
             f.command().args(ARGS).output().unwrap(),
             2,
-            &["requires --yes", "create_link"],
+            &[
+                "requires --yes",
+                "create_link",
+                "prior operation recovery: old-pending",
+                "a1 base/item: Pending -> Failed",
+            ],
         );
         no_new_operation(&f);
         assert!(state(&f)["active_operation"].is_null());

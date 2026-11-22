@@ -6,6 +6,7 @@ use crate::application::queries::{
 };
 use crate::domain::{
     actual::{ActualResource, CopyTargetObservation, TargetObservation},
+    desired::ResolvedResourceOrchestration,
     diagnostic::{Diagnostic, OrderingBlockReason},
     plan::{ActionKind, ActionReason, Plan},
 };
@@ -240,6 +241,13 @@ pub(super) fn validation(
     if report.profiles.is_empty() {
         writeln!(out, "No profiles discovered.")?;
     }
+    if !report.checked_instances.is_empty() {
+        writeln!(
+            out,
+            "checked closure: {}",
+            report.checked_instances.join(", ")
+        )?;
+    }
     Ok(code)
 }
 
@@ -322,6 +330,13 @@ pub(super) fn desired_resources(
     )?;
     for resource in &report.resources {
         render_resolved_resource(out, resource)?;
+        if let Some(facts) = report
+            .orchestration
+            .iter()
+            .find(|facts| facts.resource_id() == resource.resource_id())
+        {
+            render_orchestration(out, facts)?;
+        }
     }
     Ok(())
 }
@@ -330,9 +345,42 @@ pub(super) fn desired_resource(
     out: &mut impl Write,
     root_profile: &crate::domain::ids::ProfileId,
     resource: &crate::domain::desired::ResolvedResource,
+    orchestration: Option<&ResolvedResourceOrchestration>,
 ) -> io::Result<()> {
     writeln!(out, "Desired resource for {root_profile}:")?;
-    render_resolved_resource(out, resource)
+    render_resolved_resource(out, resource)?;
+    if let Some(facts) = orchestration {
+        render_orchestration(out, facts)?;
+    }
+    Ok(())
+}
+
+pub(super) fn render_orchestration(
+    out: &mut impl Write,
+    facts: &ResolvedResourceOrchestration,
+) -> io::Result<()> {
+    match facts.stage() {
+        Some(stage) => writeln!(
+            out,
+            "  effective phase: {stage} (source: {})",
+            facts.stage_source().unwrap_or("unknown declaration")
+        )?,
+        None => writeln!(out, "  effective phase: none")?,
+    }
+    for predecessor in facts.depends_on() {
+        let source = facts
+            .dependency_sources()
+            .iter()
+            .find(|(id, _)| id == predecessor)
+            .map(|(_, source)| source.as_str())
+            .unwrap_or("unknown declaration");
+        writeln!(
+            out,
+            "  direct dependency: {predecessor} -> {} (source: {source})",
+            facts.resource_id()
+        )?;
+    }
+    Ok(())
 }
 
 pub(super) fn known_resources(
@@ -525,6 +573,10 @@ pub(super) fn plan(
             "blocked"
         }
     )?;
+    for facts in &report.resources {
+        writeln!(out, "Desired resource: {}", facts.resource_id())?;
+        render_orchestration(out, facts)?;
+    }
     planned(out, err, &report.plan)
 }
 
@@ -655,7 +707,7 @@ pub(super) fn planned(out: &mut impl Write, err: &mut impl Write, plan: &Plan) -
                 )?;
                 writeln!(
                     err,
-                    "remove the entire rebuild set from Desired, apply stale removal under recorded order until every member and old ordering fact is gone, then restore the new declarations and replan"
+                    "remove the entire rebuild set from Desired, apply stale removal under recorded order until every member and old ordering fact is gone, then restore the new declarations and run plan and apply under the new order; recover or retry any failed or uncertain removal before treating the rebuild as complete"
                 )?;
             }
         }

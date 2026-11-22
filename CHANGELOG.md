@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.9.0
+
+- Added schema-6 ordering across included profiles with root stages, include stage assignments, and cross-instance resource dependencies.
+- Recorded and recovered verified ordering facts with lifecycle actions, and reported conflicts with recorded order and the resources that need rebuilding.
+
 ## v0.8.3
 
 - Allow profiles to bind `source.path` from a string parameter.

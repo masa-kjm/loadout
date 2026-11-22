@@ -41,7 +41,7 @@ loadout config use ./.loadout/config.yaml
 `init` creates `.loadout/config.yaml` and an empty `.loadout/profiles/base.yaml`. It configures the current directory as the `native` store. Add a source file named `example.txt` in this directory, then replace `base.yaml` with:
 
 ```yaml
-schema_version: 5
+schema_version: 6
 id: base
 resources:
   example:
